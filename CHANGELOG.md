@@ -4,6 +4,21 @@ All notable changes to the three-role-model plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-14
+
+### Added
+- **Build leg 3 — the workflow skills + bundled memory search.** Ported the 7
+  role/workflow skills (issue-to-ship, auto-flow, delegate, per-task-review-loop,
+  ship, coherent-plan, double-critique) with every ledger/memory invocation
+  re-pathed to `${CLAUDE_PLUGIN_ROOT}`, and bundled a self-contained cairn search
+  shim (`bin/cairn-find.mjs` + `bin/cairn-lib/`) so the search-before-plan step
+  works with zero external dependencies.
+
+### Changed
+- **`/ship` made portable for public use.** Removed the private employer-brand
+  denylist gate entirely; the repo-specific release + index-check gates now
+  degrade-skip when their helper is absent, so `/ship` runs anywhere.
+
 ## [0.2.0] - 2026-06-14
 
 ### Added
