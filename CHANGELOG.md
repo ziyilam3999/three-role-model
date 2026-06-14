@@ -4,6 +4,19 @@ All notable changes to the three-role-model plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-06-14
+
+### Added
+- **Build leg 4 — the standalone doctrine.** Replaced the placeholder
+  `3-role-model.md` with the full, self-contained doctrine for the 3-role
+  development model: the planner → plan-review → executor → execution-review
+  flow, the two knobs (executor placement / evaluator) as tables, the role
+  invariants (never self-review, stateless reviewers, search-memory-first,
+  instrumented ledger), the skills-as-role-primitives mapping, role-tooling
+  rules, the never-background-and-end rule, and the four not-briefable inline
+  criteria. Written to be understood by a reader with no external context; all
+  bundled-artifact references use `${CLAUDE_PLUGIN_ROOT}`.
+
 ## [0.3.0] - 2026-06-14
 
 ### Added
