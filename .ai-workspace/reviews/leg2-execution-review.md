@@ -16,7 +16,7 @@
 4. **Smoke tests are real** — 9 scripts exercise actual functionality with exit-code +
    output validation.
 5. **PORT-NOTEs** — 5 comments deferring doctrine to Leg 4; deferrals reasonable.
-6. **Privacy** — grep for shopee/sea limited/garena: clean.
+6. **Privacy** — grep for the regulated employer-brand denylist tokens: clean.
 7. **Faithful port** — enforce-plan.sh, inline-delegate-nudge.sh, enforce-ship.sh diffed
    byte-identical against originals; 3 smokes run with CLAUDE_PLUGIN_ROOT set:
    3role-ledger-smoke 16 PASS, enforce-ship-marker-hint 4 PASS, enforce-review-or-lfah 12 PASS.
