@@ -1,5 +1,6 @@
 {
   "name": "three-role-model",
+  "description": "Single-plugin marketplace for the 3-role development model: planner -> plan-review -> executor -> execution-review, each a separate subagent, never self-review.",
   "owner": {
     "name": "ziyilam3999",
     "url": "https://github.com/ziyilam3999"

@@ -1,0 +1,155 @@
+===== three-role-model LIVE install smoke =====
+date: 2026-06-14T06:15:38Z
+CLAUDE_CONFIG_DIR=/var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/config
+REPO (marketplace source)=<REPO>
+claude version: 2.1.177 (Claude Code)
+
+### Step 1 — validate the plugin manifest
+$ claude plugin validate <REPO>
+Validating marketplace manifest: <REPO>/.claude-plugin/marketplace.json
+
+⚠ Found 1 warning:
+
+  ❯ description: No marketplace description provided. Adding a description helps users understand what this marketplace offers
+
+✔ Validation passed with warnings
+[exit:]
+
+### Step 1b — validate --strict
+$ claude plugin validate --strict <REPO>
+Validating marketplace manifest: <REPO>/.claude-plugin/marketplace.json
+
+⚠ Found 1 warning:
+
+  ❯ description: No marketplace description provided. Adding a description helps users understand what this marketplace offers
+
+✘ Validation failed (--strict treats warnings as errors)
+[exit:]
+
+### Step 2 — add the local marketplace
+$ claude plugin marketplace add <REPO>
+Adding marketplace…✔ Successfully added marketplace: three-role-model (declared in user settings)
+[exit:]
+
+### Step 2b — list marketplaces
+$ claude plugin marketplace list
+Configured marketplaces:
+
+  ❯ three-role-model
+    Source: Directory (<REPO>)
+
+[exit:]
+
+### Step 3 — install the plugin (user scope)
+$ claude plugin install three-role-model@three-role-model --scope user
+Installing plugin "three-role-model@three-role-model"...✔ Successfully installed plugin: three-role-model@three-role-model (scope: user)
+[exit:]
+
+SANDBOX_PATH_SAVED
+### AC-a — plugin installed + component inventory
+$ claude plugin list --json
+[
+  {
+    "id": "three-role-model@three-role-model",
+    "version": "0.5.0",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/config/plugins/cache/three-role-model/three-role-model/0.5.0",
+    "installedAt": "2026-06-14T06:15:40.136Z",
+    "lastUpdated": "2026-06-14T06:15:40.136Z"
+  }
+]
+[exit:]
+
+$ claude plugin details three-role-model
+three-role-model 0.5.0
+  The 3-role development model as a Claude Code plugin: planner -> plan-review -> executor -> execution-review, each a separate subagent, never self-review. Bundles the role-enforcing hooks, the orchestration skills, a memory-search shim, the standalone doctrine, and a scaffolding command that makes the model the default for new skills, agents, hooks, and commands.
+  Source: three-role-model@three-role-model
+
+Component inventory
+  Skills (8)  auto-flow, coherent-plan, delegate, double-critique, issue-to-ship, per-task-review-loop, scaffold, ship
+  Agents (0)
+  Hooks (2)  PreToolUse, SubagentStop  (harness-only — no model context cost)
+  MCP servers (0)
+  LSP servers (0)
+
+Projected token cost
+  Always-on:   ~1,588 tok   added to every session
+
+Per-component (rounded)
+  component             always-on  on-invoke
+  per-task-review-loop       ~440      ~3.6k
+  coherent-plan              ~110      ~4.3k
+  double-critique            ~240      ~9.5k
+  issue-to-ship              ~170      ~4.9k
+  delegate                   ~200      ~8.2k
+  ship                       ~110     ~15.3k
+  auto-flow                  ~300      ~6.6k
+  scaffold                    ~30       ~770
+
+  On-invoke cost is paid each time a skill or agent fires.
+  Token counts are estimates and may differ from actual usage.
+[exit:]
+
+### Verify the INSTALLED copy carries the inherit-plan-review fold (Task 1 shipped)
+$ node "$CACHE/bin/3role-ledger.mjs"  (usage line)
+usage: 3role-ledger.mjs <append|check|resolve-agent|inherit-plan-review> --session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)]
+
+### AC-b — fire a bundled hook LIVE with ${CLAUDE_PLUGIN_ROOT} resolved to the cache dir
+Payload: Write to a NEW .ai-workspace/plans/x.md with NO '## Execution model' section -> must BLOCK (exit 2)
+$ CLAUDE_PLUGIN_ROOT=$CACHE bash "$CACHE/hooks/enforce-plan.sh"  <<< PAYLOAD
+BLOCKED: New plan file missing "## Execution model" section. Every new plan under .ai-workspace/plans/*.md must declare its execution model (inline / subagent / phased) with a non-empty rationale. See CLAUDE.md task-sizing ladder (3+ files / architectural decision / >10 LOC -> DELEGATE).
+[enforce-plan.sh exit:2]   (expected 2 = BLOCK)
+
+### AC-c — ledger append+read round-trip under THREE_ROLE_LEDGER_DIR=$SANDBOX/ledger (installed cache copy)
+$ append --session s1 --task t1 --role planner --agent a1 --artifact /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/plan.md
+OK appended role=planner -> /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/ledger/s1/t1.jsonl
+[exit:]
+
+$ check --session s1 --task t1
+BLOCK: planner agentId "a1" does not resolve to a real subagent transcript (/var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/projects/*/s1/subagents/agent-a1.jsonl) — forged or no spawn happened; provide a real agentId OR an explicit inline-skip:<specific reason>; missing plan-review ledger line; missing executor ledger line; missing execution-review ledger line
+[exit:]
+
+### AC-c (cont) — exercise the NEW inherit-plan-review against the installed copy
+$ append --session s1 --task parent --role planner --agent PA --artifact /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/plan.md
+OK appended role=planner -> /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/ledger/s1/parent.jsonl
+[exit:]
+
+$ append --session s1 --task parent --role plan-review --agent PR --artifact /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/review.md
+OK appended role=plan-review -> /var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/ledger/s1/parent.jsonl
+[exit:]
+
+$ inherit-plan-review --session s1 --task leg1 --parent parent
+OK inherited plan-review from parent parent -> task leg1
+[exit:]
+
+--- leg1 ledger now carries inherited planner+plan-review: ---
+{"role":"planner","session_id":"s1","ts":"2026-06-14T06:16:35.106Z","agentId":"PA","artifact_path":"/var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/plan.md","inherited_from":"parent"}
+{"role":"plan-review","session_id":"s1","ts":"2026-06-14T06:16:35.107Z","agentId":"PR","artifact_path":"/var/folders/lf/s9hpn0s1427bsqzk203v3p2c0000gn/T/tmp.QUvC1K7CqI/review.md","inherited_from":"parent"}
+
+$ check --session s1 --task leg1
+BLOCK: missing executor ledger line; missing execution-review ledger line
+[exit:]
+
+### Re-validate --strict after adding the marketplace description (now clean)
+$ claude plugin validate --strict <REPO>
+Validating marketplace manifest: <REPO>/.claude-plugin/marketplace.json
+
+✔ Validation passed
+[exit:]
+
+### Cleanup — uninstall + remove marketplace (CLI, reversible; sandbox is mv'd to quarantine, not rm)
+$ claude plugin uninstall three-role-model --scope user -y
+✔ Successfully uninstalled plugin: three-role-model (scope: user)
+[exit:]
+
+$ claude plugin marketplace remove three-role-model
+✔ Successfully removed marketplace: three-role-model
+[exit:]
+
+### Post-cleanup — plugin list should no longer contain three-role-model
+$ claude plugin list --json
+[]
+[exit:]
+
+===== END install smoke =====
