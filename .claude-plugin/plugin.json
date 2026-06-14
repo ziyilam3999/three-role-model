@@ -1,7 +1,7 @@
 {
   "name": "three-role-model",
   "description": "The 3-role development model as a Claude Code plugin: planner -> plan-review -> executor -> execution-review, each a separate subagent, never self-review. Bundles the role-enforcing hooks, the orchestration skills, a memory-search shim, the standalone doctrine, and a scaffolding command that makes the model the default for new skills, agents, hooks, and commands.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": {
     "name": "ziyilam3999"
   },

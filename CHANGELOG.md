@@ -4,6 +4,21 @@ All notable changes to the three-role-model plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-06-14
+
+### Added
+- **Ignore-orientation preamble for spawned subagent prompts.** Both the
+  bundled stateless reviewer prompt (`skills/ship/references/reviewer-prompt.md`)
+  and the scaffold agent template (`templates/agent.md.tmpl`) now open with a
+  preamble that tells a one-shot role subagent to IGNORE any post-compact
+  resume protocol, orientation block, or "ELI5 the plan + 3-tier" instruction
+  that leaks into its context — it targets the main session, not the subagent.
+  This hardens role subagents (which share the parent session id) against being
+  derailed into reconciling a TaskList or presenting a tiered plan instead of
+  doing the single task they were briefed for. The main-session scaffold
+  command template is deliberately left untouched, because a slash command runs
+  in the main session where the resume protocol legitimately should fire.
+
 ## [0.6.0] - 2026-06-14
 
 ### Added
