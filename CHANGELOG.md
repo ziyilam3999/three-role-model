@@ -4,6 +4,30 @@ All notable changes to the three-role-model plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-06-14
+
+### Added
+- **Build leg 6 — install-proven and parity-synced.** The bundled
+  `bin/3role-ledger.mjs` now carries the `inherit-plan-review` subcommand,
+  bringing it to parity with the upstream ledger: it copies a parent task's
+  verified planner + plan-review onto a child leg and fails closed unless the
+  parent review resolves to a real subagent transcript. `cmdAppend` was
+  refactored to share the same overlay-merge core.
+- **Live install proof** under `hooks/_smoke/`: a runbook plus a scrubbed
+  transcript of validating, marketplace-adding, installing, listing, and
+  inspecting the plugin in a sandbox config dir — a hook fires from the
+  installed cache with `${CLAUDE_PLUGIN_ROOT}` resolved, and the ledger CLI
+  round-trips from the installed copy.
+
+### Changed
+- **README** finalized with the two install commands, the env-var config table
+  (`THREE_ROLE_LEDGER_DIR` / `THREE_ROLE_PROJECTS_ROOT` / `CAIRN_PERSIST_ROOT`),
+  the `${CLAUDE_PLUGIN_ROOT}` portability note, and the doctrine link.
+- **`hooks/three-role-transition-gate.sh`** BLOCK message now points to
+  `inherit-plan-review … --parent <parentTaskId>`.
+- **`.claude-plugin/marketplace.json`** gained a top-level `description` so
+  `claude plugin validate --strict` passes.
+
 ## [0.5.0] - 2026-06-14
 
 ### Added
