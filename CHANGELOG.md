@@ -4,6 +4,21 @@ All notable changes to the three-role-model plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-06-14
+
+### Added
+- **Build leg 5 — the default mechanism.** Added `/three-role-model:scaffold
+  <kind> <name>`, the command that stamps out a new skill, command, hook, or
+  agent from a pre-wired template, plus the four `templates/*.tmpl` it copies.
+  Each template ships a real `## Execution model` block (placement + evaluator
+  keywords, so the generated artifact passes the plan-shape gate out of the
+  box), the role-ledger spawn snippet citing
+  `${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs`, and a doctrine pointer; the
+  hook template also carries a ready `hooks.json` entry stub.
+- **The default-development-model doctrine line** in both `3-role-model.md` and
+  `README.md`: new primitives run through the 3-role model by default and are
+  scaffolded pre-wired — hand-writing one that skips the model is the exception.
+
 ## [0.4.0] - 2026-06-14
 
 ### Added
