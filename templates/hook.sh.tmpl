@@ -1,0 +1,44 @@
+#!/bin/bash
+# Hook: __NAME__
+# TODO: one-line description of what this hook enforces or captures.
+#
+# Reads the tool-call JSON payload on stdin, inspects it, and either allows
+# (exit 0) or blocks (exit 2 with a stderr message the model can see).
+#
+# ## Execution model
+#   This primitive is built through the 3-role model — planner -> plan-review ->
+#   executor -> execution-review, each a separate subagent, never self-review.
+#   - Executor placement: delegate — a single fresh subagent builds __NAME__ from a
+#     self-contained brief (the default; switch to parallel / inline / test-loop only
+#     when the task nature calls for it).
+#   - Evaluator: reviewer — a stateless, independent reviewer vets the result before
+#     ship (use a test-oracle instead, or both, when a binary acceptance test exists).
+#   Keep both the placement keyword and the evaluator keyword present — they are the
+#   shape declaration the model's gates grep for.
+#
+#   See ${CLAUDE_PLUGIN_ROOT}/3-role-model.md — the 3-role model is the default for new primitives in this workspace.
+#
+# ## Role-ledger spawn snippet
+#   When the orchestrator spawns each role subagent for __NAME__ it prepends the role
+#   tag to the brief and records the role in the per-task ledger:
+#     3ROLE_TASK:<id> ROLE:<role>
+#     node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --agent <agentId>
+#   At role close, append the artifact path (the overlay merges onto the spawn-time id):
+#     node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --artifact <path>
+#
+# ## hooks.json entry stub — add this object to the matching matcher block in hooks/hooks.json:
+#   {
+#     "type": "command",
+#     "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/__NAME__.sh\"",
+#     "timeout": 10
+#   }
+set -e
+
+INPUT=$(cat)
+
+# Parse JSON fields using Node.js (jq is not always available on Git Bash / Windows).
+FILE_PATH=$(echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);console.log(j.tool_input?.file_path||'')}catch{console.log('')}})")
+
+# TODO: implement the gate. Block with: echo "BLOCKED: <reason>" >&2 ; exit 2
+# Default: allow.
+exit 0
