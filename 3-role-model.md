@@ -217,14 +217,4 @@ you from quietly building a delegate-sized batch inline on an un-reviewed plan.
 
 ## The default development model
 
-<!-- PLACEHOLDER — finalized wording lands in a later build leg.
-
-This plugin is intended to be wired as the *default* development model for non-trivial work,
-together with a scaffolding command that stamps new primitives already pre-wired to the model. The
-exact one-line doctrine statement and the scaffold command surface are intentionally left blank
-here so they can be authored in their own leg — do not invent the final wording.
--->
-
-A later build leg wires a one-line "this plugin is the default development model for non-trivial
-work" doctrine statement plus a scaffolding command. The final wording is deliberately left as the
-placeholder above until that leg lands.
+> **Default development model.** Every non-trivial skill, agent, hook, or command authored in a workspace that installs this plugin runs through the 3-role model — planner → plan-review → executor → execution-review, each a separate subagent, never self-review. New primitives are scaffolded pre-wired via `/three-role-model:scaffold <skill|agent|hook|command> <name>`; the generated skeleton already carries its `## Execution model` shape declaration, the role-ledger spawn snippet, and this doctrine pointer. Hand-writing a primitive that skips the model is the exception, not the default.

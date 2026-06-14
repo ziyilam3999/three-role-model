@@ -58,6 +58,10 @@ leg's docs as they land.
 5. **The `/three-role-model:scaffold` command + the default-doctrine line**
 6. **Live install test + finalized docs**
 
+## The default development model
+
+> **Default development model.** Every non-trivial skill, agent, hook, or command authored in a workspace that installs this plugin runs through the 3-role model — planner → plan-review → executor → execution-review, each a separate subagent, never self-review. New primitives are scaffolded pre-wired via `/three-role-model:scaffold <skill|agent|hook|command> <name>`; the generated skeleton already carries its `## Execution model` shape declaration, the role-ledger spawn snippet, and this doctrine pointer. Hand-writing a primitive that skips the model is the exception, not the default.
+
 ## License
 
 [MIT](./LICENSE).

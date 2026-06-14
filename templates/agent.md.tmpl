@@ -1,0 +1,45 @@
+---
+name: __NAME__
+description: TODO one-line description of the __NAME__ agent — its job and when to spawn it.
+tools: ["*"]
+---
+
+# __NAME__
+
+TODO: the system prompt for the __NAME__ subagent. Describe its role, its inputs, and the
+shape of the output it must return.
+
+## Execution model
+
+This agent participates in the 3-role model — **planner -> plan-review -> executor ->
+execution-review**, each a separate subagent, never self-review. Spawn it with the tools
+its role needs: writers (planner / executor) get a full-tool type, pure reviewers get a
+read-only Explore-style type that still keeps Bash, Read, Grep, and Skill.
+
+- **Executor placement:** `delegate` — a single fresh subagent does the work from a
+  self-contained brief (the default placement; switch to `parallel`, `inline`, or a
+  test-loop only when the task nature calls for it).
+- **Evaluator:** `reviewer` — a stateless, independent reviewer vets the result before
+  ship (use a `test-oracle` instead, or `both`, whenever a binary acceptance test exists).
+
+Keep both the placement keyword and the evaluator keyword present — they are the shape
+declaration the model's gates grep for. A reviewer agent must never be the executor (that
+would be self-review).
+
+See ${CLAUDE_PLUGIN_ROOT}/3-role-model.md — the 3-role model is the default for new primitives in this workspace.
+
+## Role-ledger spawn snippet
+
+When the orchestrator spawns this agent as a role subagent it prepends the role tag to the
+brief and records the role in the per-task ledger:
+
+```
+3ROLE_TASK:<id> ROLE:<role>
+node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --agent <agentId>
+```
+
+At role close, append the artifact path (the overlay merges onto the spawn-time id):
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --artifact <path>
+```

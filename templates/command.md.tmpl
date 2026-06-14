@@ -1,0 +1,44 @@
+---
+description: TODO one-line description of the /__NAME__ command — what it does when invoked.
+---
+
+# /__NAME__
+
+TODO: what this command does, in one or two plain sentences. Describe the arguments it
+accepts and the outcome it produces.
+
+## Execution model
+
+This primitive is built through the 3-role model — **planner -> plan-review -> executor
+-> execution-review**, each a separate subagent, never self-review.
+
+- **Executor placement:** `delegate` — a single fresh subagent builds __NAME__ from a
+  self-contained brief (the default placement; switch to `parallel`, `inline`, or a
+  test-loop only when the task nature calls for it).
+- **Evaluator:** `reviewer` — a stateless, independent reviewer vets the result before
+  ship (use a `test-oracle` instead, or `both`, whenever a binary acceptance test exists).
+
+Keep both the placement keyword and the evaluator keyword present — they are the shape
+declaration the model's gates grep for.
+
+See ${CLAUDE_PLUGIN_ROOT}/3-role-model.md — the 3-role model is the default for new primitives in this workspace.
+
+## Role-ledger spawn snippet
+
+When the orchestrator spawns each role subagent for __NAME__, it prepends the role tag to
+the brief and records the role in the per-task ledger:
+
+```
+3ROLE_TASK:<id> ROLE:<role>
+node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --agent <agentId>
+```
+
+At role close, append the artifact path (the overlay merges onto the spawn-time id):
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> --artifact <path>
+```
+
+## Behavior
+
+TODO: spell out the step-by-step behavior of /__NAME__ here.
