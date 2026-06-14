@@ -1,0 +1,17 @@
+{
+  "name": "three-role-model",
+  "version": "0.1.0",
+  "description": "The 3-role development model as a Claude Code plugin: planner -> plan-review -> executor -> execution-review, never self-review.",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "homepage": "https://github.com/ziyilam3999/three-role-model",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ziyilam3999/three-role-model.git"
+  },
+  "scripts": {
+    "test": "node scripts/ci-validate.mjs",
+    "lint:hooks": "bash scripts/lint-hooks.sh"
+  }
+}

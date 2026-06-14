@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# The plugin is bash hooks + zero-dependency node (.mjs) + markdown. There is no
+# build step and no npm dependency tree, so CI runs on Linux only (the hooks are
+# bash; a Windows runner cannot `bash -n` them meaningfully).
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate manifests + bin scripts + bundled tests
+        run: node scripts/ci-validate.mjs
+
+      - name: Shell syntax check (bash -n) on every hook
+        shell: bash
+        run: |
+          set -e
+          found=0
+          for f in $(find hooks -name '*.sh' 2>/dev/null); do
+            found=1
+            bash -n "$f" && echo "bash -n OK: $f"
+          done
+          if [ "$found" = "0" ]; then echo "no hooks yet (bootstrap) — skipping"; fi
+
+      - name: Smoke tests (hooks/_smoke/*.sh, if any)
+        shell: bash
+        run: |
+          set -e
+          found=0
+          for f in $(find hooks/_smoke -name '*.sh' 2>/dev/null); do
+            found=1
+            echo "running $f"
+            CLAUDE_PLUGIN_ROOT="$GITHUB_WORKSPACE" bash "$f"
+          done
+          if [ "$found" = "0" ]; then echo "no smoke tests yet (bootstrap) — skipping"; fi
+
+      - name: Validate commit message (Conventional Commits)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          if echo "$COMMIT_MSG" | grep -qE "^Merge "; then exit 0; fi
+          if ! echo "$COMMIT_MSG" | grep -qE "^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert)(\(.+\))?(!)?: .+"; then
+            echo "ERROR: HEAD commit message is not Conventional Commits format."
+            echo "  Got: $COMMIT_MSG"
+            exit 1
+          fi
+          echo "commit message OK: $COMMIT_MSG"

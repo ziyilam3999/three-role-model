@@ -1,0 +1,17 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch (never committed)
+tmp/
+.ai-workspace/_*/
+*-run/
+
+# The ledger is a runtime scratch dir, never part of the repo
+.three-role-ledger/

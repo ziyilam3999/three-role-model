@@ -1,0 +1,14 @@
+{
+  "name": "three-role-model",
+  "owner": {
+    "name": "ziyilam3999",
+    "url": "https://github.com/ziyilam3999"
+  },
+  "plugins": [
+    {
+      "name": "three-role-model",
+      "source": "./",
+      "description": "The 3-role development model (planner -> plan-review -> executor -> execution-review, never self-review) as installable hooks, skills, commands, and doctrine."
+    }
+  ]
+}
