@@ -1,3 +1,9 @@
+## [0.8.1](https://github.com/ziyilam3999/three-role-model/compare/v0.8.0...v0.8.1) (2026-06-21)
+
+### Chore
+
+* sync canonical from ai-brain #1100 Slice 1 — agent self-record + self_authored provenance + CODEWORK released?-arm regex tighten + subagent-ledger overlay (#15)
+
 ## [0.8.0](https://github.com/ziyilam3999/three-role-model/compare/v0.7.0...v0.8.0) (2026-06-21)
 
 ### Features
