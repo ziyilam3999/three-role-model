@@ -140,4 +140,62 @@ n857=$(ledger_count s857 857 planner ag857); n999=$(ledger_count s857 999 execut
   && ok "real SubagentStop shape: reads agent_transcript_path (857/planner) NOT transcript_path (999)" \
   || bad "real-shape regression broken (rc=$RC n857=$n857 n999=$n999 out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1100 — AC1 (self-record + agentId merge) + AC3 (provenance stamp). LED is the sibling helper (line ~110).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+APLAN="$TMP/ac-plan.md"; printf '## ELI5\nx\n### Binary AC\n- AC1\n' > "$APLAN"
+AREV="$TMP/ac-rev.md";  printf '## Review\nverdict: PASS\n' > "$AREV"
+appendLED() { THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" node "$LED" append "$@" >/dev/null 2>&1; }
+checkLED() { THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" node "$LED" check "$@" 2>&1; }
+# add an assistant Bash tool_use self-append line for <role> to transcript <file>: add_selfappend <file> <role>
+add_selfappend() {
+  ROLE="$2" node -e '
+    const fs=require("fs");
+    const cmd="node hooks/3role-ledger.mjs append --session S --task 1100 --role "+process.env.ROLE+" --artifact /tmp/a.md";
+    const line=JSON.stringify({type:"assistant",message:{role:"assistant",content:[{type:"tool_use",name:"Bash",input:{command:cmd}}]}});
+    fs.appendFileSync(process.argv[1], line+"\n");
+  ' "$1"
+}
+
+# ---- AC1. SELF-RECORD first (artifact ONLY, no agentId) -> SubagentStop MERGES the harness agentId ->
+#          3role-ledger.mjs check reports the planner role RESOLVED (one line carrying BOTH fields). ----
+appendLED --session sAC1 --task 1100 --role planner --artifact "$APLAN"          # self-record: artifact, NO agentId
+TP=$(mk_transcript sAC1 agP1 "3ROLE_TASK:1100 ROLE:planner"$'\n'"You are the planner.")
+run "$TP" sAC1 agP1                                                              # hook overlay-merges agentId agP1
+# complete the other 3 roles (real resolvable transcripts) so `check` can exit 0
+mk_transcript sAC1 agR1 "x" >/dev/null; appendLED --session sAC1 --task 1100 --role plan-review      --agent agR1 --artifact "$AREV"
+mk_transcript sAC1 agE1 "x" >/dev/null; appendLED --session sAC1 --task 1100 --role executor         --agent agE1 --artifact "branch feat/x"
+mk_transcript sAC1 agV1 "x" >/dev/null; appendLED --session sAC1 --task 1100 --role execution-review --agent agV1 --artifact "$AREV"
+merged=$(grep -E '"role":"planner"' "$LEDGERDIR/sAC1/1100.jsonl" 2>/dev/null | grep -c '"agentId":"agP1"')
+OUT1=$(checkLED --session sAC1 --task 1100); C1=$?
+{ [ "$RC" = "0" ] && [ "$merged" = "1" ] && [ "$C1" = "0" ] && echo "$OUT1" | grep -qi "complete"; } \
+  && ok "AC1 self-record(artifact) + SubagentStop agentId MERGE -> check RESOLVED (exit 0)" \
+  || bad "AC1 self-record+merge broken (RC=$RC merged=$merged C1=$C1 out=$OUT1)"
+
+# ---- AC3+. transcript WITH the agent's own self-append (Bash append --role planner) -> self_authored:true ----
+TPA=$(mk_transcript sAC3a agPA "3ROLE_TASK:1100 ROLE:planner"$'\n'"You are the planner.")
+add_selfappend "$TPA" planner
+appendLED --session sAC3a --task 1100 --role planner --artifact "$APLAN"          # the agent's self-record line
+run "$TPA" sAC3a agPA                                                            # hook scans -> stamps self_authored
+stamped=$(grep -E '"role":"planner"' "$LEDGERDIR/sAC3a/1100.jsonl" 2>/dev/null | grep -c '"self_authored":true')
+{ [ "$RC" = "0" ] && [ "$stamped" = "1" ]; } \
+  && ok "AC3+ transcript WITH self-append -> self_authored:true stamped on the merged line" \
+  || bad "AC3+ should stamp self_authored (rc=$RC stamped=$stamped)"
+
+# ---- AC3-. complete ledger with NO self_authored stamps -> check SURFACES a PROVENANCE flag, still exit 0 ----
+mk_transcript sAC3b agPb "x" >/dev/null; appendLED --session sAC3b --task 1100 --role planner          --agent agPb --artifact "$APLAN"
+mk_transcript sAC3b agRb "x" >/dev/null; appendLED --session sAC3b --task 1100 --role plan-review       --agent agRb --artifact "$AREV"
+mk_transcript sAC3b agEb "x" >/dev/null; appendLED --session sAC3b --task 1100 --role executor          --agent agEb --artifact "branch feat/x"
+mk_transcript sAC3b agVb "x" >/dev/null; appendLED --session sAC3b --task 1100 --role execution-review  --agent agVb --artifact "$AREV"
+OUT3=$(checkLED --session sAC3b --task 1100); C3=$?
+{ [ "$C3" = "0" ] && echo "$OUT3" | grep -qi "PROVENANCE"; } \
+  && ok "AC3- no self_authored stamps -> check surfaces PROVENANCE flag (exit 0, not bricked)" \
+  || bad "AC3- should flag provenance (C3=$C3 out=$OUT3)"
+
+# ---- AC3 strict. --require-provenance promotes a missing stamp to a BLOCK (opt-in strict, never default) ----
+OUT3r=$(checkLED --session sAC3b --task 1100 --require-provenance); C3r=$?
+{ [ "$C3r" = "2" ] && echo "$OUT3r" | grep -qi "self_authored provenance stamp"; } \
+  && ok "AC3 --require-provenance -> missing stamp BLOCKs (opt-in strict)" \
+  || bad "AC3 require-provenance should block (C3r=$C3r out=$OUT3r)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

@@ -76,7 +76,10 @@ read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE < <(
     if(md.evidence!=null) evParts.push(String(md.evidence));
     for(const k of Object.keys(md)){ if(k==="three_role_skip"||k==="evidence") continue; const v=md[k]; if(typeof v==="string") evParts.push(v); }
     const evText=evParts.join(" ");
-    const CODEWORK_RE=/(\bPR\s*#?\d+|\bpull[ _-]?request\b|\bmerged?\b|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bshipped\b|\breleased?\b[\s\S]{0,12}v?\d+\.\d+\.\d+)/i;
+    // #1100 item 5: the released? arm requires the REAL shape — lowercase released/release + whitespace +
+    // 'v' + semver (\breleased?\b\s+v\d+\.\d+\.\d+). A hyphenated quarantine dir name like "release-0.70.0"
+    // (no 'v', '-' not whitespace) no longer over-fires CODEWORK; a real "released v0.70.0" still does.
+    const CODEWORK_RE=/(\bPR\s*#?\d+|\bpull[ _-]?request\b|\bmerged?\b|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bshipped\b|\breleased?\b\s+v\d+\.\d+\.\d+)/i;
     const codework = CODEWORK_RE.test(evText) ? "1" : "0";
     // three_role_skip strength: reuse the ledger NONSPECIFIC denylist semantics AND a ≥20-char minimum, so
     // the plan example "done" (and "n/a"/"skip"/empty) is rejected (plan-review improvement #1).
