@@ -306,4 +306,20 @@ CAP=$(printf '%s' '{"session_id":"s9005","tool_input":{"taskId":"9005","status":
 run '{"tool_input":{"taskId":"9006","status":"completed","metadata":{"evidence":"'"$EV"'"}}}'
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "no session_id"; } && ok "U6 untagged code-work + no session_id -> BLOCK (fail-closed)" || bad "U6 should block (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1100 item 5 (AC2) — CODEWORK_RE over-fire, BOTH-ENDS. The `released?` arm now requires the REAL shape
+# (released/release + whitespace + 'v' + semver). A hyphenated quarantine dir name "release-0.70.0" (no 'v',
+# '-' not whitespace, no other code-work token) must NOT fire CODEWORK -> untagged fail-OPEN allow; a real
+# "released v0.70.0" MUST fire CODEWORK -> routed to the code-work branch -> BLOCK (no ledger backs it).
+# RED on master: master's arm `\breleased?\b[\s\S]{0,12}v?\d+\.\d+\.\d+` matches "release-0.70.0" -> CODEWORK=1
+# -> R1 would BLOCK instead of allow-silent. GREEN after the tighten.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# ---- R1. evidence "release-0.70.0" ALONE -> CODEWORK=0 -> allow silent (NO over-fire) ----
+run '{"session_id":"sR1","tool_input":{"taskId":"R1","status":"completed","metadata":{"evidence":"cut from worktree release-0.70.0, no PR yet"}}}'
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC2: 'release-0.70.0' alone -> CODEWORK=0 -> allow silent (no over-fire)" || bad "AC2 'release-0.70.0' should NOT fire codework (rc=$RC out=$CAP)"
+
+# ---- R2. evidence "released v0.70.0" -> CODEWORK=1 -> routed to code-work branch -> BLOCK (no ledger) ----
+run '{"session_id":"sR2","tool_input":{"taskId":"R2","status":"completed","metadata":{"evidence":"released v0.70.0"}}}'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "UNPROVEN\|no role-ledger"; } && ok "AC2: 'released v0.70.0' -> CODEWORK=1 -> routed to code-work branch (BLOCK, no ledger)" || bad "AC2 'released v0.70.0' should fire codework (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

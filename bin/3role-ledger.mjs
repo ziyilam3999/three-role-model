@@ -14,14 +14,19 @@
 //
 // Subcommands:
 //   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
+//                                        [--verdict V] [--self-authored]
 //     Writes one JSONL line to <ledger-dir>/<S>/<T>.jsonl. Idempotent PER ROLE — re-appending the same
-//     role UPDATES the line (drops the prior one), never duplicates.
-//   check --session S --task T
+//     role UPDATES the line (drops the prior one), never duplicates. A role agent self-recording its OWN
+//     line passes --artifact (and --verdict for review-roles) with NO --agent; the SubagentStop hook later
+//     overlay-merges the harness-captured --agent (#855) and stamps --self-authored (#1100 item 3).
+//   check --session S --task T [--require-provenance]
 //     Exit 0 (+ "OK ...") iff all four required roles (planner, plan-review, executor, execution-review)
 //     are present AND satisfied; otherwise exit 2 (+ "BLOCK: <reason>"). A role is satisfied by EITHER
 //     (a) an agentId that resolves to a real subagent transcript AND a well-shaped artifact, OR (b) an
 //     explicit, SPECIFIC inline-skip reason. execution-review is NEVER inline-skippable — it needs a real
-//     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token.
+//     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
+//     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
+//     promotes a missing stamp to a BLOCK.
 //   resolve-agent --session S --task T --role R
 //     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
 //     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
@@ -241,13 +246,15 @@ function overlayAppend(session, task, role, fields) {
   // (APPROVE / PASS / BLOCK / SHIP-WITH-FIXES / APPROVE-WITH-NOTES). Read-only downstream: the agent-kanban
   // board surfaces it as a colored pill. Overlay only when provided (back-compat: absent ⇒ no verdict).
   if ('verdict' in fields) entry.verdict = fields.verdict;
+  // #1100 item 3: provenance stamp — overlay only when provided (back-compat: absent ⇒ unstamped).
+  if ('self_authored' in fields) entry.self_authored = fields.self_authored;
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
   // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
   // otherwise resurrect).
   if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
-  if ('skip_reason' in fields) { delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; }
+  if ('skip_reason' in fields) { delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored; }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
   return file;
@@ -264,6 +271,10 @@ function cmdAppend(o) {
   if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
   if ('oracle' in o) fields.oracle = o.oracle;
   if ('verdict' in o) fields.verdict = o.verdict;
+  // #1100 item 3: provenance — a line authored BY the role's own agent (its SubagentStop scan saw the agent
+  // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
+  // `--self-authored` (no value) is true, `--self-authored false` is false.
+  if ('self-authored' in o) fields.self_authored = (o['self-authored'] !== 'false');
   // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
   // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
   // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
@@ -343,7 +354,25 @@ function cmdCheck(o) {
     const r = checkRole(role, e, session);
     if (r) problems.push(r);
   }
+  // #1100 item 3: provenance flags — a required role that ran as a REAL spawn (not an inline-skip) but whose
+  // line lacks the self_authored stamp is provenance-unverified (an orchestrator-fabricated line has no
+  // authoring agent turn). By DEFAULT this only SURFACES (never a silent brick — the honest residual: a
+  // quiet-but-legit agent that forgot to self-append). Strict-block is opt-IN via --require-provenance.
+  const provenanceFlags = [];
+  for (const role of REQUIRED_ROLES) {
+    const e = byRole[role];
+    if (!e || ('skip_reason' in e)) continue;        // missing handled above; skips don't have an authoring turn
+    if (!e.self_authored) provenanceFlags.push(role);
+  }
+  const requireProv = ('require-provenance' in o);
+  if (requireProv) {
+    for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
+  }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  if (provenanceFlags.length) {
+    console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
+      ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
+  }
   console.log('OK: role-ledger complete for task ' + sanitize(task) +
     ' (planner, plan-review, executor, execution-review all resolved)');
   process.exit(0);

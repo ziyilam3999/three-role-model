@@ -7,10 +7,12 @@
 # never a gate: it exits 0 on every path (a Stop hook that only emits exit-0 stderr cannot steer the model;
 # steering is the COMPLETION gate's job — this just records).
 #
-# Why this exists (the #850 leg, harness-side): the orchestrator-written ledger (PR1) is the AUTHORITATIVE
-# label, but it depends on the orchestrator remembering to append. This hook is the harness-driven backstop
-# that records the spawn the instant it stops — forgery-resistant because the transcript file only exists if
-# a real spawn happened.
+# Why this exists (the #850 leg, harness-side): the role agent self-records its OWN {role, artifact} line
+# (#1100), but the agentId is harness-only. This hook is the AUTHORITATIVE agentId writer (#1100 item 2,
+# promoted from best-effort backup): it overlay-merges {agentId} onto the agent-authored line (#855) the
+# instant the subagent stops — forgery-resistant because the transcript file only exists if a real spawn
+# happened. It ALSO stamps self_authored:true (#1100 item 3) when the transcript shows the agent's own
+# self-append for this role, so `check` can flag orchestrator-fabricated (un-self-authored) lines.
 #
 # Fire conditions (ALL must hold, else no-op exit 0 writing nothing):
 #   (a) the RESOLVED subagent transcript (agent_transcript_path when present, else transcript_path) contains
@@ -74,14 +76,15 @@ else
 fi
 [ -n "$AGENTID" ] || exit 0
 
-# (b) read the brief (first type:user message) + classify the role. Emits: "<taskId> <role>" or "" (no tag).
-read -r TASKID ROLE < <(
+# (b) read the brief (first type:user message) + classify the role, AND scan the transcript for the agent's OWN
+# self-append (provenance, #1100 item 3). Emits: "<taskId> <role> <selfAuthored 0|1>" or "" (no tag).
+read -r TASKID ROLE SELFAUTH < <(
   TRANSCRIPT_PATH="$TRANSCRIPT" node -e '
     const fs=require("fs");
     let txt=""; try{ txt=fs.readFileSync(process.env.TRANSCRIPT_PATH,"utf8"); }catch(e){ process.exit(0); }
+    const lines=txt.split("\n").filter(l=>l.trim());
     let brief="";
-    for (const ln of txt.split("\n")) {
-      if (!ln.trim()) continue;
+    for (const ln of lines) {
       let j; try{ j=JSON.parse(ln); }catch(e){ continue; }
       const isUser = j && (j.type==="user" || (j.message && j.message.role==="user"));
       if (!isUser) continue;
@@ -106,13 +109,35 @@ read -r TASKID ROLE < <(
       else if (/\bexecutor\b|\bimplement\b|\bbuild\b/.test(b)) role="executor";
       else process.exit(0);                      // unclassifiable -> no-op
     }
-    process.stdout.write(taskId + " " + role);
+    // #1100 item 3 PROVENANCE SCAN: did THIS agent self-author its OWN ledger line for THIS role? The strongest
+    // signal is an assistant Bash tool_use invoking `3role-ledger.mjs append ... --role <thisRole>` in the
+    // agent`s own transcript. Found -> stamp self_authored:true (a forged line written only by the orchestrator
+    // has NO such authoring turn, so it stays unstamped and `check` surfaces it).
+    let selfAuthored=false;
+    const roleRe=new RegExp("--role\\s+"+role);
+    for (const ln of lines) {
+      let j; try{ j=JSON.parse(ln); }catch(e){ continue; }
+      const isAsst = j && (j.type==="assistant" || (j.message && j.message.role==="assistant"));
+      if (!isAsst) continue;
+      const c = j.message && j.message.content;
+      if (!Array.isArray(c)) continue;
+      for (const blk of c) {
+        if (!blk || blk.type!=="tool_use") continue;
+        if (String(blk.name||"").toLowerCase()!=="bash") continue;
+        const cmd=String((blk.input&&blk.input.command)||"");
+        if (/3role-ledger\.mjs[\s\S]*?\bappend\b/.test(cmd) && roleRe.test(cmd)) { selfAuthored=true; break; }
+      }
+      if (selfAuthored) break;
+    }
+    process.stdout.write(taskId + " " + role + " " + (selfAuthored?"1":"0"));
   ' 2>/dev/null
 )
 [ -n "$TASKID" ] && [ -n "$ROLE" ] || exit 0
 [ -n "$SESSION" ] && [ "$SESSION" != "-" ] || exit 0
 
 # Append the ledger line via the flat sibling helper (idempotent per role). Never block: this is a recorder.
+# When the agent self-authored (provenance), stamp self_authored:true; the agentId here is AUTHORITATIVE
+# (harness-captured) and overlay-merges onto any agent-authored {role, artifact} line (#855, #1100 item 2).
 # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
 # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
@@ -121,5 +146,7 @@ else
   HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
 fi
 [ -f "$HELPER" ] || exit 0
-node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" >/dev/null 2>&1
+SELF_FLAG=""
+[ "$SELFAUTH" = "1" ] && SELF_FLAG="--self-authored"
+node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG >/dev/null 2>&1
 exit 0
