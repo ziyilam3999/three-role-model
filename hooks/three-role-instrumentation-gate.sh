@@ -51,7 +51,12 @@ INPUT=$(cat)
 #   MODELRUN  — tool_input.metadata.model_run on THIS update (the discriminator: perf-log card id/path). "" if absent.
 #   PERFPATH  — an explicit perf-log path cited on THIS update: metadata.model_perf_log wins; else, if model_run
 #               itself looks like a path (contains "/" or ends .md), use it. "" if none.
-read -r STATUS TASKID SESSION MODELRUN PERFPATH < <(
+#   CODEWORK  — "1" if the completion shows OBJECTIVE code-work evidence (PR / merge / commit-sha / "shipped" /
+#               "released vX.Y.Z") in metadata.evidence (+ other metadata string values), else "0" (#1098).
+#   SKIPSTATE — "valid" | "invalid" | "none": classification of metadata.three_role_skip. "valid" = a SPECIFIC
+#               reason (≥20 chars, not on the non-specific denylist incl. "done"); "invalid" = present but empty /
+#               generic; "none" = not supplied (#1098 + plan-review improvement #1).
+read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const ti=d.tool_input||{};
@@ -63,8 +68,26 @@ read -r STATUS TASKID SESSION MODELRUN PERFPATH < <(
     // cited perf-log path: explicit metadata.model_perf_log wins; else model_run if it itself looks like a path.
     let perf=(md.model_perf_log!=null ? String(md.model_perf_log) : "").trim();
     if(!perf && modelrun && (modelrun.indexOf("/")>=0 || /\.md$/i.test(modelrun))) perf=modelrun;
+    // ── #1098 untagged-path classification ──────────────────────────────────────────────────────
+    // OBJECTIVE code-work signal over metadata.evidence + every other metadata string value (skip excluded).
+    // commit-sha arm uses a lookahead requiring ≥1 hex LETTER so a plain decimal id (e.g. "1098000") is NOT
+    // mistaken for a sha; PR / merge / shipped / released-vX.Y.Z are explicit tokens.
+    const evParts=[];
+    if(md.evidence!=null) evParts.push(String(md.evidence));
+    for(const k of Object.keys(md)){ if(k==="three_role_skip"||k==="evidence") continue; const v=md[k]; if(typeof v==="string") evParts.push(v); }
+    const evText=evParts.join(" ");
+    const CODEWORK_RE=/(\bPR\s*#?\d+|\bpull[ _-]?request\b|\bmerged?\b|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bshipped\b|\breleased?\b[\s\S]{0,12}v?\d+\.\d+\.\d+)/i;
+    const codework = CODEWORK_RE.test(evText) ? "1" : "0";
+    // three_role_skip strength: reuse the ledger NONSPECIFIC denylist semantics AND a ≥20-char minimum, so
+    // the plan example "done" (and "n/a"/"skip"/empty) is rejected (plan-review improvement #1).
+    const NONSPECIFIC=/^(n\/?a|skip(ped)?|none|null|tbd|inline|done|-+|\.+)$/i;
+    let skipstate="none";
+    if("three_role_skip" in md){
+      const skipRaw=(md.three_role_skip!=null ? String(md.three_role_skip) : "").trim();
+      skipstate=(skipRaw==="" || NONSPECIFIC.test(skipRaw) || skipRaw.length<20) ? "invalid" : "valid";
+    }
     const enc=(s)=> (s===""? "-" : encodeURIComponent(s));
-    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf)].join(" "));
+    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf), codework, skipstate].join(" "));
   ' 2>/dev/null
 )
 # decode helper (paths/ids may contain spaces/encoded chars)
@@ -75,9 +98,11 @@ MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"
 [ "$STATUS" = "completed" ] || exit 0
 [ -n "$TASKID" ] && [ "$TASKID" != "-" ] || exit 0
 
-# DISCRIMINATOR (objective): only a TAGGED 3-role run carries metadata.model_run. No tag -> not our concern ->
-# allow silent (trivial-skip / untagged completions are NEVER gated). This is the fail-open backstop seam.
-[ -n "$MODELRUN" ] || exit 0
+# DISCRIMINATOR (objective): a TAGGED 3-role run carries metadata.model_run -> the tagged perf-card + ledger
+# legs below. UNTAGGED completions (no model_run) are NO LONGER blanket-allowed (#1098 — that opt-in seam is
+# exactly how inline-orchestrator code-work slipped both gates): they are routed through the untagged
+# fail-CLOSED branch below (defined after the helpers it calls). Only a TRIVIAL untagged completion (no
+# objective code-work evidence) still fails open there.
 
 # Resolve a cited path: absolute as-is; else relative to CLAUDE_PROJECT_DIR, then cwd, then $HOME (perf-log
 # cards usually live under ~/.claude/agent-working-memory/...). Echoes "" if not found.
@@ -129,6 +154,53 @@ block_ledger(){
   exit 2
 }
 
+# ── UNTAGGED path (#1098): opt-IN → opt-OUT, fail-CLOSED ─────────────────────────────────────────────
+# Block message for an untagged completion that shows objective code-work evidence but cannot prove the
+# 3-role process ran (no resolvable ledger) and offers no valid skip. Names BOTH escapes (Rule-17 both-ends).
+block_untagged(){
+  {
+    echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} completed."
+    echo "  This completion shows OBJECTIVE code-work evidence (a PR / merge / commit-sha / 'shipped' / 'released vX.Y.Z'),"
+    echo "  but the 3-role process is UNPROVEN: $1"
+    echo "  A code-work completion (#1098: untagged is no longer a free pass) must satisfy ONE of:"
+    echo "    (a) a resolvable 4-role role-ledger for this run (planner, plan-review, executor, execution-review):"
+    echo "          node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" check --session ${SESSION} --task ${TASKID}"
+    echo "        append lines with: node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" append --session ${SESSION} --task ${TASKID} --role <role> --agent <agentId> --artifact <path>"
+    echo "    (b) an explicit, SPECIFIC metadata.three_role_skip reason (≥20 chars, not 'done'/'n/a'/generic) saying"
+    echo "        why the 3-role process was genuinely inapplicable to this completion."
+    echo "  Kill-switch (not a real 3-role run / retiring a task): THREE_ROLE_INSTRUMENT_OFF=1."
+  } >&2
+  exit 2
+}
+
+# The untagged branch ALWAYS exits (allow 0 or block 2); past it, MODELRUN is guaranteed non-empty -> tagged legs.
+if [ -z "$MODELRUN" ]; then
+  # No objective code-work signal -> trivial / doc / restore completion -> allow silent (the fail-OPEN residual).
+  [ "$CODEWORK" = "1" ] || exit 0
+  # Code-work evidence present. ESCAPE 1: a valid, SPECIFIC metadata.three_role_skip reason.
+  [ "$SKIPSTATE" = "valid" ] && exit 0
+  # ESCAPE 2: a resolvable 4-role ledger. FAIL-CLOSED on anything unresolvable — never wave through on can't-tell.
+  if [ -z "$SESSION" ] || [ "$SESSION" = "-" ]; then
+    block_untagged "no session_id on the completion — the role-ledger cannot be resolved (fail-closed)."
+  fi
+  # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+  # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
+    UHELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
+  else
+    UHELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
+  fi
+  if [ ! -f "$UHELPER" ]; then
+    block_untagged "the role-ledger helper (3role-ledger.mjs) is unavailable — cannot verify the 3-role process (fail-closed)."
+  fi
+  ULEDGER_OUT="$(node "$UHELPER" check --session "$SESSION" --task "$TASKID" 2>&1)"; ULRC=$?
+  if [ "$ULRC" != "0" ]; then
+    block_untagged "${ULEDGER_OUT:-role-ledger check failed}"
+  fi
+  echo "THREE-ROLE INSTRUMENTATION GATE: #${TASKID} OK — untagged code-work completion backed by a resolvable 4-role ledger." >&2
+  exit 0
+fi
+
 # fix-landed leg (objective): the cited perf-log card must EXIST and carry an entry citing this taskId.
 [ -n "$PERFPATH" ] || block "No perf-log card path was cited (metadata.model_perf_log, or a path-shaped metadata.model_run)."
 CARD="$(resolve_path "$PERFPATH")"
@@ -162,8 +234,8 @@ esac
 # test-oracle:<path> that exists. The flat sibling helper encapsulates the check; same kill-switches above.
 # Fail-OPEN (allow, note it) only when the helper or the session id is unavailable — never silently brick
 # a tagged completion if the helper symlink is missing; the perf-card leg already passed by this point.
-# Resolve the ledger helper: prefer the plugin bin via ${CLAUDE_PLUGIN_ROOT}; fall back to a repo-relative
-# ../bin path (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
+# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
   LEDGER_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
 else

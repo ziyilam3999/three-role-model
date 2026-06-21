@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PreToolUse(Agent|Task) hook — THREE-ROLE TRANSITION GATE. Enforces SEQUENCING of the
+# PreToolUse(Agent|Task) hook — THREE-ROLE TRANSITION GATE (#851 PR2, Phase 3b). Enforces SEQUENCING of the
 # 3-role model at SPAWN time: you cannot spawn the EXECUTOR for a task before the PLAN has been REVIEWED.
 #
 # Mechanism: the orchestrator prepends "3ROLE_TASK:<id> ROLE:<role>" to every role subagent's prompt (the same
@@ -18,11 +18,11 @@
 # Only the EXECUTOR transition is gated. planner / plan-review / execution-review spawns are always ALLOWED
 # (planner has no precondition; reviewer spawns must be free to run). Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1,
 # SHIP_PIPELINE=1. Fail-open on any missing/unparseable state. No `set -e` (a non-block non-zero must not be
-# read as a permission decision — fail-closed-smoke lesson).
+# read as a permission decision — #749 fail-closed-smoke lesson).
 # PORT-NOTE: cites `parent-claude.md Invariant #2` (ai-brain doctrine); plugin ships doctrine as 3-role-model.md
 #   (Leg 4). Comment/advisory only — nothing reads the file; safe forward-ref.
 # Reference: parent-claude.md Invariant #2 ("the plan is reviewed by a STATELESS reviewer before execution"),
-# hooks/3role-ledger.mjs (ledger format + THREE_ROLE_LEDGER_DIR).
+# hooks/3role-ledger.mjs (ledger format + THREE_ROLE_LEDGER_DIR), the plan #851 Phase 3b.
 
 INPUT=$(cat)
 

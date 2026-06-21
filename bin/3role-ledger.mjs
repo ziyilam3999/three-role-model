@@ -6,7 +6,7 @@
 // forgery-resistant signal the harness already produces: one transcript file per real subagent spawn
 // (`~/.claude/projects/*/<session>/subagents/agent-<agentId>.jsonl`). The orchestrator cannot create
 // that file without actually spawning, so binding a per-task role ledger to those files turns "I claim
-// the planner ran" into a checkable boolean.
+// the planner ran" into a checkable boolean — the leg #850 needed.
 //
 // FLAT file (NOT under hooks/lib/) because setup.sh only symlinks flat hook files (a subdir is skipped);
 // the gate finds it as a sibling via `dirname "${BASH_SOURCE[0]}"` whether run from the repo or the
@@ -25,11 +25,11 @@
 //   resolve-agent --session S --task T --role R
 //     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
 //     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
-//     `3ROLE_TASK:<T> ROLE:<R>`. Exit 0 with the agentId on stdout when a match exists; prints
+//     `3ROLE_TASK:<T> ROLE:<R>` (#860). Exit 0 with the agentId on stdout when a match exists; prints
 //     nothing + exits non-zero when no transcript carries the tag. Newest-mtime (not first-match) because a
 //     tag can repeat across transcripts (an earlier probe/retry reusing a role tag), so the most recent
 //     write is the real role spawn — a bare first-match/head -1 can grab a stale probe.
-//   inherit-plan-review --session S --task T --parent P
+//   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
 //     inline-skipped parent entry is rejected because the session-bound carve-out does not transfer to a leg).
@@ -56,7 +56,7 @@ const REQUIRED_ROLES = ['planner', 'plan-review', 'executor', 'execution-review'
 // "acceptance" ("we await acceptance from QA") can NEVER match — only a real heading does. Accepts the
 // natural variants planners actually write: `## ELI5`, `### Binary AC`, `## Binary acceptance criteria`,
 // `### Acceptance criteria`, `## Acceptance`, `## AC`. The `ac\b` boundary keeps the second arm from
-// half-matching the "Ac" of "Acceptance" — it falls through to the `acceptance` arm.
+// half-matching the "Ac" of "Acceptance" — it falls through to the `acceptance` arm (#855).
 const PLAN_RE = /^#{2,4}[ \t]*(eli5|(binary[ \t]+)?ac\b|(binary[ \t]+)?acceptance([ \t]+criteria)?\b)/im;
 const VERDICT_RE = /(PASS|FAIL|APPROVE|verdict|##\s*Review)/i;
 // Non-specific / placeholder skip reasons that are NOT acceptable (the carve-out is for genuinely
@@ -101,7 +101,7 @@ function agentResolves(session, agentId) {
   return false;
 }
 
-// resolve the agentId of the NEWEST-mtime subagent transcript carrying the exact spawn tag
+// #860: resolve the agentId of the NEWEST-mtime subagent transcript carrying the exact spawn tag
 // `3ROLE_TASK:<task> ROLE:<role>`. Returns the agentId string or '' when no transcript carries the tag.
 // Newest-mtime, not first-match: a tag can repeat across transcripts (an earlier probe/retry reusing a
 // role tag), so the most recent write is the real role spawn.
@@ -211,9 +211,9 @@ function checkRole(role, e, session) {
   return null;
 }
 
-// OVERLAY-MERGE core, extracted so both `append` and `inherit-plan-review` write through the SAME path
-// (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for `role`
-// (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
+// OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
+// path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
+// `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
 // "provided" signal — an absent key PERSISTS the prior value; role / session_id / ts always refresh), applies
 // the same mutual-exclusion guard, writes back. Recognized `fields` keys: agentId, artifact_path, skip_reason,
 // oracle, inherited_from. Returns the ledger file path.
@@ -237,13 +237,17 @@ function overlayAppend(session, task, role, fields) {
   if ('skip_reason' in fields) entry.skip_reason = fields.skip_reason;
   if ('oracle' in fields) entry.oracle = fields.oracle;
   if ('inherited_from' in fields) entry.inherited_from = fields.inherited_from;
+  // #1036: review roles (plan-review / execution-review / ship-review) may record a one-word VERDICT
+  // (APPROVE / PASS / BLOCK / SHIP-WITH-FIXES / APPROVE-WITH-NOTES). Read-only downstream: the agent-kanban
+  // board surfaces it as a colored pill. Overlay only when provided (back-compat: absent ⇒ no verdict).
+  if ('verdict' in fields) entry.verdict = fields.verdict;
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
   // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
   // otherwise resurrect).
   if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
-  if ('skip_reason' in fields) { delete entry.agentId; delete entry.artifact_path; delete entry.oracle; }
+  if ('skip_reason' in fields) { delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
   return file;
@@ -259,12 +263,23 @@ function cmdAppend(o) {
   if ('artifact' in o) fields.artifact_path = o.artifact;
   if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
   if ('oracle' in o) fields.oracle = o.oracle;
+  if ('verdict' in o) fields.verdict = o.verdict;
+  // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
+  // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
+  // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
+  // primary-clone path after merge+FF; cite THAT. Warn (stderr is visible to the orchestrator, unlike an
+  // exit-0 hook nudge — #769) but do NOT block: the path may legitimately still exist this instant.
+  if (fields.artifact_path && /\/\.claude\/worktrees\//.test(String(fields.artifact_path))) {
+    console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
+      'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
+      'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
+  }
   const file = overlayAppend(session, task, role, fields);
   console.log('OK appended role=' + role + ' -> ' + file);
   process.exit(0);
 }
 
-// inherit-plan-review --session S --task T --parent P
+// #881: inherit-plan-review --session S --task T --parent P
 // A LEG sub-task (T) may inherit its PARENT's (P) planner + plan-review ledger lines — but ONLY if the parent
 // genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (verify-then-write, fail-closed). A missing /
 // forged / inline-skipped parent review BLOCKs (exit 3) and writes NOTHING — you cannot launder an absent or
@@ -286,9 +301,9 @@ function cmdInherit(o) {
   const planReview = byRole['plan-review'];
   if (!planner) block('parent has no planner line');
   if (!planReview) block('parent has no plan-review line');
-  // EXPLICIT inline-skip rejection. checkRole returns null for a well-formed inline-skip, so we must reject
-  // skip_reason here BEFORE trusting either entry — the carve-out is session-bound and does not transfer to a
-  // leg (a leg inherits ONLY a transcript-backed parent planner + plan-review).
+  // EXPLICIT inline-skip rejection (the #881 catch). checkRole returns null for a well-formed inline-skip, so
+  // we must reject skip_reason here BEFORE trusting either entry — the carve-out is session-bound and does not
+  // transfer to a leg (a leg inherits ONLY a transcript-backed parent planner + plan-review).
   for (const [r, ent] of [['planner', planner], ['plan-review', planReview]]) {
     if ('skip_reason' in ent) {
       block('parent ' + r + ' was inline-skipped — the carve-out does not apply to legs; provide a real ' +
@@ -334,7 +349,7 @@ function cmdCheck(o) {
   process.exit(0);
 }
 
-// resolve-agent --session S --task T --role R -> newest-mtime tagged transcript's agentId on stdout.
+// #860: resolve-agent --session S --task T --role R -> newest-mtime tagged transcript's agentId on stdout.
 function cmdResolveAgent(o) {
   const session = o.session, task = o.task, role = o.role;
   if (!session || !task || !role) { console.error('resolve-agent: --session, --task, --role are required'); process.exit(2); }

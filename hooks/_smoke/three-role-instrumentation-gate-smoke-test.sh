@@ -246,4 +246,64 @@ CAP=$(printf '%s' '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status
   | CLAUDE_PLUGIN_ROOT= THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$NOHELPDIR/gate.sh" 2>&1 >/dev/null); RC=$?
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger SKIPPED"; } && ok "helper-absent + session present -> ALLOW (fail-open documented)" || bad "helper-absent should fail-open allow (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1098 — UNTAGGED-path fail-CLOSED cases. The opt-in seam (no metadata.model_run) used to allow EVERY
+# untagged completion silently. Now an untagged completion that shows OBJECTIVE code-work evidence
+# (PR / merge / commit-sha / "shipped" / "released vX.Y.Z") must carry EITHER a resolvable 4-role ledger
+# OR a valid metadata.three_role_skip; else BLOCK. Trivial (no-evidence) untagged completions still fail OPEN.
+# Each runU pipes an UNtagged (no model_run) completed payload. CODE-work evidence below cites a PR + sha.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+EV='shipped PR #1098, merged commit a1b2c3d'   # objective code-work signal (PR + merge + commit-sha)
+# runU <taskId> <session> [extra-metadata-json]  — untagged completion with code-work evidence
+runU() {
+  local extra="${3:-}"; local md='"evidence":"'"$EV"'"'
+  [ -n "$extra" ] && md="$md,$extra"
+  run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{'"$md"'}}}'
+}
+
+# ---- U1. code-work evidence + NO ledger + NO skip -> BLOCK (the #1098 bypass closed) ----
+runU 9001 s9001
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "no role-ledger\|UNPROVEN"; } && ok "U1 untagged code-work + no ledger + no skip -> BLOCK" || bad "U1 should block (rc=$RC out=$CAP)"
+
+# ---- U2. code-work evidence + COMPLETE 4-role ledger -> ALLOW ----
+ledger_complete s9002 9002
+runU 9002 s9002
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "resolvable 4-role ledger"; } && ok "U2 untagged code-work + complete ledger -> ALLOW" || bad "U2 should allow (rc=$RC out=$CAP)"
+
+# ---- U2b (plan-review #2). code-work evidence + ledger MISSING one role (execution-review) -> BLOCK ----
+mk_sub s9002b agP; mk_sub s9002b agR; mk_sub s9002b agE
+appendL --session s9002b --task 9002 --role planner     --agent agP --artifact "$LART_PLAN"
+appendL --session s9002b --task 9002 --role plan-review  --agent agR --artifact "$LART_REV"
+appendL --session s9002b --task 9002 --role executor     --agent agE --artifact "branch feat/x"
+runU 9002 s9002b
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "missing execution-review"; } && ok "U2b untagged code-work + incomplete ledger -> BLOCK" || bad "U2b should block (rc=$RC out=$CAP)"
+
+# ---- U3. code-work evidence + valid SPECIFIC three_role_skip -> ALLOW ----
+runU 9003 s9003 '"three_role_skip":"hotfix tightly coupled to live mid-edit session state, not briefable as a 3-role run"'
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "U3 untagged code-work + valid specific skip -> ALLOW silent" || bad "U3 should allow (rc=$RC out=$CAP)"
+
+# ---- U3b. code-work evidence + empty/generic skip ("done"/"n/a") -> BLOCK (skip-strength, plan-review #1) ----
+runU 9003 s9003b '"three_role_skip":"done"'
+{ [ "$RC" = "2" ]; } && ok "U3b untagged code-work + generic skip 'done' -> BLOCK" || bad "U3b 'done' should block (rc=$RC out=$CAP)"
+runU 9003 s9003c '"three_role_skip":"n/a"'
+{ [ "$RC" = "2" ]; } && ok "U3b untagged code-work + generic skip 'n/a' -> BLOCK" || bad "U3b 'n/a' should block (rc=$RC out=$CAP)"
+runU 9003 s9003d '"three_role_skip":""'
+{ [ "$RC" = "2" ]; } && ok "U3b untagged code-work + empty skip -> BLOCK" || bad "U3b empty should block (rc=$RC out=$CAP)"
+
+# ---- U4 (plan-review #3). vague/unmapped evidence ("updated the thing") -> ALLOW (acknowledged fail-OPEN residual) ----
+run '{"session_id":"s9004","tool_input":{"taskId":"9004","status":"completed","metadata":{"evidence":"updated the thing"}}}'
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "U4 vague evidence (no code-work signal) -> ALLOW (documented fail-OPEN residual)" || bad "U4 vague should allow (rc=$RC out=$CAP)"
+
+# ---- U5. kill-switches on the U1 (would-block) untagged code-work payload -> ALLOW silent ----
+CAP=$(printf '%s' '{"session_id":"s9005","tool_input":{"taskId":"9005","status":"completed","metadata":{"evidence":"'"$EV"'"}}}' \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "U5 THREE_ROLE_INSTRUMENT_OFF=1 on untagged code-work -> allow silent" || bad "U5 OFF should allow (rc=$RC out=$CAP)"
+CAP=$(printf '%s' '{"session_id":"s9005","tool_input":{"taskId":"9005","status":"completed","metadata":{"evidence":"'"$EV"'"}}}' \
+  | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "U5 SHIP_PIPELINE=1 on untagged code-work -> allow silent" || bad "U5 SHIP_PIPELINE should allow (rc=$RC out=$CAP)"
+
+# ---- U6. code-work evidence + MISSING session_id -> BLOCK (fail-CLOSED on can't-tell) ----
+run '{"tool_input":{"taskId":"9006","status":"completed","metadata":{"evidence":"'"$EV"'"}}}'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "no session_id"; } && ok "U6 untagged code-work + no session_id -> BLOCK (fail-closed)" || bad "U6 should block (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
