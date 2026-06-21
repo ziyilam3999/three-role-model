@@ -199,4 +199,28 @@ OUT=$(node "$LED" resolve-agent --session "$RSID" --task "$RTASK" --role "$RROLE
 OUT=$(node "$LED" resolve-agent --session "$RSID" --task "$RTASK" --role "execution-review" 2>/dev/null); RC=$?
 { [ "$RC" != "0" ] && [ -z "$OUT" ]; } && ok "resolve-agent: no matching tag -> empty + nonzero" || bad "resolve-agent no-match should be empty+nonzero (rc=$RC out=$OUT)"
 
+# ---------------------------------------------------------------------------
+# #897 — append warns (stderr) when --artifact is inside a build worktree (transient -> dangles after
+#        quarantine), but stays SILENT for a stable path. Both-ends: warn on worktree path, NOT on a primary path.
+# ---------------------------------------------------------------------------
+WSID="sess-wtwarn"; WTASK="897w"
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact "/Users/x/repo/.claude/worktrees/897-foo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && ok "#897 worktree artifact path -> WARN on stderr" || bad "#897 should WARN on a .claude/worktrees/ artifact path (got: $ERR)"
+
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact "/Users/x/repo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable primary path (got: $ERR)" || ok "#897 stable primary artifact path -> no warn"
+
+# ---------------------------------------------------------------------------
+# #1036 — append --verdict persists a review verdict; skip_reason clears it; absent -> no field (back-compat).
+# ---------------------------------------------------------------------------
+VSID="sess-verdict"; VTASK="1036v"; VFILE="$THREE_ROLE_LEDGER_DIR/$VSID/$VTASK.jsonl"
+node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --agent ev1 --artifact "$TMP/rev.md" --verdict "APPROVE-WITH-NOTES" >/dev/null
+grep -q '"verdict":"APPROVE-WITH-NOTES"' "$VFILE" && ok "#1036 append --verdict persists the verdict" || bad "#1036 --verdict not persisted (got: $(tail -1 "$VFILE"))"
+node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --skip-reason "n/a" >/dev/null
+grep -q '"verdict"' "$VFILE" && bad "#1036 skip should clear verdict (got: $(tail -1 "$VFILE"))" || ok "#1036 skip_reason clears the verdict"
+node "$LED" append --session "$VSID" --task "${VTASK}bc" --role planner --agent p9 --artifact "$TMP/plan.md" >/dev/null
+grep -q '"verdict"' "$THREE_ROLE_LEDGER_DIR/$VSID/${VTASK}bc.jsonl" && bad "#1036 no --verdict should mean no verdict field" || ok "#1036 absent --verdict -> no verdict field (back-compat)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

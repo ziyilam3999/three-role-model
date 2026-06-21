@@ -113,8 +113,8 @@ read -r TASKID ROLE < <(
 [ -n "$SESSION" ] && [ "$SESSION" != "-" ] || exit 0
 
 # Append the ledger line via the flat sibling helper (idempotent per role). Never block: this is a recorder.
-# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path.
-# R1: ${CLAUDE_PLUGIN_ROOT} may be UNSET in a SubagentStop hook shell — the ../bin fallback covers that.
+# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
   HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
 else
