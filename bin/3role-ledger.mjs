@@ -153,6 +153,50 @@ function resolveArtifact(p) {
 
 function stripOraclePrefix(s) { return String(s == null ? '' : s).replace(/^oracle:/i, ''); }
 
+// #1199 Part B — normalize a PATH-SHAPED artifact value to a CWD-INDEPENDENT form AT WRITE TIME, so a
+// later `check` from any other cwd resolves it. A NON-path value (PR URL, branch name, commit sha,
+// "shipped") is stored VERBATIM — never mangled into a bogus absolute path.
+//
+// R3/R4 — the value-shape guard must NOT treat "any slash" as a path. Two common executor values contain a
+// slash but are NOT files: a branch (`feat/1199-x`) and a PR URL (`https://github.com/...`). So:
+//   - URL scheme (`http(s)://`, `git://`, `ssh://`, ...) → verbatim.
+//   - already a portable home-tilde path (`~/...`) → verbatim (no username, resolves from any cwd).
+//   - explicit path shape (`/`, `./`, `../`, `.claude/`, `.ai-workspace/`) → resolve to absolute.
+//   - an ambiguous slashed token (`src/llm/generate.ts` vs `feat/x`) → treat as a path ONLY if it resolves
+//     to a file that EXISTS on disk (a real executor SOURCE artifact does; a branch never does).
+//   - no slash (`PR #123`, a sha, `shipped`) → verbatim.
+//
+// R6 privacy — the ledger append fires a PostToolUse sync (kanban-sync-on-ledger-append.sh) that publishes
+// ledger state to the Vercel-hosted agent-kanban board. To keep a raw `/Users/<name>/...` home path off
+// both the at-rest ledger AND that publish surface, when the resolved absolute path is under $HOME we store
+// the HOME-RELATIVE TILDE form `~/<rest>` — it carries NO username and resolveArtifact()'s `~/` arm expands
+// it from ANY cwd. A path genuinely OUTSIDE $HOME is stored absolute (no home to leak).
+function normalizeArtifact(raw) {
+  const v = String(raw == null ? '' : raw);
+  if (v === '') return v;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v;   // URL scheme → not a filesystem path.
+  if (v === '~' || v.startsWith('~/')) return v;        // already a portable home-tilde path.
+  let abs = '';
+  if (v.startsWith('/')) {
+    abs = v;
+  } else if (/^(\.\/|\.\.\/|\.claude\/|\.ai-workspace\/)/.test(v)) {
+    abs = path.resolve(process.cwd(), v);               // explicit relative path shape → resolve.
+  } else if (v.includes('/')) {
+    const cand = path.resolve(process.cwd(), v);
+    if (fileExists(cand)) abs = cand;                   // real source artifact (exists on disk).
+    else return v;                                      // branch-shaped / non-file slashed token → verbatim.
+  } else {
+    return v;                                           // no slash → verbatim (PR #N, sha, "shipped").
+  }
+  abs = path.normalize(abs).replace(/\/+$/, '');
+  const homePrefix = HOME.replace(/\/+$/, '') + path.sep;
+  if (abs === HOME || abs.startsWith(homePrefix)) {     // R6: collapse $HOME prefix to `~` (no username).
+    const rest = abs === HOME ? '' : abs.slice(homePrefix.length);
+    return rest ? '~/' + rest : '~';
+  }
+  return abs;
+}
+
 // Returns {skip:false} when no skip was attempted; {skip:true, ok:true} for a valid reason;
 // {skip:true, err:"..."} for an empty/non-specific reason.
 function classifySkip(e) {
@@ -267,7 +311,7 @@ function cmdAppend(o) {
   // Map the CLI flag names onto the canonical entry field names overlayAppend overlays.
   const fields = {};
   if ('agent' in o) fields.agentId = o.agent;
-  if ('artifact' in o) fields.artifact_path = o.artifact;
+  if ('artifact' in o) fields.artifact_path = normalizeArtifact(o.artifact);   // #1199 Part B: cwd-independent + home-tilde.
   if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
   if ('oracle' in o) fields.oracle = o.oracle;
   if ('verdict' in o) fields.verdict = o.verdict;
