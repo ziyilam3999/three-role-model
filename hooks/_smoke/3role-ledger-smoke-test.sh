@@ -203,13 +203,15 @@ OUT=$(node "$LED" resolve-agent --session "$RSID" --task "$RTASK" --role "execut
 # #897 — append warns (stderr) when --artifact is inside a build worktree (transient -> dangles after
 #        quarantine), but stays SILENT for a stable path. Both-ends: warn on worktree path, NOT on a primary path.
 # ---------------------------------------------------------------------------
+# NOTE: use a non-$HOME absolute base (/tmp/...) so #1199 home-tilde normalization leaves it ABSOLUTE
+# (the WARN regex needs the literal `/.claude/worktrees/` segment) AND so this file carries no `/Users/`.
 WSID="sess-wtwarn"; WTASK="897w"
 ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
-  --agent ew1 --artifact "/Users/x/repo/.claude/worktrees/897-foo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+  --agent ew1 --artifact "/tmp/x/repo/.claude/worktrees/897-foo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
 echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && ok "#897 worktree artifact path -> WARN on stderr" || bad "#897 should WARN on a .claude/worktrees/ artifact path (got: $ERR)"
 
 ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
-  --agent ew1 --artifact "/Users/x/repo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+  --agent ew1 --artifact "/tmp/x/repo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
 echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable primary path (got: $ERR)" || ok "#897 stable primary artifact path -> no warn"
 
 # ---------------------------------------------------------------------------
@@ -222,5 +224,87 @@ node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --s
 grep -q '"verdict"' "$VFILE" && bad "#1036 skip should clear verdict (got: $(tail -1 "$VFILE"))" || ok "#1036 skip_reason clears the verdict"
 node "$LED" append --session "$VSID" --task "${VTASK}bc" --role planner --agent p9 --artifact "$TMP/plan.md" >/dev/null
 grep -q '"verdict"' "$THREE_ROLE_LEDGER_DIR/$VSID/${VTASK}bc.jsonl" && bad "#1036 no --verdict should mean no verdict field" || ok "#1036 absent --verdict -> no verdict field (back-compat)"
+
+# ---------------------------------------------------------------------------
+# #1199 Part B — append normalizes a PATH-SHAPED artifact to a CWD-INDEPENDENT (+ home-tilde) form;
+# a NON-path value (branch / URL / PR #N) is stored VERBATIM. resolveArtifact is UNCHANGED (back-compat).
+# ---------------------------------------------------------------------------
+NSID="sess-1199"
+
+# 21. (R5) CROSS-CWD RED->GREEN: append a RELATIVE artifact from cwd X (where the file lives), then check
+#     from cwd Y (where it does NOT). The file is isolated to X and CLAUDE_PROJECT_DIR is unset, so on the
+#     OLD verbatim-store code the stored value is relative and `check` from Y can NOT resolve it (BLOCK) —
+#     the RED. The fix stores an ABSOLUTE path at write time, so check from Y resolves it (GREEN).
+CWDX="$(mktemp -d)"; CWDY="$(mktemp -d)"
+mkdir -p "$CWDX/.ai-workspace/reviews"
+printf '## Review\nverdict: PASS\n' > "$CWDX/.ai-workspace/reviews/rev.md"
+mk_sub "$SID" xpl; mk_sub "$SID" xpr; mk_sub "$SID" xex; mk_sub "$SID" xer
+# planner artifact authored + appended FROM cwd X (relative, explicit `.ai-workspace/` prefix)
+printf '## ELI5\np\n### Binary AC\n- a\n' > "$CWDX/.ai-workspace/reviews/plan.md"
+( cd "$CWDX" && env -u CLAUDE_PROJECT_DIR node "$LED" append --session "$SID" --task 1199x --role planner \
+    --agent xpl --artifact ".ai-workspace/reviews/plan.md" >/dev/null )
+NF="$THREE_ROLE_LEDGER_DIR/$SID/1199x.jsonl"
+grep -q '"artifact_path":"/' "$NF" && ok "#1199 cross-cwd: relative artifact stored ABSOLUTE at write time" || bad "#1199 stored value should be absolute (got: $(grep planner "$NF"))"
+# fill the other roles (all relative-from-X), then check from cwd Y
+( cd "$CWDX" && env -u CLAUDE_PROJECT_DIR node "$LED" append --session "$SID" --task 1199x --role plan-review --agent xpr --artifact ".ai-workspace/reviews/rev.md" >/dev/null )
+( cd "$CWDX" && env -u CLAUDE_PROJECT_DIR node "$LED" append --session "$SID" --task 1199x --role executor --agent xex --artifact "PR #99" >/dev/null )
+( cd "$CWDX" && env -u CLAUDE_PROJECT_DIR node "$LED" append --session "$SID" --task 1199x --role execution-review --agent xer --artifact ".ai-workspace/reviews/rev.md" >/dev/null )
+OUT=$( cd "$CWDY" && env -u CLAUDE_PROJECT_DIR node "$LED" check --session "$SID" --task 1199x 2>&1 ); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "#1199 cross-cwd: check from a DIFFERENT cwd resolves the stored absolute path (GREEN)" || bad "#1199 cross-cwd check from Y should resolve (rc=$RC out=$OUT)"
+
+# 22. (back-compat) a PRE-FIX RELATIVE ledger entry (hand-written) still resolves from its origin cwd via
+#     the UNCHANGED resolveArtifact fallback chain. Prove resolveArtifact was NOT touched.
+mkdir -p "$THREE_ROLE_LEDGER_DIR/$SID"
+BF="$THREE_ROLE_LEDGER_DIR/$SID/1199bc.jsonl"
+printf '## ELI5\np\n### Binary AC\n- a\n' > "$CWDX/.ai-workspace/reviews/plan2.md"
+mk_sub "$SID" bcp; mk_sub "$SID" bcr; mk_sub "$SID" bce; mk_sub "$SID" bcer
+BF="$BF" node -e '
+  const fs=require("fs");
+  const L=[
+    {role:"planner",agentId:"bcp",artifact_path:".ai-workspace/reviews/plan2.md"},
+    {role:"plan-review",agentId:"bcr",artifact_path:".ai-workspace/reviews/rev.md"},
+    {role:"executor",agentId:"bce",artifact_path:"PR #100"},
+    {role:"execution-review",agentId:"bcer",artifact_path:".ai-workspace/reviews/rev.md"},
+  ].map(o=>JSON.stringify(o)).join("\n")+"\n";
+  fs.writeFileSync(process.env.BF, L);
+'
+OUT=$( cd "$CWDX" && env -u CLAUDE_PROJECT_DIR node "$LED" check --session "$SID" --task 1199bc 2>&1 ); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "#1199 back-compat: pre-fix RELATIVE entry still resolves from origin cwd" || bad "#1199 back-compat relative entry should resolve (rc=$RC out=$OUT)"
+
+# 23. (R3/R4) SLASHED executor controls: a branch and a PR URL both contain '/' but are NOT files -> stored
+#     VERBATIM, never mangled into an absolute/tilde path.
+node "$LED" append --session "$NSID" --task brn --role executor --agent z1 --artifact "feat/1199-ledger-path-guard" >/dev/null
+BRNF="$THREE_ROLE_LEDGER_DIR/$NSID/brn.jsonl"
+grep -q '"artifact_path":"feat/1199-ledger-path-guard"' "$BRNF" && ok "#1199 slashed branch artifact -> stored VERBATIM (not mangled)" || bad "#1199 branch should be verbatim (got: $(cat "$BRNF"))"
+node "$LED" append --session "$NSID" --task url --role executor --agent z2 --artifact "https://github.com/o/r/pull/123" >/dev/null
+URLF="$THREE_ROLE_LEDGER_DIR/$NSID/url.jsonl"
+grep -q '"artifact_path":"https://github.com/o/r/pull/123"' "$URLF" && ok "#1199 PR URL artifact -> stored VERBATIM (URL scheme not mangled)" || bad "#1199 URL should be verbatim (got: $(cat "$URLF"))"
+
+# 24. (R3) a real relative SOURCE artifact (executor's src/x.ts that EXISTS on disk) DOES normalize to an
+#     absolute path (so the completion gate finds it cross-cwd).
+SRCX="$(mktemp -d)"; mkdir -p "$SRCX/src/llm"; printf 'export const x=1;\n' > "$SRCX/src/llm/generate.ts"
+( cd "$SRCX" && node "$LED" append --session "$NSID" --task src --role executor --agent z3 --artifact "src/llm/generate.ts" >/dev/null )
+SRCF="$THREE_ROLE_LEDGER_DIR/$NSID/src.jsonl"
+grep -q '"artifact_path":"/' "$SRCF" && ok "#1199 real relative SOURCE artifact (exists on disk) -> normalized ABSOLUTE" || bad "#1199 existing src path should normalize absolute (got: $(cat "$SRCF"))"
+
+# 25. (R6) a path UNDER \$HOME is stored as a HOME-RELATIVE TILDE path (~/...): no username, no /Users/, and
+#     resolveArtifact's ~/ arm resolves it from any cwd.
+HOMEDIR="$(node -e 'process.stdout.write(require("os").homedir())')"
+HTMP="$(mktemp -d "$HOMEDIR/.3role-smoke-XXXXXX")"
+mkdir -p "$HTMP/.ai-workspace/reviews"; printf '## Review\nverdict: PASS\n' > "$HTMP/.ai-workspace/reviews/h.md"
+HABS="$HTMP/.ai-workspace/reviews/h.md"
+mk_sub "$NSID" z4
+node "$LED" append --session "$NSID" --task home --role execution-review --agent z4 --artifact "$HABS" >/dev/null
+HOMEF="$THREE_ROLE_LEDGER_DIR/$NSID/home.jsonl"
+{ grep -q '"artifact_path":"~/' "$HOMEF" && ! grep -q "$HOMEDIR" "$HOMEF"; } && ok "#1199 R6: \$HOME path stored as ~/... tilde form (no username/home leak)" || bad "#1199 R6 home path should store as ~/ (got: $(cat "$HOMEF"))"
+# prove resolveArtifact expands the stored ~/ form (check from an unrelated cwd resolves it)
+mk_sub "$NSID" hp; mk_sub "$NSID" hr; mk_sub "$NSID" he
+printf '## ELI5\np\n### Binary AC\n- a\n' > "$HTMP/.ai-workspace/reviews/plan.md"
+node "$LED" append --session "$NSID" --task home --role planner --agent hp --artifact "$HTMP/.ai-workspace/reviews/plan.md" >/dev/null
+node "$LED" append --session "$NSID" --task home --role plan-review --agent hr --artifact "$HTMP/.ai-workspace/reviews/h.md" >/dev/null
+node "$LED" append --session "$NSID" --task home --role executor --agent he --artifact "PR #5" >/dev/null
+OUT=$( cd "$TMP" && node "$LED" check --session "$NSID" --task home 2>&1 ); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "#1199 R6: stored ~/ form resolves via resolveArtifact from an unrelated cwd" || bad "#1199 R6 tilde form should resolve (rc=$RC out=$OUT)"
+rm -rf "$CWDX" "$CWDY" "$SRCX" "$HTMP" 2>/dev/null
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
