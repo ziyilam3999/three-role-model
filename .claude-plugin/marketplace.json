@@ -1,6 +1,6 @@
 {
   "name": "three-role-model",
-  "description": "Single-plugin marketplace for the 3-role development model: planner -> plan-review -> executor -> execution-review, each a separate subagent, never self-review.",
+  "description": "Single-plugin marketplace for the 3-role development model: planner -> plan-review -> executor -> execution-review, each a separate subagent, never self-review. Also ships Autonomous Pipeline Mode (approve once, then run the pipeline) — the stop-check + post-compact resume-sequencer hooks and doctrine.",
   "owner": {
     "name": "ziyilam3999",
     "url": "https://github.com/ziyilam3999"
@@ -9,7 +9,7 @@
     {
       "name": "three-role-model",
       "source": "./",
-      "description": "The 3-role development model (planner -> plan-review -> executor -> execution-review, never self-review) as installable hooks, skills, commands, and doctrine."
+      "description": "The 3-role development model (planner -> plan-review -> executor -> execution-review, never self-review) plus Autonomous Pipeline Mode (approve once, then run — stop-check + post-compact resume-sequencer hooks and doctrine), as installable hooks, skills, commands, and doctrine."
     }
   ]
 }
