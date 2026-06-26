@@ -128,7 +128,9 @@ present=""
 # recency gate: at least one PRESENT sentinel is fresh (a compact/clear happened within the window)
 now=$(date +%s); any_fresh=0
 for s in $present; do
-  mt=$(stat -f %m "$s" 2>/dev/null || echo 0)
+  # GNU form FIRST: on Linux it succeeds so the BSD form never runs; on macOS GNU fails clean (stderr only)
+  # and BSD runs. BSD-first would be wrong — on Linux `stat -f` prints fs info to stdout before erroring.
+  mt=$(stat -c %Y "$s" 2>/dev/null || stat -f %m "$s" 2>/dev/null || echo 0)   # GNU (Linux CI) | BSD (macOS) | 0
   [ $(( now - mt )) -lt $(( WINDOW_MIN * 60 )) ] && any_fresh=1
 done
 if [ "$any_fresh" -eq 0 ]; then
