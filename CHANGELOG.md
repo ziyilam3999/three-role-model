@@ -1,3 +1,34 @@
+## [0.9.0] - 2026-06-26
+
+### Added
+- **Autonomous Pipeline Mode** — the "approve once, then run the pipeline"
+  discipline, packaged alongside the 3-role model. Two new hooks:
+  - `hooks/autonomous-approval-stop-check.sh` — a `Stop` hook that catches a turn
+    ending by asking the operator to approve continuing its OWN next step (e.g.
+    "should I ship X now, or later?") when that step is already in the approved
+    plan or a standing workflow. Blocks once (loop-safe), degrades to a no-op on
+    a host without the author's infra, and carries the `AUTONOMOUS_STOP_OVERRIDE=1`
+    single-use override.
+  - `hooks/post-compact-resume-sequencer.sh` — surfaces the Post-Compact Resume &
+    Sequencing Protocol (ELI5 the plan + re-sequence remaining work into 3 tiers +
+    one approve-gate) at `SessionStart` for the `compact` and `clear` matchers and
+    via a `UserPromptSubmit` resume-intent backstop. Non-blocking (always exits 0);
+    sentinel dir is overridable via `POST_COMPACT_SESS_DIR`.
+- **Bundled doctrine** `post-compact-resume-sequencing-protocol.md` at the repo
+  root, with a Packaging note clarifying that the scheduled "wake up and continue"
+  autonomous-loop tick is a Claude Code runtime feature and is NOT packaged by this
+  plugin.
+- Two portability smoke tests under `hooks/_smoke/` (auto-discovered by CI),
+  covering the no-op / bypass / fire paths of both hooks — the stop-check smoke
+  asserts a positive fixture for each of the three fire-condition OR-disjuncts.
+- `hooks/hooks.json` gains `Stop`, `SessionStart` (compact + clear matchers), and
+  `UserPromptSubmit` registrations, all via `${CLAUDE_PLUGIN_ROOT}`.
+
+### Changed
+- `plugin.json` version corrected to `0.9.0` (it had drifted to `0.7.0` behind the
+  `package.json` / git-tag release line) and `package.json` bumped in lockstep.
+  Both manifest descriptions now mention Autonomous Pipeline Mode.
+
 ## [0.8.1](https://github.com/ziyilam3999/three-role-model/compare/v0.8.0...v0.8.1) (2026-06-21)
 
 ### Chore
