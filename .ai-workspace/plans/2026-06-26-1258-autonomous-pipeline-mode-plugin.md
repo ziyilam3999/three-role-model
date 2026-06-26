@@ -184,3 +184,17 @@ The fire condition is `((PROCEED or NOW_OR_LATER) and has_q) or LMK` — THREE p
 **[LOW — advisory] Stop-check stderr still references the private memory pointer `feedback_no_stop_for_already_approved_step`.** On a bare host this is a dangling reference, but only inside the exit-2 BLOCK message — printed text, not a file read, so it neither errors nor blocks. Plan already lists the repoint as optional; acceptable to ship verbatim.
 
 **Required to flip to PASS:** apply the MED fix above (one fixture line in AC11). LOW items are advisory.
+
+---
+
+## Review (execution-review)
+
+**Decision: PASS** — commit `dddef4c`. All 7 review checks independently re-run in the worktree with pasted evidence (artifact: `.ai-workspace/reviews/1258-execution-review.md`).
+
+- **1. Both smokes PASS** — stop-check `8/8 PASS` (incl. the D2 NOW_OR_LATER per-disjunct fixture asserting exit 2 + BLOCKED — the plan-review MED fold landed); resume-sequencer `5/5 PASS`.
+- **2. CI green** — `npm test` (`ci-validate: PASS`) + `npm run lint:hooks` (bash -n OK on all hooks incl. the two new ones).
+- **3. hooks.json valid** — Stop + SessionStart(`compact` no-arg, `clear` `--clear-mode`) + UserPromptSubmit(`--prompt-mode`) all via `${CLAUDE_PLUGIN_ROOT}`, timeout 10; pre-existing PreToolUse + SubagentStop blocks intact (not clobbered).
+- **4. Versions** — plugin.json + package.json both `0.9.0`; CHANGELOG top `## [0.9.0] - 2026-06-26`; non-colliding next MINOR (v0.8.0/v0.8.1 already tagged); plugin.json drift repaired.
+- **5. Portability (crux)** — read both copied sources (python3 guarded → exit 0; `$HOME`-rooted self-created writes `|| true`; `set +e` / `set -uo pipefail` + exit 0 on all non-trigger paths; no `/Users/` literal, no ai-brain path). PROVEN by bare-host execution (`HOME=$(mktemp -d)`, even with python3 stripped from PATH): all non-trigger inputs → rc=0, zero stderr.
+- **6. Privacy** — `/Users/...` grep empty on the 5 new files AND the full commit diff; no employer/internal tokens.
+- **7. Doctrine doc** — Packaging note (L10) + ScheduleWakeup-not-packageable caveat (L26) both present.
