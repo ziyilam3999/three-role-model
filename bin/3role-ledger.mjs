@@ -194,21 +194,36 @@ function segmentIsRealAssert(seg) {
   return false;
 }
 
-// Is ONE content line real-evidence (R1 in any &&-segment, OR R2 anywhere on the line)?
-function lineIsRealEvidence(line) {
-  const s = String(line == null ? '' : line);
-  // R2 — a captured run-summary with digit-bearing counts (anywhere on the line).
+// R2 — does ONE `&&`-segment carry a CAPTURED run-summary count (exit/output of a real run)? Mirrors R1's
+// command-position echo-trap: a count sitting INSIDE an echo/printf literal is printed TEXT, not captured
+// output, so a segment whose trimmed form STARTS with echo/printf is SKIPPED before the count regexes run.
+// A bare captured line (no echo/printf prefix) is a single segment that keeps its count -> stays REAL.
+function segmentIsCapturedCount(seg) {
+  const s = String(seg == null ? '' : seg).trim();
+  if (!s) return false;
+  if (/^(echo|printf)\b/.test(s)) return false;   // printed literal, not captured output -> NOT real.
   if (/\b\d+\s+passed\b/i.test(s)) return true;
   if (/\b\d+\s+failed\b/i.test(s)) return true;
   if (/\bPASS=\d+\b[\s\S]*\bFAIL=\d+\b/i.test(s)) return true;
   if (/\bran\s+\d+\b/i.test(s)) return true;
   if (/\bOK\s*\(\d+/i.test(s)) return true;
   if (/\b\d+\s+(tests?|assertions?|checks?)\b/i.test(s)) return true;
-  // R1 — evaluate EACH &&-segment so a real command on EITHER side of `&&` counts (the LEFT-of-`&&`
+  return false;
+}
+
+// Is ONE content line real-evidence (R1 OR R2 in any &&-segment)?
+function lineIsRealEvidence(line) {
+  const s = String(line == null ? '' : line);
+  // Evaluate EACH &&-segment so a real command/count on EITHER side of `&&` counts (the LEFT-of-`&&`
   // realness is decided by the segment's command, NOT the bare presence of `&&`): `grep -q X f && echo
-  // PASS` is real (left segment asserts), `true && echo PASS` is vacuous (both segments trivial).
+  // PASS` is real (left segment asserts), `true && echo PASS` is vacuous (both segments trivial). R2
+  // counts are gated at COMMAND POSITION too (segmentIsCapturedCount skips echo/printf segments), so a
+  // count quoted inside `echo "12 passed, 0 failed"` is printed TEXT, not captured output -> NOT real.
   const segs = s.split('&&');
-  for (const seg of segs) { if (segmentIsRealAssert(seg)) return true; }
+  for (const seg of segs) {
+    if (segmentIsRealAssert(seg)) return true;   // R1 — executed assert (exit = verdict).
+    if (segmentIsCapturedCount(seg)) return true; // R2 — captured run-summary count.
+  }
   return false;
 }
 

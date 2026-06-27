@@ -408,7 +408,7 @@ runC 12699 sC9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 cat > "$TMP/perf-1276.md" <<EOF
 # 3-role performance log — #1276 vacuous-oracle guard
-## rounds for #12760 #12761 #12762 #12763 #12764 #12765 #12766 #12767 #12768 #12769 #12770 #12771 #12772
+## rounds for #12760 #12761 #12762 #12763 #12764 #12765 #12766 #12767 #12768 #12769 #12770 #12771 #12772 #12773 #12774 #12775
 EOF
 # runV <taskId> <session> : tagged completion citing perf-1276.md (perf leg passes), ledger store wired.
 runV() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}'; }
@@ -495,5 +495,25 @@ ledger_oracle sV13 12772 "$TMP/vac-alltrue.txt"
 CAP=$(printf '%s' '{"session_id":"sV13","tool_input":{"taskId":"12772","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}' \
   | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "vacuous + SHIP_PIPELINE=1 -> allow silent (ship exemption)" || bad "SHIP_PIPELINE should allow vacuous (rc=$RC out=$CAP)"
+
+# ── #1282 — R2 echo-trap: a count string INSIDE an echo/printf literal is printed TEXT, not captured ──
+# output (mirrors the R1 echo-trap precedent at count-position). Echo-wrapped count -> vacuous -> BLOCK;
+# the bare captured twins stay REAL -> ALLOW (no regression to legitimate captured-count evidence).
+
+# VAC-ECHOCOUNT (#1282) — count string INSIDE an echo literal: printed text, not a captured run summary.
+printf 'echo "12 passed, 0 failed -- PASS"\n' > "$TMP/vac-echocount.txt"
+ledger_oracle sV14 12773 "$TMP/vac-echocount.txt"; runV 12773 sV14
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-ECHOCOUNT (echo-wrapped count) -> BLOCK" || bad "VAC-ECHOCOUNT should block (rc=$RC out=$CAP)"
+
+# VAC-CAPTUREDCOUNT (#1282) — a captured runner summary line (no echo/printf wrap) stays REAL -> ALLOW.
+printf 'Ran 14 tests in 0.3s\n14 passed, 0 failed\n' > "$TMP/vac-captured.txt"
+ledger_oracle sV15 12774 "$TMP/vac-captured.txt"; runV 12774 sV15
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-CAPTUREDCOUNT (captured runner counts) -> ALLOW" || bad "VAC-CAPTUREDCOUNT should allow (rc=$RC out=$CAP)"
+
+# VAC-PASSFAIL (#1282) — bare `PASS=5 FAIL=0` captured count (one &&-segment, space-separated) stays REAL
+# -> ALLOW. Locks the PASS=/FAIL= shape after the regexes moved into the per-`&&`-segment loop.
+printf 'PASS=5 FAIL=0\n' > "$TMP/vac-passfail.txt"
+ledger_oracle sV16 12775 "$TMP/vac-passfail.txt"; runV 12775 sV16
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-PASSFAIL (bare PASS=5 FAIL=0 captured) -> ALLOW" || bad "VAC-PASSFAIL should allow (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
