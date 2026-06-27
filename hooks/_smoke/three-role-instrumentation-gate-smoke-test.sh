@@ -55,8 +55,11 @@ appendL() { THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJRO
 mk_sub() { mkdir -p "$PROJROOT/proj/$1/subagents"; printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1" > "$PROJROOT/proj/$1/subagents/agent-$2.jsonl"; }
 # artifact fixtures for ledger roles
 LART_PLAN="$TMP/lplan.md"; LART_REV="$TMP/lrev.md"
-printf '## ELI5\nplan\n### Binary AC\n- AC1\n' > "$LART_PLAN"
-printf '## Review\nverdict: PASS\n' > "$LART_REV"
+# #1303: under ledger-first resolution every ledger-complete ALLOW case now resolves its 4a/4b docs from these
+# shared ledger artifacts (not the empty convention dir), so they must carry a `cairn:` line — while keeping the
+# `## ELI5`/`### Binary AC` (PLAN_RE) and `## Review`/verdict (VERDICT_RE) shapes the ledger leg needs.
+printf '## ELI5\nplan\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$LART_PLAN"
+printf '## Review\ncairn: "synth reviewer hit"\nverdict: PASS\n' > "$LART_REV"
 # build a complete, valid ledger for (session,task) with all four roles resolvable: ledger_complete <session> <task>
 ledger_complete() {
   local s="$1" t="$2"
@@ -329,8 +332,8 @@ run '{"session_id":"sR2","tool_input":{"taskId":"R2","status":"completed","metad
 # default-path, exercised by AC4a-negative-NO-OVERRIDE).
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 cat > "$TMP/perf-1269.md" <<EOF
-# 3-role performance log — #1269 cairn-citation legs
-## rounds for #12691 #12692 #12693 #12694 #12695 #12696 #12697 #12698 #12699
+# 3-role performance log — #1269 cairn-citation legs (+ #1303 ledger-first resolution)
+## rounds for #12691 #12692 #12693 #12694 #12695 #12696 #12697 #12698 #12699 #12700 #12701 #12702
 EOF
 
 # runC <taskId> <session> [extra-env...] : tagged completion citing perf-1269.md (absolute), ledger store wired.
@@ -340,62 +343,132 @@ runC() {
     | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?
 }
 # mkplan <case-dir> <cairn?yes|no> : create <dir>/.ai-workspace/plans/p.md (with or without a cairn: line).
+# #1303: the plan carries a PLAN_RE heading (## ELI5 / ### Binary AC) so it can ALSO serve as the planner's
+# LEDGER artifact (re-pointed in the C-cases below) — under ledger-first the gate resolves 4a from that artifact.
 mkplan() {
   mkdir -p "$1/.ai-workspace/plans"
-  if [ "$2" = yes ]; then printf '# Plan\ncairn: "a matched hit"\n\nbody\n' > "$1/.ai-workspace/plans/p.md"
-  else printf '# Plan\n\nbody, no citation here\n' > "$1/.ai-workspace/plans/p.md"; fi
+  if [ "$2" = yes ]; then printf '## ELI5\nplan\ncairn: "a matched hit"\n### Binary AC\n- AC1\n\nbody\n' > "$1/.ai-workspace/plans/p.md"
+  else printf '## ELI5\nplan\n### Binary AC\n- AC1\n\nbody, no citation here\n' > "$1/.ai-workspace/plans/p.md"; fi
 }
 
-# ---- C1 (AC4a-positive). plan carries cairn: -> exit 0 ----
+# #1303: under ledger-first resolution the C-cases re-point their planner / plan-review LEDGER artifacts at the
+# case's OWN docs (the cairn legs test DOC CONTENT, not the shared $LART_* fixtures). Re-appending a role
+# overlay-updates its line (idempotent per role); pointing planner at a real cairn-less/cairn-bearing plan, or
+# inline-skipping it, is what makes each case discriminate under ledger-first. agP/agR/agV subs already exist
+# (ledger_complete created them), so re-pointed agentIds still resolve.
+
+# ---- C1 (AC4a-positive). planner LEDGER artifact = plan w/ cairn: -> resolved ledger-first -> exit 0 ----
 ledger_complete sC1 12691; D="$TMP/c1"; mkplan "$D" yes
+appendL --session sC1 --task 12691 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
 runC 12691 sC1 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4a-positive: plan w/ cairn: -> ALLOW" || bad "AC4a-positive should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4a-positive: ledger-resolved plan w/ cairn: -> ALLOW" || bad "AC4a-positive should allow (rc=$RC out=$CAP)"
 
-# ---- C2 (AC4a-negative, override). plan lacks cairn:, THREE_ROLE_PLANS_DIR set -> BLOCK ----
+# ---- C2 (AC4a-negative, override). planner LEDGER artifact = cairn-LESS plan -> BLOCK ----
 ledger_complete sC2 12692; D="$TMP/c2"; mkplan "$D" no
+appendL --session sC2 --task 12692 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
 runC 12692 sC2 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-negative(override): cairn-less plan -> BLOCK" || bad "AC4a-negative should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-negative(override): ledger-resolved cairn-less plan -> BLOCK" || bad "AC4a-negative should block (rc=$RC out=$CAP)"
 
-# ---- C3 (AC4a-negative-NO-OVERRIDE, the load-bearing one). THREE_ROLE_PLANS_DIR UNSET, real cwd via
-#      CLAUDE_PROJECT_DIR holding a cairn-less plan -> BLOCK (proves the production default-path blocks). ----
+# ---- C3 (AC4a-negative-NO-OVERRIDE, the convention-dir FALLBACK witness). planner INLINE-SKIP -> resolve-artifact
+#      exits 1 -> 4a FALLS BACK to the CLAUDE_PROJECT_DIR convention dir holding a cairn-less plan -> BLOCK. ----
 ledger_complete sC3 12693; D="$TMP/c3realproj"; mkplan "$D" no
+appendL --session sC3 --task 12693 --role planner --skip-reason "planner was tightly coupled to live mid-edit session state, not briefable as a standalone plan"
 runC 12693 sC3 CLAUDE_PROJECT_DIR="$D"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-negative-NO-OVERRIDE: default-path cairn-less plan -> BLOCK" || bad "AC4a-NO-OVERRIDE should block via default wiring (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-NO-OVERRIDE: planner skip -> convention-dir fallback cairn-less plan -> BLOCK" || bad "AC4a-NO-OVERRIDE should block via convention fallback (rc=$RC out=$CAP)"
 
-# ---- C4 (AC4a-failopen). plans dir exists but NO plan file -> fail-open exit 0 ----
+# ---- C4 (AC4a-failopen, M1). planner INLINE-SKIP -> resolve-artifact exits 1 -> 4a falls back to an EMPTY
+#      convention plans dir -> APLAN empty -> cairn legs skip -> ALLOW (genuine 4a-fail-open, not via resolution). ----
 ledger_complete sC4 12694; D="$TMP/c4"; mkdir -p "$D/.ai-workspace/plans"
+appendL --session sC4 --task 12694 --role planner --skip-reason "planner inseparable from live session state, ran inline against mid-edit positions not a briefable plan"
 runC 12694 sC4 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "0" ]; } && ok "AC4a-failopen: no plan file -> ALLOW (can't-tell residual)" || bad "AC4a-failopen should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ]; } && ok "AC4a-failopen: planner skip + empty convention dir -> ALLOW (4a fail-open)" || bad "AC4a-failopen should allow (rc=$RC out=$CAP)"
 
-# ---- C5 (AC4b-positive, reviews artifact). plan w/ cairn: + reviews/<id>.md w/ cairn: -> exit 0 ----
+# ---- C5 (AC4b-positive, reviews artifact). planner->plan w/ cairn:, plan-review->reviews/<id>.md w/ cairn: -> exit 0 ----
 ledger_complete sC5 12695; D="$TMP/c5"; mkplan "$D" yes
 mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\ncairn: "reviewer hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/12695.md"
+appendL --session sC5 --task 12695 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC5 --task 12695 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12695.md"
 runC 12695 sC5 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(reviews artifact w/ cairn:) -> ALLOW" || bad "AC4b-positive(artifact) should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(ledger reviews artifact w/ cairn:) -> ALLOW" || bad "AC4b-positive(artifact) should allow (rc=$RC out=$CAP)"
 
-# ---- C6 (AC4b-positive, in-plan ## Review). plan w/ top cairn: + ## Review section w/ its own cairn: -> exit 0 ----
+# ---- C6 (AC4b-positive, in-plan ## Review). planner->plan, plan-review->SAME plan file (AREVIEW==APLAN -> awk route);
+#      ## Review section carries its own cairn: -> exit 0 ----
 ledger_complete sC6 12696; D="$TMP/c6"; mkdir -p "$D/.ai-workspace/plans"
-printf '# Plan\ncairn: "planner hit"\n\nbody\n\n## Review\nDecision: PASS\ncairn: "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\ncairn: "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sC6 --task 12696 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC6 --task 12696 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
 runC 12696 sC6 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(in-plan ## Review w/ cairn:) -> ALLOW" || bad "AC4b-positive(in-plan) should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(in-plan ## Review w/ cairn:, awk route) -> ALLOW" || bad "AC4b-positive(in-plan) should allow (rc=$RC out=$CAP)"
 
-# ---- C7 (AC4b-negative, reviews artifact). plan w/ cairn: + reviews/<id>.md WITHOUT cairn: -> BLOCK ----
+# ---- C7 (AC4b-negative, reviews artifact). planner->plan w/ cairn:, plan-review->reviews/<id>.md WITHOUT cairn: -> BLOCK ----
 ledger_complete sC7 12697; D="$TMP/c7"; mkplan "$D" yes
 mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\nverdict: PASS\nno citation\n' > "$D/.ai-workspace/reviews/12697.md"
+appendL --session sC7 --task 12697 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC7 --task 12697 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12697.md"
 runC 12697 sC7 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(reviews artifact, no cairn:) -> BLOCK" || bad "AC4b-negative(artifact) should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(ledger reviews artifact, no cairn:) -> BLOCK" || bad "AC4b-negative(artifact) should block (rc=$RC out=$CAP)"
 
-# ---- C8 (AC4b-negative, in-plan ## Review). plan w/ top cairn: + ## Review section WITHOUT cairn: -> BLOCK
-#      (the planner's top-of-file cairn: must NOT satisfy 4b — the awk scan only counts a cairn: after ## Review).
+# ---- C8 (AC4b-negative, in-plan ## Review). planner->plan, plan-review->SAME plan file (awk route); ## Review
+#      section has NO cairn: (only the planner's top-of-file line) -> BLOCK (planner line must NOT satisfy 4b). ----
 ledger_complete sC8 12698; D="$TMP/c8"; mkdir -p "$D/.ai-workspace/plans"
-printf '# Plan\ncairn: "planner hit only"\n\nbody\n\n## Review\nDecision: PASS\nno reviewer citation\n' > "$D/.ai-workspace/plans/p.md"
+printf '## ELI5\nplan\ncairn: "planner hit only"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\nno reviewer citation\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sC8 --task 12698 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC8 --task 12698 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
 runC 12698 sC8 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(in-plan ## Review, planner cairn: only) -> BLOCK" || bad "AC4b-negative(in-plan) should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(in-plan ## Review, planner cairn: only, awk route) -> BLOCK" || bad "AC4b-negative(in-plan) should block (rc=$RC out=$CAP)"
 
-# ---- C9 (AC4b-failopen). plan w/ cairn:, NO reviews artifact AND no ## Review section -> exit 0 ----
+# ---- C9 (AC4b-failopen, the ONLY 4b-fail-open guard — M1). planner->plan w/ cairn:, plan-review INLINE-SKIP ->
+#      resolve-artifact exits 1, NO reviews artifact, NO ## Review -> AREVIEW empty -> 4b GENUINELY fail-opens -> exit 0 ----
 ledger_complete sC9 12699; D="$TMP/c9"; mkplan "$D" yes
+appendL --session sC9 --task 12699 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC9 --task 12699 --role plan-review --skip-reason "plan-review was interleaved with a live in-session decision, not separable as a standalone review artifact"
 runC 12699 sC9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
-{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-failopen: no review present -> ALLOW (can't-tell residual)" || bad "AC4b-failopen should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-failopen: plan-review skip + no review discoverable -> ALLOW (4b fail-open)" || bad "AC4b-failopen should allow (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1303 — LEDGER-FIRST resolution of the 4a/4b docs (fixes the #1266 wrong-dir + stale-newest false-block).
+# The gate now resolves the planner/plan-review docs from the ledger artifact_path FIRST, convention dir as
+# fallback. C10 = the docs/ regression; C11 = the stale-newest false-block; C12 = the convention fallback.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ---- C10 (AC2, docs/ regression). planner+plan-review LEDGER artifacts live under docs/ (NOT .ai-workspace/),
+#      each WITH cairn:. THREE_ROLE_PLANS_DIR points at a DIFFERENT .ai-workspace/plans holding a cairn-LESS plan
+#      (M2: cairn-less, NOT empty, so master would read the wrong plan -> BLOCK; ledger-first reads docs/ -> ALLOW). ----
+ledger_complete sC10 12700; D="$TMP/c10"
+mkdir -p "$D/docs/plans" "$D/docs/reviews" "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "docs plan hit"\n### Binary AC\n- AC1\n' > "$D/docs/plans/p.md"
+printf '## Review\ncairn: "docs review hit"\nverdict: PASS\n' > "$D/docs/reviews/r.md"
+printf '## ELI5\nstale convention plan\n### Binary AC\n- AC1\n\nno citation here\n' > "$D/.ai-workspace/plans/p.md"   # cairn-LESS decoy
+appendL --session sC10 --task 12700 --role planner     --agent agP --artifact "$D/docs/plans/p.md"
+appendL --session sC10 --task 12700 --role plan-review --agent agR --artifact "$D/docs/reviews/r.md"
+runC 12700 sC10 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "C10 docs/ ledger artifacts (cairn-less convention decoy) -> ALLOW (#1266 wrong-dir fixed)" || bad "C10 should allow via ledger docs/ resolution (rc=$RC out=$CAP)"
+
+# ---- C11 (AC3, stale-newest false-block). Convention .ai-workspace/plans holds a plan WITH cairn: (4a satisfied
+#      regardless). Convention reviews/ holds ONLY a STALE newest 9999-execution-review.md WITHOUT cairn: (M3: no
+#      reviews/<taskId>.md present, so master's newest-file fallback reads the stale file -> BLOCK). Ledger
+#      plan-review -> a docs/ review WITH cairn: -> ledger-first reads that -> ALLOW. RED on master, GREEN after. ----
+ledger_complete sC11 12701; D="$TMP/c11"
+mkdir -p "$D/.ai-workspace/plans" "$D/.ai-workspace/reviews" "$D/docs/reviews"
+printf '## ELI5\nplan\ncairn: "convention plan hit"\n### Binary AC\n- AC1\n' > "$D/.ai-workspace/plans/p.md"
+printf '## Review\nverdict: PASS\nstale, no citation\n' > "$D/.ai-workspace/reviews/9999-execution-review.md"   # STALE newest, no <taskId>.md
+printf '## Review\ncairn: "docs review hit"\nverdict: PASS\n' > "$D/docs/reviews/r.md"
+appendL --session sC11 --task 12701 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sC11 --task 12701 --role plan-review --agent agR --artifact "$D/docs/reviews/r.md"
+runC 12701 sC11 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "C11 stale-newest convention review NOT read (ledger review w/ cairn:) -> ALLOW (#1266 stale-newest fixed)" || bad "C11 should allow via ledger review resolution (rc=$RC out=$CAP)"
+
+# ---- C12 (AC4, convention fallback). planner AND plan-review BOTH inline-skipped (ledger leg still passes —
+#      both are inline-skippable) -> resolve-artifact exits 1 for each -> BOTH legs fall back to the convention
+#      dir: .ai-workspace/plans plan WITH cairn: + reviews/<taskId>.md WITH cairn: -> ALLOW (no regression). ----
+ledger_complete sC12 12702; D="$TMP/c12"
+mkdir -p "$D/.ai-workspace/plans" "$D/.ai-workspace/reviews"
+printf '## ELI5\nplan\ncairn: "convention plan hit"\n### Binary AC\n- AC1\n' > "$D/.ai-workspace/plans/p.md"
+printf '## Review\ncairn: "convention review hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/12702.md"
+appendL --session sC12 --task 12702 --role planner     --skip-reason "planner ran inline against unsettled mid-edit state, no standalone briefable plan artifact"
+appendL --session sC12 --task 12702 --role plan-review --skip-reason "plan-review interleaved with a live in-session paid-call decision, no standalone review artifact"
+runC 12702 sC12 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "C12 ledger has no usable artifact -> both legs fall back to convention dir -> ALLOW" || bad "C12 should allow via convention fallback (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1276 — VACUOUS-ORACLE guard. The gate now opts the ledger `check` into --reject-vacuous-oracle: an
@@ -403,8 +476,10 @@ runC 12699 sC9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 # (all-trivially-true / bare-verdict / echo-only) is BLOCKED. Five POSITIVE-BLOCK sub-forms (incl. the two
 # adversarial false-negative boundaries) + four CLEAN-NEGATIVE ALLOW twins + fail-open + three bypasses.
 # Each tagged completion cites perf-1276.md (perf leg passes) and a 3-real-role + oracle ledger, so the
-# vacuous check decides the outcome. (CLAUDE_PROJECT_DIR=$PROJ has no .ai-workspace/plans, so the #1269
-# cairn legs fail-open-skip on the ALLOW twins.) Synthetic-only values; no real home paths.
+# vacuous check decides the outcome. (#1303: under ledger-first resolution the ALLOW twins now resolve
+# planner->$LART_PLAN / plan-review->$LART_REV from the LEDGER and DO reach the #1269 cairn legs — they pass
+# because the shared $LART_* fixtures carry cairn: lines, no longer via fail-open-skip.) Synthetic-only
+# values; no real home paths.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 cat > "$TMP/perf-1276.md" <<EOF
 # 3-role performance log — #1276 vacuous-oracle guard
