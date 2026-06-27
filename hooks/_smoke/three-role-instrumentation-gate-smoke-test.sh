@@ -322,4 +322,79 @@ run '{"session_id":"sR1","tool_input":{"taskId":"R1","status":"completed","metad
 run '{"session_id":"sR2","tool_input":{"taskId":"R2","status":"completed","metadata":{"evidence":"released v0.70.0"}}}'
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "UNPROVEN\|no role-ledger"; } && ok "AC2: 'released v0.70.0' -> CODEWORK=1 -> routed to code-work branch (BLOCK, no ledger)" || bad "AC2 'released v0.70.0' should fire codework (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1269 — cairn-citation legs (4a planner + 4b reviewer). Each tagged completion cites perf-1269.md (perf
+# leg passes) AND has a complete 4-role ledger (ledger leg passes), so the RESULT is decided by the cairn
+# legs. The active plan is resolved from THREE_ROLE_PLANS_DIR (override) or CLAUDE_PROJECT_DIR (the real
+# default-path, exercised by AC4a-negative-NO-OVERRIDE).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$TMP/perf-1269.md" <<EOF
+# 3-role performance log — #1269 cairn-citation legs
+## rounds for #12691 #12692 #12693 #12694 #12695 #12696 #12697 #12698 #12699
+EOF
+
+# runC <taskId> <session> [extra-env...] : tagged completion citing perf-1269.md (absolute), ledger store wired.
+runC() {
+  local t="$1" s="$2"; shift 2
+  CAP=$(printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1269.md"}}}' \
+    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+}
+# mkplan <case-dir> <cairn?yes|no> : create <dir>/.ai-workspace/plans/p.md (with or without a cairn: line).
+mkplan() {
+  mkdir -p "$1/.ai-workspace/plans"
+  if [ "$2" = yes ]; then printf '# Plan\ncairn: "a matched hit"\n\nbody\n' > "$1/.ai-workspace/plans/p.md"
+  else printf '# Plan\n\nbody, no citation here\n' > "$1/.ai-workspace/plans/p.md"; fi
+}
+
+# ---- C1 (AC4a-positive). plan carries cairn: -> exit 0 ----
+ledger_complete sC1 12691; D="$TMP/c1"; mkplan "$D" yes
+runC 12691 sC1 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4a-positive: plan w/ cairn: -> ALLOW" || bad "AC4a-positive should allow (rc=$RC out=$CAP)"
+
+# ---- C2 (AC4a-negative, override). plan lacks cairn:, THREE_ROLE_PLANS_DIR set -> BLOCK ----
+ledger_complete sC2 12692; D="$TMP/c2"; mkplan "$D" no
+runC 12692 sC2 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-negative(override): cairn-less plan -> BLOCK" || bad "AC4a-negative should block (rc=$RC out=$CAP)"
+
+# ---- C3 (AC4a-negative-NO-OVERRIDE, the load-bearing one). THREE_ROLE_PLANS_DIR UNSET, real cwd via
+#      CLAUDE_PROJECT_DIR holding a cairn-less plan -> BLOCK (proves the production default-path blocks). ----
+ledger_complete sC3 12693; D="$TMP/c3realproj"; mkplan "$D" no
+runC 12693 sC3 CLAUDE_PROJECT_DIR="$D"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-negative-NO-OVERRIDE: default-path cairn-less plan -> BLOCK" || bad "AC4a-NO-OVERRIDE should block via default wiring (rc=$RC out=$CAP)"
+
+# ---- C4 (AC4a-failopen). plans dir exists but NO plan file -> fail-open exit 0 ----
+ledger_complete sC4 12694; D="$TMP/c4"; mkdir -p "$D/.ai-workspace/plans"
+runC 12694 sC4 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ]; } && ok "AC4a-failopen: no plan file -> ALLOW (can't-tell residual)" || bad "AC4a-failopen should allow (rc=$RC out=$CAP)"
+
+# ---- C5 (AC4b-positive, reviews artifact). plan w/ cairn: + reviews/<id>.md w/ cairn: -> exit 0 ----
+ledger_complete sC5 12695; D="$TMP/c5"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\ncairn: "reviewer hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/12695.md"
+runC 12695 sC5 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(reviews artifact w/ cairn:) -> ALLOW" || bad "AC4b-positive(artifact) should allow (rc=$RC out=$CAP)"
+
+# ---- C6 (AC4b-positive, in-plan ## Review). plan w/ top cairn: + ## Review section w/ its own cairn: -> exit 0 ----
+ledger_complete sC6 12696; D="$TMP/c6"; mkdir -p "$D/.ai-workspace/plans"
+printf '# Plan\ncairn: "planner hit"\n\nbody\n\n## Review\nDecision: PASS\ncairn: "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+runC 12696 sC6 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-positive(in-plan ## Review w/ cairn:) -> ALLOW" || bad "AC4b-positive(in-plan) should allow (rc=$RC out=$CAP)"
+
+# ---- C7 (AC4b-negative, reviews artifact). plan w/ cairn: + reviews/<id>.md WITHOUT cairn: -> BLOCK ----
+ledger_complete sC7 12697; D="$TMP/c7"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\nverdict: PASS\nno citation\n' > "$D/.ai-workspace/reviews/12697.md"
+runC 12697 sC7 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(reviews artifact, no cairn:) -> BLOCK" || bad "AC4b-negative(artifact) should block (rc=$RC out=$CAP)"
+
+# ---- C8 (AC4b-negative, in-plan ## Review). plan w/ top cairn: + ## Review section WITHOUT cairn: -> BLOCK
+#      (the planner's top-of-file cairn: must NOT satisfy 4b — the awk scan only counts a cairn: after ## Review).
+ledger_complete sC8 12698; D="$TMP/c8"; mkdir -p "$D/.ai-workspace/plans"
+printf '# Plan\ncairn: "planner hit only"\n\nbody\n\n## Review\nDecision: PASS\nno reviewer citation\n' > "$D/.ai-workspace/plans/p.md"
+runC 12698 sC8 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC4b-negative(in-plan ## Review, planner cairn: only) -> BLOCK" || bad "AC4b-negative(in-plan) should block (rc=$RC out=$CAP)"
+
+# ---- C9 (AC4b-failopen). plan w/ cairn:, NO reviews artifact AND no ## Review section -> exit 0 ----
+ledger_complete sC9 12699; D="$TMP/c9"; mkplan "$D" yes
+runC 12699 sC9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-failopen: no review present -> ALLOW (can't-tell residual)" || bad "AC4b-failopen should allow (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

@@ -28,6 +28,14 @@
 # useful (root-cause quality). Same boundary the dogfood gates draw — they check artifact presence + shape,
 # never build quality. That residue keeps doctrine #6 + the /issue-to-ship Stage-6 harvest instruction-class.
 #
+# cairn-citation legs (#1269): in ADDITION to the perf-card + role-ledger legs, a tagged completion must prove
+# BOTH memory-consuming roles searched memory — 4a = the PLANNER's plan carries a `cairn:` line; 4b = the
+# plan-REVIEWER's review carries its OWN `cairn:` line (a separate reviews/<id>.md, else a `cairn:` line AFTER
+# the in-plan `## Review` header — the awk scan excludes the planner's top-of-file line). These are ARTIFACT
+# checks, so the proof is session-INDEPENDENT (MED-2): the planning-time floor gate cannot distinguish the two
+# roles under shared subagent session_ids, but the completion-time citations can. Both BLOCK when the artifact
+# exists-but-uncited and fail-OPEN when no artifact is discoverable (same can't-tell residual as the perf-card).
+#
 # Why TaskUpdate, not `gh pr merge`: the merge-gates (enforce-review-or-lfah.sh) honor SHIP_PIPELINE=1 and are
 # exempt during the real /ship path, so a perf-gate on that seam would never fire on a genuine 3-role ship. The
 # headline TaskUpdate→completed is the "run is done" moment, outside SHIP_PIPELINE, and is exactly what the
@@ -56,10 +64,13 @@ INPUT=$(cat)
 #   SKIPSTATE — "valid" | "invalid" | "none": classification of metadata.three_role_skip. "valid" = a SPECIFIC
 #               reason (≥20 chars, not on the non-specific denylist incl. "done"); "invalid" = present but empty /
 #               generic; "none" = not supplied (#1098 + plan-review improvement #1).
-read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE < <(
+#   PCWD      — d.cwd on THIS update (the PreToolUse payload carries it), used to derive the plans dir for
+#               the #1269 cairn-citation legs. "" if absent (the leg then falls back to CLAUDE_PROJECT_DIR/$PWD).
+read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE PCWD < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const ti=d.tool_input||{};
+    const cwd=(d.cwd!=null ? String(d.cwd) : "").trim();
     const status=(ti.status||"").toString().replace(/\s+/g," ").trim();
     const taskId=(ti.taskId||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
     const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
@@ -90,12 +101,12 @@ read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE < <(
       skipstate=(skipRaw==="" || NONSPECIFIC.test(skipRaw) || skipRaw.length<20) ? "invalid" : "valid";
     }
     const enc=(s)=> (s===""? "-" : encodeURIComponent(s));
-    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf), codework, skipstate].join(" "));
+    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf), codework, skipstate, enc(cwd)].join(" "));
   ' 2>/dev/null
 )
 # decode helper (paths/ids may contain spaces/encoded chars)
 dec(){ [ "$1" = "-" ] && { printf ''; return; }; printf '%b' "${1//%/\\x}"; }
-MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"
+MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD")"
 
 # Only completions matter; anything else (delete / in_progress / metadata edit / unparseable) -> allow.
 [ "$STATUS" = "completed" ] || exit 0
@@ -261,6 +272,43 @@ if [ -f "$LEDGER_HELPER" ]; then
   LEDGER_NOTE=" + ledger OK"
 else
   LEDGER_NOTE=" + ledger SKIPPED (helper unavailable — fail-open)"
+fi
+
+# ── cairn-citation legs (#1269) ─────────────────────────────────────────────────────────────────────
+# A tagged completion must prove BOTH memory-consuming roles searched memory: 4a = the PLANNER's plan must
+# carry a `cairn:` receipt line; 4b = the plan-REVIEWER's review must carry its OWN `cairn:` line. Both are
+# ARTIFACT checks, so the guarantee is session-INDEPENDENT — the planning-time floor gate
+# (cairn-search-before-planning.sh) cannot, under shared subagent session_ids, distinguish the two roles;
+# these completion-time artifact citations do (MED-2 resolution). Fail-OPEN when the artifact is not
+# discoverable (can't-tell, mirrors the perf-card ERR->allow residual); BLOCK when the artifact EXISTS but
+# carries no `cairn:` line. Placed AFTER the perf-card + ledger legs already hold (LOW-2: the receipt rides
+# on top of the heavier instrumentation). Plans-dir from a DEFINED chain (HIGH-1, never the round-1 empty
+# $CWD): THREE_ROLE_PLANS_DIR (test override) -> $PCWD (parser-emitted cwd) -> $CLAUDE_PROJECT_DIR -> $PWD.
+PLANS_DIR="${THREE_ROLE_PLANS_DIR:-${PCWD:-${CLAUDE_PROJECT_DIR:-$PWD}}/.ai-workspace/plans}"
+APLAN="$(ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1)"
+if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
+  # 4a — the planner's plan must carry a `cairn:` line.
+  grep -Eiq '^[[:space:]]*cairn:' "$APLAN" 2>/dev/null \
+    || block "the active plan ($APLAN) carries no \`cairn:\` citation line — prove the PLANNER searched memory (cairn/AWM/project-index). Add a \`cairn: \"<hit>\"\` or \`cairn: no hits for <q>\` line, then re-complete. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
+
+  # 4b — the plan-REVIEWER's review must carry its OWN `cairn:` line. Two shapes, checked in order:
+  #   (1) a separate reviews artifact ${PLANS_DIR%/plans}/reviews/<taskId>.md (or the newest reviews/*.md);
+  #   (2) else a `## Review` section appended INTO the active plan — a `cairn:` line AFTER the `## Review`
+  #       header (the awk scan EXCLUDES the planner's top-of-file cairn: line, so 4b genuinely proves the
+  #       REVIEWER, not the planner, cited memory).
+  # Fail-OPEN only when NEITHER form exists (can't-tell); BLOCK when a review IS present but uncited (R7: if
+  # the in-plan scan proves brittle in practice the separate reviews/ artifact form is preferred).
+  REVIEWS_DIR="${PLANS_DIR%/plans}/reviews"
+  AREVIEW=""
+  if [ -f "$REVIEWS_DIR/$TASKID.md" ]; then AREVIEW="$REVIEWS_DIR/$TASKID.md"
+  else AREVIEW="$(ls -t "$REVIEWS_DIR"/*.md 2>/dev/null | head -1)"; fi
+  if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ]; then
+    grep -Eiq '^[[:space:]]*cairn:' "$AREVIEW" 2>/dev/null \
+      || block "the plan-review ($AREVIEW) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
+  elif grep -Eq '^## Review' "$APLAN" 2>/dev/null; then
+    awk '/^## Review/{r=1} r&&/^[[:space:]]*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
+      || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
+  fi
 fi
 
 # Allow + a brief confirming note (non-blocking).

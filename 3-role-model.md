@@ -65,20 +65,32 @@ lines **and** no architectural decision — those can be fixed in place.)
    oracle before ship — never self-review.** Not the executor grading its own work, and not the
    orchestrator quietly grading it inline.
 
-4. **Search memory first.** Both the planner and the plan-reviewer search the project's memory
-   before planning, and the plan cites what was found. From inside a subagent shell, run the
-   bundled, dependency-free search shim:
+4. **Search memory first — all THREE systems.** Both the planner and the plan-reviewer consult
+   every memory system before planning, and the plan/review cites what was found. The three
+   systems, each with its own job:
 
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/bin/cairn-find.mjs "<keyword>"
-   ```
+   1. **cairn** (what went wrong before) — from inside a subagent shell, run the bundled,
+      dependency-free search shim:
 
-   Query with single, salient keywords (the matcher is substring-based). The shim **degrades
-   gracefully**: if no memory store is present on the machine, every tier walk silently returns
-   empty and you simply get *no hits* — it never errors out. Point it at a store by setting
-   `CAIRN_PERSIST_ROOT` (it defaults to the repo it ships in). Either way, the plan should carry a
-   one-line citation that quotes a matched result *or* states plainly that there were no hits for
-   the queries tried — the cheapest honest signal that the search actually ran.
+      ```
+      node ${CLAUDE_PLUGIN_ROOT}/bin/cairn-find.mjs "<keyword>"
+      ```
+
+      Query with single, salient keywords (the matcher is substring-based). The shim **degrades
+      gracefully**: if no memory store is present on the machine, every tier walk silently returns
+      empty and you simply get *no hits* — it never errors out. Point it at a store by setting
+      `CAIRN_PERSIST_ROOT` (it defaults to the repo it ships in).
+   2. **working-memory active-decision cards** (what we decided) — the CLI above is keyword-gated,
+      so open and Read the matched `~/.claude/agent-working-memory/tier-b/topics/<topic>/<id>.md`
+      cards IN FULL.
+   3. **the live project-index** (where the files are) — Read `<repo>/.ai-workspace/PROJECT-INDEX.md`
+      (generate it via `/project-index` if absent). This is the LIVE per-repo map, distinct from any
+      cached primer the cairn shim happens to walk.
+
+   Either way, the plan/review MUST carry a one-line citation that quotes a matched result —
+   `cairn: "<quoted matched hit>"` — *or* states plainly `cairn: no hits for <queries tried>`. That
+   line is the cheapest honest signal that the search actually ran, and the instrumentation gate
+   verifies it at completion.
 
 5. **Every role subagent is spawned with the tools its job needs.** See *Role tooling* below.
 
