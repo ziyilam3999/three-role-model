@@ -397,4 +397,103 @@ ledger_complete sC9 12699; D="$TMP/c9"; mkplan "$D" yes
 runC 12699 sC9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC4b-failopen: no review present -> ALLOW (can't-tell residual)" || bad "AC4b-failopen should allow (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1276 — VACUOUS-ORACLE guard. The gate now opts the ledger `check` into --reject-vacuous-oracle: an
+# execution-review oracle that EXISTS and carries a PASS token but contains ZERO real assertions
+# (all-trivially-true / bare-verdict / echo-only) is BLOCKED. Five POSITIVE-BLOCK sub-forms (incl. the two
+# adversarial false-negative boundaries) + four CLEAN-NEGATIVE ALLOW twins + fail-open + three bypasses.
+# Each tagged completion cites perf-1276.md (perf leg passes) and a 3-real-role + oracle ledger, so the
+# vacuous check decides the outcome. (CLAUDE_PROJECT_DIR=$PROJ has no .ai-workspace/plans, so the #1269
+# cairn legs fail-open-skip on the ALLOW twins.) Synthetic-only values; no real home paths.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$TMP/perf-1276.md" <<EOF
+# 3-role performance log — #1276 vacuous-oracle guard
+## rounds for #12760 #12761 #12762 #12763 #12764 #12765 #12766 #12767 #12768 #12769 #12770 #12771 #12772
+EOF
+# runV <taskId> <session> : tagged completion citing perf-1276.md (perf leg passes), ledger store wired.
+runV() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}'; }
+# ledger_oracle <session> <task> <oracle-file> : 3 real roles + execution-review satisfied by an ORACLE
+# file (so the vacuous classifier, not an agentId, decides). Models L9/L10.
+ledger_oracle() {
+  local s="$1" t="$2" orc="$3"
+  mk_sub "$s" agP; mk_sub "$s" agR; mk_sub "$s" agE
+  appendL --session "$s" --task "$t" --role planner          --agent agP --artifact "$LART_PLAN"
+  appendL --session "$s" --task "$t" --role plan-review       --agent agR --artifact "$LART_REV"
+  appendL --session "$s" --task "$t" --role executor          --agent agE --artifact "branch feat/x"
+  appendL --session "$s" --task "$t" --role execution-review  --oracle "$orc"
+}
+
+# ── POSITIVE-BLOCK sub-forms (each a REAL exit-2 block whose stderr names the oracle vacuous) ──
+# VAC-ALLTRUE — only true/:/exit 0/[ 1 = 1 ]/test 1 = 1 lines (+ a PASS token to reach the check).
+printf 'true\n:\nexit 0\n[ 1 = 1 ]\ntest 1 = 1\nPASS\n' > "$TMP/vac-alltrue.txt"
+ledger_oracle sV1 12760 "$TMP/vac-alltrue.txt"; runV 12760 sV1
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-ALLTRUE (all-trivially-true oracle) -> BLOCK" || bad "VAC-ALLTRUE should block (rc=$RC out=$CAP)"
+
+# VAC-ZEROASSERT — a lone PASS token, nothing runnable at all.
+printf 'PASS\n' > "$TMP/vac-zero.txt"
+ledger_oracle sV2 12761 "$TMP/vac-zero.txt"; runV 12761 sV2
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-ZEROASSERT (bare verdict only) -> BLOCK" || bad "VAC-ZEROASSERT should block (rc=$RC out=$CAP)"
+
+# VAC-ECHOONLY — echo-only; EMBEDS a real-command substring inside the echo literal (Finding 1b): a
+# classifier that greps `grep -q` anywhere-on-line would FALSE-NEGATIVE; an executed-command classifier blocks.
+printf 'echo "grep -q X build.log -- PASS"\necho PASS\n' > "$TMP/vac-echo.txt"
+ledger_oracle sV3 12762 "$TMP/vac-echo.txt"; runV 12762 sV3
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-ECHOONLY (echo w/ embedded real-cmd substring) -> BLOCK" || bad "VAC-ECHOONLY should block (rc=$RC out=$CAP)"
+
+# VAC-AMPTRIVIAL — `true && echo PASS` (Finding 1a): trivially-true LEFT operand short-circuits to echo;
+# nothing is asserted. The &&-sparing must test the LEFT operand's realness, not bare `&&` presence.
+printf 'true && echo PASS\n' > "$TMP/vac-amp.txt"
+ledger_oracle sV4 12763 "$TMP/vac-amp.txt"; runV 12763 sV4
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-AMPTRIVIAL (true && echo PASS) -> BLOCK" || bad "VAC-AMPTRIVIAL should block (rc=$RC out=$CAP)"
+
+# VAC-FAKEBRACKET — the only [[ … ]] is a constant comparison [[ 1 = 1 ]] (still vacuous).
+printf '[[ 1 = 1 ]]\nPASS\n' > "$TMP/vac-fake.txt"
+ledger_oracle sV5 12764 "$TMP/vac-fake.txt"; runV 12764 sV5
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "vacuous"; } && ok "VAC-FAKEBRACKET ([[ 1 = 1 ]] constant) -> BLOCK" || bad "VAC-FAKEBRACKET should block (rc=$RC out=$CAP)"
+
+# ── CLEAN-NEGATIVE ALLOW twins (each must ALLOW, exit 0 — catches over-matching AND false-block) ──
+# VAC-REAL — a real assert command (grep -q with an operand).
+printf 'grep -q "all green" build.log\nPASS\n' > "$TMP/vac-real.txt"
+ledger_oracle sV6 12765 "$TMP/vac-real.txt"; runV 12765 sV6
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-REAL (real grep -q assert) -> ALLOW" || bad "VAC-REAL should allow (rc=$RC out=$CAP)"
+
+# VAC-SUMMARY — a captured run-summary with digit-bearing counts (the no-regression twin of L9).
+printf 'tests: 12 passed, 0 failed -- PASS\n' > "$TMP/vac-summary.txt"
+ledger_oracle sV7 12766 "$TMP/vac-summary.txt"; runV 12766 sV7
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-SUMMARY (12 passed, 0 failed counts) -> ALLOW" || bad "VAC-SUMMARY should allow (rc=$RC out=$CAP)"
+
+# VAC-OKBRACKET — a real double-bracket filesystem-test assert [[ -f build.log ]] (Finding 2: guards
+# against FALSE-BLOCKing a genuine bash [[ oracle).
+printf '[[ -f build.log ]]\nPASS\n' > "$TMP/vac-okbracket.txt"
+ledger_oracle sV8 12767 "$TMP/vac-okbracket.txt"; runV 12767 sV8
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-OKBRACKET ([[ -f build.log ]] real fs-test) -> ALLOW" || bad "VAC-OKBRACKET should allow (rc=$RC out=$CAP)"
+
+# VAC-SKIP — execution-review satisfied by a REAL reviewer agentId (no oracle) -> the vacuous check never
+# fires -> ALLOW (orthogonal escape door is untouched).
+ledger_complete sV9 12768; runV 12768 sV9
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-SKIP (real reviewer agentId, no oracle) -> ALLOW" || bad "VAC-SKIP should allow (rc=$RC out=$CAP)"
+
+# ── fail-open on an unparseable (binary-ish, NUL-bearing) oracle that carries a PASS token -> ALLOW ──
+# Proves the new check NEVER fail-CLOSES on a parse error.
+printf 'PASS\n' > "$TMP/vac-binary.txt"; printf '\000\001\002 binoracle\n' >> "$TMP/vac-binary.txt"
+ledger_oracle sV10 12769 "$TMP/vac-binary.txt"; runV 12769 sV10
+{ [ "$RC" = "0" ]; } && ok "vacuous fail-open: unparseable (NUL-bearing) oracle -> ALLOW (never fail-closed)" || bad "binary oracle should fail-open allow (rc=$RC out=$CAP)"
+
+# ── three bypass fixtures: a vacuous oracle that WOULD block is ALLOWED under each off-switch ──
+# (master kill-switch / feature kill-switch / ship exemption). Same vacuous all-true oracle as VAC-ALLTRUE.
+ledger_oracle sV11 12770 "$TMP/vac-alltrue.txt"
+CAP=$(printf '%s' '{"session_id":"sV11","tool_input":{"taskId":"12770","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}' \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "vacuous + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent (master bypass)" || bad "master kill-switch should allow vacuous (rc=$RC out=$CAP)"
+
+ledger_oracle sV12 12771 "$TMP/vac-alltrue.txt"
+CAP=$(printf '%s' '{"session_id":"sV12","tool_input":{"taskId":"12771","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}' \
+  | VACUOUS_ORACLE_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "vacuous + VACUOUS_ORACLE_OFF=1 -> ALLOW (feature bypass reverts to exists+PASS)" || bad "feature kill-switch should allow vacuous (rc=$RC out=$CAP)"
+
+ledger_oracle sV13 12772 "$TMP/vac-alltrue.txt"
+CAP=$(printf '%s' '{"session_id":"sV13","tool_input":{"taskId":"12772","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}' \
+  | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "vacuous + SHIP_PIPELINE=1 -> allow silent (ship exemption)" || bad "SHIP_PIPELINE should allow vacuous (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
