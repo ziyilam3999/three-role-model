@@ -38,6 +38,23 @@ would be self-review).
 
 See ${CLAUDE_PLUGIN_ROOT}/3-role-model.md — the 3-role model is the default for new primitives in this workspace.
 
+## Consult memory first (mandatory)
+
+If this agent is the **planner** or the **plan-review** role, search all three memory systems
+before writing the plan / review, and end the artifact with a `cairn:` citation line — the
+model's instrumentation gate verifies that line at completion:
+
+```
+Before writing the plan / review, run ALL THREE and carry a `cairn:` citation line in your artifact:
+1. cairn + AWM via CLI:  node ${CLAUDE_PLUGIN_ROOT}/bin/cairn-find.mjs "<salient keyword>"   (one strong keyword; matcher is substring)
+2. AWM active decisions: Read the matched ~/.claude/agent-working-memory/tier-b/topics/<topic>/<id>.md cards IN FULL (the CLI is keyword-gated; open the cards).
+3. Live project-index:   Read <repo>/.ai-workspace/PROJECT-INDEX.md (run /project-index to GENERATE it if absent).
+Your plan/review MUST end with:  `cairn: "<quoted matched hit>"`  OR  `cairn: no hits for <queries tried>`.
+```
+
+The shim degrades gracefully on a bare host (no store -> *no hits*, never an error), so the
+`cairn: no hits for <queries>` form is always honestly available.
+
 ## Role-ledger spawn snippet
 
 When the orchestrator spawns this agent as a role subagent it prepends the role tag to the
