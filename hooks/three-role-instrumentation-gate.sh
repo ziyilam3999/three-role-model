@@ -52,6 +52,14 @@ INPUT=$(cat)
 [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
 [ "${SHIP_PIPELINE:-}" = "1" ] && exit 0
 
+# #1276 vacuous-oracle guard: opt the ledger `check` calls into rejecting an execution-review oracle that
+# exists + carries a PASS token but is VACUOUS (0 real assertions — all-trivially-true / bare-verdict /
+# echo-only). The classifier lives in the synced helper (the only place the oracle path is resolved+read);
+# this hook just passes the opt-in flag, gated by the feature kill-switch. The master kill-switch /
+# SHIP_PIPELINE already short-circuited above. Empty -> no flag (today's exists+PASS acceptance).
+VAC_FLAG="--reject-vacuous-oracle"
+[ "${VACUOUS_ORACLE_OFF:-}" = "1" ] && VAC_FLAG=""
+
 # Parse the update payload (node = the dep already required by sibling hooks).
 #   STATUS    — tool_input.status
 #   TASKID    — sanitized tool_input.taskId
@@ -207,7 +215,7 @@ if [ -z "$MODELRUN" ]; then
   if [ ! -f "$UHELPER" ]; then
     block_untagged "the role-ledger helper (3role-ledger.mjs) is unavailable — cannot verify the 3-role process (fail-closed)."
   fi
-  ULEDGER_OUT="$(node "$UHELPER" check --session "$SESSION" --task "$TASKID" 2>&1)"; ULRC=$?
+  ULEDGER_OUT="$(node "$UHELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG 2>&1)"; ULRC=$?
   if [ "$ULRC" != "0" ]; then
     block_untagged "${ULEDGER_OUT:-role-ledger check failed}"
   fi
@@ -265,7 +273,7 @@ fi
 # HELPER-absence stays fail-OPEN (allow, note it) — never silently brick a tagged completion if the symlink is
 # missing; the perf-card leg already passed by this point.
 if [ -f "$LEDGER_HELPER" ]; then
-  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" 2>&1)"; LRC=$?
+  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG 2>&1)"; LRC=$?
   if [ "$LRC" != "0" ]; then
     block_ledger "${LEDGER_OUT:-role-ledger check failed}"
   fi

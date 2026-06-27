@@ -153,6 +153,89 @@ function resolveArtifact(p) {
 
 function stripOraclePrefix(s) { return String(s == null ? '' : s).replace(/^oracle:/i, ''); }
 
+// #1276 — vacuous-oracle classifier (RE-AUTHORED from the design intent of the upstream spec-driven
+// harness's guardrails #9/#11 — see the Port-C "vacuous oracle" guard plan; no pattern was copied from
+// any external source). An execution-review oracle that EXISTS and carries a PASS/verdict token but
+// contains ZERO real assertions (all-trivially-true / bare-verdict / echo-only) proves nothing — "a PASS
+// that asserts nothing is not a PASS." This classifier returns true ONLY when the oracle is POSITIVELY
+// vacuous; ANY parse trouble / binary-ish content / unexpected shape returns false (FAIL-OPEN — never
+// fail-closed: a malformed-but-present oracle is ALLOWED, not blocked).
+//
+// Operate over CONTENT lines (blank + `#`-comment lines dropped). A line is REAL-EVIDENCE when it either
+// (R1) EXECUTES an assert command whose exit is the verdict, or (R2) carries a digit-bearing run-summary
+// count. The R1 discriminator is that a REAL command is EXECUTED at a COMMAND POSITION (start of an
+// `&&`-segment) — a command NAME quoted inside an echo/printf literal is printed TEXT, not run, so it does
+// NOT count. The oracle is VACUOUS iff it has ZERO real-evidence content lines.
+
+// R1 — does ONE `&&`-segment EXECUTE a real assert command (exit = verdict)?
+function segmentIsRealAssert(seg) {
+  const s = String(seg == null ? '' : seg).trim();
+  if (!s) return false;
+  // grep -q / -E / -F with an operand (the assert: search a file/stream, exit reflects a match).
+  if (/^grep\b[^\n]*\s-[A-Za-z]*[qEF][A-Za-z]*\b[^\n]*\s\S/.test(s)) return true;
+  // test / [ / [[ — REAL only with a $-var OR a filesystem-test flag (-e/-f/-d/-s/-r/-x) + operand; a
+  // constant-vs-constant bracket ([ 1 = 1 ], [[ 1 = 1 ]], test 1 = 1) asserts nothing -> NOT real.
+  if (/^(test\b|\[\[?)/.test(s)) {
+    if (/\$[A-Za-z_{]/.test(s)) return true;
+    if (/\s-[efdsrx]\s+\S/.test(s)) return true;
+    return false;
+  }
+  // arithmetic (( ... )) test.
+  if (/^\(\(.*\)\)/.test(s)) return true;
+  // diff / cmp of two operands.
+  if (/^(diff|cmp)\b\s+\S+\s+\S+/.test(s)) return true;
+  // smoke / program / test-runner invocations executed for their exit code.
+  if (/^bash\b[^\n]*smoke/i.test(s)) return true;
+  if (/^\.\//.test(s)) return true;
+  if (/^(pytest|jest|vitest)\b/.test(s)) return true;
+  if (/^go\s+test\b/.test(s)) return true;
+  if (/^npm\s+test\b/.test(s)) return true;
+  if (/^node\b[^\n]*\.mjs\b/.test(s)) return true;
+  return false;
+}
+
+// Is ONE content line real-evidence (R1 in any &&-segment, OR R2 anywhere on the line)?
+function lineIsRealEvidence(line) {
+  const s = String(line == null ? '' : line);
+  // R2 — a captured run-summary with digit-bearing counts (anywhere on the line).
+  if (/\b\d+\s+passed\b/i.test(s)) return true;
+  if (/\b\d+\s+failed\b/i.test(s)) return true;
+  if (/\bPASS=\d+\b[\s\S]*\bFAIL=\d+\b/i.test(s)) return true;
+  if (/\bran\s+\d+\b/i.test(s)) return true;
+  if (/\bOK\s*\(\d+/i.test(s)) return true;
+  if (/\b\d+\s+(tests?|assertions?|checks?)\b/i.test(s)) return true;
+  // R1 — evaluate EACH &&-segment so a real command on EITHER side of `&&` counts (the LEFT-of-`&&`
+  // realness is decided by the segment's command, NOT the bare presence of `&&`): `grep -q X f && echo
+  // PASS` is real (left segment asserts), `true && echo PASS` is vacuous (both segments trivial).
+  const segs = s.split('&&');
+  for (const seg of segs) { if (segmentIsRealAssert(seg)) return true; }
+  return false;
+}
+
+// Returns true iff the oracle file is POSITIVELY vacuous. Fail-OPEN (false) on any error / kill-switch /
+// binary-ish content.
+function isVacuousOracle(filePath) {
+  try {
+    if (process.env.VACUOUS_ORACLE_OFF === '1') return false;   // belt-and-suspenders kill-switch.
+    const raw = fs.readFileSync(filePath, 'utf8');
+    // Binary-ish / unparseable bytes (NUL present) -> cannot classify a script -> FAIL-OPEN.
+    if (raw.indexOf('\u0000') >= 0) return false;
+    let hasContent = false;
+    for (const ln of raw.split('\n')) {
+      const line = ln.trim();
+      if (!line) continue;
+      if (line.charAt(0) === '#') continue;   // comment line — drop.
+      hasContent = true;
+      if (lineIsRealEvidence(line)) return false;   // >= 1 real-evidence line -> NOT vacuous.
+    }
+    // Zero real-evidence lines among >=1 content line -> vacuous. No content lines at all -> can't-tell ->
+    // fail-open (not vacuous).
+    return hasContent;
+  } catch (e) {
+    return false;   // FAIL-OPEN — never fail-closed on a classifier error.
+  }
+}
+
 // #1199 Part B — normalize a PATH-SHAPED artifact value to a CWD-INDEPENDENT form AT WRITE TIME, so a
 // later `check` from any other cwd resolves it. A NON-path value (PR URL, branch name, commit sha,
 // "shipped") is stored VERBATIM — never mangled into a bogus absolute path.
@@ -207,8 +290,10 @@ function classifySkip(e) {
   return { skip: true, ok: true };
 }
 
-// Returns null when the role is satisfied, else a problem string.
-function checkRole(role, e, session) {
+// Returns null when the role is satisfied, else a problem string. `opts.rejectVacuousOracle` (#1276) — set
+// ONLY by the instrumentation-gate's `check --reject-vacuous-oracle` — additionally REJECTS an
+// execution-review oracle that exists + carries a PASS token but is vacuous (0 real assertions).
+function checkRole(role, e, session, opts) {
   const sk = classifySkip(e);
   if (role === 'execution-review') {
     if (sk.skip) {
@@ -219,6 +304,14 @@ function checkRole(role, e, session) {
       const op = resolveArtifact(stripOraclePrefix(e.oracle));
       if (!op) return 'execution-review oracle path "' + e.oracle + '" does not exist';
       if (!fileHas(op, VERDICT_RE)) return 'execution-review oracle "' + op + '" lacks a PASS/verdict token';
+      // #1276: a PASS that asserts nothing is not a PASS. When the gate opts in (and the feature kill-switch
+      // is not set), reject a positively-vacuous oracle. The classifier fails OPEN, so this NEVER blocks on
+      // a parse error — only on a file proven to carry zero real-evidence lines.
+      if (opts && opts.rejectVacuousOracle && process.env.VACUOUS_ORACLE_OFF !== '1' && isVacuousOracle(op)) {
+        return 'execution-review oracle "' + op + '" is vacuous — 0 real assertions (all-trivially-true / ' +
+          'bare-verdict / echo-only); a PASS that asserts nothing is not a PASS. Add a REAL check (an assert ' +
+          'command whose exit is the verdict, or a captured test-run summary with counts) OR name a real reviewer agentId';
+      }
       return null;
     }
     if (!agentResolves(session, e.agentId)) {
@@ -391,11 +484,14 @@ function cmdCheck(o) {
   }
   const byRole = {};
   for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  // #1276: the vacuous-oracle rejection is OPT-IN via --reject-vacuous-oracle (only the instrumentation
+  // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
+  const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o) };
   const problems = [];
   for (const role of REQUIRED_ROLES) {
     const e = byRole[role];
     if (!e) { problems.push('missing ' + role + ' ledger line'); continue; }
-    const r = checkRole(role, e, session);
+    const r = checkRole(role, e, session, checkOpts);
     if (r) problems.push(r);
   }
   // #1100 item 3: provenance flags — a required role that ran as a REAL spawn (not an inline-skip) but whose
