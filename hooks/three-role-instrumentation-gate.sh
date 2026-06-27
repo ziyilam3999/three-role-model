@@ -293,24 +293,40 @@ fi
 # on top of the heavier instrumentation). Plans-dir from a DEFINED chain (HIGH-1, never the round-1 empty
 # $CWD): THREE_ROLE_PLANS_DIR (test override) -> $PCWD (parser-emitted cwd) -> $CLAUDE_PROJECT_DIR -> $PWD.
 PLANS_DIR="${THREE_ROLE_PLANS_DIR:-${PCWD:-${CLAUDE_PROJECT_DIR:-$PWD}}/.ai-workspace/plans}"
-APLAN="$(ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1)"
+REVIEWS_DIR="${PLANS_DIR%/plans}/reviews"
+
+# 4a doc — resolve the PLANNER's plan from the 3-role LEDGER's artifact_path for THIS task (#1303 —
+# authoritative, task-scoped). This closes the #1266 failure modes: a lane that files its plan under docs/
+# (not .ai-workspace/) is no longer invisible, and a NEWER stranger file in the convention dir is no longer
+# grabbed by ls -t. Fall back to the convention dir + newest-file ONLY when the ledger has no usable
+# artifact_path (helper absent, no planner line, no/empty artifact_path, or a dangling path) — nothing regresses.
+APLAN=""
+if [ -f "$LEDGER_HELPER" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
+  APLAN="$(node "$LEDGER_HELPER" resolve-artifact --session "$SESSION" --task "$TASKID" --role planner 2>/dev/null)"
+fi
+{ [ -n "$APLAN" ] && [ -f "$APLAN" ]; } || APLAN="$(ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1)"
+
 if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
-  # 4a — the planner's plan must carry a `cairn:` line.
+  # 4a — the planner's plan must carry a `cairn:` line. (PRESENCE check UNCHANGED.)
   grep -Eiq '^[[:space:]]*cairn:' "$APLAN" 2>/dev/null \
     || block "the active plan ($APLAN) carries no \`cairn:\` citation line — prove the PLANNER searched memory (cairn/AWM/project-index). Add a \`cairn: \"<hit>\"\` or \`cairn: no hits for <q>\` line, then re-complete. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
 
-  # 4b — the plan-REVIEWER's review must carry its OWN `cairn:` line. Two shapes, checked in order:
-  #   (1) a separate reviews artifact ${PLANS_DIR%/plans}/reviews/<taskId>.md (or the newest reviews/*.md);
-  #   (2) else a `## Review` section appended INTO the active plan — a `cairn:` line AFTER the `## Review`
-  #       header (the awk scan EXCLUDES the planner's top-of-file cairn: line, so 4b genuinely proves the
-  #       REVIEWER, not the planner, cited memory).
-  # Fail-OPEN only when NEITHER form exists (can't-tell); BLOCK when a review IS present but uncited (R7: if
-  # the in-plan scan proves brittle in practice the separate reviews/ artifact form is preferred).
-  REVIEWS_DIR="${PLANS_DIR%/plans}/reviews"
+  # 4b doc — resolve the plan-REVIEWER's review from the LEDGER's plan-review artifact_path for THIS task
+  # (#1303), then fall back to the convention reviews dir (reviews/<taskId>.md, else the newest reviews/*.md).
   AREVIEW=""
-  if [ -f "$REVIEWS_DIR/$TASKID.md" ]; then AREVIEW="$REVIEWS_DIR/$TASKID.md"
-  else AREVIEW="$(ls -t "$REVIEWS_DIR"/*.md 2>/dev/null | head -1)"; fi
-  if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ]; then
+  if [ -f "$LEDGER_HELPER" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
+    AREVIEW="$(node "$LEDGER_HELPER" resolve-artifact --session "$SESSION" --task "$TASKID" --role plan-review 2>/dev/null)"
+  fi
+  if [ -z "$AREVIEW" ] || [ ! -f "$AREVIEW" ]; then
+    if [ -f "$REVIEWS_DIR/$TASKID.md" ]; then AREVIEW="$REVIEWS_DIR/$TASKID.md"
+    else AREVIEW="$(ls -t "$REVIEWS_DIR"/*.md 2>/dev/null | head -1)"; fi
+  fi
+  # A review doc that is a SEPARATE file from the plan -> its own `cairn:` line. When the ledger points the
+  # plan-review artifact AT THE PLAN FILE itself (in-plan `## Review`), AREVIEW == APLAN: route to the awk
+  # `## Review` scan (which EXCLUDES the planner's top-of-file cairn: line) so the planner's line can NEVER
+  # satisfy 4b (the #1269 invariant — and STRICTER for the in-plan case, never looser).
+  # Fail-OPEN only when NEITHER form exists (can't-tell); BLOCK when a review IS present but uncited.
+  if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ] && [ "$AREVIEW" != "$APLAN" ]; then
     grep -Eiq '^[[:space:]]*cairn:' "$AREVIEW" 2>/dev/null \
       || block "the plan-review ($AREVIEW) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   elif grep -Eq '^## Review' "$APLAN" 2>/dev/null; then

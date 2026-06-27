@@ -34,6 +34,15 @@
 //     nothing + exits non-zero when no transcript carries the tag. Newest-mtime (not first-match) because a
 //     tag can repeat across transcripts (an earlier probe/retry reusing a role tag), so the most recent
 //     write is the real role spawn — a bare first-match/head -1 can grab a stale probe.
+//   resolve-artifact --session S --task T --role R                  (#1303)
+//     Prints the existence-checked ABSOLUTE artifact_path for ONE role of ONE task on stdout, then exit 0.
+//     Reuses ledgerFile() + resolveArtifact() (the SAME parse cmdCheck/cmdInherit use — last line per role
+//     wins). Exits NON-ZERO (printing nothing) on EVERY "no usable artifact" branch: no ledger file, no line
+//     for the role, an absent/empty/whitespace artifact_path (e.g. an inline-skip line), or a dangling path
+//     that does not resolve on disk. The instrumentation gate calls this to resolve the planner / plan-review
+//     docs (cairn legs 4a/4b) LEDGER-FIRST — the non-zero exit is the "ledger has no usable artifact_path ->
+//     fall back to the convention dir" contract (#1266 wrong-dir + stale-newest fix). A `verdict:` field on
+//     the line is ignored; only artifact_path is read.
 //   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
@@ -543,15 +552,37 @@ function cmdResolveAgent(o) {
   process.exit(0);
 }
 
+// #1303: resolve-artifact --session S --task T --role R -> existence-checked absolute artifact_path on stdout.
+// Reuses ledgerFile() + resolveArtifact() (the load-bearing helpers) and the SAME last-line-per-role parse
+// cmdCheck/cmdInherit use. Exits non-zero on every "no usable artifact" branch so the gate falls back to the
+// convention dir (the #1266 ledger-first fix). Only artifact_path is read — verdict/skip fields are ignored.
+function cmdResolveArtifact(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) { console.error('resolve-artifact: --session, --task, --role are required'); process.exit(2); }
+  const file = ledgerFile(session, task);
+  let lines;
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) { process.exit(1); }   // no ledger -> caller falls back to convention dir
+  const byRole = {};
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  const e = byRole[role];
+  if (!e || !e.artifact_path || String(e.artifact_path).trim() === '') process.exit(1);
+  const abs = resolveArtifact(e.artifact_path); // expands ~ / CLAUDE_PROJECT_DIR / cwd / $HOME, '' if not on disk
+  if (!abs) process.exit(1);
+  console.log(abs);
+  process.exit(0);
+}
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
   if (cmd === 'append') cmdAppend(opts);
   else if (cmd === 'check') cmdCheck(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
+  else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|resolve-agent|inherit-plan-review> --session S --task T ' +
+    console.log('usage: 3role-ledger.mjs <append|check|resolve-agent|resolve-artifact|inherit-plan-review> --session S --task T ' +
       '[--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)]');
     process.exit(2);
   }
