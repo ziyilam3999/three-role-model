@@ -43,6 +43,16 @@
 //     docs (cairn legs 4a/4b) LEDGER-FIRST — the non-zero exit is the "ledger has no usable artifact_path ->
 //     fall back to the convention dir" contract (#1266 wrong-dir + stale-newest fix). A `verdict:` field on
 //     the line is ignored; only artifact_path is read.
+//   heartbeat --session S --task T                                 (#1350)
+//     LEADING-EDGE lane liveness: bump the <task>.jsonl file MTIME to ~now so agent-kanban's swimlane
+//     liveness counter (which stats <ledgerDir>/<session>/<task>.jsonl mtime via ledgerMtimeByTaskId →
+//     updatedAt = max(mtimeMs, ledgerMtimeMs) → computeActiveIds secondary-window test) sees the lane as
+//     LIVE the instant a role is SPAWNED — not only when a role COMPLETES (the trailing-edge append).
+//     Writes NO JSONL line: if <task>.jsonl exists it is utimes-touched in place (content untouched); if
+//     absent it is created as a ZERO-byte file. Because no line is written there is nothing for
+//     overlayAppend to merge/drop/clobber, so a subsequent real append/check/resolve-artifact reads the
+//     file byte-correctly — AC-4 (no overlay/close corruption) is true BY CONSTRUCTION. ALWAYS exits 0
+//     (fail-open) — a heartbeat error must NEVER wedge the spawn it instruments.
 //   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
@@ -573,17 +583,40 @@ function cmdResolveArtifact(o) {
   process.exit(0);
 }
 
+// #1350: heartbeat --session S --task T -> bump <task>.jsonl mtime to ~now (touch-existing OR create-zero-byte).
+// Writes NO JSONL line (AC-4 non-corruption by construction). ALWAYS exits 0 (fail-open) — a heartbeat error
+// must never wedge the spawn it instruments, so the whole body is wrapped and every failure path returns 0.
+function cmdHeartbeat(o) {
+  try {
+    const session = o.session, task = o.task;
+    // Missing args -> nothing to touch; fail-open (do NOT exit 2 like the other subcommands).
+    if (!session || !task) process.exit(0);
+    const file = ledgerFile(session, task);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fileExists(file)) {
+      // Create a ZERO-byte file. 'a' (append) NEVER truncates — so even on a race where a real append just
+      // created a non-empty <task>.jsonl, this opens-and-closes without clobbering its content.
+      fs.closeSync(fs.openSync(file, 'a'));
+    }
+    // Advance mtime to ~now (the entire board signal). Content is left untouched on every path.
+    const now = new Date();
+    fs.utimesSync(file, now, now);
+  } catch (e) { /* fail-open: a heartbeat error never blocks the spawn */ }
+  process.exit(0);
+}
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
   if (cmd === 'append') cmdAppend(opts);
   else if (cmd === 'check') cmdCheck(opts);
+  else if (cmd === 'heartbeat') cmdHeartbeat(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|resolve-agent|resolve-artifact|inherit-plan-review> --session S --task T ' +
-      '[--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)]');
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|resolve-agent|resolve-artifact|inherit-plan-review> ' +
+      '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)]');
     process.exit(2);
   }
 } catch (e) {
