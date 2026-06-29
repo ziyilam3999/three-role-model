@@ -10,6 +10,13 @@ ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
 HOOK="$ROOT/hooks/three-role-spawn-ledger.sh"
 LED="$ROOT/bin/3role-ledger.mjs"
 
+# #1354 portability: the post-append board resync is a MACHINE-LOCAL agent-kanban hook (kanban-resync.sh) that
+# sits next to this hook in ai-brain but is NOT synced into the public three-role-model plugin. So `would-sync`
+# only fires where that helper is present. Detect it so the both-ends assertions hold in BOTH trees: ai-brain
+# (helper present) REQUIRES would-sync; the plugin (helper absent) requires the guarded call to cleanly NO-OP
+# (the ledger write still happens, no would-sync). Either way the ledger-write half is always asserted.
+RESYNC_PRESENT=no; [ -f "$(dirname "$HOOK")/kanban-resync.sh" ] && RESYNC_PRESENT=yes
+
 fail=0
 ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; fail=1; }
@@ -26,10 +33,14 @@ LEDGERDIR="$TMP/ledger"; PROJROOT="$TMP/projects"
 # no-agentId branch covered regardless of the probe outcome.
 
 # run <payload-json> [env KEY=VAL ...] -> sets RC, CAP. Pins THREE_ROLE_LEDGER_DIR / _PROJECTS_ROOT.
+# Threads KANBAN_SYNC_DRYRUN=1 (so the post-append resync echoes `would-sync` on stdout instead of touching
+# the network) + KANBAN_AUTOSYNC_OFF_FILE at a guaranteed-absent temp path (so the shared resync launcher
+# stays hermetic against the operator's real kill-switch). #1354 automated-edge both-ends coverage.
 run() {
   local payload="$1"; shift
   CAP=$(printf '%s' "$payload" \
-    | env "$@" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1); RC=$?
+    | env "$@" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" \
+        KANBAN_SYNC_DRYRUN=1 KANBAN_AUTOSYNC_OFF_FILE="$TMP/none-kanban" bash "$HOOK" 2>&1); RC=$?
 }
 # Count ledger lines with role=$3 [agentId=$4] in <LEDGERDIR>/<session>/<task>.jsonl
 ledger_count() {
@@ -102,5 +113,35 @@ P10='{"session_id":"s1187h","tool_input":{"description":"3ROLE_TASK:1187 ROLE:pl
 run "$P10"
 n10=$(ledger_count s1187h 1187 plan-review agD)
 { [ "$RC" = "0" ] && [ "$n10" = "1" ]; } && ok "tags in description field -> still detected + appended" || bad "should read joined field set (rc=$RC n10=$n10 out=$CAP)"
+
+# ===== #1354 AUTOMATED-EDGE BOTH-ENDS: the JSONL write and the board resync live in the SAME hook block, so
+#       on the automated spawn edge you cannot write the {role} ledger line WITHOUT firing the resync. =====
+
+# ---- 11. POSITIVE both-ends: a both-tags spawn -> WRITES the {role} ledger line AND (where kanban-resync.sh is
+#          present, i.e. ai-brain) emits `would-sync`. In the plugin (helper absent) the guarded resync cleanly
+#          no-ops -> ledger line still written, no would-sync. The ledger half is asserted always; the resync
+#          half flips on RESYNC_PRESENT, so the SAME synced smoke passes in both trees. ----
+P11='{"session_id":"s1354a","tool_input":{"prompt":"3ROLE_TASK:1354 ROLE:planner\nYou are the planner."},"tool_response":{"agentId":"ag1354"}}'
+run "$P11"
+n11=$(ledger_count s1354a 1354 planner ag1354)
+sync11=$(printf '%s' "$CAP" | grep -c 'would-sync'); [ -n "$sync11" ] || sync11=0
+if [ "$RESYNC_PRESENT" = "yes" ]; then sync11_ok=$([ "$sync11" -ge 1 ] && echo yes || echo no); else sync11_ok=$([ "$sync11" = "0" ] && echo yes || echo no); fi
+{ [ "$RC" = "0" ] && [ "$n11" = "1" ] && [ "$sync11_ok" = "yes" ]; } && ok "automated edge: {role} ledger line written AND resync half matches helper-presence ($RESYNC_PRESENT)" || bad "both-ends: should write {planner} AND resync-half per presence (rc=$RC n11=$n11 resync=$RESYNC_PRESENT sync11=$sync11 out=$CAP)"
+
+# ---- 12. NEGATIVE untagged: a non-3-role spawn -> NO ledger line AND NO would-sync (resync never fires). ----
+P12='{"session_id":"s1354b","tool_input":{"prompt":"Do some general research. No role tags."},"tool_response":{"agentId":"agZ"}}'
+run "$P12"
+empty12="$([ -z "$(ls -A "$LEDGERDIR/s1354b" 2>/dev/null)" ] && echo yes || echo no)"
+sync12=$(printf '%s' "$CAP" | grep -c 'would-sync'); [ -n "$sync12" ] || sync12=0
+{ [ "$RC" = "0" ] && [ "$empty12" = "yes" ] && [ "$sync12" = "0" ]; } && ok "automated edge: untagged spawn -> NO ledger line AND NO would-sync" || bad "untagged should fire neither half (rc=$RC empty12=$empty12 sync12=$sync12 out=$CAP)"
+
+# ---- 13. NEGATIVE non-vacuity: the SAME positive payload as #11 but with the kill-switch on -> NO ledger
+#          line AND NO would-sync (proves the switch suppresses a REAL resync, not a no-op). ----
+P13='{"session_id":"s1354c","tool_input":{"prompt":"3ROLE_TASK:1354 ROLE:planner\nYou are the planner."},"tool_response":{"agentId":"ag1354"}}'
+run "$P13" THREE_ROLE_SPAWN_LEDGER_OFF=1
+f13a="$([ -f "$LEDGERDIR/s1354c/1354.jsonl" ] && echo yes || echo no)"; sync13a=$(printf '%s' "$CAP" | grep -c 'would-sync'); [ -n "$sync13a" ] || sync13a=0
+run "$P13" THREE_ROLE_INSTRUMENT_OFF=1
+f13b="$([ -f "$LEDGERDIR/s1354c/1354.jsonl" ] && echo yes || echo no)"; sync13b=$(printf '%s' "$CAP" | grep -c 'would-sync'); [ -n "$sync13b" ] || sync13b=0
+{ [ "$f13a" = "no" ] && [ "$sync13a" = "0" ] && [ "$f13b" = "no" ] && [ "$sync13b" = "0" ]; } && ok "automated edge: kill-switch on POSITIVE payload -> NO ledger line AND NO would-sync (non-vacuous)" || bad "kill-switch should suppress BOTH halves (f13a=$f13a sync13a=$sync13a f13b=$f13b sync13b=$sync13b)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

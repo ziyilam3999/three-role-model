@@ -93,6 +93,7 @@ read -r TASKID ROLE SESSION AGENTID < <(
 # A spawn with no usable session cannot be filed -> no-op (fail-open).
 [ -n "$SESSION" ] && [ "$SESSION" != "-" ] || exit 0
 
+HOOK_DIR="$(dirname "${BASH_SOURCE[0]}")"
 # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
 # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
@@ -109,4 +110,16 @@ if [ -n "$AGENTID" ] && [ "$AGENTID" != "-" ]; then
 else
   node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" >/dev/null 2>&1
 fi
+
+# Both append branches merge here. Resync the live board on this AUTOMATED write
+# edge so the role BADGE refreshes the instant the ledger line lands — the gap
+# #1354 closes (the Bash-matcher resync hook never saw this internal node spawn).
+# The helper backgrounds the real sync internally, so the spawn path takes no
+# added latency; it is fail-open and always exits 0, so it can never block the
+# spawn. A SINGLE post-block call covers BOTH append branches by control-flow
+# merge. Co-symlinked next to this hook by setup.sh's flat-file loop. Guarded by
+# a presence test so the ported plugin copy (which does NOT carry this machine-local
+# agent-kanban helper) fails open cleanly instead of erroring on a missing file.
+[ -f "$HOOK_DIR/kanban-resync.sh" ] && bash "$HOOK_DIR/kanban-resync.sh"
+
 exit 0
