@@ -678,4 +678,67 @@ CAP=$(printf '%s' '{"session_id":"sO10","tool_input":{"taskId":"14310","status":
   | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "O10 SHIP_PIPELINE=1 on outcome-less payload -> allow silent (ship exemption)" || bad "O10 SHIP_PIPELINE should allow silent (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1448 — per-role MODEL-POLICY leg (completion-seam). The gate passes --enforce-role-models to the ledger
+# `check` on the tagged path (unless CC_ROLE_MODEL_GATE_OFF=1). When a role's ACTUAL transcript model
+# (message.model on its subagent transcript — forgery-resistant) contradicts cc-roles.env, the ledger emits
+# a `MODEL-POLICY:` problem, `check` exits 2, and the gate routes to block_model. Every OTHER leg must pass
+# (perf card, complete ledger, cairn, outcome) so the MODEL leg alone decides the outcome. Fixtures give ONLY
+# the executor transcript a model line (mk_sub_model) — the other three use plain mk_sub (no model -> that
+# role fail-opens on the model leg), so only the executor can mismatch. Synthetic-only; no real home paths.
+# NOTE: the whole EXISTING corpus above uses plain mk_sub (no message.model) -> every role fail-opens on the
+# model leg -> the added --enforce-role-models flag is inert there (proven by the corpus staying green).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$TMP/perf-1448.md" <<EOF
+# 3-role performance log — #1448 per-role model-policy leg
+## rounds for #14481 #14482 #14483 #14484 #14485
+EOF
+# a transcript fixture carrying an assistant message.model line (the model leg reads it): mk_sub_model <s> <id> <model-id>
+mk_sub_model() {
+  mkdir -p "$PROJROOT/proj/$1/subagents"
+  { printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$3"; } \
+    > "$PROJROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+# complete 4-role ledger where the EXECUTOR transcript carries model $3: ledger_execmodel <session> <task> <exec-model-id>
+ledger_execmodel() {
+  mk_sub "$1" agP; mk_sub "$1" agR; mk_sub_model "$1" agE "$3"; mk_sub "$1" agV
+  appendL --session "$1" --task "$2" --role planner          --agent agP --artifact "$LART_PLAN"
+  appendL --session "$1" --task "$2" --role plan-review       --agent agR --artifact "$LART_REV"
+  appendL --session "$1" --task "$2" --role executor          --agent agE --artifact "branch feat/x"
+  appendL --session "$1" --task "$2" --role execution-review  --agent agV --artifact "$LART_REV"
+}
+# runM <taskId> <session> [extra-env...] : tagged completion citing perf-1448.md + valid outcome, ledger store wired.
+runM() {
+  local t="$1" s="$2"; shift 2
+  CAP=$(printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1448.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+}
+MODCFG="$TMP/cc-roles-mod.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_ROLE_EXECUTOR_EFFORT=medium\n' > "$MODCFG"
+
+# ---- MDL1 (model BLOCK). executor transcript=opus vs config=sonnet -> MODEL-POLICY mismatch -> block_model exit 2 ----
+ledger_execmodel sMDL1 14481 "claude-opus-4-8"
+runM 14481 sMDL1 CC_ROLES_ENV="$MODCFG"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "model-policy leg FAILED"; } && ok "MDL1 executor=opus vs config=sonnet -> BLOCK (model-policy leg)" || bad "MDL1 wrong model should block via model leg (rc=$RC out=$CAP)"
+
+# ---- MDL2 (model ALLOW). executor transcript=sonnet matches config=sonnet -> ledger OK + model-policy OK -> exit 0 ----
+ledger_execmodel sMDL2 14482 "claude-sonnet-4-6"
+runM 14482 sMDL2 CC_ROLES_ENV="$MODCFG"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "model-policy OK"; } && ok "MDL2 executor=sonnet matches config -> ALLOW (+ model-policy OK note)" || bad "MDL2 matching model should allow (rc=$RC out=$CAP)"
+
+# ---- MDL3 (feature kill-switch). MDL1 red fixture + CC_ROLE_MODEL_GATE_OFF=1 -> model leg NOT enforced -> exit 0 ----
+ledger_execmodel sMDL3 14483 "claude-opus-4-8"
+runM 14483 sMDL3 CC_ROLES_ENV="$MODCFG" CC_ROLE_MODEL_GATE_OFF=1
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "MDL3 CC_ROLE_MODEL_GATE_OFF=1 over wrong-model -> ALLOW (feature kill-switch)" || bad "MDL3 kill-switch should allow (rc=$RC out=$CAP)"
+
+# ---- MDL4 (no-config). executor transcript=opus but CC_ROLES_ENV=/nonexistent -> model enforcement SKIPPED -> exit 0 ----
+ledger_execmodel sMDL4 14484 "claude-opus-4-8"
+runM 14484 sMDL4 CC_ROLES_ENV=/nonexistent
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "MDL4 no-config -> model enforcement skipped -> ALLOW (no false-block)" || bad "MDL4 no-config should allow (rc=$RC out=$CAP)"
+
+# ---- MDL5 (master kill-switch). MDL1 red fixture + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent (short-circuits) ----
+ledger_execmodel sMDL5 14485 "claude-opus-4-8"
+runM 14485 sMDL5 CC_ROLES_ENV="$MODCFG" THREE_ROLE_INSTRUMENT_OFF=1
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "MDL5 THREE_ROLE_INSTRUMENT_OFF=1 over wrong-model -> allow silent (master bypass)" || bad "MDL5 master kill-switch should allow silent (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

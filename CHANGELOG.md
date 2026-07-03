@@ -1,3 +1,23 @@
+## [0.10.0] - 2026-07-03
+
+### Added
+- **Per-role model policy** — a config-driven control surface that pins each role
+  in the chain (orchestrator, planner, plan-review, executor, execution-review)
+  to a model tier, with the tier MECHANICALLY enforced against the subagent's
+  actual transcript `message.model`. New file `config/cc-roles.env` holds the
+  per-role `_MODEL` (enforced) and `_EFFORT` (doc/spawn-advisory only — the Agent
+  spawn tool has a `model` param but no `effort` param) settings. FAIL-SAFE is
+  `opus` — a missing/garbled config never fails open to a cheaper tier.
+- New hook `hooks/three-role-model-policy-gate.sh` (PreToolUse `Agent|Task`,
+  leading-edge, block-once advisory) — surfaces the resolved per-role model when a
+  role subagent is spawned on a tier that disagrees with policy. Kill-switch
+  `CC_ROLE_MODEL_GATE_OFF=1`; `SHIP_PIPELINE=1` exempts.
+- `bin/3role-ledger.mjs` gains `resolve-role-model`, model-policy lint, and an
+  opt-in completion-time enforcement leg (`--enforce-role-models`) reused by the
+  instrumentation gate. Kill-switch `THREE_ROLE_INSTRUMENT_OFF=1`.
+- A portability smoke test under `hooks/_smoke/` covering the model-policy gate's
+  no-op / bypass / fire / fail-safe paths.
+
 ## [0.9.0] - 2026-06-26
 
 ### Added

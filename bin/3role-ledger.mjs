@@ -53,6 +53,16 @@
 //     overlayAppend to merge/drop/clobber, so a subsequent real append/check/resolve-artifact reads the
 //     file byte-correctly — AC-4 (no overlay/close corruption) is true BY CONSTRUCTION. ALWAYS exits 0
 //     (fail-open) — a heartbeat error must NEVER wedge the spawn it instruments.
+//   resolve-role-model --role R [--with-effort]                    (#1448)
+//     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
+//     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
+//     an invalid per-role value => opus (never fail-open-to-cheap). --with-effort prints "<model> <effort>".
+//     Lints the config on read (loud INVALID-MODEL / Fable stderr warnings). Always exits 0.
+//   check --session S --task T --enforce-role-models               (#1448)
+//     The --enforce-role-models flag (opt-in; only the instrumentation gate passes it) adds a per-role
+//     MODEL-POLICY leg: for each role that resolves to a real transcript, compare its ACTUAL model
+//     (message.model, forgery-resistant) to cc-roles.env's tier; a mismatch => exit 2. No config => skip
+//     (fail-safe). Fable->Opus silent reroute is OK. Kill-switch CC_ROLE_MODEL_GATE_OFF=1.
 //   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
@@ -65,10 +75,15 @@
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
 //   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
 //   THREE_ROLE_PROJECTS_ROOT (default ~/.claude/projects)
+//   CC_ROLES_ENV             (#1448) — explicit per-role-model config path. When SET it is AUTHORITATIVE +
+//                            TERMINAL (never falls through to ~/.config / plugin / repo defaults), so a smoke
+//                            sets CC_ROLES_ENV=/nonexistent to simulate "no config" (=> every role opus).
+//   CC_ROLE_MODEL_GATE_OFF=1 (#1448) — skip the --enforce-role-models MODEL-POLICY leg (feature kill-switch).
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
 const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude', '3role-ledger');
@@ -94,6 +109,150 @@ function ledgerFile(session, task) {
 }
 function fileExists(p) { try { return fs.statSync(p).isFile(); } catch (e) { return false; } }
 function fileHas(p, re) { try { return re.test(fs.readFileSync(p, 'utf8')); } catch (e) { return false; } }
+
+// ── #1448 per-role MODEL POLICY (config resolution + transcript-model read + lint) ─────────────────────
+// The interactive 4-role chain staffs every seat with Opus by default (a spawn today carries model=(none), so
+// each role inherits the session model). config/cc-roles.env maps each role -> a model TIER; this block reads
+// it (fail-SAFE to opus), reads the FORGERY-RESISTANT actual model from the role's subagent transcript
+// (message.model), and lints the config. MODEL is the only mechanically-enforced dimension (effort is not
+// recorded in the transcript). See .ai-workspace/plans/2026-07-03-1448-per-role-model-policy.md.
+const ROLE_MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
+
+// Ledger role -> config-key STEM (hyphen->underscore, upper): plan-review -> PLAN_REVIEW, execution-review ->
+// EXECUTION_REVIEW, executor -> EXECUTOR. ORCHESTRATOR has a policy/lint entry but is NOT transcript-enforced.
+function roleKeyStem(role) { return String(role == null ? '' : role).toUpperCase().replace(/-/g, '_'); }
+
+// Resolve the cc-roles.env config file path. First hit wins across the chain, with ONE override rule:
+//   CC_ROLES_ENV, when SET, is AUTHORITATIVE + TERMINAL — it selects EXACTLY that file and NEVER falls through
+//   to the machine/plugin/repo defaults. So a smoke simulates "no config" with CC_ROLES_ENV=/nonexistent (or
+//   /dev/null) and gets the fail-safe all-opus path without leaking the repo's own config/cc-roles.env
+//   (AC-3 / green-gate: CC_ROLES_ENV=/dev/null => opus for every role).
+//   Unset CC_ROLES_ENV: ~/.config/cc-roles.env -> ${CLAUDE_PLUGIN_ROOT}/config/cc-roles.env -> the
+//   realpath-resolved repo config -> none => '' (=> every role opus).
+// The fs.realpathSync step is LOAD-BEARING (defect-1b): setup.sh installs THIS helper as a SYMLINK at
+// ~/.claude/hooks/3role-ledger.mjs -> the repo file. A naive import.meta.url join resolves ../config to
+// ~/.claude/config (does NOT exist) -> silent all-opus on every real invocation while passing every
+// worktree-run smoke. realpathSync walks THROUGH the symlink to the real repo file FIRST, so ../config lands
+// in the repo. AC-4 exercises this via the installed symlink from a cwd outside the repo.
+function resolveConfigPath() {
+  if ('CC_ROLES_ENV' in process.env) {
+    const p = process.env.CC_ROLES_ENV;
+    return (p && fileExists(p)) ? p : '';
+  }
+  const cands = [path.join(HOME, '.config', 'cc-roles.env')];
+  if (process.env.CLAUDE_PLUGIN_ROOT) cands.push(path.join(process.env.CLAUDE_PLUGIN_ROOT, 'config', 'cc-roles.env'));
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  cands.push(path.join(selfDir, '..', 'config', 'cc-roles.env'));
+  for (const c of cands) { if (c && fileExists(c)) return c; }
+  return '';
+}
+
+// Parse a shell-env KEY=VALUE file into a plain object (# comments + blanks dropped; optional surrounding
+// quotes stripped). Never throws — an unreadable file returns {}.
+function parseEnvFile(filePath) {
+  const out = {};
+  let raw;
+  try { raw = fs.readFileSync(filePath, 'utf8'); } catch (e) { return out; }
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s || s.charAt(0) === '#') continue;
+    const eq = s.indexOf('=');
+    if (eq < 0) continue;
+    const k = s.slice(0, eq).trim();
+    let v = s.slice(eq + 1).trim();
+    if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) v = v.slice(1, -1);
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+// Load the config ONCE per command invocation. { found, cfg, configPath }. found=false => no config resolved.
+function loadRoleConfig() {
+  const configPath = resolveConfigPath();
+  if (!configPath) return { found: false, cfg: {}, configPath: '' };
+  return { found: true, cfg: parseEnvFile(configPath), configPath };
+}
+
+// Resolve a role's model TIER from an already-parsed cfg, fail-SAFE to opus (missing OR invalid => opus).
+function roleModelFromCfg(cfg, role) {
+  const raw = cfg['CC_ROLE_' + roleKeyStem(role) + '_MODEL'];
+  return ROLE_MODELS.includes(raw) ? raw : 'opus';
+}
+function roleEffortFromCfg(cfg, role) {
+  const v = cfg['CC_ROLE_' + roleKeyStem(role) + '_EFFORT'];
+  return v == null ? '' : String(v);
+}
+
+// Config LINT (defect-3 + Fable guards) — emits stderr warnings; the pass/fail is unaffected (the gate's
+// `expected` fails SAFE to opus, so a garbage value collapses to opus at the gate and CANNOT be caught there —
+// VISIBILITY is entirely the lint's job). Fires on EVERY config read (every resolve-role-model + every enforce
+// check + every spawn-hook call). Call ONCE per invocation (loud, not 5x). THREE warn classes:
+//   1. INVALID-MODEL — a present *_MODEL whose value is not a known tier (typo / empty). The silent-overpay guard.
+//   2. FABLE-ON-ORCHESTRATOR — the always-on seat pinned to fable (never-pin; refuse/warn).
+//   3. FABLE-COST-CLIFF — any VALID *_MODEL=fable (post-July-7 subsidy-cliff cost warning).
+function lintRoleConfig(cfg) {
+  for (const k of Object.keys(cfg)) {
+    const m = k.match(/^CC_ROLE_(.+)_MODEL$/);
+    if (!m) continue;
+    const val = cfg[k];
+    if (!ROLE_MODELS.includes(val)) {
+      process.stderr.write('INVALID-MODEL cc-roles.env: ' + k + '="' + val + '" is not a known tier ' +
+        '(opus|sonnet|haiku|fable) — falling back to opus (you are paying OPUS rates while thinking you set "' +
+        val + '").\n');
+      continue;   // an invalid value is not also a fable warning.
+    }
+    if (val === 'fable') {
+      if (m[1] === 'ORCHESTRATOR') {
+        process.stderr.write('FABLE-ON-ORCHESTRATOR cc-roles.env: ' + k + '=fable — refusing to pin the ' +
+          'always-on orchestrator seat to Fable (2x Opus, high-frequency; burns the subsidised bar fast). ' +
+          'The orchestrator is documented opus-only.\n');
+      }
+      process.stderr.write('FABLE-COST-CLIFF cc-roles.env: ' + k + '=fable — Fable\'s subsidised usage bar ' +
+        'expires ~July 7-8; after that a Fable-pinned seat bills out-of-pocket (~2x Opus). Use Fable only for ' +
+        'the hardest one-off plans, never a standing seat.\n');
+    }
+  }
+}
+
+// claude model-id -> our tier. Unknown/absent => '' (can't-tell => the caller fails OPEN for that role).
+function modelIdToTier(modelId) {
+  const s = String(modelId == null ? '' : modelId).toLowerCase();
+  if (/^claude-opus-/.test(s)) return 'opus';
+  if (/^claude-sonnet-/.test(s)) return 'sonnet';
+  if (/^claude-haiku-/.test(s)) return 'haiku';
+  if (/^claude-fable-/.test(s)) return 'fable';
+  return '';
+}
+
+// FORGERY-RESISTANT actual-model read: the LAST `type:"assistant"` line's message.model in the role's subagent
+// transcript (the model that produced the closing tokens — the harness writes it, the orchestrator cannot forge
+// it). Same glob as agentResolves(). Returns the model-id string or '' when no assistant model line exists
+// (=> can't-tell => caller fails OPEN for that role — mirrors the gate's existing ERR->allow residual).
+function transcriptModel(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let last = '';
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (j && j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+        last = j.message.model;
+      }
+    }
+    if (last) return last;
+  }
+  return '';
+}
 
 // Parse `--key value` flags. An empty next-arg ("") IS consumed (so `--skip-reason ""` records an
 // explicit empty reason → caught as a non-specific skip). A flag with no following value → "".
@@ -528,6 +687,33 @@ function cmdCheck(o) {
     const r = checkRole(role, e, session, checkOpts);
     if (r) problems.push(r);
   }
+  // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
+  // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.
+  // Fail-SAFE: no config resolved => skip ENTIRELY (all-opus is the safe default we must not false-block).
+  // Per role: inline-skip / missing / unresolvable-agentId / no message.model => fail-open (can't-tell). A
+  // mismatch pushes a MODEL-POLICY: problem (=> exit 2). Fable->Opus silent reroute (expected fable, actual
+  // opus) is OK-with-note. Also honors the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 internally (belt &
+  // suspenders: the gate already strips the flag, but a direct `check --enforce-role-models` must skip too).
+  if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
+    const { found, cfg } = loadRoleConfig();
+    if (found) {
+      lintRoleConfig(cfg);   // defect-3 visibility: fires on stderr on every enforce read (loud, once).
+      for (const role of REQUIRED_ROLES) {
+        const e = byRole[role];
+        if (!e || ('skip_reason' in e)) continue;              // no transcript to read for a missing / inline-skip role
+        if (!agentResolves(session, e.agentId)) continue;      // presence already reported above; can't-tell here
+        const actualId = transcriptModel(session, e.agentId);
+        const actual = modelIdToTier(actualId);
+        if (!actual) continue;                                 // no message.model / unknown id => fail-open
+        const expected = roleModelFromCfg(cfg, role);
+        if (actual === expected) continue;                     // match => OK
+        if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note
+        problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
+          ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
+          ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+      }
+    }
+  }
   // #1100 item 3: provenance flags — a required role that ran as a REAL spawn (not an inline-skip) but whose
   // line lacks the self_authored stamp is provenance-unverified (an orchestrator-fabricated line has no
   // authoring agent turn). By DEFAULT this only SURFACES (never a silent brick — the honest residual: a
@@ -605,6 +791,23 @@ function cmdHeartbeat(o) {
   process.exit(0);
 }
 
+// #1448: resolve-role-model --role <role> [--with-effort]
+// Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
+// fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
+// "<model> <effort>". Lints the config on read (defect-3 stderr visibility). Always exits 0 — a resolver error
+// must never wedge a spawn; opus is the safe answer.
+function cmdResolveRoleModel(o) {
+  const role = o.role;
+  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator)'); process.exit(2); }
+  const { found, cfg } = loadRoleConfig();
+  if (found) lintRoleConfig(cfg);
+  const model = found ? roleModelFromCfg(cfg, role) : 'opus';
+  const effort = found ? roleEffortFromCfg(cfg, role) : '';
+  if ('with-effort' in o) console.log(model + (effort ? ' ' + effort : ''));
+  else console.log(model);
+  process.exit(0);
+}
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
@@ -613,10 +816,12 @@ try {
   else if (cmd === 'heartbeat') cmdHeartbeat(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
+  else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|resolve-agent|resolve-artifact|inherit-plan-review> ' +
-      '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)]');
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|resolve-agent|resolve-artifact|resolve-role-model|inherit-plan-review> ' +
+      '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
+      '[--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)]');
     process.exit(2);
   }
 } catch (e) {
