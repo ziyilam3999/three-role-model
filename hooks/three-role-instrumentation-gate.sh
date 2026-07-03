@@ -60,6 +60,16 @@ INPUT=$(cat)
 VAC_FLAG="--reject-vacuous-oracle"
 [ "${VACUOUS_ORACLE_OFF:-}" = "1" ] && VAC_FLAG=""
 
+# #1448 per-role MODEL-POLICY leg: opt the tagged-path ledger `check` into enforcing each role's ACTUAL
+# transcript model (message.model — forgery-resistant) against cc-roles.env. This is a LOAD-BEARING true block
+# (exit 2 denies the completion), not an advisory: the seam can deny and the signal cannot be forged. The model
+# logic lives in the synced helper (check --enforce-role-models); this hook just passes the opt-in flag, gated
+# by the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 (the helper honors it internally too). No config resolved
+# => the helper skips enforcement entirely (fail-safe — all-Opus is the safe default we must not false-block).
+# Master THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE already short-circuited above. Empty -> no flag.
+MODEL_FLAG="--enforce-role-models"
+[ "${CC_ROLE_MODEL_GATE_OFF:-}" = "1" ] && MODEL_FLAG=""
+
 # Parse the update payload (node = the dep already required by sibling hooks).
 #   STATUS    — tool_input.status
 #   TASKID    — sanitized tool_input.taskId
@@ -187,6 +197,25 @@ block_ledger(){
   exit 2
 }
 
+# #1448 per-role MODEL-POLICY leg block message: a role's ACTUAL transcript model contradicts cc-roles.env.
+# Load-bearing (forgery-resistant transcript read); the specific per-role expected-vs-actual is carried in $1
+# (the ledger `check` output, which names role + expected + actual). Satisfiable two ways: re-run the role on
+# the policy tier, OR update cc-roles.env if the policy itself is wrong.
+block_model(){
+  {
+    echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+    echo "  model-policy leg FAILED: $1"
+    echo "  A tagged 3-role completion must run each role on the model TIER cc-roles.env assigns it (#1448, Option A:"
+    echo "  Opus on planner + both review gates, Sonnet on the executor). The check reads the FORGERY-RESISTANT"
+    echo "  transcript model (message.model on the role's subagent transcript) — not a claimable field."
+    echo "  Fix ONE of: (a) re-run the offending role on the policy tier (pass model:<tier> to the Agent tool), or"
+    echo "  (b) if the policy itself is wrong, update the role's CC_ROLE_*_MODEL in config/cc-roles.env."
+    echo "  Resolve a role's policy: node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" resolve-role-model --role <role>."
+    echo "  Feature kill-switch (skip only this leg): CC_ROLE_MODEL_GATE_OFF=1. Master: THREE_ROLE_INSTRUMENT_OFF=1."
+  } >&2
+  exit 2
+}
+
 # outcome_eval leg (VEI #1430) block message: the post-ship OUTCOME verdict is missing/unknown, or its evidence
 # is non-specific. Metadata-only (no card read) => genuinely fail-CLOSED. An honest `missed`/`partial` verdict
 # WITH specific evidence is ACCEPTED (it ALLOWS the close) — this block fires ONLY on a missing/unknown verdict
@@ -305,11 +334,17 @@ fi
 # HELPER-absence stays fail-OPEN (allow, note it) — never silently brick a tagged completion if the symlink is
 # missing; the perf-card leg already passed by this point.
 if [ -f "$LEDGER_HELPER" ]; then
-  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG 2>&1)"; LRC=$?
+  # #1448: $MODEL_FLAG adds the per-role MODEL-POLICY enforcement (empty when CC_ROLE_MODEL_GATE_OFF=1).
+  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG $MODEL_FLAG 2>&1)"; LRC=$?
   if [ "$LRC" != "0" ]; then
-    block_ledger "${LEDGER_OUT:-role-ledger check failed}"
+    # Route to a MODEL-specific block message when the failure is a model-policy mismatch (the ledger prefixes
+    # those problems with `MODEL-POLICY:`); otherwise the role-presence/ledger message.
+    case "$LEDGER_OUT" in
+      *MODEL-POLICY:*) block_model "$LEDGER_OUT" ;;
+      *)               block_ledger "${LEDGER_OUT:-role-ledger check failed}" ;;
+    esac
   fi
-  LEDGER_NOTE=" + ledger OK"
+  LEDGER_NOTE=" + ledger OK${MODEL_FLAG:+ + model-policy OK}"
 else
   LEDGER_NOTE=" + ledger SKIPPED (helper unavailable — fail-open)"
 fi
