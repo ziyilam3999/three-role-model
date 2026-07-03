@@ -58,11 +58,19 @@
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
 //     an invalid per-role value => opus (never fail-open-to-cheap). --with-effort prints "<model> <effort>".
 //     Lints the config on read (loud INVALID-MODEL / Fable stderr warnings). Always exits 0.
-//   check --session S --task T --enforce-role-models               (#1448)
+//   check --session S --task T --enforce-role-models               (#1448 + #1458)
 //     The --enforce-role-models flag (opt-in; only the instrumentation gate passes it) adds a per-role
 //     MODEL-POLICY leg: for each role that resolves to a real transcript, compare its ACTUAL model
 //     (message.model, forgery-resistant) to cc-roles.env's tier; a mismatch => exit 2. No config => skip
 //     (fail-safe). Fable->Opus silent reroute is OK. Kill-switch CC_ROLE_MODEL_GATE_OFF=1.
+//     #1458 MODEL-VERSION sub-leg (assert-latest / fail-on-drift): when a role's tier matches AND a concrete
+//     version pin is configured for that tier/role (CC_TIER_<TIER>_VERSION or the CC_ROLE_<ROLE>_MODEL_VERSION
+//     override), the ACTUAL transcript model id is compared to the pin — a mismatch pushes a `MODEL-VERSION:`
+//     problem (=> exit 2). No pin configured => the version sub-leg is DORMANT for that role (tier leg alone
+//     still enforces). Fail-CLOSED on can't-tell (unreadable/unparseable transcript model) ONLY when a pin is
+//     present. Dedicated kill-switch CC_ROLE_VERSION_GATE_OFF=1 (skips ONLY the version sub-leg;
+//     CC_ROLE_MODEL_GATE_OFF=1 still disables the whole model+version leg). Completion-time ONLY — the
+//     leading-edge spawn gate sees a tier ALIAS, never a concrete version, so it cannot check this.
 //   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
@@ -79,6 +87,8 @@
 //                            TERMINAL (never falls through to ~/.config / plugin / repo defaults), so a smoke
 //                            sets CC_ROLES_ENV=/nonexistent to simulate "no config" (=> every role opus).
 //   CC_ROLE_MODEL_GATE_OFF=1 (#1448) — skip the --enforce-role-models MODEL-POLICY leg (feature kill-switch).
+//   CC_ROLE_VERSION_GATE_OFF=1 (#1458) — skip ONLY the version-pin (assert-latest) sub-leg of
+//                            --enforce-role-models; CC_ROLE_MODEL_GATE_OFF=1 still disables the whole leg.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -185,6 +195,18 @@ function roleEffortFromCfg(cfg, role) {
   return v == null ? '' : String(v);
 }
 
+// #1458 — Resolve a role's VERSION PIN from an already-parsed cfg: a per-ROLE override
+// (CC_ROLE_<ROLE>_MODEL_VERSION) wins when present; else the per-TIER pin (CC_TIER_<TIER>_VERSION) for the
+// role's expected tier; else '' (NO PIN => the version sub-leg is DORMANT for that role — the tier leg alone
+// still enforces). This is an ASSERTION knob (validate against a concrete claude-* id), never a SELECTION
+// knob — the spawn alias cannot choose an old version, so there is nothing to "select" here.
+function roleVersionFromCfg(cfg, role, expectedTier) {
+  const roleOverride = cfg['CC_ROLE_' + roleKeyStem(role) + '_MODEL_VERSION'];
+  if (roleOverride) return roleOverride;
+  const tierPin = cfg['CC_TIER_' + String(expectedTier || '').toUpperCase() + '_VERSION'];
+  return tierPin || '';
+}
+
 // Config LINT (defect-3 + Fable guards) — emits stderr warnings; the pass/fail is unaffected (the gate's
 // `expected` fails SAFE to opus, so a garbage value collapses to opus at the gate and CANNOT be caught there —
 // VISIBILITY is entirely the lint's job). Fires on EVERY config read (every resolve-role-model + every enforce
@@ -212,6 +234,18 @@ function lintRoleConfig(cfg) {
       process.stderr.write('FABLE-COST-CLIFF cc-roles.env: ' + k + '=fable — Fable\'s subsidised usage bar ' +
         'expires ~July 7-8; after that a Fable-pinned seat bills out-of-pocket (~2x Opus). Use Fable only for ' +
         'the hardest one-off plans, never a standing seat.\n');
+    }
+  }
+  // #1458 INVALID-VERSION — a present CC_TIER_*_VERSION or CC_ROLE_*_MODEL_VERSION pin whose non-empty value
+  // does not look like a concrete claude-* model id. Visibility-only (mirrors INVALID-MODEL's doctrine): the
+  // version leg will treat the malformed value as a literal pin and will very likely FAIL every run against it.
+  for (const k of Object.keys(cfg)) {
+    const isVersionKey = /^CC_TIER_[A-Z]+_VERSION$/.test(k) || /^CC_ROLE_.+_MODEL_VERSION$/.test(k);
+    if (!isVersionKey) continue;
+    const val = cfg[k];
+    if (val && !/^claude-/.test(val)) {
+      process.stderr.write('INVALID-VERSION cc-roles.env: ' + k + '="' + val + '" does not look like a concrete ' +
+        'claude-* model id — the version leg will treat it as a literal pin and likely FAIL every run.\n');
     }
   }
 }
@@ -702,12 +736,29 @@ function cmdCheck(o) {
         const e = byRole[role];
         if (!e || ('skip_reason' in e)) continue;              // no transcript to read for a missing / inline-skip role
         if (!agentResolves(session, e.agentId)) continue;      // presence already reported above; can't-tell here
-        const actualId = transcriptModel(session, e.agentId);
-        const actual = modelIdToTier(actualId);
-        if (!actual) continue;                                 // no message.model / unknown id => fail-open
+        // #1458: resolve the tier + the version PIN (if any) BEFORE reading the actual transcript model, so the
+        // version sub-leg's fail-closed-on-can't-tell can fire even on the TIER can't-tell path below.
         const expected = roleModelFromCfg(cfg, role);
-        if (actual === expected) continue;                     // match => OK
-        if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note
+        const pin = roleVersionFromCfg(cfg, role, expected);
+        const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
+        const actualId = transcriptModel(session, e.agentId);   // concrete id, '' if no assistant model line
+        const actual = modelIdToTier(actualId);                 // tier, '' if empty/unknown-prefix
+        if (!actual) {                                          // TIER can't-tell (existing fail-open) ...
+          if (versionOn) problems.push('MODEL-VERSION: role ' + role + ' — the transcript model is unreadable/' +
+            'unparseable (' + (actualId || '<none>') + ') so the ' + expected + ' pin ' + pin + ' CANNOT be ' +
+            'verified (fail-closed: a configured pin means we do not wave through can\'t-tell). ' +
+            'Kill-switch: CC_ROLE_VERSION_GATE_OFF=1 (or CC_ROLE_MODEL_GATE_OFF=1).');
+          continue;                                              // ... but a pin fail-CLOSES the version sub-leg
+        }
+        if (actual === expected) {                               // tier match => OK; check the version sub-leg
+          if (versionOn && actualId !== pin) problems.push('MODEL-VERSION: role ' + role + ' ran on ' + actualId +
+            ' but cc-roles.env pins ' + expected + ' -> ' + pin + ' (ASSERT-LATEST drift: the tier latest may ' +
+            'have moved, or the role ran on an unexpected version). If ' + actualId + ' is the new blessed ' +
+            'latest, update CC_TIER_' + expected.toUpperCase() + '_VERSION (or CC_ROLE_' + roleKeyStem(role) +
+            '_MODEL_VERSION), then re-run the plugin sync; else investigate. Kill-switch: CC_ROLE_VERSION_GATE_OFF=1.');
+          continue;
+        }
+        if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
         problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
           ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
           ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
@@ -798,7 +849,7 @@ function cmdHeartbeat(o) {
 // must never wedge a spawn; opus is the safe answer.
 function cmdResolveRoleModel(o) {
   const role = o.role;
-  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator)'); process.exit(2); }
+  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research)'); process.exit(2); }
   const { found, cfg } = loadRoleConfig();
   if (found) lintRoleConfig(cfg);
   const model = found ? roleModelFromCfg(cfg, role) : 'opus';

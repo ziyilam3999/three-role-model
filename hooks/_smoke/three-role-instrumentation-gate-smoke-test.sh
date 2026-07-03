@@ -16,6 +16,15 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 SID="sess-847"
 PROJ="$TMP/proj"; mkdir -p "$PROJ"
 
+# #1458: hermetically insulate EVERY call below from the REAL repo config/cc-roles.env, which now carries live
+# CC_TIER_*_VERSION pins. Before #1458 the ambient repo config bled through silently here (harmlessly — the
+# TIER leg's can't-tell already failed OPEN on these fixtures' assistant-model-less transcripts, so no test
+# ever noticed which config it was reading). The version sub-leg's fail-closed-on-can't-tell makes that
+# bleed-through visible: a pin now configured for real turns the SAME can't-tell fixture into a BLOCK. Export
+# a "no config resolves" default so every pre-existing call is unaffected; the MDL*/W* arms that WANT
+# model-policy/version enforcement explicitly override CC_ROLES_ENV per call (env CC_ROLES_ENV=<fixture> ...).
+export CC_ROLES_ENV="$TMP/no-such-cc-roles.env"
+
 # ---- perf-log card fixtures ----
 # A card WITH an entry citing task #847 (a per-round entry naming the run).
 cat > "$TMP/perf-good.md" <<EOF
@@ -740,5 +749,51 @@ runM 14484 sMDL4 CC_ROLES_ENV=/nonexistent
 ledger_execmodel sMDL5 14485 "claude-opus-4-8"
 runM 14485 sMDL5 CC_ROLES_ENV="$MODCFG" THREE_ROLE_INSTRUMENT_OFF=1
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "MDL5 THREE_ROLE_INSTRUMENT_OFF=1 over wrong-model -> allow silent (master bypass)" || bad "MDL5 master kill-switch should allow silent (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1458 — MODEL-VERSION completion-seam leg (assert-latest / fail-on-drift). Same shape as MDL1-MDL5 above
+# but a DEDICATED pinned config (MVERCFG_* — NEVER MODCFG: MODCFG MUST stay pin-free, else the pre-existing
+# sMDL2 "claude-sonnet-4-6" arm above would flip to exit 2 the moment it gained a CC_TIER_SONNET_VERSION pin).
+# Every OTHER leg must pass (perf card, complete ledger, cairn, outcome) so the VERSION leg alone decides.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$TMP/perf-1458.md" <<EOF
+# 3-role performance log — #1458 model-VERSION drift leg
+## rounds for #14581 #14582 #14583 #14584 #14585
+EOF
+# runW <taskId> <session> [extra-env...] : tagged completion citing perf-1458.md + valid outcome, ledger wired.
+runW() {
+  local t="$1" s="$2"; shift 2
+  CAP=$(printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1458.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+}
+MVERCFG_RED="$TMP/mvercfg-red.env";     printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_TIER_SONNET_VERSION=claude-sonnet-6\n' > "$MVERCFG_RED"
+MVERCFG_GREEN="$TMP/mvercfg-green.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_TIER_SONNET_VERSION=claude-sonnet-5\n' > "$MVERCFG_GREEN"
+MVERCFG_NOPIN="$TMP/mvercfg-nopin.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\n' > "$MVERCFG_NOPIN"
+
+# ---- W1 (RED, primary close-gate proof). executor transcript=claude-sonnet-5, pin=claude-sonnet-6 -> BLOCK
+#      via block_version; stderr names the version leg + the observed/pinned ids. ----
+ledger_execmodel sW1 14581 "claude-sonnet-5"
+runW 14581 sW1 CC_ROLES_ENV="$MVERCFG_RED"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "model-VERSION leg FAILED" && echo "$CAP" | grep -q "claude-sonnet-5" && echo "$CAP" | grep -q "claude-sonnet-6"; } \
+  && ok "W1 executor=claude-sonnet-5 vs pin=claude-sonnet-6 -> BLOCK (block_version, names observed+pinned)" || bad "W1 version drift should block via block_version (rc=$RC out=$CAP)"
+
+# ---- W2 (GREEN). executor transcript matches the pin exactly -> ALLOW. ----
+ledger_execmodel sW2 14582 "claude-sonnet-5"
+runW 14582 sW2 CC_ROLES_ENV="$MVERCFG_GREEN"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "W2 executor matches pin exactly -> ALLOW" || bad "W2 matching pin should allow (rc=$RC out=$CAP)"
+
+# ---- W3 (no-pin dormant). same drifted transcript, config has NO CC_TIER_SONNET_VERSION -> version leg
+#      dormant, tier leg alone passes -> ALLOW. ----
+ledger_execmodel sW3 14583 "claude-sonnet-6"
+runW 14583 sW3 CC_ROLES_ENV="$MVERCFG_NOPIN"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "W3 no-pin dormant -> ALLOW" || bad "W3 no-pin should allow (rc=$RC out=$CAP)"
+
+# ---- W4 (version-only kill-switch). W1's RED fixture + CC_ROLE_VERSION_GATE_OFF=1 -> ALLOW. ----
+runW 14581 sW1 CC_ROLES_ENV="$MVERCFG_RED" CC_ROLE_VERSION_GATE_OFF=1
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "W4 CC_ROLE_VERSION_GATE_OFF=1 over RED drift -> ALLOW (version-only kill-switch)" || bad "W4 version kill-switch should allow (rc=$RC out=$CAP)"
+
+# ---- W5 (whole-leg kill-switch). W1's RED fixture + CC_ROLE_MODEL_GATE_OFF=1 -> ALLOW. ----
+runW 14581 sW1 CC_ROLES_ENV="$MVERCFG_RED" CC_ROLE_MODEL_GATE_OFF=1
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "W5 CC_ROLE_MODEL_GATE_OFF=1 over RED drift -> ALLOW (whole model+version leg off)" || bad "W5 model kill-switch should allow (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
