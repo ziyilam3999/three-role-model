@@ -74,7 +74,10 @@ VAC_FLAG="--reject-vacuous-oracle"
 #               generic; "none" = not supplied (#1098 + plan-review improvement #1).
 #   PCWD      — d.cwd on THIS update (the PreToolUse payload carries it), used to derive the plans dir for
 #               the #1269 cairn-citation legs. "" if absent (the leg then falls back to CLAUDE_PROJECT_DIR/$PWD).
-read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE PCWD < <(
+#   OUTCOME   — md.outcome_eval normalized to lowercase (VEI #1430): the post-ship verdict. "" if absent.
+#   OEVSTATE  — "valid" | "invalid" | "none": classification of md.outcome_evidence, reusing the SAME
+#               NONSPECIFIC denylist + >=20-char test as SKIPSTATE (VEI #1430).
+read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE PCWD OUTCOME OEVSTATE < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const ti=d.tool_input||{};
@@ -108,13 +111,21 @@ read -r STATUS TASKID SESSION MODELRUN PERFPATH CODEWORK SKIPSTATE PCWD < <(
       const skipRaw=(md.three_role_skip!=null ? String(md.three_role_skip) : "").trim();
       skipstate=(skipRaw==="" || NONSPECIFIC.test(skipRaw) || skipRaw.length<20) ? "invalid" : "valid";
     }
+    // outcome_eval leg (VEI #1430): normalize the verdict to lowercase; classify the evidence with the SAME
+    // NONSPECIFIC denylist + >=20-char minimum used for three_role_skip (reused, not a second copy of the rule).
+    const outcome=(md.outcome_eval!=null ? String(md.outcome_eval) : "").trim().toLowerCase();
+    let oevstate="none";
+    if("outcome_evidence" in md){
+      const oevRaw=(md.outcome_evidence!=null ? String(md.outcome_evidence) : "").trim();
+      oevstate=(oevRaw==="" || NONSPECIFIC.test(oevRaw) || oevRaw.length<20) ? "invalid" : "valid";
+    }
     const enc=(s)=> (s===""? "-" : encodeURIComponent(s));
-    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf), codework, skipstate, enc(cwd)].join(" "));
+    process.stdout.write([status||"-", taskId||"-", session||"-", enc(modelrun), enc(perf), codework, skipstate, enc(cwd), enc(outcome), oevstate].join(" "));
   ' 2>/dev/null
 )
 # decode helper (paths/ids may contain spaces/encoded chars)
 dec(){ [ "$1" = "-" ] && { printf ''; return; }; printf '%b' "${1//%/\\x}"; }
-MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD")"
+MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD")"; OUTCOME="$(dec "$OUTCOME")"
 
 # Only completions matter; anything else (delete / in_progress / metadata edit / unparseable) -> allow.
 [ "$STATUS" = "completed" ] || exit 0
@@ -172,6 +183,27 @@ block_ledger(){
     echo "    node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" append --session ${SESSION} --task ${TASKID} --role <planner|plan-review|executor|execution-review> --agent <agentId> --artifact <path>"
     echo "    (inline-skip a non-review role: ... --role planner --skip-reason \"<specific reason it was inseparable from live session state>\")"
     echo "  Kill-switch (not a real 3-role run / retiring a task): THREE_ROLE_INSTRUMENT_OFF=1."
+  } >&2
+  exit 2
+}
+
+# outcome_eval leg (VEI #1430) block message: the post-ship OUTCOME verdict is missing/unknown, or its evidence
+# is non-specific. Metadata-only (no card read) => genuinely fail-CLOSED. An honest `missed`/`partial` verdict
+# WITH specific evidence is ACCEPTED (it ALLOWS the close) — this block fires ONLY on a missing/unknown verdict
+# or absent/generic evidence, never to punish an honest miss (that would only incentivize a false `achieved`).
+block_outcome(){
+  {
+    echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+    echo "  outcome_eval leg FAILED: $1"
+    echo "  A tagged 3-role completion must record an HONEST post-ship OUTCOME verdict + specific live-evidence"
+    echo "  (parent-claude.md Invariant #6, VEI #1430): metadata.outcome_eval in {achieved|partial|missed} AND"
+    echo "  metadata.outcome_evidence = a SPECIFIC live-run/production observation (>=20 non-ws chars, not"
+    echo "  'done'/'n/a'/generic). A missing or unknown verdict is can't-tell => fail-closed (blocked here)."
+    echo "  An honest 'missed'/'partial' WITH evidence is ACCEPTED (it ALLOWS — Phase 3 files the iteration"
+    echo "  ticket); the gate never rewards a false 'achieved'. Record the verdict, then re-complete:"
+    echo "    TaskUpdate(taskId=${TASKID}, status=completed, metadata={\"model_run\":\"<card>\",\"model_perf_log\":\"/abs/<card>.md\",\"outcome_eval\":\"achieved|partial|missed\",\"outcome_evidence\":\"<specific live evidence>\"})"
+    echo "  Durable record: add the \`## OUTCOME\` row to the perf-log card (skills/issue-to-ship/references/3role-perf-log-template.md)."
+    echo "  Feature kill-switch (skip only this leg): OUTCOME_EVAL_GATE_OFF=1. Master: THREE_ROLE_INSTRUMENT_OFF=1."
   } >&2
   exit 2
 }
@@ -333,6 +365,27 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
     awk '/^## Review/{r=1} r&&/^[[:space:]]*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
       || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   fi
+fi
+
+# ── outcome_eval leg (VEI #1430) ─────────────────────────────────────────────────────────────────────
+# Placed AFTER the cairn block's `fi` (TOP-LEVEL, NOT nested inside `if [ -n "$APLAN" ]`) so it fires on the
+# SOLE tagged ALLOW exit below — a tagged completion with no discoverable plan (APLAN empty) still reaches it,
+# so every tagged completion is gated (nesting it would create an APLAN-empty bypass). A tagged 3-role
+# completion must record an HONEST post-ship OUTCOME verdict + specific live-evidence in its metadata
+# (parent-claude.md Invariant #6, VEI): metadata-only (no card read) => genuinely fail-CLOSED. Both checks must
+# hold, else block_outcome (exit 2). An honest `missed`/`partial` verdict WITH evidence ALLOWS — Phase 3 turns
+# it into the next iteration ticket; blocking an honest miss would only reward a false `achieved`. Feature
+# kill-switch OUTCOME_EVAL_GATE_OFF=1 skips ONLY this leg (mirrors VACUOUS_ORACLE_OFF); the master
+# THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE switches already short-circuited at the top.
+if [ "${OUTCOME_EVAL_GATE_OFF:-}" != "1" ]; then
+  # (2a) the verdict must be one of the three honest values — absent / any other string => can't-tell => BLOCK.
+  case "$OUTCOME" in
+    achieved|partial|missed) : ;;
+    *) block_outcome "no valid metadata.outcome_eval verdict (got '${OUTCOME:-<absent>}'; must be one of achieved|partial|missed)." ;;
+  esac
+  # (2b) the evidence must be SPECIFIC (present, >=20 non-ws chars, not on the NONSPECIFIC denylist).
+  [ "$OEVSTATE" = "valid" ] \
+    || block_outcome "metadata.outcome_evidence is ${OEVSTATE:-absent} — needs specific live-run/production evidence (>=20 chars, not 'done'/'n/a'/generic)."
 fi
 
 # Allow + a brief confirming note (non-blocking).

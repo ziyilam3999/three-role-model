@@ -77,9 +77,19 @@ EOF
 # the existing ALLOW cases (2, 2b) use session sess-847 / task 847 — give them a complete ledger so they still ALLOW
 ledger_complete "$SID" 847
 
+# ── VEI #1430 — outcome_eval leg sweep support ──────────────────────────────────────────────────────
+# The gate now runs a FINAL metadata-only leg on every TAGGED completion: metadata.outcome_eval must be a
+# verdict in {achieved|partial|missed} AND metadata.outcome_evidence must be SPECIFIC (>=20 non-ws chars, off
+# the NONSPECIFIC denylist). OEV is a shared VALID evidence string. The both-direction regression sweep injects
+# the two keys into every shared TAGGED-ALLOW builder (runT/runV/runC) so the ENTIRE OLD corpus runs against the
+# NEW arm in ONE edit (not twenty). BLOCK cases keep blocking on their earlier leg (perf/ledger/cairn/vacuous
+# all run before the outcome leg), so the injected keys are harmless there. Synthetic-only; no real home paths.
+OEV='post-ship live run: watchdog fired 3 stale-board alerts in a 5m window, 0 false-positives'
+
 run() { CAP=$(printf '%s' "$1" | THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
 # helper: run a tagged completion citing the multi-mention perf card, for taskId $1 in session $2
-runT() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-multi.md"}}}'; }
+# (VEI #1430: carries a valid outcome_eval verdict + specific evidence so the swept ALLOW cases clear the new leg)
+runT() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-multi.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'; }
 
 # ---- 1. UNTAGGED completion (no metadata.model_run) -> allow silent (IGNORED) ----
 run '{"tool_name":"TaskUpdate","session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed"}}'
@@ -93,12 +103,12 @@ run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed",
 run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"in_progress","metadata":{"model_run":"r-847","model_perf_log":"'"$TMP"'/perf-good.md"}}}'
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "in_progress tagged -> allow silent (only completions gated)" || bad "in_progress should allow silent (rc=$RC out=$CAP)"
 
-# ---- 2. TAGGED completion, cited card HAS an entry for #847 -> ALLOW ----
-run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"r-847","model_perf_log":"'"$TMP"'/perf-good.md"}}}'
+# ---- 2. TAGGED completion, cited card HAS an entry for #847 -> ALLOW (VEI #1430: + valid outcome verdict/evidence) ----
+run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"r-847","model_perf_log":"'"$TMP"'/perf-good.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "tagged + card has entry for #847 -> ALLOW" || bad "good card should pass (rc=$RC out=$CAP)"
 
-# ---- 2b. model_run is itself the path (no separate model_perf_log) + card has entry -> ALLOW ----
-run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"'"$TMP"'/perf-good.md"}}}'
+# ---- 2b. model_run is itself the path (no separate model_perf_log) + card has entry -> ALLOW (VEI #1430: + outcome verdict/evidence) ----
+run '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"'"$TMP"'/perf-good.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "model_run-as-path + card has entry -> ALLOW" || bad "path-shaped model_run should resolve (rc=$RC out=$CAP)"
 
 # ---- 3. TAGGED completion, cited card LACKS an entry for #847 -> BLOCK ----
@@ -245,7 +255,7 @@ CAP=$(printf '%s' '{"tool_input":{"taskId":"8511","status":"completed","metadata
 # Point the helper-dir resolution at a hook COPY whose sibling 3role-ledger.mjs does NOT exist, so the helper
 # leg is skipped (fail-open) while session IS present. Proves HELPER-absence (unlike SESSION-absence) allows.
 NOHELPDIR="$TMP/nohelper"; mkdir -p "$NOHELPDIR"; cp "$HOOK" "$NOHELPDIR/gate.sh"
-CAP=$(printf '%s' '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-good.md"}}}' \
+CAP=$(printf '%s' '{"session_id":"'"$SID"'","tool_input":{"taskId":"847","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-good.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
   | CLAUDE_PLUGIN_ROOT= THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$NOHELPDIR/gate.sh" 2>&1 >/dev/null); RC=$?
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger SKIPPED"; } && ok "helper-absent + session present -> ALLOW (fail-open documented)" || bad "helper-absent should fail-open allow (rc=$RC out=$CAP)"
 
@@ -339,7 +349,7 @@ EOF
 # runC <taskId> <session> [extra-env...] : tagged completion citing perf-1269.md (absolute), ledger store wired.
 runC() {
   local t="$1" s="$2"; shift 2
-  CAP=$(printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1269.md"}}}' \
+  CAP=$(printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1269.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
     | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?
 }
 # mkplan <case-dir> <cairn?yes|no> : create <dir>/.ai-workspace/plans/p.md (with or without a cairn: line).
@@ -486,7 +496,8 @@ cat > "$TMP/perf-1276.md" <<EOF
 ## rounds for #12760 #12761 #12762 #12763 #12764 #12765 #12766 #12767 #12768 #12769 #12770 #12771 #12772 #12773 #12774 #12775
 EOF
 # runV <taskId> <session> : tagged completion citing perf-1276.md (perf leg passes), ledger store wired.
-runV() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}'; }
+# (VEI #1430: swept — carries a valid outcome_eval verdict + specific evidence so ALLOW twins clear the new leg)
+runV() { run '{"session_id":"'"$2"'","tool_input":{"taskId":"'"$1"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'; }
 # ledger_oracle <session> <task> <oracle-file> : 3 real roles + execution-review satisfied by an ORACLE
 # file (so the vacuous classifier, not an agentId, decides). Models L9/L10.
 ledger_oracle() {
@@ -562,7 +573,9 @@ CAP=$(printf '%s' '{"session_id":"sV11","tool_input":{"taskId":"12770","status":
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "vacuous + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent (master bypass)" || bad "master kill-switch should allow vacuous (rc=$RC out=$CAP)"
 
 ledger_oracle sV12 12771 "$TMP/vac-alltrue.txt"
-CAP=$(printf '%s' '{"session_id":"sV12","tool_input":{"taskId":"12771","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md"}}}' \
+# VEI #1430: VACUOUS_ORACLE_OFF only skips the vacuous sub-check inside the ledger leg — it does NOT short-circuit
+# at the top, so this tagged completion still reaches the outcome_eval leg and needs a valid verdict + evidence.
+CAP=$(printf '%s' '{"session_id":"sV12","tool_input":{"taskId":"12771","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1276.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
   | VACUOUS_ORACLE_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "vacuous + VACUOUS_ORACLE_OFF=1 -> ALLOW (feature bypass reverts to exists+PASS)" || bad "feature kill-switch should allow vacuous (rc=$RC out=$CAP)"
 
@@ -590,5 +603,79 @@ ledger_oracle sV15 12774 "$TMP/vac-captured.txt"; runV 12774 sV15
 printf 'PASS=5 FAIL=0\n' > "$TMP/vac-passfail.txt"
 ledger_oracle sV16 12775 "$TMP/vac-passfail.txt"; runV 12775 sV16
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "VAC-PASSFAIL (bare PASS=5 FAIL=0 captured) -> ALLOW" || bad "VAC-PASSFAIL should allow (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# VEI #1430 — outcome_eval leg (final, metadata-only). A TAGGED completion with a valid perf card AND a
+# complete 4-role ledger AND cited cairn is now ALSO required to record an HONEST post-ship outcome verdict
+# (metadata.outcome_eval in {achieved|partial|missed}) + SPECIFIC evidence (metadata.outcome_evidence,
+# >=20 non-ws chars, off the NONSPECIFIC denylist). An honest missed/partial WITH evidence ALLOWS
+# (anti-gaming: the gate never rewards a false 'achieved'). Kill-switch OUTCOME_EVAL_GATE_OFF=1 skips ONLY
+# this leg; THREE_ROLE_INSTRUMENT_OFF=1 / SHIP_PIPELINE=1 short-circuit the whole gate.
+#
+# F3 (E1 vacuous-witness class) — CRITICAL: O1-O5 are built from a DEDICATED outcome-free builder `runO`
+# (raw `run` + `ledger_complete` + a taskId-citing perf card, NO outcome keys). They MUST NOT reuse the
+# swept runT/runV/runC (those inject a valid verdict, so an O1 built from them would silently carry a verdict
+# and never go RED). Both-ends non-vacuity is proven by the mutation run: `OUTCOME_EVAL_GATE_OFF=1 bash <this>`
+# flips exactly O1/O3/O4/O5 from BLOCK to ALLOW (4 red witnesses). O3/O4/O5 assert stderr names `outcome_eval`
+# so each BLOCK is bound to the outcome leg (not a different leg blocking vacuously).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$TMP/perf-1430.md" <<EOF
+# 3-role performance log — #1430 outcome_eval leg
+## rounds for #14301 #14302 #14303 #14304 #14305 #14306 #14307 #14308 #14309 #14310
+EOF
+# runO <taskId> <session> [extra-metadata-json] : DEDICATED outcome-free tagged builder (raw run + perf-1430.md,
+# NO outcome keys unless passed as $3). Distinct from runT/runV/runC precisely so O1/O3/O4/O5 can go RED.
+runO() {
+  local t="$1" s="$2" extra="${3:-}"
+  local md='"model_run":"r","model_perf_log":"'"$TMP"'/perf-1430.md"'
+  [ -n "$extra" ] && md="$md,$extra"
+  run '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{'"$md"'}}}'
+}
+
+# ---- O1 (RED-on-bug, positive-BLOCK). complete ledger + perf card cites taskId, NO outcome_eval -> BLOCK ----
+ledger_complete sO1 14301; runO 14301 sO1
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "outcome_eval"; } && ok "O1 tagged, complete ledger, NO outcome_eval -> BLOCK (red-on-bug witness)" || bad "O1 should block naming outcome_eval (rc=$RC out=$CAP)"
+
+# ---- O2 (green-on-fix). same dedicated builder + achieved + specific evidence -> ALLOW ----
+ledger_complete sO2 14302; runO 14302 sO2 '"outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"'
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "O2 achieved + specific evidence -> ALLOW" || bad "O2 should allow (rc=$RC out=$CAP)"
+
+# ---- O3. invalid verdict value 'great' (not in {achieved|partial|missed}) -> BLOCK naming outcome_eval ----
+ledger_complete sO3 14303; runO 14303 sO3 '"outcome_eval":"great","outcome_evidence":"'"$OEV"'"'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "outcome_eval"; } && ok "O3 invalid verdict 'great' -> BLOCK (outcome-leg bound)" || bad "O3 should block naming outcome_eval (rc=$RC out=$CAP)"
+
+# ---- O4. valid verdict, outcome_evidence MISSING -> BLOCK naming outcome_eval ----
+ledger_complete sO4 14304; runO 14304 sO4 '"outcome_eval":"achieved"'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "outcome_eval"; } && ok "O4 valid verdict, evidence missing -> BLOCK (outcome-leg bound)" || bad "O4 should block naming outcome_eval (rc=$RC out=$CAP)"
+
+# ---- O5. valid verdict, outcome_evidence 'done' (NONSPECIFIC / <20 chars) -> BLOCK naming outcome_eval ----
+ledger_complete sO5 14305; runO 14305 sO5 '"outcome_eval":"achieved","outcome_evidence":"done"'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "outcome_eval"; } && ok "O5 valid verdict, generic 'done' evidence -> BLOCK (outcome-leg bound)" || bad "O5 should block naming outcome_eval (rc=$RC out=$CAP)"
+
+# ---- O6 (partial ALLOWs). partial + specific evidence -> ALLOW ----
+ledger_complete sO6 14306; runO 14306 sO6 '"outcome_eval":"partial","outcome_evidence":"'"$OEV"'"'
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "O6 partial + specific evidence -> ALLOW" || bad "O6 should allow (rc=$RC out=$CAP)"
+
+# ---- O7 (missed ALLOWs, anti-gaming). missed + specific evidence -> ALLOW (honest miss recorded, not blocked) ----
+ledger_complete sO7 14307; runO 14307 sO7 '"outcome_eval":"missed","outcome_evidence":"'"$OEV"'"'
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "O7 missed + specific evidence -> ALLOW (anti-gaming: honest miss recorded)" || bad "O7 should allow (rc=$RC out=$CAP)"
+
+# ---- O8 (feature bypass). the O1 would-block payload + OUTCOME_EVAL_GATE_OFF=1 -> ALLOW ----
+ledger_complete sO8 14308
+CAP=$(printf '%s' '{"session_id":"sO8","tool_input":{"taskId":"14308","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1430.md"}}}' \
+  | OUTCOME_EVAL_GATE_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "O8 OUTCOME_EVAL_GATE_OFF=1 skips the outcome leg -> ALLOW (feature bypass)" || bad "O8 feature kill-switch should allow (rc=$RC out=$CAP)"
+
+# ---- O9 (master bypass). O1 would-block payload + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent ----
+ledger_complete sO9 14309
+CAP=$(printf '%s' '{"session_id":"sO9","tool_input":{"taskId":"14309","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1430.md"}}}' \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "O9 THREE_ROLE_INSTRUMENT_OFF=1 on outcome-less payload -> allow silent (master bypass)" || bad "O9 master kill-switch should allow silent (rc=$RC out=$CAP)"
+
+# ---- O10 (master bypass). O1 would-block payload + SHIP_PIPELINE=1 -> allow silent ----
+ledger_complete sO10 14310
+CAP=$(printf '%s' '{"session_id":"sO10","tool_input":{"taskId":"14310","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1430.md"}}}' \
+  | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "O10 SHIP_PIPELINE=1 on outcome-less payload -> allow silent (ship exemption)" || bad "O10 SHIP_PIPELINE should allow silent (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
