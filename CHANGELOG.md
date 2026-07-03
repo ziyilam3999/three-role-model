@@ -1,3 +1,53 @@
+## [0.11.0] - 2026-07-04
+
+### Added
+- **Per-role MODEL-VERSION pins (assert-latest / fail-on-drift)** — completes the
+  per-role control surface alongside the existing MODEL TIER lever. `config/cc-roles.env`
+  gains a per-TIER concrete-version pin table (`CC_TIER_OPUS_VERSION`,
+  `CC_TIER_SONNET_VERSION`, `CC_TIER_HAIKU_VERSION`, `CC_TIER_FABLE_VERSION`, seeded with
+  the current-latest ids) plus an optional per-ROLE assertion override
+  (`CC_ROLE_<ROLE>_MODEL_VERSION`, default unset). A tier alias (`sonnet`) always
+  resolves to the tier's LATEST concrete version at spawn time, revealed only in the
+  subagent transcript's `message.model` — so the platform can silently bump a tier's
+  latest without any visible signal. The completion-time `check --enforce-role-models`
+  leg in `bin/3role-ledger.mjs` now compares the transcript's actual model id to the
+  configured pin (inside the already-matched-tier branch, so a genuine tier mismatch
+  stays the headline `MODEL-POLICY:` problem and version is never double-reported): a
+  mismatch pushes a `MODEL-VERSION:` problem -> exit 2. No pin configured for a
+  tier/role leaves the version sub-leg DORMANT (no behavior change) so a consumer can
+  adopt tier enforcement without opting into drift-detection. Fail-CLOSED on
+  can't-tell (unreadable/unparseable transcript model) ONLY when a pin is configured.
+- `hooks/three-role-instrumentation-gate.sh` routes a `MODEL-VERSION:` ledger problem
+  to a distinct `block_version` message (a version drift means "update the pin
+  deliberately," never "just re-run the role" — `block_model` stays the tier-mismatch
+  message). Dedicated kill-switch `CC_ROLE_VERSION_GATE_OFF=1` disables ONLY the
+  version sub-leg; `CC_ROLE_MODEL_GATE_OFF=1` still disables the whole model+version
+  leg. The leading-edge `hooks/three-role-model-policy-gate.sh` is UNCHANGED — at
+  spawn time the tool sees a tier alias, never a concrete version, so it structurally
+  cannot check version drift (completion-time-only by design, not an omission).
+- `bin/3role-ledger.mjs` gains an `INVALID-VERSION` config lint (a `CC_TIER_*_VERSION`
+  or `CC_ROLE_*_MODEL_VERSION` value that doesn't look like a concrete `claude-*` id)
+  and a `resolve-role-model` role list extended to name the new `research` seat.
+- **New seat: `research`/search** — `config/cc-roles.env` adds
+  `CC_ROLE_RESEARCH_MODEL=sonnet` + `CC_ROLE_RESEARCH_EFFORT=high` for the ad-hoc
+  Explore/research subagents. Not one of the four transcript-enforced roles, so it is
+  resolvable at spawn time but never completion-gate-blocked.
+- **Seat-value tweaks**: `CC_ROLE_ORCHESTRATOR_EFFORT` `high` -> `xhigh`;
+  `CC_ROLE_EXECUTOR_EFFORT` `medium` -> `high`.
+- **Effort-honesty documentation**: `config/cc-roles.env`'s header now carries a
+  per-lever enforcement matrix stating exactly which of MODEL TIER / MODEL VERSION /
+  EFFORT is a mechanical hard block vs an advisory note. EFFORT remains advisory/doc-only
+  for Agent-spawned roles (the spawn tool has no effort param and the transcript never
+  records it) — no gate anywhere pretends to enforce it. A documented forward CONTRACT
+  covers the Workflow `agent()` API (which DOES accept an effort param): any future
+  call site for a chain role must resolve `--with-effort` and pass it through.
+- Both `hooks/_smoke/3role-ledger-smoke-test.sh` and
+  `hooks/_smoke/three-role-instrumentation-gate-smoke-test.sh` gain both-ends coverage
+  for the version leg on a DEDICATED pinned fixture (RED drift / GREEN match / no-pin
+  dormant / fail-closed can't-tell / both kill-switches) — the pre-existing pin-free
+  `claude-sonnet-4-6` tier arms are untouched and stay green, proving the tier leg is
+  version-agnostic.
+
 ## [0.10.0] - 2026-07-03
 
 ### Added

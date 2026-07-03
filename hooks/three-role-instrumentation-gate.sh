@@ -67,6 +67,12 @@ VAC_FLAG="--reject-vacuous-oracle"
 # by the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 (the helper honors it internally too). No config resolved
 # => the helper skips enforcement entirely (fail-safe — all-Opus is the safe default we must not false-block).
 # Master THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE already short-circuited above. Empty -> no flag.
+# #1458 piggybacks on this SAME flag: when a role's tier matches AND a concrete CC_TIER_<TIER>_VERSION (or
+# CC_ROLE_<ROLE>_MODEL_VERSION override) pin is configured, the helper ALSO asserts the transcript model
+# equals the pin (assert-latest / fail-on-drift) and emits a `MODEL-VERSION:` problem on mismatch — routed
+# below to block_version, distinct from block_model. A dedicated CC_ROLE_VERSION_GATE_OFF=1 disables ONLY that
+# version sub-leg (CC_ROLE_MODEL_GATE_OFF=1 above still disables the whole model+version leg). No pin
+# configured for a tier/role => the version sub-leg is DORMANT for it (no behavior change, no false-block).
 MODEL_FLAG="--enforce-role-models"
 [ "${CC_ROLE_MODEL_GATE_OFF:-}" = "1" ] && MODEL_FLAG=""
 
@@ -216,6 +222,26 @@ block_model(){
   exit 2
 }
 
+# #1458 per-role MODEL-VERSION leg block message: a role's ACTUAL transcript model contradicts the concrete
+# version cc-roles.env PINS for its tier (assert-latest / fail-on-drift). Distinct from block_model: a version
+# drift is a DELIBERATE-update signal (the platform likely moved the tier's latest, or the role ran on an
+# unexpected version) — it is NOT fixed by simply re-running the role on the same tier. $1 carries the ledger
+# `check` output (names role + the observed id + the pinned id).
+block_version(){
+  {
+    echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+    echo "  model-VERSION leg FAILED (assert-latest / fail-on-drift, #1458): $1"
+    echo "  A tagged 3-role completion's role transcripts must match the EXACT version cc-roles.env pins for the"
+    echo "  role's tier — a mismatch means either the platform silently bumped the tier's latest, or the role ran"
+    echo "  on an unexpected version. A version drift is NOT fixed by re-running the role on the same tier."
+    echo "  Fix ONE of: (a) if the observed version is the new blessed latest, update the tier's *_VERSION pin in"
+    echo "  config/cc-roles.env (then re-run the plugin sync), or (b) investigate why the role ran an unexpected version."
+    echo "  Feature kill-switches (skip only the version sub-leg): CC_ROLE_VERSION_GATE_OFF=1, or CC_ROLE_MODEL_GATE_OFF=1"
+    echo "  (skips the whole model+version leg). Master: THREE_ROLE_INSTRUMENT_OFF=1."
+  } >&2
+  exit 2
+}
+
 # outcome_eval leg (VEI #1430) block message: the post-ship OUTCOME verdict is missing/unknown, or its evidence
 # is non-specific. Metadata-only (no card read) => genuinely fail-CLOSED. An honest `missed`/`partial` verdict
 # WITH specific evidence is ACCEPTED (it ALLOWS the close) — this block fires ONLY on a missing/unknown verdict
@@ -340,8 +366,9 @@ if [ -f "$LEDGER_HELPER" ]; then
     # Route to a MODEL-specific block message when the failure is a model-policy mismatch (the ledger prefixes
     # those problems with `MODEL-POLICY:`); otherwise the role-presence/ledger message.
     case "$LEDGER_OUT" in
-      *MODEL-POLICY:*) block_model "$LEDGER_OUT" ;;
-      *)               block_ledger "${LEDGER_OUT:-role-ledger check failed}" ;;
+      *MODEL-VERSION:*) block_version "$LEDGER_OUT" ;;
+      *MODEL-POLICY:*)  block_model "$LEDGER_OUT" ;;
+      *)                block_ledger "${LEDGER_OUT:-role-ledger check failed}" ;;
     esac
   fi
   LEDGER_NOTE=" + ledger OK${MODEL_FLAG:+ + model-policy OK}"

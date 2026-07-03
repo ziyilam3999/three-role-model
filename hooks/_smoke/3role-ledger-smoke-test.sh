@@ -381,4 +381,66 @@ CC_ROLES_ENV="$MFABO" node "$LED" resolve-role-model --role orchestrator 2>"$TMP
 { [ "$(grep -Ec 'FABLE-ON-ORCHESTRATOR' "$TMP/mfab.err")" -ge 1 ] && [ "$(grep -Ec 'FABLE-COST-CLIFF' "$TMP/mfab.err")" -ge 1 ]; } \
   && ok "M9 orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-COST-CLIFF warnings" || bad "M9 fable-on-orchestrator warnings missing (err=$(cat "$TMP/mfab.err"))"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1458 — MODEL-VERSION sub-leg (assert-latest / fail-on-drift), on a DEDICATED fixture (MVER_*, NEVER MCFG).
+# FIXTURE ISOLATION (the trap): MCFG (used by M1-M9 above) MUST STAY PIN-FREE — adding a CC_TIER_SONNET_VERSION
+# pin to MCFG would flip the pre-existing pin-free msGREEN "claude-sonnet-4-6" arm (M2) to exit 2. So every
+# version-drift arm below builds its OWN dedicated pinned config file — proving the tier leg (M1-M9, still
+# pin-free) is version-agnostic (a version bump never breaks tier enforcement).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+MVER_RED="$TMP/mver-red.env";     printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_TIER_SONNET_VERSION=claude-sonnet-6\n' > "$MVER_RED"
+MVER_GREEN="$TMP/mver-green.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_TIER_SONNET_VERSION=claude-sonnet-5\n' > "$MVER_GREEN"
+MVER_NOPIN="$TMP/mver-nopin.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\n' > "$MVER_NOPIN"
+
+# V1. RED (AC-4): executor transcript=claude-sonnet-5, pin=claude-sonnet-6 -> exit 2, MODEL-VERSION names
+#     role + observed (claude-sonnet-5) + pinned (claude-sonnet-6).
+model_ledger msVRED 9201 "claude-sonnet-5"
+OUT=$(CC_ROLES_ENV="$MVER_RED" node "$LED" check --session msVRED --task 9201 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-VERSION" && echo "$OUT" | grep -qi "executor" && echo "$OUT" | grep -q "claude-sonnet-5" && echo "$OUT" | grep -q "claude-sonnet-6"; } \
+  && ok "V1 RED (AC-4): executor=claude-sonnet-5 vs pin=claude-sonnet-6 -> exit 2 MODEL-VERSION (names observed+pinned)" || bad "V1 version drift should block (rc=$RC out=$OUT)"
+
+# V2. GREEN (AC-5): executor transcript matches the pin exactly -> exit 0.
+model_ledger msVGREEN 9202 "claude-sonnet-5"
+OUT=$(CC_ROLES_ENV="$MVER_GREEN" node "$LED" check --session msVGREEN --task 9202 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "V2 GREEN (AC-5): executor matches pin exactly -> exit 0" || bad "V2 matching pin should allow (rc=$RC out=$OUT)"
+
+# V3. NO-PIN DORMANT (AC-6): same drifted transcript id, config carries NO CC_TIER_SONNET_VERSION -> version
+#     leg dormant, tier leg alone still passes (sonnet==sonnet) -> exit 0.
+model_ledger msVNOPIN 9203 "claude-sonnet-6"
+OUT=$(CC_ROLES_ENV="$MVER_NOPIN" node "$LED" check --session msVNOPIN --task 9203 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "V3 no-pin dormant (AC-6): no CC_TIER_SONNET_VERSION -> version leg skipped -> exit 0" || bad "V3 no-pin should allow (rc=$RC out=$OUT)"
+
+# V4. FAIL-CLOSED CAN'T-TELL WITH PIN (AC-7): a pin IS configured but the executor transcript carries NO
+#     assistant message.model line (plain mk_sub, not mk_sub_model) -> exit 2, MODEL-VERSION can't-tell message.
+mk_sub msVCT mCTp; mk_sub msVCT mCTr; mk_sub msVCT mCTe; mk_sub msVCT mCTv
+node "$LED" append --session msVCT --task 9204 --role planner         --agent mCTp --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session msVCT --task 9204 --role plan-review      --agent mCTr --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session msVCT --task 9204 --role executor         --agent mCTe --artifact "PR #9204" >/dev/null
+node "$LED" append --session msVCT --task 9204 --role execution-review --agent mCTv --artifact "$TMP/rev.md" >/dev/null
+OUT=$(CC_ROLES_ENV="$MVER_GREEN" node "$LED" check --session msVCT --task 9204 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-VERSION" && echo "$OUT" | grep -qi "cannot be verified"; } \
+  && ok "V4 fail-closed can't-tell WITH pin (AC-7): no message.model line + pin present -> exit 2" || bad "V4 can't-tell-with-pin should block (rc=$RC out=$OUT)"
+
+# V5. VERSION-ONLY KILL-SWITCH (AC-8): CC_ROLE_VERSION_GATE_OFF=1 over the V1 RED fixture -> exit 0.
+OUT=$(CC_ROLE_VERSION_GATE_OFF=1 CC_ROLES_ENV="$MVER_RED" node "$LED" check --session msVRED --task 9201 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "V5 CC_ROLE_VERSION_GATE_OFF=1 over RED drift -> exit 0 (version-only kill-switch)" || bad "V5 version kill-switch should allow (rc=$RC out=$OUT)"
+
+# V6. WHOLE-LEG KILL-SWITCH (AC-8): CC_ROLE_MODEL_GATE_OFF=1 over the V1 RED fixture -> exit 0.
+OUT=$(CC_ROLE_MODEL_GATE_OFF=1 CC_ROLES_ENV="$MVER_RED" node "$LED" check --session msVRED --task 9201 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "V6 CC_ROLE_MODEL_GATE_OFF=1 over RED drift -> exit 0 (whole model+version leg off)" || bad "V6 model kill-switch should allow (rc=$RC out=$OUT)"
+
+# V7. INVALID-VERSION lint both-ends (AC-12).
+MVER_TYPO="$TMP/mver-typo.env"; printf 'CC_TIER_SONNET_VERSION=sonnet5\n' > "$MVER_TYPO"
+CC_ROLES_ENV="$MVER_TYPO" node "$LED" resolve-role-model --role executor 2>"$TMP/mverlint.err" >/dev/null
+[ "$(grep -Ec 'INVALID-VERSION' "$TMP/mverlint.err")" -ge 1 ] \
+  && ok "V7 RED: malformed pin 'sonnet5' -> INVALID-VERSION on stderr" || bad "V7 malformed pin should warn INVALID-VERSION (err=$(cat "$TMP/mverlint.err"))"
+CC_ROLES_ENV="$MVER_GREEN" node "$LED" resolve-role-model --role executor 2>"$TMP/mverlint2.err" >/dev/null
+[ "$(grep -Ec 'INVALID-VERSION' "$TMP/mverlint2.err")" -eq 0 ] \
+  && ok "V7 GREEN: valid 'claude-sonnet-5' pin -> NO INVALID-VERSION" || bad "V7 valid pin should not warn (err=$(cat "$TMP/mverlint2.err"))"
+
+# V8. Re-assert MCFG stays pin-free (AC-9 witness, this file): the pre-existing pin-free msGREEN
+#     "claude-sonnet-4-6" arm (M2, config MCFG) is untouched by any MVER_* fixture above (distinct files).
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msGREEN --task 9102 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "V8 re-assert: MCFG stays pin-free -- msGREEN claude-sonnet-4-6 arm still exit 0" || bad "V8 MCFG pin-free re-assert failed (rc=$RC out=$OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
