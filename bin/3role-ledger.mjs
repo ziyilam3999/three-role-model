@@ -15,18 +15,32 @@
 // Subcommands:
 //   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
 //                                        [--verdict V] [--self-authored]
+//                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
 //     Writes one JSONL line to <ledger-dir>/<S>/<T>.jsonl. Idempotent PER ROLE — re-appending the same
 //     role UPDATES the line (drops the prior one), never duplicates. A role agent self-recording its OWN
 //     line passes --artifact (and --verdict for review-roles) with NO --agent; the SubagentStop hook later
 //     overlay-merges the harness-captured --agent (#855) and stamps --self-authored (#1100 item 3).
-//     #1465 — EVERY append also best-effort resolves + overlays three OPTIONAL provenance fields:
+//     #1465 — EVERY append also best-effort resolves + overlays two OPTIONAL model-provenance fields:
 //     modelVersion (transcriptModel() over the resolved agentId — --agent when given, else
-//     resolveAgent(session, task, role)), modelTier (modelIdToTier(modelVersion)), and effort
-//     (process.env.CLAUDE_EFFORT). Fail-open + back-compat: absent inputs simply omit the fields; no new
-//     required flags; check/checkRole never reference them. Centralizing this in cmdAppend means the
-//     SubagentStop hook's EXISTING stop-time `append --agent` (three-role-subagent-ledger.sh) automatically
-//     re-resolves the model against the by-then-COMPLETE transcript with zero hook edit — the free
-//     backfill for a self-append that ran too early to see `message.model`.
+//     resolveAgent(session, task, role)) and modelTier (modelIdToTier(modelVersion)). Fail-open + back-compat:
+//     absent inputs simply omit the fields; check/checkRole never reference them. Centralizing this in
+//     cmdAppend means the SubagentStop hook's EXISTING stop-time `append --agent`
+//     (three-role-subagent-ledger.sh) automatically re-resolves the model against the by-then-COMPLETE
+//     transcript with zero hook edit — the free backfill for a self-append that ran too early to see
+//     `message.model`. This transcript auto-capture is OBSERVED and always wins when a message.model line
+//     exists yet (i.e. it overwrites an --model-version/--model-tier passed on the SAME call, in the rare case
+//     both are present) — normally the two never co-occur (see below).
+//     #1466 — `--effort`/`--model-version`/`--model-tier` are EXPLICIT overlay flags, the ONLY way any of the
+//     three provenance fields get written now (the #1465 ambient `process.env.CLAUDE_EFFORT` auto-capture is
+//     REMOVED — it stamped the ORCHESTRATOR's session effort on every append, including a close-out with no
+//     effort opinion of its own, clobbering a role's real per-role effort the instant the orchestrator's own
+//     effort differed). Two callers use them: the spawn-time hook (three-role-spawn-ledger.sh) passes all
+//     three as the role's ASSIGNED {tier, version, effort} (resolved from config/cc-roles.env, known up front);
+//     the close-time hook (three-role-subagent-ledger.sh) passes ONLY --effort as the OBSERVED
+//     `effort.level` from its SubagentStop payload (modelVersion/modelTier at close stay on the transcript
+//     auto-capture path above, unchanged). Every OTHER append (self-record, close-out --artifact) passes NONE
+//     of the three, so overlayAppend's per-key "provided" discipline (#855) PRESERVES whatever a role's real
+//     line already carries — an orchestrator's --artifact-only close-out can never clobber a role's effort.
 //   check --session S --task T [--require-provenance]
 //     Exit 0 (+ "OK ...") iff all four required roles (planner, plan-review, executor, execution-review)
 //     are present AND satisfied; otherwise exit 2 (+ "BLOCK: <reason>"). A role is satisfied by EITHER
@@ -61,11 +75,17 @@
 //     overlayAppend to merge/drop/clobber, so a subsequent real append/check/resolve-artifact reads the
 //     file byte-correctly — AC-4 (no overlay/close corruption) is true BY CONSTRUCTION. ALWAYS exits 0
 //     (fail-open) — a heartbeat error must NEVER wedge the spawn it instruments.
-//   resolve-role-model --role R [--with-effort]                    (#1448)
+//   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
 //     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
-//     an invalid per-role value => opus (never fail-open-to-cheap). --with-effort prints "<model> <effort>".
-//     Lints the config on read (loud INVALID-MODEL / Fable stderr warnings). Always exits 0.
+//     an invalid per-role value => opus (never fail-open-to-cheap). --with-effort ALONE prints "<model>
+//     <effort>" (or bare "<model>" if no effort is configured — UNCHANGED #1448 shape, back-compat). --with-
+//     version ALONE prints "<model> <version>" (the role's ASSIGNED concrete pin — roleVersionFromCfg's
+//     CC_TIER_<TIER>_VERSION, falling back to the tier alias itself when no pin is configured, so this token
+//     is NEVER empty). BOTH together print "<model> <effort-or-'-'> <version>" (a `-` sentinel fills a
+//     genuinely-unset effort so a plain `read -r A B C` always gets exactly 3 well-formed tokens — the
+//     spawn-time badge stamp is the caller). Lints the config on read (loud INVALID-MODEL / Fable stderr
+//     warnings). Always exits 0.
 //   check --session S --task T --enforce-role-models               (#1448 + #1458)
 //     The --enforce-role-models flag (opt-in; only the instrumentation gate passes it) adds a per-role
 //     MODEL-POLICY leg: for each role that resolves to a real transcript, compare its ACTUAL model
@@ -658,15 +678,25 @@ function cmdAppend(o) {
   // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
   // `--self-authored` (no value) is true, `--self-authored false` is false.
   if ('self-authored' in o) fields.self_authored = (o['self-authored'] !== 'false');
-  // #1465 — CENTRALIZED best-effort model+effort capture. Runs on EVERY append (both a role's own
-  // self-append AND the SubagentStop hook's later --agent re-append), so the stop-time re-append
-  // automatically backfills modelVersion/modelTier from the by-then-COMPLETE transcript with ZERO edit
-  // to the shell hook (see AC1-LIVE's fallback branch). Fail-open throughout: any resolution failure
-  // just omits the field (back-compat — old ledger lines and check/checkRole never reference these).
+  // #1466 — EXPLICIT provenance overlay flags, parsed BEFORE the model auto-capture below so a resolvable
+  // transcript (OBSERVED) can still overwrite an explicitly-asserted --model-version/--model-tier (ASSIGNED)
+  // when both are present on the SAME call — normally they never co-occur (see the file-header comment).
+  // --effort has NO auto-capture counterpart any more (removed below), so this is its ONLY source.
+  if ('effort' in o) fields.effort = o.effort;
+  if ('model-version' in o) fields.modelVersion = o['model-version'];
+  if ('model-tier' in o) fields.modelTier = o['model-tier'];
+  // #1465 — CENTRALIZED best-effort MODEL capture (unchanged by #1466 — only the effort half below moved).
+  // Runs on EVERY append (both a role's own self-append AND the SubagentStop hook's later --agent
+  // re-append), so the stop-time re-append automatically backfills modelVersion/modelTier from the
+  // by-then-COMPLETE transcript with ZERO edit to the shell hook (see AC1-LIVE's fallback branch). Fail-open
+  // throughout: any resolution failure just omits the field (back-compat — old ledger lines and
+  // check/checkRole never reference these).
   //   agentId for the model lookup <- --agent when present, ELSE resolveAgent(session, task, role) (a
   //   self-append carries no --agent; its own transcript is scanned for the literal spawn tag).
   //   model <- transcriptModel(session, agentId) -> modelVersion; modelIdToTier(modelVersion) -> modelTier.
-  //   effort <- process.env.CLAUDE_EFFORT (session-inherited).
+  // This OBSERVED capture wins over an explicit --model-version/--model-tier from above ONLY when a real
+  // message.model line already exists (at spawn time it never does yet, so an ASSIGNED stamp survives
+  // untouched until the role's own transcript actually completes — #1466 AC-8b, "observed wins").
   try {
     const agentIdForModel = ('agent' in o && o.agent) ? o.agent : resolveAgent(session, task, role);
     if (agentIdForModel) {
@@ -678,10 +708,13 @@ function cmdAppend(o) {
       }
     }
   } catch (e) { /* fail-open: a capture error must never wedge an append */ }
-  try {
-    const effort = process.env.CLAUDE_EFFORT;
-    if (effort) fields.effort = effort;
-  } catch (e) { /* fail-open */ }
+  // #1466 — the #1465 AMBIENT `process.env.CLAUDE_EFFORT` auto-capture that used to sit here is REMOVED. It
+  // stamped the ORCHESTRATOR's session effort on EVERY append — including a close-out `--artifact`-only call
+  // with no effort opinion of its own — so the moment a role's real effort differed from the orchestrator's,
+  // the very next unrelated append silently clobbered it back to the session value (the bug this fixes).
+  // Effort is now written ONLY via the explicit --effort flag above: the spawn hook stamps ASSIGNED, the
+  // SubagentStop hook stamps OBSERVED (`effort.level`), and every other append (self-record, close-out)
+  // passes none — overlayAppend's per-key "provided" discipline then PRESERVES the role's real value untouched.
   // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
   // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
   // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
@@ -897,8 +930,22 @@ function cmdResolveRoleModel(o) {
   if (found) lintRoleConfig(cfg);
   const model = found ? roleModelFromCfg(cfg, role) : 'opus';
   const effort = found ? roleEffortFromCfg(cfg, role) : '';
-  if ('with-effort' in o) console.log(model + (effort ? ' ' + effort : ''));
-  else console.log(model);
+  const withEffort = ('with-effort' in o);
+  const withVersion = ('with-version' in o);
+  if (!withEffort && !withVersion) { console.log(model); process.exit(0); }
+  if (withEffort && !withVersion) {
+    // #1448 shape, UNCHANGED for back-compat (three-role-model-policy-gate.sh does `read -r EXPECTED EFFORT`):
+    // "<model> <effort>", or bare "<model>" when no effort is configured (no trailing empty token).
+    console.log(model + (effort ? ' ' + effort : ''));
+    process.exit(0);
+  }
+  // #1466 — version requested (alone, or together with effort). roleVersionFromCfg's per-role/per-tier pin,
+  // falling back to the tier alias itself when unset, so `version` is NEVER empty — a spawn-time badge stamp
+  // must always have something non-blank to show. When effort is ALSO requested but unresolved, use a `-`
+  // sentinel (not '') so a plain `read -r A B C` over the space-joined line always yields exactly 3 tokens.
+  const version = (found && roleVersionFromCfg(cfg, role, model)) || model;
+  const tokens = withEffort ? [model, effort || '-', version] : [model, version];
+  console.log(tokens.join(' '));
   process.exit(0);
 }
 

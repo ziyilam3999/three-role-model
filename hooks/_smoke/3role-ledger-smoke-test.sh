@@ -448,56 +448,59 @@ OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msGREEN --task 9102 --enf
 # Reuses mk_sub (resolvable, NO message.model line) / mk_sub_model (resolvable, WITH a message.model
 # line — both already defined above for the #1448 model-policy block). Every case passes --agent
 # explicitly (deterministic; the self-append/resolveAgent timing path is proven separately, LIVE, by
-# AC1-LIVE — not a synthetic fixture). CLAUDE_EFFORT is explicitly forced present/absent per case via
-# `env -u` so this is correct regardless of the CALLER shell's own ambient CLAUDE_EFFORT.
+# AC1-LIVE — not a synthetic fixture). #1466: the ambient process.env.CLAUDE_EFFORT auto-capture is
+# REMOVED (it stamped the ORCHESTRATOR's session effort on every append, clobbering a role's real
+# per-role effort — see hooks/three-role-effort-mechanism-smoke-test.sh AC-5 for the clobber-safety
+# proof); effort is now written ONLY via the explicit --effort flag, so these cases pass/omit --effort
+# directly instead of setting/unsetting the CLAUDE_EFFORT env var (which no longer has any effect on
+# cmdAppend at all).
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 MESID="sess-1465-model"
 
-# CASE GREEN (both): message.model line present + CLAUDE_EFFORT=xhigh -> line carries all three keys.
+# CASE GREEN (both): message.model line present + explicit --effort xhigh -> line carries all three keys.
 mk_sub_model "$MESID" me-green "claude-sonnet-5"
-CLAUDE_EFFORT=xhigh node "$LED" append --session "$MESID" --task 1465g --role executor --agent me-green --artifact "PR #1" >/dev/null
+node "$LED" append --session "$MESID" --task 1465g --role executor --agent me-green --artifact "PR #1" --effort xhigh >/dev/null
 GF="$THREE_ROLE_LEDGER_DIR/$MESID/1465g.jsonl"
 { grep -q '"effort":"xhigh"' "$GF" && grep -q '"modelVersion":"claude-sonnet-5"' "$GF" && grep -q '"modelTier":"sonnet"' "$GF"; } \
-  && ok "#1465 AC1 GREEN: model+effort both resolvable -> line carries effort+modelVersion+modelTier" \
+  && ok "#1465 AC1 GREEN: model auto-capture + explicit --effort -> line carries effort+modelVersion+modelTier" \
   || bad "#1465 AC1 GREEN failed (got: $(cat "$GF" 2>/dev/null))"
 
-# CASE PARTIAL-A (effort only): resolvable agent, NO message.model line, CLAUDE_EFFORT=xhigh -> line
+# CASE PARTIAL-A (effort only): resolvable agent, NO message.model line, explicit --effort xhigh -> line
 # carries effort, NEITHER modelVersion NOR modelTier (proves effort does not ride on the model path).
 mk_sub "$MESID" me-parta
-CLAUDE_EFFORT=xhigh node "$LED" append --session "$MESID" --task 1465pa --role executor --agent me-parta --artifact "PR #2" >/dev/null
+node "$LED" append --session "$MESID" --task 1465pa --role executor --agent me-parta --artifact "PR #2" --effort xhigh >/dev/null
 PAF="$THREE_ROLE_LEDGER_DIR/$MESID/1465pa.jsonl"
 { grep -q '"effort":"xhigh"' "$PAF" && ! grep -q '"modelVersion"' "$PAF" && ! grep -q '"modelTier"' "$PAF"; } \
-  && ok "#1465 AC1 PARTIAL-A: effort-only (no model line) -> effort present, model fields absent" \
+  && ok "#1465 AC1 PARTIAL-A: explicit --effort, no model line -> effort present, model fields absent" \
   || bad "#1465 AC1 PARTIAL-A failed (got: $(cat "$PAF" 2>/dev/null))"
 
-# CASE PARTIAL-B (model only): message.model line present, CLAUDE_EFFORT UNSET -> modelVersion+modelTier
-# present, NO effort key (proves model does not ride on the effort path).
+# CASE PARTIAL-B (model only): message.model line present, NO --effort flag passed -> modelVersion+modelTier
+# present, NO effort key (proves the model auto-capture does not ride on any effort input).
 mk_sub_model "$MESID" me-partb "claude-sonnet-5"
-env -u CLAUDE_EFFORT node "$LED" append --session "$MESID" --task 1465pb --role executor --agent me-partb --artifact "PR #3" >/dev/null
+node "$LED" append --session "$MESID" --task 1465pb --role executor --agent me-partb --artifact "PR #3" >/dev/null
 PBF="$THREE_ROLE_LEDGER_DIR/$MESID/1465pb.jsonl"
 { grep -q '"modelVersion":"claude-sonnet-5"' "$PBF" && grep -q '"modelTier":"sonnet"' "$PBF" && ! grep -q '"effort"' "$PBF"; } \
-  && ok "#1465 AC1 PARTIAL-B: model-only (no CLAUDE_EFFORT) -> model fields present, no effort key" \
+  && ok "#1465 AC1 PARTIAL-B: model-only (no --effort flag) -> model fields present, no effort key" \
   || bad "#1465 AC1 PARTIAL-B failed (got: $(cat "$PBF" 2>/dev/null))"
 
-# CASE RED (neither, NON-VACUOUS): the SAME resolvable agent shape, NO message.model line, CLAUDE_EFFORT
-# UNSET -> line carries NONE of the three fields, but the agentId itself STILL resolves onto the line
-# (proves the omission is because there is no model line / no effort env, NOT a no-transcript/fail-open
-# vacuous path).
+# CASE RED (neither, NON-VACUOUS): the SAME resolvable agent shape, NO message.model line, NO --effort flag
+# -> line carries NONE of the three fields, but the agentId itself STILL resolves onto the line (proves the
+# omission is because there is no model line / no effort flag, NOT a no-transcript/fail-open vacuous path).
 mk_sub "$MESID" me-red
-env -u CLAUDE_EFFORT node "$LED" append --session "$MESID" --task 1465r --role executor --agent me-red --artifact "PR #4" >/dev/null
+node "$LED" append --session "$MESID" --task 1465r --role executor --agent me-red --artifact "PR #4" >/dev/null
 RF="$THREE_ROLE_LEDGER_DIR/$MESID/1465r.jsonl"
 { ! grep -q '"effort"' "$RF" && ! grep -q '"modelVersion"' "$RF" && ! grep -q '"modelTier"' "$RF" && grep -q '"agentId":"me-red"' "$RF"; } \
-  && ok "#1465 AC1 RED: no model line + no effort env -> none of the three fields (agentId still resolves, non-vacuous)" \
+  && ok "#1465 AC1 RED: no model line + no --effort flag -> none of the three fields (agentId still resolves, non-vacuous)" \
   || bad "#1465 AC1 RED failed (got: $(cat "$RF" 2>/dev/null))"
 
 # AC2 back-compat: a COMPLETE 4-role ledger built with NO model/effort resolvable (old shape) -> `check`
 # still exits 0/OK, and an explicit assertion that none of the appended lines carry any of the 3 new keys.
 mk_sub "$SID" old1465p; mk_sub "$SID" old1465r; mk_sub "$SID" old1465e; mk_sub "$SID" old1465v
 OT="1465oldshape"
-env -u CLAUDE_EFFORT node "$LED" append --session "$SID" --task "$OT" --role planner         --agent old1465p --artifact "$TMP/plan.md" >/dev/null
-env -u CLAUDE_EFFORT node "$LED" append --session "$SID" --task "$OT" --role plan-review      --agent old1465r --artifact "$TMP/rev.md" >/dev/null
-env -u CLAUDE_EFFORT node "$LED" append --session "$SID" --task "$OT" --role executor         --agent old1465e --artifact "PR #1465old" >/dev/null
-env -u CLAUDE_EFFORT node "$LED" append --session "$SID" --task "$OT" --role execution-review --agent old1465v --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$SID" --task "$OT" --role planner         --agent old1465p --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$SID" --task "$OT" --role plan-review      --agent old1465r --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$SID" --task "$OT" --role executor         --agent old1465e --artifact "PR #1465old" >/dev/null
+node "$LED" append --session "$SID" --task "$OT" --role execution-review --agent old1465v --artifact "$TMP/rev.md" >/dev/null
 OLDF="$THREE_ROLE_LEDGER_DIR/$SID/$OT.jsonl"
 OUT=$(node "$LED" check --session "$SID" --task "$OT" 2>&1); RC=$?
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! grep -qE '"modelVersion"|"modelTier"|"effort"' "$OLDF"; } \
