@@ -103,12 +103,31 @@ else
 fi
 [ -f "$HELPER" ] || exit 0
 
+# #1466 — resolve the role's ASSIGNED {tier, effort, version} via the SAME resolver the model-policy gate and
+# the orchestrator use (config/cc-roles.env, fail-safe to opus), and stamp it onto THIS spawn-time line. This
+# is what makes the badge render WHILE the role is still running (a non-empty modelVersion is all cardModel()
+# needs) with the role's OWN policy effort — NOT the orchestrator's inherited session effort (the bug this
+# fixes: the prior stamp came from process.env.CLAUDE_EFFORT, i.e. the ORCHESTRATOR's effort). Fail-open: a
+# helper error leaves all three at the "-" sentinel, so nothing extra is passed and today's degraded-but-safe
+# {role}-only or {role,agentId} line still gets written below.
+ATIER="-"; AEFFORT="-"; AVERSION="-"
+read -r ATIER AEFFORT AVERSION < <(node "$HELPER" resolve-role-model --role "$ROLE" --with-effort --with-version 2>/dev/null)
+[ -n "${ATIER:-}" ] || ATIER="-"
+[ -n "${AEFFORT:-}" ] || AEFFORT="-"
+[ -n "${AVERSION:-}" ] || AVERSION="-"
+ASSIGNED_FLAGS=""
+[ "$ATIER" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-tier $ATIER"
+[ "$AVERSION" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-version $AVERSION"
+[ "$AEFFORT" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --effort $AEFFORT"
+
 # Append. NEVER --artifact (no path -> no dangle; artifact composes later via overlay-merge). Pass --agent
 # ONLY when an agentId was extracted; otherwise the degraded {role}-only line (SubagentStop fills agentId).
+# Always pass the ASSIGNED_FLAGS resolved above (when resolvable) so the badge renders the instant this line
+# lands, carrying the role's OWN policy values.
 if [ -n "$AGENTID" ] && [ "$AGENTID" != "-" ]; then
-  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" >/dev/null 2>&1
+  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $ASSIGNED_FLAGS >/dev/null 2>&1
 else
-  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" >/dev/null 2>&1
+  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" $ASSIGNED_FLAGS >/dev/null 2>&1
 fi
 
 # Both append branches merge here. Resync the live board on this AUTOMATED write

@@ -44,20 +44,25 @@ INPUT=$(cat)
 # transcript (NOT under /subagents/). We PREFER agent_transcript_path; fall back to transcript_path ONLY when
 # agent_transcript_path is absent/empty (back-compat with old fixtures + a main-session Stop). The payload also
 # carries `agent_id` directly — prefer it for the agentId; fall back to the filename parse below when absent.
-read -r TRANSCRIPT SESSION PAYLOAD_AGENTID < <(
+read -r TRANSCRIPT SESSION PAYLOAD_AGENTID PAYLOAD_EFFORT < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const atp=(d.agent_transcript_path||"").toString();
     const tp=(atp!=="" ? atp : (d.transcript_path||"").toString());
     const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
     const aid=(d.agent_id||"").toString().replace(/[^0-9A-Za-z_-]/g,"");
+    // #1466 -- the OBSERVED reasoning-effort signal on a SubagentStop payload: a nested effort.level string
+    // (the harness'\''s own record of what the STOPPING subagent actually ran at -- not the transcript, which
+    // never carries it). Absent/malformed -> "" (fail-open; the append below then omits --effort entirely).
+    const eff=(d.effort && typeof d.effort.level==="string") ? d.effort.level : "";
     const enc=(s)=> (s===""? "-" : encodeURIComponent(s));
-    process.stdout.write([enc(tp), session||"-", aid||"-"].join(" "));
+    process.stdout.write([enc(tp), session||"-", aid||"-", enc(eff)].join(" "));
   ' 2>/dev/null
 )
 dec(){ [ "$1" = "-" ] && { printf ''; return; }; printf '%b' "${1//%/\\x}"; }
 TRANSCRIPT="$(dec "$TRANSCRIPT")"
 [ "$PAYLOAD_AGENTID" = "-" ] && PAYLOAD_AGENTID=""
+PAYLOAD_EFFORT="$(dec "$PAYLOAD_EFFORT")"
 
 # (a) must be a SUBAGENT transcript. No-op otherwise (main-session Stop shape / unparseable).
 case "$TRANSCRIPT" in
@@ -148,5 +153,11 @@ fi
 [ -f "$HELPER" ] || exit 0
 SELF_FLAG=""
 [ "$SELFAUTH" = "1" ] && SELF_FLAG="--self-authored"
-node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG >/dev/null 2>&1
+# #1466 -- pass the OBSERVED effort (payload effort.level) ONLY when the payload actually carried one; an
+# absent/malformed value means --effort is omitted entirely, so overlayAppend's per-key "provided" discipline
+# leaves whatever the spawn-time ASSIGNED stamp (or a prior line) already carries untouched -- never a blank
+# clobber. When present, this OBSERVED value OVERWRITES the ASSIGNED one (observed wins at close).
+EFFORT_FLAG=""
+[ -n "$PAYLOAD_EFFORT" ] && EFFORT_FLAG="--effort $PAYLOAD_EFFORT"
+node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG >/dev/null 2>&1
 exit 0
