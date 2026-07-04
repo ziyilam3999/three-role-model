@@ -19,6 +19,14 @@
 //     role UPDATES the line (drops the prior one), never duplicates. A role agent self-recording its OWN
 //     line passes --artifact (and --verdict for review-roles) with NO --agent; the SubagentStop hook later
 //     overlay-merges the harness-captured --agent (#855) and stamps --self-authored (#1100 item 3).
+//     #1465 — EVERY append also best-effort resolves + overlays three OPTIONAL provenance fields:
+//     modelVersion (transcriptModel() over the resolved agentId — --agent when given, else
+//     resolveAgent(session, task, role)), modelTier (modelIdToTier(modelVersion)), and effort
+//     (process.env.CLAUDE_EFFORT). Fail-open + back-compat: absent inputs simply omit the fields; no new
+//     required flags; check/checkRole never reference them. Centralizing this in cmdAppend means the
+//     SubagentStop hook's EXISTING stop-time `append --agent` (three-role-subagent-ledger.sh) automatically
+//     re-resolves the model against the by-then-COMPLETE transcript with zero hook edit — the free
+//     backfill for a self-append that ran too early to see `message.model`.
 //   check --session S --task T [--require-provenance]
 //     Exit 0 (+ "OK ...") iff all four required roles (planner, plan-review, executor, execution-review)
 //     are present AND satisfied; otherwise exit 2 (+ "BLOCK: <reason>"). A role is satisfied by EITHER
@@ -612,13 +620,24 @@ function overlayAppend(session, task, role, fields) {
   if ('verdict' in fields) entry.verdict = fields.verdict;
   // #1100 item 3: provenance stamp — overlay only when provided (back-compat: absent ⇒ unstamped).
   if ('self_authored' in fields) entry.self_authored = fields.self_authored;
+  // #1465 — OPTIONAL model+effort provenance. Overlay only when this call resolved a value (own-key
+  // presence is the "provided" signal, same discipline as every other field above); an unprovided key
+  // PERSISTS the prior line's value, so "model resolved at spawn-time self-append" composes with
+  // "artifact at close" exactly like agentId/artifact_path do (#855 overlay-merge).
+  if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
+  if ('modelTier' in fields) entry.modelTier = fields.modelTier;
+  if ('effort' in fields) entry.effort = fields.effort;
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
   // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
-  // otherwise resurrect).
+  // otherwise resurrect) — modelVersion/modelTier/effort join that clear-list too (#1465): they are
+  // provenance OF a real spawn's transcript, so a skip line must not carry a stale claimed model.
   if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
-  if ('skip_reason' in fields) { delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored; }
+  if ('skip_reason' in fields) {
+    delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
+    delete entry.modelVersion; delete entry.modelTier; delete entry.effort;
+  }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
   return file;
@@ -639,6 +658,30 @@ function cmdAppend(o) {
   // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
   // `--self-authored` (no value) is true, `--self-authored false` is false.
   if ('self-authored' in o) fields.self_authored = (o['self-authored'] !== 'false');
+  // #1465 — CENTRALIZED best-effort model+effort capture. Runs on EVERY append (both a role's own
+  // self-append AND the SubagentStop hook's later --agent re-append), so the stop-time re-append
+  // automatically backfills modelVersion/modelTier from the by-then-COMPLETE transcript with ZERO edit
+  // to the shell hook (see AC1-LIVE's fallback branch). Fail-open throughout: any resolution failure
+  // just omits the field (back-compat — old ledger lines and check/checkRole never reference these).
+  //   agentId for the model lookup <- --agent when present, ELSE resolveAgent(session, task, role) (a
+  //   self-append carries no --agent; its own transcript is scanned for the literal spawn tag).
+  //   model <- transcriptModel(session, agentId) -> modelVersion; modelIdToTier(modelVersion) -> modelTier.
+  //   effort <- process.env.CLAUDE_EFFORT (session-inherited).
+  try {
+    const agentIdForModel = ('agent' in o && o.agent) ? o.agent : resolveAgent(session, task, role);
+    if (agentIdForModel) {
+      const modelId = transcriptModel(session, agentIdForModel);
+      if (modelId) {
+        fields.modelVersion = modelId;
+        const tier = modelIdToTier(modelId);
+        if (tier) fields.modelTier = tier;
+      }
+    }
+  } catch (e) { /* fail-open: a capture error must never wedge an append */ }
+  try {
+    const effort = process.env.CLAUDE_EFFORT;
+    if (effort) fields.effort = effort;
+  } catch (e) { /* fail-open */ }
   // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
   // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
   // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
