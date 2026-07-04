@@ -75,6 +75,19 @@
 //     overlayAppend to merge/drop/clobber, so a subsequent real append/check/resolve-artifact reads the
 //     file byte-correctly — AC-4 (no overlay/close corruption) is true BY CONSTRUCTION. ALWAYS exits 0
 //     (fail-open) — a heartbeat error must NEVER wedge the spawn it instruments.
+//   refresh-models --session S                                     (#1481)
+//     IN-FLIGHT model backfill: the missing TRIGGER the #1481 root-cause identified (cmdAppend's model
+//     capture already exists and is green today; there was simply no event that RE-INVOKED it between a
+//     background role spawn and SubagentStop). Walks every task ledger under <LEDGER_DIR>/<S>/*.jsonl and,
+//     for each REQUIRED-role line that (a) is not inline-skipped, (b) LACKS a modelVersion yet, and (c)
+//     resolves an agentId (its own --agent, else resolveAgent(session, task, role) by tag), re-resolves the
+//     model via the SAME resolveModelFields() helper cmdAppend uses (reuse, not a re-implementation) and
+//     overlay-appends ONLY {modelVersion[, modelTier]} — agentId/artifact_path/effort/verdict/self_authored
+//     are left untouched (overlayAppend's per-key "provided" discipline, #855). Idempotent, absent->present
+//     ONLY: a role that already carries a modelVersion is never re-touched. Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, and ONLY when >=1 role actually flipped
+//     absent->present (no-change scans never resync — bounds the extra board-upload cost). ALWAYS exits 0
+//     (fail-open) — a refresh error must never wedge its caller (a backgrounded hook trigger).
 //   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
 //     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
@@ -122,6 +135,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 
 const HOME = os.homedir();
 const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude', '3role-ledger');
@@ -389,6 +403,46 @@ function resolveArtifact(p) {
   cands.push(s);
   for (const c of cands) if (fileExists(c)) return c;
   return '';
+}
+
+// #1481 — the SHARED model-resolution helper both cmdAppend AND cmdRefreshModels call (reuse, never a
+// second copy of the transcriptModel()->overlay-merge path). Given a role's explicitAgent (pass '' / falsy
+// to fall back to resolveAgent's tag search) returns {} when no model is resolvable yet (fail-open,
+// can't-tell), else {modelVersion[, modelTier]} (modelTier omitted only if the id doesn't map to a known
+// tier prefix — modelIdToTier's own fail-open contract).
+function resolveModelFields(session, task, role, explicitAgent) {
+  try {
+    const agentIdForModel = explicitAgent || resolveAgent(session, task, role);
+    if (!agentIdForModel) return {};
+    const modelId = transcriptModel(session, agentIdForModel);
+    if (!modelId) return {};
+    const fields = { modelVersion: modelId };
+    const tier = modelIdToTier(modelId);
+    if (tier) fields.modelTier = tier;
+    return fields;
+  } catch (e) { return {}; }   // fail-open: a resolution error must never wedge the caller.
+}
+
+// #1481 — resolve the directory this file ACTUALLY lives in (symlink-aware, mirrors resolveConfigPath's
+// realpathSync trick — setup.sh installs this file as a SYMLINK at ~/.claude/hooks/3role-ledger.mjs, so a
+// naive import.meta.url dirname would miss a sibling like kanban-resync.sh living next to the REPO file).
+function selfDir() {
+  try { return path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { return path.dirname(fileURLToPath(import.meta.url)); }
+}
+
+// #1481 — fire the shared kanban-resync.sh launcher as a DETACHED background subprocess (never blocks,
+// never throws to the caller). Mirrors the existing bash callers' `bash kanban-resync.sh` contract (that
+// script itself backgrounds the REAL sync via nohup and always exits 0) — this just gets us from a node
+// caller to that same sibling script. Silently no-ops if the script is absent (ported/plugin copies that
+// don't carry this machine-local agent-kanban helper) or on any spawn error.
+function fireResyncBackground() {
+  try {
+    const script = path.join(selfDir(), 'kanban-resync.sh');
+    if (!fileExists(script)) return;
+    const child = spawn('bash', [script], { stdio: 'ignore', detached: true });
+    child.unref();
+  } catch (e) { /* fail-open */ }
 }
 
 function stripOraclePrefix(s) { return String(s == null ? '' : s).replace(/^oracle:/i, ''); }
@@ -697,17 +751,14 @@ function cmdAppend(o) {
   // This OBSERVED capture wins over an explicit --model-version/--model-tier from above ONLY when a real
   // message.model line already exists (at spawn time it never does yet, so an ASSIGNED stamp survives
   // untouched until the role's own transcript actually completes — #1466 AC-8b, "observed wins").
-  try {
-    const agentIdForModel = ('agent' in o && o.agent) ? o.agent : resolveAgent(session, task, role);
-    if (agentIdForModel) {
-      const modelId = transcriptModel(session, agentIdForModel);
-      if (modelId) {
-        fields.modelVersion = modelId;
-        const tier = modelIdToTier(modelId);
-        if (tier) fields.modelTier = tier;
-      }
-    }
-  } catch (e) { /* fail-open: a capture error must never wedge an append */ }
+  // #1481: this now calls the SHARED resolveModelFields() helper (extracted, not re-implemented) — the
+  // exact same transcriptModel()->overlay-merge path cmdRefreshModels reuses for the in-flight backfill.
+  {
+    const explicitAgent = ('agent' in o && o.agent) ? o.agent : '';
+    const modelFields = resolveModelFields(session, task, role, explicitAgent);
+    if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
+    if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
+  }
   // #1466 — the #1465 AMBIENT `process.env.CLAUDE_EFFORT` auto-capture that used to sit here is REMOVED. It
   // stamped the ORCHESTRATOR's session effort on EVERY append — including a close-out `--artifact`-only call
   // with no effort opinion of its own — so the moment a role's real effort differed from the orchestrator's,
@@ -918,6 +969,54 @@ function cmdHeartbeat(o) {
   process.exit(0);
 }
 
+// #1481: refresh-models --session S -> in-flight model backfill (the NEW in-flight TRIGGER'S oracle unit;
+// see the file-header doc block above). Walks <LEDGER_DIR>/<S>/*.jsonl; for each REQUIRED-role line that
+// lacks a modelVersion and is not inline-skipped, re-resolves the model via the SAME resolveModelFields()
+// helper cmdAppend uses and overlay-appends ONLY the model fields (idempotent, absent->present only —
+// never rewrites an already-present model, never touches agentId/artifact_path/effort/verdict/
+// self_authored). Fires kanban-resync.sh (backgrounded) at most ONCE per invocation, only when >=1 role
+// actually changed. ALWAYS exits 0 (fail-open) — mirrors cmdHeartbeat's contract: a refresh error must
+// never wedge the caller (a backgrounded hook trigger with no one watching stderr).
+function cmdRefreshModels(o) {
+  try {
+    const session = o.session;
+    if (!session) { console.log('OK refresh-models: no --session given (fail-open, nothing to do)'); process.exit(0); }
+    const sess = sanitize(session);
+    const dir = path.join(LEDGER_DIR, sess);
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); }
+    catch (e) { console.log('OK refresh-models: no ledger dir for session ' + sess); process.exit(0); }
+    let scanned = 0;
+    let changed = 0;
+    for (const fn of files) {
+      const task = fn.slice(0, -('.jsonl'.length));
+      const file = path.join(dir, fn);
+      let lines;
+      try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
+      catch (e) { continue; }
+      const byRole = {};
+      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+      for (const role of REQUIRED_ROLES) {
+        const e = byRole[role];
+        if (!e) continue;                       // no line for this role yet -> nothing to refresh
+        if ('skip_reason' in e) continue;        // inline-skip -> no transcript to read
+        if (e.modelVersion) continue;            // ABSENT->PRESENT ONLY: already has a model, never rewrite
+        scanned++;
+        const modelFields = resolveModelFields(sess, task, role, e.agentId || '');
+        if (!modelFields.modelVersion) continue; // transcript still carries no message.model line yet -> too early
+        overlayAppend(sess, task, role, modelFields);
+        changed++;
+      }
+    }
+    if (changed > 0) fireResyncBackground();
+    console.log('OK refresh-models: session=' + sess + ' scanned=' + scanned + ' changed=' + changed);
+    process.exit(0);
+  } catch (e) {
+    console.log('OK refresh-models: error (fail-open): ' + (e && e.message ? e.message : e));
+    process.exit(0);
+  }
+}
+
 // #1448: resolve-role-model --role <role> [--with-effort]
 // Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
 // fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
@@ -955,14 +1054,15 @@ try {
   if (cmd === 'append') cmdAppend(opts);
   else if (cmd === 'check') cmdCheck(opts);
   else if (cmd === 'heartbeat') cmdHeartbeat(opts);
+  else if (cmd === 'refresh-models') cmdRefreshModels(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|resolve-agent|resolve-artifact|resolve-role-model|inherit-plan-review> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|inherit-plan-review> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
-      '[--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)]');
+      '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)]');
     process.exit(2);
   }
 } catch (e) {
