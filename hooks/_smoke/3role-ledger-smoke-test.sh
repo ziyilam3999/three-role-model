@@ -507,4 +507,65 @@ OUT=$(node "$LED" check --session "$SID" --task "$OT" 2>&1); RC=$?
   && ok "#1465 AC2: old-shape 4-role ledger (no model/effort resolvable) -> check still OK, no model/effort fields present" \
   || bad "#1465 AC2 back-compat failed (rc=$RC out=$OUT ledger=$(cat "$OLDF" 2>/dev/null))"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1481 — T1: `refresh-models --session S` IN-FLIGHT model backfill. The oracle is the NEW subcommand
+# itself (RED pre-fix: `refresh-models` is unrecognized, prints usage, exits 2 -> the ledger line NEVER
+# gains a model -> every assertion below fails). The already-green `append` auto-capture (#1465) is REUSED
+# via the shared resolveModelFields() helper, not the oracle.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+SID_RF="sess-1481-refresh"; TASK_RF="1481r"
+RFFILE="$THREE_ROLE_LEDGER_DIR/$SID_RF/$TASK_RF.jsonl"
+
+# T1a setup: an in-progress EXECUTOR line, written while its transcript carries NO message.model line yet
+# (mk_sub) -> lands model-less (agentId + artifact + effort captured; no modelVersion/modelTier).
+mk_sub "$SID_RF" rf-e1
+node "$LED" append --session "$SID_RF" --task "$TASK_RF" --role executor --agent rf-e1 --artifact "PR #1481" --effort xhigh >/dev/null
+{ grep -q '"agentId":"rf-e1"' "$RFFILE" && ! grep -q '"modelVersion"' "$RFFILE"; } \
+  && ok "#1481 T1a setup: in-progress executor line written model-less (agentId present, no modelVersion yet)" \
+  || bad "#1481 T1a setup failed (got: $(cat "$RFFILE" 2>/dev/null))"
+
+# T1b (RED/GREEN oracle): the SAME transcript is now UPDATED to carry message.model:"claude-sonnet-5" (the
+# subagent produced its first assistant turn) -> run `refresh-models --session S` -> the executor line
+# acquires modelTier/modelVersion, and effort/agentId/artifact_path are UNTOUCHED (no verdict field exists
+# for an executor role, before or after -- also asserted, proving nothing spurious was added).
+mk_sub_model "$SID_RF" rf-e1 "claude-sonnet-5"
+OUT_RF=$(node "$LED" refresh-models --session "$SID_RF" 2>&1); RC_RF=$?
+{ [ "$RC_RF" = "0" ] \
+  && grep -q '"modelTier":"sonnet"' "$RFFILE" \
+  && grep -q '"modelVersion":"claude-sonnet-5"' "$RFFILE" \
+  && grep -q '"effort":"xhigh"' "$RFFILE" \
+  && grep -q '"agentId":"rf-e1"' "$RFFILE" \
+  && grep -q '"artifact_path":"PR #1481"' "$RFFILE" \
+  && ! grep -q '"verdict"' "$RFFILE"; } \
+  && ok "#1481 T1: refresh-models backfills modelTier=sonnet + modelVersion=claude-sonnet-5; effort/agentId/artifact_path UNTOUCHED (rc=$RC_RF)" \
+  || bad "#1481 T1 FAILED -- refresh-models did not backfill as expected (rc=$RC_RF out=$OUT_RF ledger=$(cat "$RFFILE" 2>/dev/null))"
+
+# T1c idempotency: re-running refresh-models a SECOND time reports changed=0 (nothing left to backfill) and
+# the ledger line is byte-identical (absent->present only, never re-touches an already-present model).
+BEFORE_RF="$(cat "$RFFILE")"
+OUT_RF2=$(node "$LED" refresh-models --session "$SID_RF" 2>&1); RC_RF2=$?
+AFTER_RF="$(cat "$RFFILE")"
+{ [ "$RC_RF2" = "0" ] && echo "$OUT_RF2" | grep -q "changed=0" && [ "$BEFORE_RF" = "$AFTER_RF" ]; } \
+  && ok "#1481 T1c: re-running refresh-models is idempotent (changed=0, ledger line unchanged)" \
+  || bad "#1481 T1c idempotency failed (rc=$RC_RF2 out=$OUT_RF2 before=$BEFORE_RF after=$AFTER_RF)"
+
+# T1d never-rewrite: a role that ALREADY carries a modelVersion (captured at append time because its
+# transcript already had a message.model line) must NEVER be overwritten by refresh-models even if the
+# transcript's LATEST assistant model later changes (e.g. a stale re-run) -- absent->present ONLY.
+mk_sub_model "$SID_RF" rf-pr1 "claude-opus-4-8"
+node "$LED" append --session "$SID_RF" --task "$TASK_RF" --role plan-review --agent rf-pr1 --artifact "$TMP/rev.md" >/dev/null
+PRFILE_LINE_BEFORE="$(grep -o '"role":"plan-review"[^}]*' "$RFFILE")"
+# transcript now (hypothetically) shows a DIFFERENT model -- append a second, later assistant line.
+printf '{"type":"assistant","agentId":"rf-pr1","message":{"model":"claude-sonnet-5","role":"assistant","content":[]}}\n' >> "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RF/subagents/agent-rf-pr1.jsonl"
+node "$LED" refresh-models --session "$SID_RF" >/dev/null 2>&1
+PRFILE_LINE_AFTER="$(grep -o '"role":"plan-review"[^}]*' "$RFFILE")"
+{ [ "$PRFILE_LINE_BEFORE" = "$PRFILE_LINE_AFTER" ] && grep -q '"modelVersion":"claude-opus-4-8"' "$RFFILE"; } \
+  && ok "#1481 T1d: an ALREADY-present modelVersion is never rewritten (absent->present only)" \
+  || bad "#1481 T1d never-rewrite failed (before=$PRFILE_LINE_BEFORE after=$PRFILE_LINE_AFTER)"
+
+# T1e fail-open: a session with NO ledger dir at all -> exit 0, no throw.
+OUT_RF5=$(node "$LED" refresh-models --session "sess-1481-no-such-session" 2>&1); RC_RF5=$?
+[ "$RC_RF5" = "0" ] && ok "#1481 T1e: no ledger dir for session -> fail-open exit 0" || bad "#1481 T1e fail-open failed (rc=$RC_RF5 out=$OUT_RF5)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
