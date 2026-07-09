@@ -10,8 +10,7 @@ npm-debug.log*
 
 # Local scratch (never committed)
 tmp/
-.ai-workspace/_*/
-.ai-workspace/sessions/
+.ai-workspace/
 *-run/
 
 # The ledger is a runtime scratch dir, never part of the repo
