@@ -112,6 +112,23 @@
 //     present. Dedicated kill-switch CC_ROLE_VERSION_GATE_OFF=1 (skips ONLY the version sub-leg;
 //     CC_ROLE_MODEL_GATE_OFF=1 still disables the whole model+version leg). Completion-time ONLY — the
 //     leading-edge spawn gate sees a tier ALIAS, never a concrete version, so it cannot check this.
+//   resolve-effective-tier --model M --subagent-type T --transcript P [--session S] [--agents-dir D]
+//                          [--projects-root R]                      (#1494)
+//     The EFFECTIVE-TIER SENSOR: resolves the tier a spawn will ACTUALLY run on, by reading the current
+//     session's OWN transcript tail — never by assuming a hardcoded default. Fixes the leading-edge gate's
+//     bug (a badge-less spawn's effective tier was hardcoded to "opus", so under a Fable session it silently
+//     satisfied the opus seats' policy check while all four roles actually ran Fable). Precedence: (1) an
+//     explicit --model wins outright; (2) else the last `isSidechain:false` assistant message.model in
+//     --transcript (a bounded, grow-with-cap reverse-tail read via lastAssistantModelFromFile — never reads
+//     the whole transcript file); (3) else tier='unknown'. Agent-def frontmatter (--subagent-type +
+//     --agents-dir) is reported as provenance (`agentdefTier`) but NEVER decides `tier` (UNVERIFIED whether
+//     it overrides session inheritance). Prints "<tier> <source> agentdef=<tier|none>" on stdout, ALWAYS
+//     exits 0 (like resolve-role-model — a resolver error must never wedge the caller; it fails CLOSED to
+//     tier=unknown internally, which is the CALLER's cue to block). `tier ∈ {opus,sonnet,haiku,fable,unknown}`;
+//     the caller (three-role-model-policy-gate.sh) treats `unknown` as a named BLOCK arm — it does NOT
+//     default to opus (the fail-safe direction the #1448 leading-edge gate got backwards for Fable sessions).
+//     Exported (`resolveEffectiveTier`, `lastAssistantModelFromFile`) for #1497's Key-1 role-eligibility
+//     check to consume directly instead of re-parsing spawn payloads.
 //   inherit-plan-review --session S --task T --parent P            (#881)
 //     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
 //     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
@@ -130,6 +147,10 @@
 //   CC_ROLE_MODEL_GATE_OFF=1 (#1448) — skip the --enforce-role-models MODEL-POLICY leg (feature kill-switch).
 //   CC_ROLE_VERSION_GATE_OFF=1 (#1458) — skip ONLY the version-pin (assert-latest) sub-leg of
 //                            --enforce-role-models; CC_ROLE_MODEL_GATE_OFF=1 still disables the whole leg.
+//   CC_TIER_SENSOR_TAIL_BYTES (#1494) — lastAssistantModelFromFile()'s initial reverse-tail read window
+//                            (default 4MB — big enough to fit a single ~0.8MB transcript record with margin).
+//   CC_TIER_SENSOR_CAP_BYTES (#1494) — the grow-with-cap ceiling (default 64MB); exceeding it without a
+//                            parseable last-assistant record resolves tier='unknown' (fail-closed).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -328,6 +349,165 @@ function transcriptModel(session, agentId) {
     if (last) return last;
   }
   return '';
+}
+
+// ── #1494 EFFECTIVE-TIER SENSOR ──────────────────────────────────────────────────────────────────────────
+// The leading-edge model-policy gate (three-role-model-policy-gate.sh) used to HARDCODE the effective tier of
+// a badge-less spawn to "opus" (the documented session default). Under an Opus session that's usually right;
+// under a Fable session it's WRONG — a badge-less spawn actually inherits Fable, and the hardcoded guess let
+// all four roles run Fable across 19 tasks in total silence (the gate computed effective=opus==expected=opus
+// and stayed quiet). ADD, do NOT refactor transcriptModel() (finding H) — that function is load-bearing for
+// the completion-time gate (transcriptModel() reads a role's OWN subagent transcript by agentId; this sensor
+// reads the MAIN SESSION transcript directly by path, a different shape of the same "read the transcript, do
+// not assume" idea) and stays byte-unchanged (AC-19).
+const TIER_SENSOR_DEFAULT_TAIL_BYTES = 4 * 1024 * 1024;    // >= a single ~0.8MB record with margin (measured).
+const TIER_SENSOR_DEFAULT_CAP_BYTES = 64 * 1024 * 1024;    // bounded — NEVER readFileSync the whole (281MB+) file.
+
+// Bounded REVERSE-TAIL read of the last `type:"assistant"` record in a growing JSONL transcript, filtered to
+// the MAIN session (isSidechain===false, so a subagent/sidechain record can never leak in as "the session
+// model" — finding C). Reads only the last `tailBytes` from EOF; if no matching record is found in that
+// window (trailing junk, or a record straddling the window edge), DOUBLES the window and retries, up to
+// `capBytes`. Exceeding the cap without a parseable last-assistant record returns null (caller fails CLOSED).
+// tailBytes/capBytes are configurable via opts OR env (CC_TIER_SENSOR_TAIL_BYTES / CC_TIER_SENSOR_CAP_BYTES,
+// Rule 16) so a smoke can force the grow-path and cap-path with SMALL fixtures instead of 200MB files.
+function lastAssistantModelFromFile(filePath, opts) {
+  opts = opts || {};
+  const envTail = Number(process.env.CC_TIER_SENSOR_TAIL_BYTES);
+  const envCap = Number(process.env.CC_TIER_SENSOR_CAP_BYTES);
+  const tailBytes = Number(opts.tailBytes) > 0 ? Number(opts.tailBytes)
+    : (envTail > 0 ? envTail : TIER_SENSOR_DEFAULT_TAIL_BYTES);
+  const capBytes = Number(opts.capBytes) > 0 ? Number(opts.capBytes)
+    : (envCap > 0 ? envCap : TIER_SENSOR_DEFAULT_CAP_BYTES);
+  const mainSessionOnly = opts.mainSessionOnly !== false;   // default true.
+
+  let fd;
+  let size;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    size = fs.fstatSync(fd).size;
+  } catch (e) { return null; }   // missing / unreadable -> can't-tell.
+
+  try {
+    let window = Math.max(1, Math.min(tailBytes, capBytes));
+    for (;;) {
+      const start = Math.max(0, size - window);
+      const length = size - start;
+      if (length > 0) {
+        const buf = Buffer.alloc(length);
+        let bytesRead = 0;
+        try { bytesRead = fs.readSync(fd, buf, 0, length, start); } catch (e) { bytesRead = 0; }
+        let text = buf.toString('utf8', 0, bytesRead);
+        // Drop the leading partial record (everything before the first \n), UNLESS this window covers byte 0
+        // (in which case there IS no leading partial record — the window starts at the true file start).
+        if (start > 0) {
+          const nl = text.indexOf('\n');
+          text = nl >= 0 ? text.slice(nl + 1) : '';
+        }
+        const lines = text.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const s = lines[i].trim();
+          if (!s) continue;
+          let j; try { j = JSON.parse(s); } catch (e) { continue; }
+          if (!j || j.type !== 'assistant') continue;
+          if (mainSessionOnly && j.isSidechain !== false) continue;   // require an EXPLICIT isSidechain:false.
+          const model = (j.message && typeof j.message.model === 'string') ? j.message.model : '';
+          if (model) return model;
+        }
+      }
+      if (start === 0) break;          // covered the whole file — nothing found, give up.
+      if (window >= capBytes) break;    // already at the cap — give up (fail-closed, never read past it).
+      window = Math.min(window * 2, capBytes);
+    }
+  } finally {
+    try { fs.closeSync(fd); } catch (e) { /* no-op */ }
+  }
+  return null;
+}
+
+// A `--model` value may be a bare TIER ALIAS (the normal spawn convention — "opus"/"sonnet"/"fable"/"haiku")
+// or, defensively, a concrete claude-* id. Returns '' when neither form resolves (caller treats as unknown).
+function modelIdOrAliasToTier(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  if (ROLE_MODELS.includes(s)) return s;
+  return modelIdToTier(s);
+}
+
+// resolveEffectiveTier — the reusable "who is this really?" reader (#1494; #1497 Key-1 consumes this, does
+// NOT re-derive it). TOTAL function: never throws, always returns a well-shaped { tier, source, agentdefTier }.
+//
+// Tier-deciding precedence (ONLY these three terms decide `tier`):
+//   1. `model` non-empty -> tier = modelIdOrAliasToTier(model), source='requested'. Explicit badge wins,
+//      regardless of transcript. An unresolvable explicit value (never seen in practice) fails CLOSED to
+//      'unknown' rather than silently falling through to term 2 — an explicit-but-garbled badge must never
+//      resolve to a guess.
+//   2. else read the session transcript tail — `transcriptPath` (the PreToolUse(Agent) payload's own
+//      `transcript_path`, used DIRECTLY — this is proven always-present, so this is the live path in
+//      practice), else (ONLY when transcriptPath is absent) a defensive, dead-code-in-practice fallback:
+//      build the MAIN-session path shape `<projectsRoot>/*/<session>.jsonl` (session as the FILENAME — this
+//      is a NEW path shape, NOT the subagent-shape glob `.../<session>/subagents/agent-<id>.jsonl` that
+//      transcriptModel()/agentResolves() use). Last `isSidechain:false` assistant `message.model` ->
+//      modelIdToTier(...); non-empty -> that tier, source='session'.
+//   3. else -> tier='unknown', source='unknown'.
+//
+// Agent-def frontmatter (`subagentType` + `agentsDir`) is PROVENANCE-ONLY: reported as `agentdefTier` but
+// NEVER enters the precedence above and NEVER changes `tier` (whether frontmatter overrides session
+// inheritance is UNVERIFIED — see the plan's `## Unverified assumptions`). `tier=unknown` ALWAYS means the
+// caller must fail closed — never coerce it to a concrete tier (never resolve an opus seat's can't-tell to
+// "opus"; that is exactly the leak this sensor exists to close).
+function resolveEffectiveTier(o) {
+  o = o || {};
+  const out = { tier: 'unknown', source: 'unknown', agentdefTier: null };
+  try {
+    const modelRaw = (o.model == null ? '' : String(o.model)).trim();
+    if (modelRaw) {
+      const t = modelIdOrAliasToTier(modelRaw);
+      out.tier = t || 'unknown';
+      out.source = 'requested';
+    } else {
+      let txPath = (o.transcriptPath == null ? '' : String(o.transcriptPath)).trim();
+      if (!txPath) {
+        // Defensive fallback (finding K/L — dead-code-in-practice: transcript_path is byte-proven always
+        // present on the payload). Build the MAIN-session path shape directly; do NOT reuse the subagent glob.
+        const session = sanitize(o.session);
+        if (session) {
+          const projectsRoot = (o.projectsRoot && String(o.projectsRoot)) ||
+            process.env.THREE_ROLE_PROJECTS_ROOT || PROJECTS_ROOT;
+          try {
+            const slugs = fs.readdirSync(projectsRoot);
+            for (const slug of slugs) {
+              const cand = path.join(projectsRoot, slug, session + '.jsonl');
+              if (fileExists(cand)) { txPath = cand; break; }
+            }
+          } catch (e) { /* no derivable session path -> stays unknown/unknown */ }
+        }
+      }
+      if (txPath) {
+        const modelId = lastAssistantModelFromFile(txPath, { mainSessionOnly: true });
+        if (modelId) {
+          const t = modelIdToTier(modelId);
+          if (t) { out.tier = t; out.source = 'session'; }
+          // else: a resolved model id with an unrecognized tier prefix -> stays unknown/unknown (can't-tell).
+        }
+      }
+    }
+  } catch (e) {
+    out.tier = 'unknown'; out.source = 'unknown';   // total function: never throws to the caller.
+  }
+  // Agent-def is PROVENANCE-ONLY — resolved independently of the precedence above, and can never widen it.
+  try {
+    const subagentType = (o.subagentType == null ? '' : String(o.subagentType)).trim();
+    const agentsDir = o.agentsDir ? String(o.agentsDir) : '';
+    if (subagentType && agentsDir) {
+      const p = path.join(agentsDir, subagentType + '.md');
+      if (fileExists(p)) {
+        const content = fs.readFileSync(p, 'utf8');
+        const m = content.match(/^model:\s*([a-z]+)/im);
+        if (m && ROLE_MODELS.includes(m[1].toLowerCase())) out.agentdefTier = m[1].toLowerCase();
+      }
+    }
+  } catch (e) { /* provenance is best-effort; must never affect tier */ }
+  return out;
 }
 
 // Parse `--key value` flags. An empty next-arg ("") IS consumed (so `--skip-reason ""` records an
@@ -1048,6 +1228,24 @@ function cmdResolveRoleModel(o) {
   process.exit(0);
 }
 
+// #1494: resolve-effective-tier --model M --subagent-type T --transcript P [--session S] [--agents-dir D]
+//        [--projects-root R]
+// CLI mirror of resolveEffectiveTier() — prints "<tier> <source> agentdef=<tier|none>" on stdout, ALWAYS
+// exits 0 (like resolve-role-model; a resolver error must never wedge the caller — it already fails CLOSED
+// to tier=unknown internally, which is the caller's cue to block, not a process-level failure).
+function cmdResolveEffectiveTier(o) {
+  const r = resolveEffectiveTier({
+    model: o.model,
+    subagentType: o['subagent-type'],
+    transcriptPath: o.transcript,
+    session: o.session,
+    agentsDir: o['agents-dir'],
+    projectsRoot: o['projects-root'],
+  });
+  console.log(r.tier + ' ' + r.source + ' agentdef=' + (r.agentdefTier || 'none'));
+  process.exit(0);
+}
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
@@ -1058,14 +1256,21 @@ try {
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
+  else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|inherit-plan-review> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
-      '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)]');
+      '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
+      '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)]');
     process.exit(2);
   }
 } catch (e) {
   console.log('BLOCK: ledger helper error: ' + (e && e.message ? e.message : e));
   process.exit(2);
 }
+
+// #1494 frozen contract for #1497 Key-1 (role eligibility) — a future direct-JS consumer imports these
+// instead of shelling out to the CLI. Exporting does not change this file's own CLI-dispatch behavior above
+// (a plain `resolve-effective-tier` CLI invocation, unqualified by path, is unaffected).
+export { resolveEffectiveTier, lastAssistantModelFromFile };
