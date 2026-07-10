@@ -744,4 +744,110 @@ OUT=$(node "$LED" check --session "$RSID" --task 1495f 2>&1); RC=$?
   && ok "[control] L-MISSING-REQUIRED-HARD-BLOCKS: missing execution-review + present research -> still BLOCK" \
   || bad "[control] L-MISSING-REQUIRED-HARD-BLOCKS failed (rc=$RC out=$OUT)"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1509 — Leg A (tracked-ness, HARD block for planner/plan-review/execution-review) + the executor-
+# disk-path SURFACED NOTE (never a block). Fixtures live inside a DEDICATED scratch git repo (mktemp -d +
+# `git init`) so `git ls-files --error-unmatch` produces REAL tracked/untracked verdicts — $TMP itself is
+# NOT a git repo (every OTHER artifact fixture in this file lives there and can-not-tell/fail-opens Leg A,
+# which is exactly why those pre-existing ALLOW cases above are unaffected by this addition).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+GITROOT="$(mktemp -d)"
+( cd "$GITROOT" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$GITROOT/.ai-workspace/plans" "$GITROOT/.ai-workspace/reviews"
+
+# Frozen-#1515-shaped fixture bodies (synthetic content, real headings so PLAN_RE/VERDICT_RE resolve) — the
+# real #1515 ticket (6th recurrence of the #861 class) shipped a PR while its three disk-path role artifacts
+# sat present-but-untracked on master; this reproduces that exact shape hermetically.
+printf '## ELI5\nfrozen #1515-shaped plan copy\n### Binary AC\n- AC1\n' > "$GITROOT/.ai-workspace/plans/1515-plan.md"
+printf '## Review\nverdict: PASS\n' > "$GITROOT/.ai-workspace/reviews/1515-planreview.md"
+printf '## Review\nverdict: PASS\n' > "$GITROOT/.ai-workspace/reviews/1515-execreview.md"
+
+TSID="sess-1509-tracked"
+mk_sub "$TSID" tp1; mk_sub "$TSID" tr1; mk_sub "$TSID" te1; mk_sub "$TSID" tv1
+node "$LED" append --session "$TSID" --task 1509red --role planner --agent tp1 --artifact "$GITROOT/.ai-workspace/plans/1515-plan.md" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role plan-review --agent tr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role executor --agent te1 --artifact "PR #1515" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role execution-review --agent tv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+
+# 1509-AC1 RED: all three disk-path artifacts EXIST but are UNTRACKED (never `git add`-ed) -> the gated leg
+# exits non-zero and NAMES the untracked roles.
+OUT=$(node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "TRACKED:" && echo "$OUT" | grep -qi "planner" && echo "$OUT" | grep -qi "plan-review" && echo "$OUT" | grep -qi "execution-review"; } \
+  && ok "[proof] 1509-AC1 RED: frozen-#1515-shaped untracked fixture -> --enforce-tracked-artifacts exit 2, names untracked roles" \
+  || bad "1509-AC1 RED failed (rc=$RC out=$OUT)"
+
+# 1509-AC3 control: base `check` WITHOUT the flag, on the SAME untracked fixture -> still exit 0
+# (existence-only, unchanged — the ~161 untracked historical artifacts and every non-gate caller must not break).
+OUT=$(node "$LED" check --session "$TSID" --task 1509red 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[control] 1509-AC3: base check WITHOUT the flag on the SAME untracked fixture -> still exit 0 (no base regression)" \
+  || bad "1509-AC3 base-check-unaffected failed (rc=$RC out=$OUT)"
+
+# 1509-AC7 sanity: the SAME RED fixture with SHIP_PIPELINE=1 exported -> the ledger CLI's Leg A still exits 2
+# (this flag is never consulted by the node helper at all — the SHIP_PIPELINE exemption logic lives entirely
+# in the hook shell script; the substantive proof that the HOOK does not route around Leg A under
+# SHIP_PIPELINE=1 is in hooks/three-role-instrumentation-gate-smoke-test.sh, cases 1509-H1/H2).
+OUT=$(SHIP_PIPELINE=1 node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-AC7 sanity: SHIP_PIPELINE=1 exported -> ledger CLI Leg A still exits 2 (env var not consulted here)" \
+  || bad "1509-AC7 ledger-CLI sanity failed (rc=$RC out=$OUT)"
+
+# 1509-AC1 GREEN: git add + commit the SAME three paths -> --enforce-tracked-artifacts now exits 0.
+( cd "$GITROOT" && git add .ai-workspace/plans/1515-plan.md .ai-workspace/reviews/1515-planreview.md .ai-workspace/reviews/1515-execreview.md && git commit -q -m "fixture: freeze #1515 artifacts" )
+OUT=$(node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1509-AC1 GREEN: same three paths committed -> --enforce-tracked-artifacts exit 0" \
+  || bad "1509-AC1 GREEN failed (rc=$RC out=$OUT)"
+
+# 1509-AC1 EXECUTOR ROLE-KEYED EXEMPTION: executor row carries a present-but-UNTRACKED disk path, the other
+# three roles TRACKED -> the tracked-leg does NOT name executor and does not block on it (exit 0).
+printf '## ELI5\nexecutor mis-cited plan copy\n### Binary AC\n- AC1\n' > "$GITROOT/.ai-workspace/plans/1509-exec-note.md"
+TSID2="sess-1509-execexempt"
+mk_sub "$TSID2" ep1; mk_sub "$TSID2" er1; mk_sub "$TSID2" ee1; mk_sub "$TSID2" ev1
+node "$LED" append --session "$TSID2" --task 1509ex --role planner --agent ep1 --artifact "$GITROOT/.ai-workspace/plans/1515-plan.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role plan-review --agent er1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role executor --agent ee1 --artifact "$GITROOT/.ai-workspace/plans/1509-exec-note.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role execution-review --agent ev1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID2" --task 1509ex --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-AC1 EXECUTOR-EXEMPT: executor's own untracked disk path is NOT named/blocked by Leg A (role-keyed exemption)" \
+  || bad "1509-AC1 executor-exempt failed (rc=$RC out=$OUT)"
+{ echo "$OUT" | grep -q "NOTE-EXECUTOR:" && echo "$OUT" | grep -qi "1509-exec-note.md"; } \
+  && ok "[proof] 1509-AC2 SURFACE: executor's disk-path row is SURFACED as a NOTE-EXECUTOR (never a block)" \
+  || bad "1509-AC2 executor NOTE not surfaced (out=$OUT)"
+
+# 1509-AC2 GREEN (plan-review==planner collision, tracked): the real doctrine-sanctioned shape (44/246 real
+# ledgers measured, e.g. #1477/#1481/#1466 — review roles self-write their `## Review` marker INTO the plan)
+# -> --enforce-tracked-artifacts exits 0, NO spurious duplication/plan-review problem (the plan REJECTS any
+# cross-role-duplication hard block as a measured-false invariant; this proves it is not walled).
+COLLIDE="$GITROOT/.ai-workspace/plans/1509-collide-plan.md"
+printf '## ELI5\ncollision plan\n### Binary AC\n- AC1\n## Review\nverdict: PASS\n' > "$COLLIDE"
+( cd "$GITROOT" && git add .ai-workspace/plans/1509-collide-plan.md && git commit -q -m "fixture: collision plan (tracked)" )
+TSID3="sess-1509-collide-pr"
+mk_sub "$TSID3" cp1; mk_sub "$TSID3" ce1; mk_sub "$TSID3" cv1
+node "$LED" append --session "$TSID3" --task 1509pr --role planner --agent cp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role plan-review --agent cp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role executor --agent ce1 --artifact "PR #1509" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role execution-review --agent cv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID3" --task 1509pr --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1509-AC2 GREEN: plan-review==planner (doctrine-sanctioned collision, tracked) -> exit 0, NOT blocked" \
+  || bad "1509-AC2 plan-review==planner should not block (rc=$RC out=$OUT)"
+
+# 1509-AC2 GREEN (executor==planner collision, tracked): the #1494-shaped historical convention (62/246 real
+# chains measured, e.g. #1494/#1420/#1414 — the executor self-cites the planner's plan file) -> exit 0, NOT
+# blocked; the executor row is SURFACED as a NOTE-EXECUTOR (never silently dropped, never a hard block).
+TSID4="sess-1509-collide-ex"
+mk_sub "$TSID4" xp1; mk_sub "$TSID4" xr1; mk_sub "$TSID4" xv1
+node "$LED" append --session "$TSID4" --task 1509ex2 --role planner --agent xp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role plan-review --agent xr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role executor --agent xp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role execution-review --agent xv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -q "NOTE-EXECUTOR:" && echo "$OUT" | grep -qi "1509-collide-plan.md"; } \
+  && ok "[proof] 1509-AC2 GREEN: executor==planner (#1494-shaped historical convention, tracked) -> exit 0, NOT blocked, NOTE-EXECUTOR surfaces the executor row" \
+  || bad "1509-AC2 executor==planner should not block + must surface NOTE (rc=$RC out=$OUT)"
+rm -rf "$GITROOT" 2>/dev/null
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

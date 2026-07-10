@@ -796,4 +796,72 @@ runW 14581 sW1 CC_ROLES_ENV="$MVERCFG_RED" CC_ROLE_VERSION_GATE_OFF=1
 runW 14581 sW1 CC_ROLES_ENV="$MVERCFG_RED" CC_ROLE_MODEL_GATE_OFF=1
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "W5 CC_ROLE_MODEL_GATE_OFF=1 over RED drift -> ALLOW (whole model+version leg off)" || bad "W5 model kill-switch should allow (rc=$RC out=$CAP)"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1509 — Leg A (tracked-ness) HARD block at the completion gate, SHIP_PIPELINE-PROOF (AC-1 real-seam RED,
+# AC-7 hardening). Fixtures live inside a DEDICATED scratch git repo (mktemp -d + `git init`) so
+# `git ls-files --error-unmatch` produces REAL tracked/untracked verdicts — every other artifact fixture in
+# this file lives directly under $TMP (not a git repo), which is exactly why the entire pre-existing corpus
+# above is unaffected by this addition (Leg A can't-tell -> fail-open there).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+GITROOT_H="$(mktemp -d)"
+( cd "$GITROOT_H" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$GITROOT_H/.ai-workspace/plans" "$GITROOT_H/.ai-workspace/reviews"
+printf '## ELI5\nplan\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_H/.ai-workspace/plans/1509h-plan.md"
+printf '## Review\ncairn: "synth reviewer hit"\nverdict: PASS\n' > "$GITROOT_H/.ai-workspace/reviews/1509h-rev.md"
+cat > "$TMP/perf-1509.md" <<EOF
+# 3-role performance log — #1509 Leg A smoke
+## rounds for #1509h #1509h2
+EOF
+
+TAGSID="sess-1509h"
+mk_sub "$TAGSID" hp1; mk_sub "$TAGSID" hr1; mk_sub "$TAGSID" he1; mk_sub "$TAGSID" hv1
+appendL --session "$TAGSID" --task 1509h --role planner          --agent hp1 --artifact "$GITROOT_H/.ai-workspace/plans/1509h-plan.md"
+appendL --session "$TAGSID" --task 1509h --role plan-review       --agent hr1 --artifact "$GITROOT_H/.ai-workspace/reviews/1509h-rev.md"
+appendL --session "$TAGSID" --task 1509h --role executor          --agent he1 --artifact "PR #1509h"
+appendL --session "$TAGSID" --task 1509h --role execution-review  --agent hv1 --artifact "$GITROOT_H/.ai-workspace/reviews/1509h-rev.md"
+
+run1509h() { run '{"session_id":"'"$TAGSID"'","tool_input":{"taskId":"1509h","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1509.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'; }
+
+# ---- H1 [proof] RED: the three disk-path artifacts EXIST on disk but are UNTRACKED (never `git add`-ed) ->
+#      a REAL tagged completion citing them is BLOCKed by Leg A, at the SAME seam as the perf-card/ledger legs. ----
+run1509h
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "tracked-ness leg FAILED" && echo "$CAP" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-H1 RED: untracked disk-path artifacts on a REAL tagged completion -> Leg A BLOCK" \
+  || bad "1509-H1 RED failed (rc=$RC out=$CAP)"
+
+# ---- H2 [proof] AC-7 SHIP_PIPELINE HARDENING: the IDENTICAL RED payload run WITH SHIP_PIPELINE=1 exported
+#      -> STILL BLOCKED. This is the round-3 review's hardening requirement made binary: Leg A does NOT
+#      honor the rest of the family's SHIP_PIPELINE exemption, proven against the SAME fixture as H1 (not a
+#      weaker synthetic substitute). ----
+CAP=$(printf '%s' '{"session_id":"'"$TAGSID"'","tool_input":{"taskId":"1509h","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1509.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+  | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-H2 AC-7: SHIP_PIPELINE=1 over the SAME untracked-artifact fixture -> STILL BLOCK (no route-around)" \
+  || bad "1509-H2 AC-7 SHIP_PIPELINE hardening failed (rc=$RC out=$CAP)"
+
+# ---- H3 [proof] GREEN: git add + commit the three artifacts -> the SAME tagged completion now ALLOWS (Leg A
+#      satisfied; the perf-card/ledger/cairn/outcome legs downstream already held for this fixture). ----
+( cd "$GITROOT_H" && git add .ai-workspace/plans/1509h-plan.md .ai-workspace/reviews/1509h-rev.md && git commit -q -m "fixture: track the 1509h artifacts" )
+run1509h
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "[proof] 1509-H3 GREEN: same artifacts committed -> tagged completion ALLOWS" \
+  || bad "1509-H3 GREEN failed (rc=$RC out=$CAP)"
+
+# ---- H4 [control] the pre-existing MASTER kill-switch still disables Leg A too (THREE_ROLE_INSTRUMENT_OFF=1
+#      over a FRESH untracked-artifact fixture — a second task so H3's commit cannot mask it). Leg A carries
+#      no bypass flag of its OWN by design; this proves the one pre-existing escape still reaches it. ----
+printf '## ELI5\nplan2\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_H/.ai-workspace/plans/1509h2-plan.md"
+mk_sub "$TAGSID" hp2; mk_sub "$TAGSID" hr2; mk_sub "$TAGSID" he2; mk_sub "$TAGSID" hv2
+appendL --session "$TAGSID" --task 1509h2 --role planner          --agent hp2 --artifact "$GITROOT_H/.ai-workspace/plans/1509h2-plan.md"
+appendL --session "$TAGSID" --task 1509h2 --role plan-review       --agent hr2 --artifact "$GITROOT_H/.ai-workspace/reviews/1509h-rev.md"
+appendL --session "$TAGSID" --task 1509h2 --role executor          --agent he2 --artifact "PR #1509h2"
+appendL --session "$TAGSID" --task 1509h2 --role execution-review  --agent hv2 --artifact "$GITROOT_H/.ai-workspace/reviews/1509h-rev.md"
+CAP=$(printf '%s' '{"session_id":"'"$TAGSID"'","tool_input":{"taskId":"1509h2","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1509.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "[control] 1509-H4: THREE_ROLE_INSTRUMENT_OFF=1 (whole-family master switch) over an untracked-Leg-A fixture -> allow silent" \
+  || bad "1509-H4 master kill-switch failed (rc=$RC out=$CAP)"
+rm -rf "$GITROOT_H" 2>/dev/null
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

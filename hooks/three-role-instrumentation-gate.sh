@@ -42,39 +42,20 @@
 # dogfood gates already use.
 #
 # Fail-open on any missing/unparseable state (no metadata.model_run / no card / unreadable) — mirrors the
-# siblings. Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1, SHIP_PIPELINE=1.
+# siblings. Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1, SHIP_PIPELINE=1 — EXCEPT #1509's Leg A (tracked-ness),
+# which deliberately does NOT honor SHIP_PIPELINE=1 (see the dedicated block below) and carries no bypass flag
+# of its own; only THREE_ROLE_INSTRUMENT_OFF=1 (the whole-family master switch) silences it.
 # Reference: hooks/dogfood-artifact-gate.sh (resolve_path + parse mirrored), parent-claude.md Invariant #6,
 # skills/issue-to-ship/references/3role-perf-log-template.md (the cited card's shape).
 
 INPUT=$(cat)
 
-# Kill-switches (consistent with sibling hooks).
+# Master kill-switch only (consistent with sibling hooks) — disables the WHOLE instrumentation gate family,
+# Leg A (#1509) included. SHIP_PIPELINE is deliberately NOT checked here any more: #1509 Leg A (tracked-ness)
+# must fire regardless of SHIP_PIPELINE (see the dedicated block below), so the payload must be PARSED before
+# any SHIP_PIPELINE short-circuit exists — the family's SHIP_PIPELINE exemption is now applied AFTER Leg A,
+# once TASKID/SESSION/MODELRUN are known (moved down from its old position right after this line).
 [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
-[ "${SHIP_PIPELINE:-}" = "1" ] && exit 0
-
-# #1276 vacuous-oracle guard: opt the ledger `check` calls into rejecting an execution-review oracle that
-# exists + carries a PASS token but is VACUOUS (0 real assertions — all-trivially-true / bare-verdict /
-# echo-only). The classifier lives in the synced helper (the only place the oracle path is resolved+read);
-# this hook just passes the opt-in flag, gated by the feature kill-switch. The master kill-switch /
-# SHIP_PIPELINE already short-circuited above. Empty -> no flag (today's exists+PASS acceptance).
-VAC_FLAG="--reject-vacuous-oracle"
-[ "${VACUOUS_ORACLE_OFF:-}" = "1" ] && VAC_FLAG=""
-
-# #1448 per-role MODEL-POLICY leg: opt the tagged-path ledger `check` into enforcing each role's ACTUAL
-# transcript model (message.model — forgery-resistant) against cc-roles.env. This is a LOAD-BEARING true block
-# (exit 2 denies the completion), not an advisory: the seam can deny and the signal cannot be forged. The model
-# logic lives in the synced helper (check --enforce-role-models); this hook just passes the opt-in flag, gated
-# by the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 (the helper honors it internally too). No config resolved
-# => the helper skips enforcement entirely (fail-safe — all-Opus is the safe default we must not false-block).
-# Master THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE already short-circuited above. Empty -> no flag.
-# #1458 piggybacks on this SAME flag: when a role's tier matches AND a concrete CC_TIER_<TIER>_VERSION (or
-# CC_ROLE_<ROLE>_MODEL_VERSION override) pin is configured, the helper ALSO asserts the transcript model
-# equals the pin (assert-latest / fail-on-drift) and emits a `MODEL-VERSION:` problem on mismatch — routed
-# below to block_version, distinct from block_model. A dedicated CC_ROLE_VERSION_GATE_OFF=1 disables ONLY that
-# version sub-leg (CC_ROLE_MODEL_GATE_OFF=1 above still disables the whole model+version leg). No pin
-# configured for a tier/role => the version sub-leg is DORMANT for it (no behavior change, no false-block).
-MODEL_FLAG="--enforce-role-models"
-[ "${CC_ROLE_MODEL_GATE_OFF:-}" = "1" ] && MODEL_FLAG=""
 
 # Parse the update payload (node = the dep already required by sibling hooks).
 #   STATUS    — tool_input.status
@@ -146,6 +127,78 @@ MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD
 # Only completions matter; anything else (delete / in_progress / metadata edit / unparseable) -> allow.
 [ "$STATUS" = "completed" ] || exit 0
 [ -n "$TASKID" ] && [ "$TASKID" != "-" ] || exit 0
+
+# ── #1509 Leg A (tracked-ness) — SHIP_PIPELINE-PROOF, runs BEFORE the family's SHIP_PIPELINE exemption ────
+# Round-3 review hardening requirement: the rest of this gate family exempts itself under SHIP_PIPELINE=1 (see
+# below). If Leg A inherited that exemption unchanged, performing a tagged close INSIDE the ship pipeline would
+# skip the tracked-ness check entirely — making SHIP_PIPELINE=1 a de-facto bypass of the exact #861/#1509 leak
+# this plan closes. So Leg A is evaluated HERE, before the family's SHIP_PIPELINE short-circuit, and does NOT
+# honor SHIP_PIPELINE at all. Scoped like every other ledger leg below: only a TAGGED completion (MODELRUN
+# non-empty) with a resolvable SESSION is in scope — an untagged completion is handled by the separate
+# untagged-path branch further down (unaffected by this leg). Fail-OPEN when the ledger helper is unavailable
+# (mirrors the file's existing HELPER-absence discipline) or when the ledger check reports anything OTHER than
+# a "TRACKED:"-prefixed problem (a missing-role / forged-agentId problem here is the EXISTING ledger leg's to
+# report below, with its richer per-role message — Leg A only owns the tracked-ness verdict). No grace/bypass
+# flag on this leg by design (parent-claude.md #1509: a `*_OFF` here would reopen the leak) — the only escapes
+# are (a) git add + commit the cited artifact, or (b) the pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 above
+# (which disables the whole family, not a Leg-A-specific bypass).
+# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
+  LEDGER_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
+else
+  LEDGER_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
+fi
+if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
+  if [ -f "$LEDGER_HELPER" ]; then
+    TRACKED_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" --enforce-tracked-artifacts 2>&1)"; TRC=$?
+    case "$TRACKED_OUT" in
+      *TRACKED:*)
+        {
+          echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+          echo "  tracked-ness leg FAILED (Leg A, #1509 — SHIP_PIPELINE does NOT exempt this leg): $TRACKED_OUT"
+          echo "  A tagged 3-role completion's planner / plan-review / execution-review artifacts must be GIT-TRACKED, not"
+          echo "  merely present on disk (the #861 class, 6 recurrences — a reviewer's Bash cwd is the PRIMARY clone, not"
+          echo "  the PR worktree, so a bare relative artifact path lands untracked and never ships with the PR)."
+          echo "  executor is exempt from this leg BY ROLE (its legitimate artifact is a PR URL / sha / branch string)."
+          echo "  Fix: git add + commit the cited artifact (from a Rule-12 worktree), then re-complete. This leg has NO"
+          echo "  grace/bypass flag by design — not even SHIP_PIPELINE=1 skips it (adding one would reopen the leak)."
+          echo "  Master kill-switch (disables the WHOLE instrumentation gate, not just this leg): THREE_ROLE_INSTRUMENT_OFF=1."
+        } >&2
+        exit 2
+        ;;
+      *) : ;;   # not this leg's problem (missing role / forged agentId / etc.) -> the ledger leg below reports it.
+    esac
+  fi
+fi
+
+# Kill-switch for the REST of the family (perf-card, role-presence, model-policy, cairn, outcome-eval legs) —
+# Leg A above deliberately does NOT honor this (see its own comment block).
+[ "${SHIP_PIPELINE:-}" = "1" ] && exit 0
+
+# #1276 vacuous-oracle guard: opt the ledger `check` calls into rejecting an execution-review oracle that
+# exists + carries a PASS token but is VACUOUS (0 real assertions — all-trivially-true / bare-verdict /
+# echo-only). The classifier lives in the synced helper (the only place the oracle path is resolved+read);
+# this hook just passes the opt-in flag, gated by the feature kill-switch. The master kill-switch /
+# SHIP_PIPELINE already short-circuited above. Empty -> no flag (today's exists+PASS acceptance).
+VAC_FLAG="--reject-vacuous-oracle"
+[ "${VACUOUS_ORACLE_OFF:-}" = "1" ] && VAC_FLAG=""
+
+# #1448 per-role MODEL-POLICY leg: opt the tagged-path ledger `check` into enforcing each role's ACTUAL
+# transcript model (message.model — forgery-resistant) against cc-roles.env. This is a LOAD-BEARING true block
+# (exit 2 denies the completion), not an advisory: the seam can deny and the signal cannot be forged. The model
+# logic lives in the synced helper (check --enforce-role-models); this hook just passes the opt-in flag, gated
+# by the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 (the helper honors it internally too). No config resolved
+# => the helper skips enforcement entirely (fail-safe — all-Opus is the safe default we must not false-block).
+# Master THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE already short-circuited above. Empty -> no flag.
+# #1458 piggybacks on this SAME flag: when a role's tier matches AND a concrete CC_TIER_<TIER>_VERSION (or
+# CC_ROLE_<ROLE>_MODEL_VERSION override) pin is configured, the helper ALSO asserts the transcript model
+# equals the pin (assert-latest / fail-on-drift) and emits a `MODEL-VERSION:` problem on mismatch — routed
+# below to block_version, distinct from block_model. A dedicated CC_ROLE_VERSION_GATE_OFF=1 disables ONLY that
+# version sub-leg (CC_ROLE_MODEL_GATE_OFF=1 above still disables the whole model+version leg). No pin
+# configured for a tier/role => the version sub-leg is DORMANT for it (no behavior change, no false-block).
+MODEL_FLAG="--enforce-role-models"
+[ "${CC_ROLE_MODEL_GATE_OFF:-}" = "1" ] && MODEL_FLAG=""
 
 # DISCRIMINATOR (objective): a TAGGED 3-role run carries metadata.model_run -> the tagged perf-card + ledger
 # legs below. UNTAGGED completions (no model_run) are NO LONGER blanket-allowed (#1098 — that opt-in seam is
@@ -343,13 +396,10 @@ esac
 # test-oracle:<path> that exists. The flat sibling helper encapsulates the check; same kill-switches above.
 # Fail-OPEN (allow, note it) only when the helper or the session id is unavailable — never silently brick
 # a tagged completion if the helper symlink is missing; the perf-card leg already passed by this point.
-# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
-# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
-  LEDGER_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
-else
-  LEDGER_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
-fi
+# ($LEDGER_HELPER is resolved once, near the top of the script — reused here so #1509's Leg A block and this
+# leg share ONE resolution site, which also keeps the plugin-sync HELPER_RE transform correct: it only
+# relabels a bare `LEDGER_HELPER=/HELPER=/UHELPER=` assignment, so introducing a differently-named variable
+# here would silently port un-relabeled and resolve to the wrong path inside the plugin.)
 # SESSION-absence FAILS CLOSED: a legit tagged 3-role run ALWAYS carries a session_id, so a tagged completion
 # with no usable session cannot have its ledger verified. Without this block the whole ledger leg would be
 # skipped and the gate would collapse to the forgeable perf-card check (the #970-review bypass). Blocking on a

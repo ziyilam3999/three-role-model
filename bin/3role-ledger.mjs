@@ -49,6 +49,22 @@
 //     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
 //     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
 //     promotes a missing stamp to a BLOCK.
+//   check --session S --task T --enforce-tracked-artifacts                                    (#1509)
+//     Leg A — TRACKED, not merely present. Opt-in (base `check` stays existence-only — ~29% of the real
+//     .ai-workspace/plans+reviews backlog is present-but-untracked today, so making this the DEFAULT would
+//     brick most closes; only the completion-time instrumentation gate passes this flag). For the THREE
+//     disk-path roles (planner, plan-review, execution-review) whose base check already resolved a real
+//     on-disk artifact (or oracle) path: HARD-BLOCKs (a "TRACKED:" problem, => exit 2) when that path exists
+//     on disk but is NOT git-tracked (`git ls-files --error-unmatch` over the file's own containing repo —
+//     exit 0/staged = tracked, exit 1 = untracked => BLOCK, any other exit e.g. 128/no-repo => can't-tell =>
+//     fail-open, never a false block on an environment hiccup). executor is EXEMPT from Leg A, keyed on
+//     ROLE (its legitimate artifact is a PR URL / sha / branch, never existence/tracked-checked) — but when
+//     the executor row resolves to an EXISTING disk path anyway (the #1494 shape: a PR-ref-shaped role citing
+//     a plan file), that is SURFACED as a "NOTE-EXECUTOR:" line (never a block — a 62/246-task measured-false
+//     invariant means artifact_path alone cannot distinguish #1494's mis-citation from 62 shipped conventions;
+//     kind/authorship discrimination is #1532). No grace/bypass flag on this leg by design (a `*_OFF` here
+//     would reopen the #1509 leak); the ONLY escapes are (a) `git add`+commit the cited artifact, or (b) the
+//     pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 that already disables the whole gate family.
 //   resolve-agent --session S --task T --role R
 //     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
 //     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
@@ -156,7 +172,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const HOME = os.homedir();
 const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude', '3role-ledger');
@@ -926,6 +942,75 @@ function checkRole(role, e, session, opts) {
   return null;
 }
 
+// ── #1509 Leg A — TRACKED, not merely present ────────────────────────────────────────────────────────────
+// The #861 class (6 recurrences): a reviewer's Bash cwd is the PRIMARY clone, not the PR worktree, so a
+// disk-path artifact lands present-but-untracked and never ships with the PR — yet today's `check` only
+// tests EXISTENCE (fileExists/resolveArtifact), which a present-but-untracked file passes. Leg A adds the
+// missing test: is the cited path actually git-tracked (or staged)? `git ls-files --error-unmatch` run with
+// `-C <the file's own containing directory>` so git auto-discovers whichever repo the artifact actually
+// lives in (works identically from the primary clone or any worktree). Exit 0 => tracked/staged => true;
+// exit 1 => a real "not known to git" verdict => false; any OTHER exit (128 not-a-repo, spawn error, missing
+// git binary) => can't-tell => null => the caller fails OPEN (never a false block on an environment hiccup —
+// mirrors every other can't-tell residual in this file).
+function isGitTracked(absPath) {
+  try {
+    const dir = path.dirname(absPath);
+    const res = spawnSync('git', ['-C', dir, 'ls-files', '--error-unmatch', '--', absPath], { encoding: 'utf8' });
+    if (res.error) return null;
+    if (res.status === 0) return true;
+    if (res.status === 1) return false;
+    return null;   // 128 (not a repo) or anything unexpected -> can't-tell -> fail-open.
+  } catch (e) { return null; }
+}
+
+// The three roles whose artifact is a disk path (planner, plan-review, execution-review) — Leg A is
+// role-keyed HARD on exactly these; executor is exempt BY ROLE (its legitimate artifact is a PR URL / sha /
+// branch string), never by guessing at the value's shape.
+const TRACKED_ROLES = ['planner', 'plan-review', 'execution-review'];
+
+// Resolve the disk path Leg A should tracked-check for one of the TRACKED_ROLES entry, mirroring exactly
+// what checkRole() already resolves for that role (oracle wins for execution-review, else artifact_path).
+// Returns '' when there is no resolvable on-disk path for this role (nothing for Leg A to check — the base
+// existence leg already reports that as its own problem; Leg A never duplicates it).
+function resolveDiskPathForRole(role, e) {
+  if (role === 'execution-review') {
+    if (e.oracle) return resolveArtifact(stripOraclePrefix(e.oracle));
+    if (e.artifact_path) return resolveArtifact(e.artifact_path);
+    return '';
+  }
+  return resolveArtifact(e.artifact_path || '');
+}
+
+// Leg A per-role check. Returns null when satisfied (not a TRACKED_ROLES role, inline-skipped, no resolvable
+// disk path, or genuinely tracked/can't-tell), else a "TRACKED:"-prefixed problem string.
+function checkTrackedRole(role, e) {
+  if (!TRACKED_ROLES.includes(role)) return null;   // executor exemption + non-disk-path roles.
+  if (classifySkip(e).skip) return null;             // inline-skip has no artifact to tracked-check.
+  const ap = resolveDiskPathForRole(role, e);
+  if (!ap) return null;                              // no resolvable disk path -> the existence leg's problem, not Leg A's.
+  if (isGitTracked(ap) === false) {
+    return role + ' artifact "' + ap + '" exists on disk but is NOT git-tracked (present-but-untracked — it ' +
+      'will never ship with the PR; the #861/#1509 class, 6 recurrences). git add + commit it (from a Rule-12 ' +
+      'worktree), then re-complete.';
+  }
+  return null;   // tracked, staged, or can't-tell (fail-open) -> satisfied.
+}
+
+// #1509 — the executor-cites-a-disk-path SURFACED NOTE (never a hard block; the #1494 shape). A measured
+// sweep of 246 real ledgers found executor==planner in 62 of them (a live, coexisting, doctrine-sanctioned
+// convention alongside the newer PR-URL citation) — so artifact_path alone cannot distinguish #1494's
+// mis-citation from those 62 shipped chains; that discrimination needs KIND/authorship inference, which is
+// #1532's own scope. This just makes the signal VISIBLE instead of silently dropped.
+function executorDiskPathNote(e) {
+  if (!e) return null;
+  const raw = String(e.artifact_path == null ? '' : e.artifact_path).trim();
+  if (!raw) return null;
+  const ap = resolveArtifact(raw);
+  if (!ap) return null;   // not an existing disk path (PR URL / branch / sha) -> nothing to surface.
+  return 'executor artifact_path "' + raw + '" resolves to a DISK PATH (' + ap + ') rather than a PR/commit/' +
+    'branch reference (the #1494 shape) — lower-fidelity, not blocked; kind/authorship verification is #1532.';
+}
+
 // OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
 // path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
 // `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
@@ -1196,9 +1281,26 @@ function cmdCheck(o) {
   if (requireProv) {
     for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
   }
+  // #1509 Leg A — TRACKED, not merely present. Opt-in via --enforce-tracked-artifacts (only the completion
+  // gate passes it; base `check` stays existence-only — AC-3). Role-keyed HARD block for the three disk-path
+  // roles; executor is exempt by role but its disk-path row (if any) is surfaced as a NOTE, never blocked.
+  const executorNotes = [];
+  if ('enforce-tracked-artifacts' in o) {
+    for (const role of REQUIRED_ROLES) {
+      const e = byRole[role];
+      if (!e) continue;   // missing-role already reported by the base existence leg above.
+      const tp = checkTrackedRole(role, e);
+      if (tp) problems.push('TRACKED: ' + tp);
+    }
+    const execNote = executorDiskPathNote(byRole['executor']);
+    if (execNote) executorNotes.push(execNote);
+  }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
   if (resumeNotes.length) {
     console.log('NOTE: ' + resumeNotes.join(' | '));
+  }
+  if (executorNotes.length) {
+    console.log('NOTE-EXECUTOR: ' + executorNotes.join(' | '));
   }
   if (provenanceFlags.length) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
@@ -1375,6 +1477,7 @@ try {
     console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
+      '[--enforce-tracked-artifacts (check, #1509)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)]');
     process.exit(2);
   }
