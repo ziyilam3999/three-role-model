@@ -49,6 +49,22 @@
 //     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
 //     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
 //     promotes a missing stamp to a BLOCK.
+//   check --session S --task T --enforce-tracked-artifacts                                    (#1509)
+//     Leg A — TRACKED, not merely present. Opt-in (base `check` stays existence-only — ~29% of the real
+//     .ai-workspace/plans+reviews backlog is present-but-untracked today, so making this the DEFAULT would
+//     brick most closes; only the completion-time instrumentation gate passes this flag). For the THREE
+//     disk-path roles (planner, plan-review, execution-review) whose base check already resolved a real
+//     on-disk artifact (or oracle) path: HARD-BLOCKs (a "TRACKED:" problem, => exit 2) when that path exists
+//     on disk but is NOT git-tracked (`git ls-files --error-unmatch` over the file's own containing repo —
+//     exit 0/staged = tracked, exit 1 = untracked => BLOCK, any other exit e.g. 128/no-repo => can't-tell =>
+//     fail-open, never a false block on an environment hiccup). executor is EXEMPT from Leg A, keyed on
+//     ROLE (its legitimate artifact is a PR URL / sha / branch, never existence/tracked-checked) — but when
+//     the executor row resolves to an EXISTING disk path anyway (the #1494 shape: a PR-ref-shaped role citing
+//     a plan file), that is SURFACED as a "NOTE-EXECUTOR:" line (never a block — a 62/246-task measured-false
+//     invariant means artifact_path alone cannot distinguish #1494's mis-citation from 62 shipped conventions;
+//     kind/authorship discrimination is #1532). No grace/bypass flag on this leg by design (a `*_OFF` here
+//     would reopen the #1509 leak); the ONLY escapes are (a) `git add`+commit the cited artifact, or (b) the
+//     pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 that already disables the whole gate family.
 //   resolve-agent --session S --task T --role R
 //     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
 //     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
@@ -156,7 +172,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const HOME = os.homedir();
 const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude', '3role-ledger');
@@ -354,6 +370,85 @@ function transcriptModel(session, agentId) {
     if (last) return last;
   }
   return '';
+}
+
+// ── #1512 RESUME-BOUNDARY DETECTOR ───────────────────────────────────────────────────────────────────────
+// A SendMessage resume discards a role's spawn-time model pin (measured: `.ai-workspace/research/
+// 2026-07-10-1512-resume-hook-edge-probe.md`) — the resumed subagent silently re-inherits the SESSION model,
+// which can land on a MORE capable tier than the role's policy (e.g. an Opus-orchestrator resuming a sonnet
+// executor). The completion-time gate needs to tell that apart from a genuinely-wrong spawn. The harness marks
+// a resume delivery with an UNFORGEABLE shape in the role's OWN transcript: a `type:"user"` record with
+// `isMeta:true` and `origin.kind==="coordinator"` (verified on-disk against the real #1494 executor transcript,
+// record 540: "The coordinator sent a message while you were working: ..."). The orchestrator cannot fabricate
+// this record — it is authored by the harness at delivery time, the same trust boundary transcriptModel()
+// already relies on for `message.model`.
+//
+// Returns { hasResume, preResumeModel, lastModel }:
+//   hasResume       — true iff >=1 resume-delivery record exists anywhere in the transcript.
+//   preResumeModel  — the LAST assistant `message.model` seen strictly BEFORE the FIRST resume boundary (the
+//                     "what the role was actually running as before ANY rework tap" reading — multi-resume
+//                     sequences anchor here, per the plan's "compare final-observed against the spawn/
+//                     pre-first-resume model that matched policy" rule, not the model before the LAST resume).
+//   lastModel       — the same value transcriptModel() would return for this agentId (computed in the same
+//                     pass to avoid a second file read); '' if no assistant message.model line exists.
+// Fails open to { hasResume:false, preResumeModel:'', lastModel:'' } on any missing/unreadable file — mirrors
+// transcriptModel()'s can't-tell contract.
+function resumeBoundaryModels(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  const empty = { hasResume: false, preResumeModel: '', lastModel: '' };
+  if (!aid) return empty;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return empty; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let firstResumeSeen = false;
+    let preResumeModel = '';
+    let lastModel = '';
+    let sawAnyLine = false;
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (!j) continue;
+      sawAnyLine = true;
+      // #1512 AC-0 live probe (2026-07-10): a resume delivery's `origin.kind` varies by WHO issued the
+      // SendMessage — 'coordinator' for a top-level-orchestrator resume (the real #1494 shape, verified
+      // on-disk), 'peer' for an agent-to-agent resume (verified live this run, probe agent a4bd765511486c4ba
+      // record 7). Both are the SAME harness-authored resume-delivery shape (type:"user", isMeta:true, a
+      // non-empty origin.kind) — match on the SHAPE, not a single hardcoded kind, so a peer-issued resume is
+      // not silently invisible to this detector.
+      if (!firstResumeSeen && j.type === 'user' && j.isMeta === true && j.origin && typeof j.origin.kind === 'string' && j.origin.kind) {
+        firstResumeSeen = true;
+      }
+      if (j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+        lastModel = j.message.model;
+        if (!firstResumeSeen) preResumeModel = j.message.model;
+      }
+    }
+    if (sawAnyLine) return { hasResume: firstResumeSeen, preResumeModel, lastModel };
+  }
+  return empty;
+}
+
+// #1512 CAPABILITY ordering (used ONLY to decide a STRICT quality up-tier for the resume-reroute arm below).
+// `fable` is deliberately EXCLUDED from this map (plan-review N4: fable is high-quality but NOT cost-monotonic
+// — ~2x Opus — so it must never be folded into a numeric rank other tiers get compared against). A resumed
+// role landing on `fable` is instead handled as an unconditional up-tier in isResumeUpTier() below, kept
+// syntactically SEPARATE from this ordering rather than assigned a rank inside it.
+const CAPABILITY_RANK = { haiku: 1, sonnet: 2, opus: 3 };
+
+// True iff `actual` is a STRICTLY more capable tier than `expected` — i.e. safe to allow-with-note when it
+// arises from a resume (never used to permit a non-resume mismatch; the caller only invokes this inside the
+// resume-boundary branch). `actual === 'fable'` is always true (see CAPABILITY_RANK comment above); otherwise
+// both tiers must be known ranks and actual's rank must exceed expected's.
+function isResumeUpTier(expected, actual) {
+  if (actual === 'fable') return true;
+  const er = CAPABILITY_RANK[expected];
+  const ar = CAPABILITY_RANK[actual];
+  return !!er && !!ar && ar > er;
 }
 
 // ── #1494 EFFECTIVE-TIER SENSOR ──────────────────────────────────────────────────────────────────────────
@@ -847,6 +942,75 @@ function checkRole(role, e, session, opts) {
   return null;
 }
 
+// ── #1509 Leg A — TRACKED, not merely present ────────────────────────────────────────────────────────────
+// The #861 class (6 recurrences): a reviewer's Bash cwd is the PRIMARY clone, not the PR worktree, so a
+// disk-path artifact lands present-but-untracked and never ships with the PR — yet today's `check` only
+// tests EXISTENCE (fileExists/resolveArtifact), which a present-but-untracked file passes. Leg A adds the
+// missing test: is the cited path actually git-tracked (or staged)? `git ls-files --error-unmatch` run with
+// `-C <the file's own containing directory>` so git auto-discovers whichever repo the artifact actually
+// lives in (works identically from the primary clone or any worktree). Exit 0 => tracked/staged => true;
+// exit 1 => a real "not known to git" verdict => false; any OTHER exit (128 not-a-repo, spawn error, missing
+// git binary) => can't-tell => null => the caller fails OPEN (never a false block on an environment hiccup —
+// mirrors every other can't-tell residual in this file).
+function isGitTracked(absPath) {
+  try {
+    const dir = path.dirname(absPath);
+    const res = spawnSync('git', ['-C', dir, 'ls-files', '--error-unmatch', '--', absPath], { encoding: 'utf8' });
+    if (res.error) return null;
+    if (res.status === 0) return true;
+    if (res.status === 1) return false;
+    return null;   // 128 (not a repo) or anything unexpected -> can't-tell -> fail-open.
+  } catch (e) { return null; }
+}
+
+// The three roles whose artifact is a disk path (planner, plan-review, execution-review) — Leg A is
+// role-keyed HARD on exactly these; executor is exempt BY ROLE (its legitimate artifact is a PR URL / sha /
+// branch string), never by guessing at the value's shape.
+const TRACKED_ROLES = ['planner', 'plan-review', 'execution-review'];
+
+// Resolve the disk path Leg A should tracked-check for one of the TRACKED_ROLES entry, mirroring exactly
+// what checkRole() already resolves for that role (oracle wins for execution-review, else artifact_path).
+// Returns '' when there is no resolvable on-disk path for this role (nothing for Leg A to check — the base
+// existence leg already reports that as its own problem; Leg A never duplicates it).
+function resolveDiskPathForRole(role, e) {
+  if (role === 'execution-review') {
+    if (e.oracle) return resolveArtifact(stripOraclePrefix(e.oracle));
+    if (e.artifact_path) return resolveArtifact(e.artifact_path);
+    return '';
+  }
+  return resolveArtifact(e.artifact_path || '');
+}
+
+// Leg A per-role check. Returns null when satisfied (not a TRACKED_ROLES role, inline-skipped, no resolvable
+// disk path, or genuinely tracked/can't-tell), else a "TRACKED:"-prefixed problem string.
+function checkTrackedRole(role, e) {
+  if (!TRACKED_ROLES.includes(role)) return null;   // executor exemption + non-disk-path roles.
+  if (classifySkip(e).skip) return null;             // inline-skip has no artifact to tracked-check.
+  const ap = resolveDiskPathForRole(role, e);
+  if (!ap) return null;                              // no resolvable disk path -> the existence leg's problem, not Leg A's.
+  if (isGitTracked(ap) === false) {
+    return role + ' artifact "' + ap + '" exists on disk but is NOT git-tracked (present-but-untracked — it ' +
+      'will never ship with the PR; the #861/#1509 class, 6 recurrences). git add + commit it (from a Rule-12 ' +
+      'worktree), then re-complete.';
+  }
+  return null;   // tracked, staged, or can't-tell (fail-open) -> satisfied.
+}
+
+// #1509 — the executor-cites-a-disk-path SURFACED NOTE (never a hard block; the #1494 shape). A measured
+// sweep of 246 real ledgers found executor==planner in 62 of them (a live, coexisting, doctrine-sanctioned
+// convention alongside the newer PR-URL citation) — so artifact_path alone cannot distinguish #1494's
+// mis-citation from those 62 shipped chains; that discrimination needs KIND/authorship inference, which is
+// #1532's own scope. This just makes the signal VISIBLE instead of silently dropped.
+function executorDiskPathNote(e) {
+  if (!e) return null;
+  const raw = String(e.artifact_path == null ? '' : e.artifact_path).trim();
+  if (!raw) return null;
+  const ap = resolveArtifact(raw);
+  if (!ap) return null;   // not an existing disk path (PR URL / branch / sha) -> nothing to surface.
+  return 'executor artifact_path "' + raw + '" resolves to a DISK PATH (' + ap + ') rather than a PR/commit/' +
+    'branch reference (the #1494 shape) — lower-fidelity, not blocked; kind/authorship verification is #1532.';
+}
+
 // OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
 // path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
 // `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
@@ -1040,6 +1204,9 @@ function cmdCheck(o) {
   // mismatch pushes a MODEL-POLICY: problem (=> exit 2). Fable->Opus silent reroute (expected fable, actual
   // opus) is OK-with-note. Also honors the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 internally (belt &
   // suspenders: the gate already strips the flag, but a direct `check --enforce-role-models` must skip too).
+  // #1512 — resume-induced quality up-tier NOTEs (allowed, never silent — AC-3). Populated below, printed
+  // near the end alongside PROVENANCE (only reachable when the loop below does NOT push a BLOCK problem).
+  const resumeNotes = [];
   if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
     const { found, cfg } = loadRoleConfig();
     if (found) {
@@ -1071,6 +1238,29 @@ function cmdCheck(o) {
           continue;
         }
         if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+        // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
+        // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
+        // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
+        // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy. Anything that
+        // fails any of these three (a down-tier, a non-resume mismatch, or a resume whose pre-resume model
+        // ALSO didn't match policy) falls straight through to the hard BLOCK below — AC-2's scope guard.
+        if (isResumeUpTier(expected, actual)) {
+          const rb = resumeBoundaryModels(session, e.agentId);
+          if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
+            let note = 'RESUME-UPTIER: role ' + role + ' was resumed via SendMessage (not respawned) — its ' +
+              'transcript shows model ' + (rb.preResumeModel || '<none>') + ' (matching policy ' + expected +
+              ') BEFORE the resume boundary and ' + actualId + ' (' + actual + ') AFTER it. A resume-induced ' +
+              'up-tier is allowed-with-note: it preserves the resumed agent\'s accumulated context (the whole ' +
+              'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
+              'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+            if (actual === 'fable') {
+              note += ' FABLE-COST-CLIFF: Fable\'s subsidised usage bar expires ~July 7-8; after that a ' +
+                'Fable reroute bills out-of-pocket (~2x Opus) — surfaced here so the cost is never hidden.';
+            }
+            resumeNotes.push(note);
+            continue;
+          }
+        }
         problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
           ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
           ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
@@ -1091,7 +1281,27 @@ function cmdCheck(o) {
   if (requireProv) {
     for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
   }
+  // #1509 Leg A — TRACKED, not merely present. Opt-in via --enforce-tracked-artifacts (only the completion
+  // gate passes it; base `check` stays existence-only — AC-3). Role-keyed HARD block for the three disk-path
+  // roles; executor is exempt by role but its disk-path row (if any) is surfaced as a NOTE, never blocked.
+  const executorNotes = [];
+  if ('enforce-tracked-artifacts' in o) {
+    for (const role of REQUIRED_ROLES) {
+      const e = byRole[role];
+      if (!e) continue;   // missing-role already reported by the base existence leg above.
+      const tp = checkTrackedRole(role, e);
+      if (tp) problems.push('TRACKED: ' + tp);
+    }
+    const execNote = executorDiskPathNote(byRole['executor']);
+    if (execNote) executorNotes.push(execNote);
+  }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  if (resumeNotes.length) {
+    console.log('NOTE: ' + resumeNotes.join(' | '));
+  }
+  if (executorNotes.length) {
+    console.log('NOTE-EXECUTOR: ' + executorNotes.join(' | '));
+  }
   if (provenanceFlags.length) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
       ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
@@ -1267,6 +1477,7 @@ try {
     console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
+      '[--enforce-tracked-artifacts (check, #1509)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)]');
     process.exit(2);
   }

@@ -382,6 +382,99 @@ CC_ROLES_ENV="$MFABO" node "$LED" resolve-role-model --role orchestrator 2>"$TMP
   && ok "M9 orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-COST-CLIFF warnings" || bad "M9 fable-on-orchestrator warnings missing (err=$(cat "$TMP/mfab.err"))"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1512 — resume-induced quality UP-TIER allow-with-note (completion-time arm), on a DEDICATED fixture
+# (mk_sub_resume, NEVER mk_sub_model) so a resume-boundary marker + a SECOND assistant model line are both
+# present. AC-2's scope guard requires the DANGEROUS direction (down-tier) and any NON-resume mismatch to
+# stay hard-blocked; AC-3 requires the allowance to be a machine-checkable NOTE, never silent.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# mk_sub_resume $session $agentId $preResumeModelId $postResumeModelId [$originKind]
+# Writes: a plain user line, an assistant line at $preResumeModelId, a resume-boundary marker
+# (type:"user", isMeta:true, origin.kind=$originKind — defaults to "coordinator", matching the real #1494
+# shape; the fix's detector also accepts "peer", verified live in the AC-0 probe artifact), then an
+# assistant line at $postResumeModelId. transcriptModel() reads the LAST assistant line (post-resume);
+# resumeBoundaryModels() reads BOTH (pre-resume anchor + hasResume).
+mk_sub_resume() {
+  local origin_kind="${5:-coordinator}"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  { printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$3";
+    printf '{"type":"user","isMeta":true,"agentId":"%s","origin":{"kind":"%s"},"message":{"role":"user","content":"The coordinator sent a message while you were working: ...NEEDS-WORK..."}}\n' "$2" "$origin_kind";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$4"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+# build a complete 4-role ledger with the executor transcript carrying a resume boundary:
+# model_ledger_resume <session> <task> <pre-model-id> <post-model-id> [origin-kind]
+model_ledger_resume() {
+  mk_sub "$1" mP; mk_sub "$1" mR; mk_sub_resume "$1" mE "$3" "$4" "${5:-coordinator}"; mk_sub "$1" mV
+  node "$LED" append --session "$1" --task "$2" --role planner         --agent mP --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role plan-review      --agent mR --artifact "$TMP/rev.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role executor         --agent mE --artifact "PR #9" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role execution-review --agent mV --artifact "$TMP/rev.md" >/dev/null
+}
+
+# R1. [proof] RED-then-GREEN: resume-induced UP-tier (executor pre-resume=sonnet matches policy, post-resume
+#     =opus, real resume boundary present) -> check --enforce-role-models exits 0 WITH a machine-checkable
+#     resume-reroute NOTE (AC-1 treatment shape + AC-3). This is the SYNTHETIC analogue of the real #1494
+#     transcript already exercised directly against pre-fix/post-fix code (see the executor's PR description
+#     for that live RED->GREEN run); here it proves the SAME shape is reachable from a hermetic fixture.
+model_ledger_resume msUP 9301 "claude-sonnet-5" "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUP --task 9301 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -qi "executor"; } \
+  && ok "[proof] R1 resume-induced up-tier (sonnet->opus, real boundary) -> exit 0 + RESUME-UPTIER NOTE (AC-1/AC-3)" \
+  || bad "R1 resume up-tier should allow-with-note (rc=$RC out=$OUT)"
+
+# R2. [proof] Same fixture, origin.kind="peer" (the second real shape the AC-0 probe surfaced) -> same
+#     allowance. Proves the detector matches the SHAPE (isMeta:true + non-empty origin.kind), not a
+#     hardcoded "coordinator" literal.
+model_ledger_resume msUPP 9302 "claude-sonnet-5" "claude-opus-4-8" "peer"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUPP --task 9302 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER"; } \
+  && ok "[proof] R2 resume-induced up-tier via origin.kind=peer -> exit 0 + NOTE (detector matches shape, not a literal)" \
+  || bad "R2 peer-origin resume up-tier should allow-with-note (rc=$RC out=$OUT)"
+
+# R3. [control] resume-induced DOWN-tier (pre-resume=opus matches an opus policy, post-resume=sonnet, real
+#     resume boundary present) -> MUST stay hard-blocked (AC-2's dangerous-direction guard). Uses a DEDICATED
+#     opus-policy config so pre-resume genuinely matches policy.
+MCFG_OPUS="$TMP/mcfg-opus.env"; printf 'CC_ROLE_EXECUTOR_MODEL=opus\n' > "$MCFG_OPUS"
+model_ledger_resume msDOWN 9303 "claude-opus-4-8" "claude-sonnet-5"
+OUT=$(CC_ROLES_ENV="$MCFG_OPUS" node "$LED" check --session msDOWN --task 9303 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R3 resume-induced DOWN-tier (opus->sonnet, real boundary) -> STILL exit 2 BLOCK (AC-2)" \
+  || bad "R3 resume down-tier must stay blocked, not allowed (rc=$RC out=$OUT)"
+
+# R4. [control] NON-resume mismatch (no resume boundary at all, plain mk_sub_model) -> MUST stay hard-blocked
+#     (AC-2's second guard: a resume boundary being ABSENT means the up-tier arm can never fire even though
+#     the observed tier IS a strict up-tier over policy).
+model_ledger msNORESUME 9304 "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msNORESUME --task 9304 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R4 non-resume mismatch (no boundary, same up-tier direction) -> STILL exit 2 BLOCK (AC-2, unchanged from M1)" \
+  || bad "R4 non-resume mismatch must stay blocked (rc=$RC out=$OUT)"
+
+# R5. [control] resume boundary present but PRE-resume model did NOT match policy either (a genuinely wrong
+#     spawn that ALSO got resumed) -> MUST stay hard-blocked — the up-tier arm requires the pre-resume model
+#     to have matched policy, proving the mismatch is resume-CAUSED, not a pre-existing wrong spawn.
+model_ledger_resume msWRONGSPAWN 9305 "claude-haiku-4-0" "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msWRONGSPAWN --task 9305 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R5 resume boundary present but pre-resume ALSO mismatched policy -> STILL exit 2 BLOCK (AC-2)" \
+  || bad "R5 pre-resume-mismatched-too case must stay blocked (rc=$RC out=$OUT)"
+
+# R6. [proof] FABLE sub-case (AC-3): resume-induced up-tier landing on fable -> NOTE carries the
+#     FABLE-COST-CLIFF substring in addition to the RESUME-UPTIER token (never hides the cost).
+model_ledger_resume msUPFAB 9306 "claude-sonnet-5" "claude-fable-1"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUPFAB --task 9306 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -q "FABLE-COST-CLIFF"; } \
+  && ok "[proof] R6 resume-induced up-tier landing on fable -> NOTE carries FABLE-COST-CLIFF (AC-3)" \
+  || bad "R6 fable sub-case must carry FABLE-COST-CLIFF in the NOTE (rc=$RC out=$OUT)"
+
+# R7. KILL-SWITCH: RED up-tier fixture but CC_ROLE_MODEL_GATE_OFF=1 -> exit 0 (whole leg off, no NOTE needed
+#     since the leg never ran).
+OUT=$(CC_ROLE_MODEL_GATE_OFF=1 CC_ROLES_ENV="$MCFG" node "$LED" check --session msUP --task 9301 --enforce-role-models 2>&1); RC=$?
+[ "$RC" = "0" ] && ok "R7 CC_ROLE_MODEL_GATE_OFF=1 over resume up-tier fixture -> exit 0 (kill-switch)" \
+  || bad "R7 kill-switch should allow (rc=$RC out=$OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1458 — MODEL-VERSION sub-leg (assert-latest / fail-on-drift), on a DEDICATED fixture (MVER_*, NEVER MCFG).
 # FIXTURE ISOLATION (the trap): MCFG (used by M1-M9 above) MUST STAY PIN-FREE — adding a CC_TIER_SONNET_VERSION
 # pin to MCFG would flip the pre-existing pin-free msGREEN "claude-sonnet-4-6" arm (M2) to exit 2. So every
@@ -650,5 +743,111 @@ OUT=$(node "$LED" check --session "$RSID" --task 1495f 2>&1); RC=$?
 { [ "$RC" = "2" ] && echo "$OUT" | grep -qi "missing execution-review"; } \
   && ok "[control] L-MISSING-REQUIRED-HARD-BLOCKS: missing execution-review + present research -> still BLOCK" \
   || bad "[control] L-MISSING-REQUIRED-HARD-BLOCKS failed (rc=$RC out=$OUT)"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1509 — Leg A (tracked-ness, HARD block for planner/plan-review/execution-review) + the executor-
+# disk-path SURFACED NOTE (never a block). Fixtures live inside a DEDICATED scratch git repo (mktemp -d +
+# `git init`) so `git ls-files --error-unmatch` produces REAL tracked/untracked verdicts — $TMP itself is
+# NOT a git repo (every OTHER artifact fixture in this file lives there and can-not-tell/fail-opens Leg A,
+# which is exactly why those pre-existing ALLOW cases above are unaffected by this addition).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+GITROOT="$(mktemp -d)"
+( cd "$GITROOT" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$GITROOT/.ai-workspace/plans" "$GITROOT/.ai-workspace/reviews"
+
+# Frozen-#1515-shaped fixture bodies (synthetic content, real headings so PLAN_RE/VERDICT_RE resolve) — the
+# real #1515 ticket (6th recurrence of the #861 class) shipped a PR while its three disk-path role artifacts
+# sat present-but-untracked on master; this reproduces that exact shape hermetically.
+printf '## ELI5\nfrozen #1515-shaped plan copy\n### Binary AC\n- AC1\n' > "$GITROOT/.ai-workspace/plans/1515-plan.md"
+printf '## Review\nverdict: PASS\n' > "$GITROOT/.ai-workspace/reviews/1515-planreview.md"
+printf '## Review\nverdict: PASS\n' > "$GITROOT/.ai-workspace/reviews/1515-execreview.md"
+
+TSID="sess-1509-tracked"
+mk_sub "$TSID" tp1; mk_sub "$TSID" tr1; mk_sub "$TSID" te1; mk_sub "$TSID" tv1
+node "$LED" append --session "$TSID" --task 1509red --role planner --agent tp1 --artifact "$GITROOT/.ai-workspace/plans/1515-plan.md" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role plan-review --agent tr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role executor --agent te1 --artifact "PR #1515" >/dev/null
+node "$LED" append --session "$TSID" --task 1509red --role execution-review --agent tv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+
+# 1509-AC1 RED: all three disk-path artifacts EXIST but are UNTRACKED (never `git add`-ed) -> the gated leg
+# exits non-zero and NAMES the untracked roles.
+OUT=$(node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "TRACKED:" && echo "$OUT" | grep -qi "planner" && echo "$OUT" | grep -qi "plan-review" && echo "$OUT" | grep -qi "execution-review"; } \
+  && ok "[proof] 1509-AC1 RED: frozen-#1515-shaped untracked fixture -> --enforce-tracked-artifacts exit 2, names untracked roles" \
+  || bad "1509-AC1 RED failed (rc=$RC out=$OUT)"
+
+# 1509-AC3 control: base `check` WITHOUT the flag, on the SAME untracked fixture -> still exit 0
+# (existence-only, unchanged — the ~161 untracked historical artifacts and every non-gate caller must not break).
+OUT=$(node "$LED" check --session "$TSID" --task 1509red 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[control] 1509-AC3: base check WITHOUT the flag on the SAME untracked fixture -> still exit 0 (no base regression)" \
+  || bad "1509-AC3 base-check-unaffected failed (rc=$RC out=$OUT)"
+
+# 1509-AC7 sanity: the SAME RED fixture with SHIP_PIPELINE=1 exported -> the ledger CLI's Leg A still exits 2
+# (this flag is never consulted by the node helper at all — the SHIP_PIPELINE exemption logic lives entirely
+# in the hook shell script; the substantive proof that the HOOK does not route around Leg A under
+# SHIP_PIPELINE=1 is in hooks/three-role-instrumentation-gate-smoke-test.sh, cases 1509-H1/H2).
+OUT=$(SHIP_PIPELINE=1 node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-AC7 sanity: SHIP_PIPELINE=1 exported -> ledger CLI Leg A still exits 2 (env var not consulted here)" \
+  || bad "1509-AC7 ledger-CLI sanity failed (rc=$RC out=$OUT)"
+
+# 1509-AC1 GREEN: git add + commit the SAME three paths -> --enforce-tracked-artifacts now exits 0.
+( cd "$GITROOT" && git add .ai-workspace/plans/1515-plan.md .ai-workspace/reviews/1515-planreview.md .ai-workspace/reviews/1515-execreview.md && git commit -q -m "fixture: freeze #1515 artifacts" )
+OUT=$(node "$LED" check --session "$TSID" --task 1509red --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1509-AC1 GREEN: same three paths committed -> --enforce-tracked-artifacts exit 0" \
+  || bad "1509-AC1 GREEN failed (rc=$RC out=$OUT)"
+
+# 1509-AC1 EXECUTOR ROLE-KEYED EXEMPTION: executor row carries a present-but-UNTRACKED disk path, the other
+# three roles TRACKED -> the tracked-leg does NOT name executor and does not block on it (exit 0).
+printf '## ELI5\nexecutor mis-cited plan copy\n### Binary AC\n- AC1\n' > "$GITROOT/.ai-workspace/plans/1509-exec-note.md"
+TSID2="sess-1509-execexempt"
+mk_sub "$TSID2" ep1; mk_sub "$TSID2" er1; mk_sub "$TSID2" ee1; mk_sub "$TSID2" ev1
+node "$LED" append --session "$TSID2" --task 1509ex --role planner --agent ep1 --artifact "$GITROOT/.ai-workspace/plans/1515-plan.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role plan-review --agent er1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role executor --agent ee1 --artifact "$GITROOT/.ai-workspace/plans/1509-exec-note.md" >/dev/null
+node "$LED" append --session "$TSID2" --task 1509ex --role execution-review --agent ev1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID2" --task 1509ex --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1509-AC1 EXECUTOR-EXEMPT: executor's own untracked disk path is NOT named/blocked by Leg A (role-keyed exemption)" \
+  || bad "1509-AC1 executor-exempt failed (rc=$RC out=$OUT)"
+{ echo "$OUT" | grep -q "NOTE-EXECUTOR:" && echo "$OUT" | grep -qi "1509-exec-note.md"; } \
+  && ok "[proof] 1509-AC2 SURFACE: executor's disk-path row is SURFACED as a NOTE-EXECUTOR (never a block)" \
+  || bad "1509-AC2 executor NOTE not surfaced (out=$OUT)"
+
+# 1509-AC2 GREEN (plan-review==planner collision, tracked): the real doctrine-sanctioned shape (44/246 real
+# ledgers measured, e.g. #1477/#1481/#1466 — review roles self-write their `## Review` marker INTO the plan)
+# -> --enforce-tracked-artifacts exits 0, NO spurious duplication/plan-review problem (the plan REJECTS any
+# cross-role-duplication hard block as a measured-false invariant; this proves it is not walled).
+COLLIDE="$GITROOT/.ai-workspace/plans/1509-collide-plan.md"
+printf '## ELI5\ncollision plan\n### Binary AC\n- AC1\n## Review\nverdict: PASS\n' > "$COLLIDE"
+( cd "$GITROOT" && git add .ai-workspace/plans/1509-collide-plan.md && git commit -q -m "fixture: collision plan (tracked)" )
+TSID3="sess-1509-collide-pr"
+mk_sub "$TSID3" cp1; mk_sub "$TSID3" ce1; mk_sub "$TSID3" cv1
+node "$LED" append --session "$TSID3" --task 1509pr --role planner --agent cp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role plan-review --agent cp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role executor --agent ce1 --artifact "PR #1509" >/dev/null
+node "$LED" append --session "$TSID3" --task 1509pr --role execution-review --agent cv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID3" --task 1509pr --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1509-AC2 GREEN: plan-review==planner (doctrine-sanctioned collision, tracked) -> exit 0, NOT blocked" \
+  || bad "1509-AC2 plan-review==planner should not block (rc=$RC out=$OUT)"
+
+# 1509-AC2 GREEN (executor==planner collision, tracked): the #1494-shaped historical convention (62/246 real
+# chains measured, e.g. #1494/#1420/#1414 — the executor self-cites the planner's plan file) -> exit 0, NOT
+# blocked; the executor row is SURFACED as a NOTE-EXECUTOR (never silently dropped, never a hard block).
+TSID4="sess-1509-collide-ex"
+mk_sub "$TSID4" xp1; mk_sub "$TSID4" xr1; mk_sub "$TSID4" xv1
+node "$LED" append --session "$TSID4" --task 1509ex2 --role planner --agent xp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role plan-review --agent xr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role executor --agent xp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID4" --task 1509ex2 --role execution-review --agent xv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-artifacts 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -q "NOTE-EXECUTOR:" && echo "$OUT" | grep -qi "1509-collide-plan.md"; } \
+  && ok "[proof] 1509-AC2 GREEN: executor==planner (#1494-shaped historical convention, tracked) -> exit 0, NOT blocked, NOTE-EXECUTOR surfaces the executor row" \
+  || bad "1509-AC2 executor==planner should not block + must surface NOTE (rc=$RC out=$OUT)"
+rm -rf "$GITROOT" 2>/dev/null
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
