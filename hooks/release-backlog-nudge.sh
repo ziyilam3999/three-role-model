@@ -55,9 +55,18 @@
 # HEAD only (a Stop hook must never `git fetch`) — an unpushed local commit still counts
 # as unreleased, which is the correct advisory direction.
 
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
 set +e
 
-[ "${RELEASE_BACKLOG_OFF:-}" = "1" ] && exit 0
+if [ "${RELEASE_BACKLOG_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "release-backlog-nudge" "RELEASE_BACKLOG_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
 
 # RELEASE_BACKLOG_REPOS UNSET => generic (all ~/coding_projects/ primary clones).
 # SET (even empty) => narrow to the listed basenames.

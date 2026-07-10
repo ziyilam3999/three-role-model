@@ -805,7 +805,10 @@ function lineIsRealEvidence(line) {
 // binary-ish content.
 function isVacuousOracle(filePath) {
   try {
-    if (process.env.VACUOUS_ORACLE_OFF === '1') return false;   // belt-and-suspenders kill-switch.
+    if (process.env.VACUOUS_ORACLE_OFF === '1') {   // belt-and-suspenders kill-switch.
+      writeBypassLog('3role-ledger-isVacuousOracle', 'VACUOUS_ORACLE_OFF', 'PERMIT');
+      return false;
+    }
     const raw = fs.readFileSync(filePath, 'utf8');
     // Binary-ish / unparseable bytes (NUL present) -> cannot classify a script -> FAIL-OPEN.
     if (raw.indexOf('\u0000') >= 0) return false;
@@ -896,6 +899,9 @@ function checkRole(role, e, session, opts) {
       // #1276: a PASS that asserts nothing is not a PASS. When the gate opts in (and the feature kill-switch
       // is not set), reject a positively-vacuous oracle. The classifier fails OPEN, so this NEVER blocks on
       // a parse error — only on a file proven to carry zero real-evidence lines.
+      if (opts && opts.rejectVacuousOracle && process.env.VACUOUS_ORACLE_OFF === '1') {
+        writeBypassLog('3role-ledger-execution-review-oracle', 'VACUOUS_ORACLE_OFF', 'PERMIT');
+      }
       if (opts && opts.rejectVacuousOracle && process.env.VACUOUS_ORACLE_OFF !== '1' && isVacuousOracle(op)) {
         return 'execution-review oracle "' + op + '" is vacuous — 0 real assertions (all-trivially-true / ' +
           'bare-verdict / echo-only); a PASS that asserts nothing is not a PASS. Add a REAL check (an assert ' +
@@ -1207,6 +1213,9 @@ function cmdCheck(o) {
   // #1512 — resume-induced quality up-tier NOTEs (allowed, never silent — AC-3). Populated below, printed
   // near the end alongside PROVENANCE (only reachable when the loop below does NOT push a BLOCK problem).
   const resumeNotes = [];
+  if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF === '1') {
+    writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_MODEL_GATE_OFF', 'PERMIT');
+  }
   if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
     const { found, cfg } = loadRoleConfig();
     if (found) {
@@ -1219,6 +1228,9 @@ function cmdCheck(o) {
         // version sub-leg's fail-closed-on-can't-tell can fire even on the TIER can't-tell path below.
         const expected = roleModelFromCfg(cfg, role);
         const pin = roleVersionFromCfg(cfg, role, expected);
+        if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
+          writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
+        }
         const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
         const actualId = transcriptModel(session, e.agentId);   // concrete id, '' if no assistant model line
         const actual = modelIdToTier(actualId);                 // tier, '' if empty/unknown-prefix
@@ -1461,6 +1473,164 @@ function cmdResolveEffectiveTier(o) {
   process.exit(0);
 }
 
+// ── #1543 log-bypass — the single shared WRITE-TIME attributed bypass-audit path ───────────────────────
+// Every ai-brain hook that reads a `*_OVERRIDE`/`*_OFF` kill-switch and honors it routes through THIS
+// subcommand instead of hand-rolling its own `echo ... >> .rule-12-overrides.log` line (the ~21 legacy
+// writers) or staying silent (the ~61 readers that logged nothing — the #1543 core defect). One JSONL
+// record per exercised bypass: `{ts,session,agent,task,role,hook,var,decision}` — see
+// docs/rule-12-overrides-log-schema.md for the published shape.
+//
+// CLI surface (AC-4 / N5 — STRUCTURAL privacy enforcement): `log-bypass --hook H --var V --decision
+// PERMIT|DENY [--session S] [--agent-id A] [--agent-type T]`. There is NO `--cmd` / command / positional
+// parameter ANYWHERE on this subcommand — raw command text is UNREACHABLE by construction, not merely
+// "not currently passed". When session/agent-id/agent-type are omitted, the CLI best-effort reads them
+// from a JSON payload on STDIN (mirroring the hook's own PreToolUse payload, which the bash wrapper
+// `hook_log_bypass` in lib-hook-override.sh pipes through unmodified) — but the STDIN parse below reads
+// ONLY the three keys `session_id`/`agent_id`/`agent_type`; it never references `tool_input` or any
+// command-bearing field, so piping a full raw hook payload (which DOES contain `tool_input.command` for
+// a Bash hook) still cannot leak command text — the parser structurally never looks at that key.
+//
+// Attribution (AC-0a/AC-0b, live-captured 2026-07-11 — see
+// .ai-workspace/research/2026-07-11-1543-in-subagent-pretooluse-bash-payload-capture.md):
+//   - `agent_id` PRESENT  -> subagent-originated. Locate the dedicated per-agent transcript
+//     `<PROJECTS_ROOT>/<slug>/<session>/subagents/agent-<agent_id>.jsonl` (the exact file
+//     `agentResolves()`/`resolveAgent()` already target — mirrors, does not reuse, since the direction is
+//     inverted: agentId -> task/role, not task/role -> agentId). Parse ONLY that file's FIRST JSONL
+//     record's `message.content` text (never a raw whole-file grep — the parent transcript AND a
+//     whole-file scan of the subagent transcript are both measured-polluted with historical/doc-example
+//     `3ROLE_TASK:... ROLE:...` text re-injected on later turns; the tag is unambiguous only in the
+//     original dispatch message). Regex `3ROLE_TASK:(\S+) ROLE:(\S+)` against that text. Match -> stamp
+//     the real task/role. No match / file missing -> fall back to the untagged-subagent sentinel
+//     (task:"", role:"") — NEVER fabricate a role for a subagent whose dispatch prompt carried no tag.
+//   - `agent_id` ABSENT -> main-session/orchestrator event (measured discriminator, #1494 + this
+//     capture). Stamped IMMEDIATELY as the orchestrator sentinel (task:"", role:"orchestrator") — the
+//     transcript is NEVER parsed for a tag on this path (that is what keeps the doc/memory pollution
+//     above from ever reaching a main-session record, not just an optimization).
+function readStdinJSON() {
+  try {
+    if (process.stdin.isTTY) return null;
+    const raw = fs.readFileSync(0, 'utf8');
+    if (!raw || !raw.trim()) return null;
+    const d = JSON.parse(raw);
+    // Structural privacy enforcement: extract ONLY these three keys. Do not reference d.tool_input or
+    // any other field anywhere in this function — that is what makes raw command text unreachable even
+    // when a full raw hook payload is piped in.
+    return {
+      session_id: d.session_id != null ? String(d.session_id) : '',
+      agent_id: d.agent_id != null ? String(d.agent_id) : '',
+      agent_type: d.agent_type != null ? String(d.agent_type) : '',
+    };
+  } catch (e) { return null; }
+}
+
+// Parse ONLY message.content text of the subagent transcript's FIRST record for the live 3ROLE_TASK tag.
+function tagFromSubagentTranscript(session, agentId) {
+  const sess = sanitize(session);
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!sess || !aid) return null;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return null; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    if (!fileExists(f)) continue;
+    let firstLine;
+    try {
+      const content = fs.readFileSync(f, 'utf8');
+      firstLine = content.split('\n').find((l) => l.trim());
+    } catch (e) { continue; }
+    if (!firstLine) continue;
+    let rec;
+    try { rec = JSON.parse(firstLine); } catch (e) { continue; }
+    const msg = (rec && rec.message) || {};
+    let text = '';
+    if (typeof msg.content === 'string') text = msg.content;
+    else if (Array.isArray(msg.content)) {
+      for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+    }
+    const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
+    if (m) return { task: m[1], role: m[2] };
+  }
+  return null;
+}
+
+function rule12LogPath() {
+  return process.env.RULE12_LOG || path.join(HOME, '.claude', '.rule-12-overrides.log');
+}
+
+// #1543 — internal (in-process, non-exiting) sibling of cmdLogBypass for this file's OWN bypass-var
+// reads (e.g. the `check --enforce-role-models` kill-switches below). Those call sites are a direct
+// CLI/library invocation with no PreToolUse hook payload to read session/agent context from — same
+// honest "no Claude Code session context" case as post-commit-auto-push.sh's native-git-hook path —
+// so they correctly fall to the orchestrator sentinel (AC-8: never a fabricated role). Best-effort,
+// never throws — a logging failure must never affect the caller's gate decision.
+function writeBypassLog(hookName, varName, decision) {
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      session: '',
+      agent: '',
+      task: '',
+      role: 'orchestrator',
+      hook: sanitize(hookName),
+      var: String(varName || '').replace(/[^A-Za-z0-9_]/g, ''),
+      decision: (String(decision).toUpperCase() === 'DENY') ? 'DENY' : 'PERMIT',
+    };
+    const logPath = rule12LogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) { /* best-effort — never throws, never blocks the caller */ }
+}
+
+// #1543 AC-4/N5: the ONLY key set ever written — a positional/`--cmd` param does not exist on this CLI,
+// so there is no code path that could add a command-text key even if a caller tried to smuggle one in.
+function cmdLogBypass(o) {
+  const hookName = sanitize(o.hook || '');
+  const varName = String(o.var || '').replace(/[^A-Za-z0-9_]/g, '');
+  const decision = (String(o.decision || '').toUpperCase() === 'DENY') ? 'DENY' : 'PERMIT';
+  if (!hookName || !varName) {
+    console.log('BLOCK: log-bypass requires --hook and --var');
+    process.exit(2);
+  }
+  const stdinPayload = readStdinJSON();
+  const session = o.session || (stdinPayload && stdinPayload.session_id) || '';
+  const agentId = o['agent-id'] || (stdinPayload && stdinPayload.agent_id) || '';
+  const agentType = o['agent-type'] || (stdinPayload && stdinPayload.agent_type) || '';
+
+  let task = '', role = '';
+  if (agentId) {
+    const tag = tagFromSubagentTranscript(session, agentId);
+    if (tag) { task = tag.task; role = tag.role; }
+    // else: subagent-originated but untagged -> task/role stay "" (distinguishable from a real role,
+    // never fabricated; distinct from the orchestrator sentinel because `agent` is still non-empty).
+  } else {
+    role = 'orchestrator';
+  }
+
+  const record = {
+    ts: new Date().toISOString(),
+    session: sanitize(session),
+    agent: String(agentId || '').replace(/[^0-9A-Za-z_-]/g, ''),
+    task: sanitize(task),
+    role: sanitize(role) || (agentId ? '' : 'orchestrator'),
+    hook: hookName,
+    var: varName,
+    decision,
+  };
+  const logPath = rule12LogPath();
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) {
+    console.log('WARN: log-bypass could not write ' + logPath + ': ' + (e && e.message ? e.message : e));
+    process.exit(0); // logging must never block the caller's gate — fail-open
+  }
+  console.log('OK: logged ' + hookName + '/' + varName + ' -> ' + logPath);
+  process.exit(0);
+  // (agentType is intentionally unused beyond availability for a future soft-fallback; keeping it
+  // resolved-but-unused documents that it WAS considered, per the AC-0a capture's agent_type field.)
+  void agentType;
+}
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
@@ -1473,12 +1643,14 @@ try {
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
+  else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|log-bypass> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts (check, #1509)] ' +
-      '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)]');
+      '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
+      '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)]');
     process.exit(2);
   }
 } catch (e) {

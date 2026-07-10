@@ -41,11 +41,23 @@
 # Reference: parent-claude.md Invariant #6, hooks/3role-ledger.mjs (append + overlay-merge), the plan
 # `.ai-workspace/plans/2026-06-24-1185-1187-spawn-ledger-hooks.md`.
 
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
 INPUT=$(cat)
 
 # Kill-switches.
-[ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
-[ "${THREE_ROLE_SPAWN_LEDGER_OFF:-}" = "1" ] && exit 0
+if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-spawn-ledger" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
+if [ "${THREE_ROLE_SPAWN_LEDGER_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-spawn-ledger" "THREE_ROLE_SPAWN_LEDGER_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
 
 command -v node >/dev/null 2>&1 || exit 0
 
