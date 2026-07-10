@@ -490,6 +490,126 @@ runC 12702 sC12 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "C12 ledger has no usable artifact -> both legs fall back to convention dir -> ALLOW" || bad "C12 should allow via convention fallback (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1518 — cairn: RECEIPT SHAPE-TOLERANCE (decoration-prefix, still line-anchored). Widens all THREE #1269
+# check-sites (4a plan grep ~L449, 4b review-file grep ~L468, 4b in-plan awk ~L471) to recognize a receipt
+# decorated with a leading markdown prefix (bullet -/*/+, blockquote >, backtick, bold **, w/ leading
+# whitespace) written on its OWN line, while a mid-sentence prose mention must still BLOCK (anti-vacuity
+# power test per #1533) -- independently at EACH separately-authored surface (S7/S10/S13). S1-S4/S8/S11 are
+# the RED->GREEN decorated-ALLOW set (blocked under the pre-fix anchored-plain-only regex, allowed post-fix);
+# S5-S7/S9-S10/S12-S13 are stable-block/allow guards whose verdict is IDENTICAL pre- and post-fix -- they
+# prove the widening did not become vacuous (an unanchored `cairn:`-anywhere fix would wrongly ALLOW S7/S10/S13).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat >> "$TMP/perf-1269.md" <<EOF
+## rounds for #12703 #12704 #12705 #12706 #12707 #12708 #12709 #12710 #12711 #12712 #12713 #12714 #12715
+EOF
+
+# ---- S1 (AC1, RED->GREEN). 4a plan's ONLY receipt is a decorated BULLET: '- cairn: "hit"' -> ALLOW post-fix ----
+ledger_complete sS1 12703; D="$TMP/s1"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n- cairn: "hit"\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS1 --task 12703 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12703 sS1 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC1: decorated-4a bullet '- cairn:' -> ALLOW" || bad "AC1 decorated-4a bullet should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S2 (AC1, RED->GREEN). 4a plan's ONLY receipt is decorated with an inline-code BACKTICK -> ALLOW post-fix ----
+ledger_complete sS2 12704; D="$TMP/s2"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n`cairn: "hit"`\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS2 --task 12704 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12704 sS2 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC1: decorated-4a backtick '\`cairn:\`' -> ALLOW" || bad "AC1 decorated-4a backtick should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S3 (AC1, RED->GREEN). 4a plan's ONLY receipt is decorated BOLD: '**cairn:** "hit"' -> ALLOW post-fix ----
+ledger_complete sS3 12705; D="$TMP/s3"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n**cairn:** "hit"\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS3 --task 12705 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12705 sS3 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC1: decorated-4a bold '**cairn:**' -> ALLOW" || bad "AC1 decorated-4a bold should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S4 (AC2, RED->GREEN). 4a plan's ONLY receipt is leading-whitespace + BLOCKQUOTE combo: '  > cairn: "hit"' ----
+ledger_complete sS4 12706; D="$TMP/s4"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n  > cairn: "hit"\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS4 --task 12706 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12706 sS4 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC2: 4a whitespace+blockquote combo '  > cairn:' -> ALLOW" || bad "AC2 4a whitespace+blockquote combo should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S5 (AC3, stable-allow, no regression). 4a plan's receipt is PLAIN 'cairn: "hit"' -> ALLOW pre- AND post-fix ----
+ledger_complete sS5 12707; D="$TMP/s5"; mkplan "$D" yes
+appendL --session sS5 --task 12707 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12707 sS5 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC3: plain-4a-still-passes (no regression) -> ALLOW" || bad "AC3 plain-4a-still-passes should allow (rc=$RC out=$CAP)"
+
+# ---- S6 (AC4, stable-block, anti-vacuity). 4a plan has NO cairn: line at all -> BLOCK pre- AND post-fix ----
+ledger_complete sS6 12708; D="$TMP/s6"; mkplan "$D" no
+appendL --session sS6 --task 12708 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12708 sS6 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4: absent-4a-still-blocks (no cairn: line) -> BLOCK" || bad "AC4 absent-4a-still-blocks should block (rc=$RC out=$CAP)"
+
+# ---- S7 (AC5, stable-block, LINE-ANCHOR POWER TEST for the 4a grep regex, #1533). 4a plan's ONLY occurrence of
+#      the token is MID-SENTENCE PROSE (not line-leading) -> BLOCK pre- AND post-fix. Proves the widening did NOT
+#      become anywhere-in-line: an unanchored fix would wrongly ALLOW this. ----
+ledger_complete sS7 12709; D="$TMP/s7"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\nAs noted the cairn: entry says X\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS7 --task 12709 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12709 sS7 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC5: mid-prose-4a-still-blocks (line-anchor power test) -> BLOCK" || bad "AC5 mid-prose-4a-still-blocks should block (rc=$RC out=$CAP)"
+
+# ---- S8 (AC6a, RED->GREEN). 4a plan valid (plain cairn:); 4b SEPARATE reviews/<id>.md's ONLY receipt is a
+#      decorated bullet -> ALLOW post-fix (blocked pre-fix). ----
+ledger_complete sS8 12710; D="$TMP/s8"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\n- cairn: "reviewer hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/12710.md"
+appendL --session sS8 --task 12710 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS8 --task 12710 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12710.md"
+runC 12710 sS8 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC6a: 4b-review-file-decorated '- cairn:' -> ALLOW" || bad "AC6a 4b-review-file-decorated should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S9 (AC6b, stable-block). 4a plan valid; 4b SEPARATE review file has NO cairn: line -> BLOCK pre- AND post-fix ----
+ledger_complete sS9 12711; D="$TMP/s9"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\nverdict: PASS\nno citation\n' > "$D/.ai-workspace/reviews/12711.md"
+appendL --session sS9 --task 12711 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS9 --task 12711 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12711.md"
+runC 12711 sS9 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC6b: 4b-review-file-absent-blocks (no cairn: line) -> BLOCK" || bad "AC6b 4b-review-file-absent-blocks should block (rc=$RC out=$CAP)"
+
+# ---- S10 (AC6c [B2], stable-block, LINE-ANCHOR POWER TEST for the SEPARATELY-authored 4b review-file grep
+#      regex, #1533). 4a plan valid; 4b SEPARATE review file's ONLY cairn: token is MID-PROSE -> BLOCK pre- AND
+#      post-fix. AC5/S7 never routes through $AREVIEW -- without this the 4b-file surface has no power test. ----
+ledger_complete sS10 12712; D="$TMP/s10"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\nDecision: PASS -- as noted the cairn: search returned hits\n' > "$D/.ai-workspace/reviews/12712.md"
+appendL --session sS10 --task 12712 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS10 --task 12712 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12712.md"
+runC 12712 sS10 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC6c[B2]: 4b-review-file-mid-prose-blocks (line-anchor power test) -> BLOCK" || bad "AC6c[B2] 4b-review-file-mid-prose-blocks should block (rc=$RC out=$CAP)"
+
+# ---- S11 (AC7a, RED->GREEN). planner->plan w/ plain cairn:, plan-review->SAME plan file (AREVIEW==APLAN -> awk
+#      route); ## Review section's ONLY receipt is a decorated bullet -> ALLOW post-fix (blocked pre-fix). ----
+ledger_complete sS11 12713; D="$TMP/s11"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\n- cairn: "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS11 --task 12713 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS11 --task 12713 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+runC 12713 sS11 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "AC7a: 4b-in-plan-awk-decorated '- cairn:' -> ALLOW" || bad "AC7a 4b-in-plan-awk-decorated should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S12 (AC7b, stable-block, #1269 invariant). planner->plan w/ cairn:, awk route; ## Review section carries
+#      NO reviewer receipt (only the planner's top-of-file line, which must NEVER satisfy 4b) -> BLOCK pre- AND
+#      post-fix. Cannot prove the anchor survived (blocks regardless) -- S13 is the real anchor oracle. ----
+ledger_complete sS12 12714; D="$TMP/s12"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "planner hit only"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\nno reviewer citation\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS12 --task 12714 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS12 --task 12714 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+runC 12714 sS12 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC7b: 4b-in-plan-awk-section-absent-blocks (planner line only) -> BLOCK" || bad "AC7b 4b-in-plan-awk-section-absent-blocks should block (rc=$RC out=$CAP)"
+
+# ---- S13 (AC7c [B1, PRIMARY], stable-block, LINE-ANCHOR POWER TEST for the grep-invisible awk regex, #1533).
+#      planner->plan w/ cairn:, awk route; ## Review section's ONLY in-section cairn: token is MID-PROSE -> BLOCK
+#      pre- AND post-fix. A widened-but-UNANCHORED awk pattern (e.g. r&&/[Cc]airn:/, ^ dropped) would wrongly
+#      ALLOW this -- this is the ONLY case with power to catch that (S12 blocks regardless of the anchor). ----
+ledger_complete sS13 12715; D="$TMP/s13"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS -- as noted the cairn: search returned hits\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS13 --task 12715 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS13 --task 12715 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+runC 12715 sS13 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC7c[B1]: 4b-in-plan-awk-mid-prose-blocks (anchor power test) -> BLOCK" || bad "AC7c[B1] 4b-in-plan-awk-mid-prose-blocks should block (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1276 — VACUOUS-ORACLE guard. The gate now opts the ledger `check` into --reject-vacuous-oracle: an
 # execution-review oracle that EXISTS and carries a PASS token but contains ZERO real assertions
 # (all-trivially-true / bare-verdict / echo-only) is BLOCKED. Five POSITIVE-BLOCK sub-forms (incl. the two
