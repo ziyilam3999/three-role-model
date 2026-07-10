@@ -356,6 +356,85 @@ function transcriptModel(session, agentId) {
   return '';
 }
 
+// ── #1512 RESUME-BOUNDARY DETECTOR ───────────────────────────────────────────────────────────────────────
+// A SendMessage resume discards a role's spawn-time model pin (measured: `.ai-workspace/research/
+// 2026-07-10-1512-resume-hook-edge-probe.md`) — the resumed subagent silently re-inherits the SESSION model,
+// which can land on a MORE capable tier than the role's policy (e.g. an Opus-orchestrator resuming a sonnet
+// executor). The completion-time gate needs to tell that apart from a genuinely-wrong spawn. The harness marks
+// a resume delivery with an UNFORGEABLE shape in the role's OWN transcript: a `type:"user"` record with
+// `isMeta:true` and `origin.kind==="coordinator"` (verified on-disk against the real #1494 executor transcript,
+// record 540: "The coordinator sent a message while you were working: ..."). The orchestrator cannot fabricate
+// this record — it is authored by the harness at delivery time, the same trust boundary transcriptModel()
+// already relies on for `message.model`.
+//
+// Returns { hasResume, preResumeModel, lastModel }:
+//   hasResume       — true iff >=1 resume-delivery record exists anywhere in the transcript.
+//   preResumeModel  — the LAST assistant `message.model` seen strictly BEFORE the FIRST resume boundary (the
+//                     "what the role was actually running as before ANY rework tap" reading — multi-resume
+//                     sequences anchor here, per the plan's "compare final-observed against the spawn/
+//                     pre-first-resume model that matched policy" rule, not the model before the LAST resume).
+//   lastModel       — the same value transcriptModel() would return for this agentId (computed in the same
+//                     pass to avoid a second file read); '' if no assistant message.model line exists.
+// Fails open to { hasResume:false, preResumeModel:'', lastModel:'' } on any missing/unreadable file — mirrors
+// transcriptModel()'s can't-tell contract.
+function resumeBoundaryModels(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  const empty = { hasResume: false, preResumeModel: '', lastModel: '' };
+  if (!aid) return empty;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return empty; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let firstResumeSeen = false;
+    let preResumeModel = '';
+    let lastModel = '';
+    let sawAnyLine = false;
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (!j) continue;
+      sawAnyLine = true;
+      // #1512 AC-0 live probe (2026-07-10): a resume delivery's `origin.kind` varies by WHO issued the
+      // SendMessage — 'coordinator' for a top-level-orchestrator resume (the real #1494 shape, verified
+      // on-disk), 'peer' for an agent-to-agent resume (verified live this run, probe agent a4bd765511486c4ba
+      // record 7). Both are the SAME harness-authored resume-delivery shape (type:"user", isMeta:true, a
+      // non-empty origin.kind) — match on the SHAPE, not a single hardcoded kind, so a peer-issued resume is
+      // not silently invisible to this detector.
+      if (!firstResumeSeen && j.type === 'user' && j.isMeta === true && j.origin && typeof j.origin.kind === 'string' && j.origin.kind) {
+        firstResumeSeen = true;
+      }
+      if (j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+        lastModel = j.message.model;
+        if (!firstResumeSeen) preResumeModel = j.message.model;
+      }
+    }
+    if (sawAnyLine) return { hasResume: firstResumeSeen, preResumeModel, lastModel };
+  }
+  return empty;
+}
+
+// #1512 CAPABILITY ordering (used ONLY to decide a STRICT quality up-tier for the resume-reroute arm below).
+// `fable` is deliberately EXCLUDED from this map (plan-review N4: fable is high-quality but NOT cost-monotonic
+// — ~2x Opus — so it must never be folded into a numeric rank other tiers get compared against). A resumed
+// role landing on `fable` is instead handled as an unconditional up-tier in isResumeUpTier() below, kept
+// syntactically SEPARATE from this ordering rather than assigned a rank inside it.
+const CAPABILITY_RANK = { haiku: 1, sonnet: 2, opus: 3 };
+
+// True iff `actual` is a STRICTLY more capable tier than `expected` — i.e. safe to allow-with-note when it
+// arises from a resume (never used to permit a non-resume mismatch; the caller only invokes this inside the
+// resume-boundary branch). `actual === 'fable'` is always true (see CAPABILITY_RANK comment above); otherwise
+// both tiers must be known ranks and actual's rank must exceed expected's.
+function isResumeUpTier(expected, actual) {
+  if (actual === 'fable') return true;
+  const er = CAPABILITY_RANK[expected];
+  const ar = CAPABILITY_RANK[actual];
+  return !!er && !!ar && ar > er;
+}
+
 // ── #1494 EFFECTIVE-TIER SENSOR ──────────────────────────────────────────────────────────────────────────
 // The leading-edge model-policy gate (three-role-model-policy-gate.sh) used to HARDCODE the effective tier of
 // a badge-less spawn to "opus" (the documented session default). Under an Opus session that's usually right;
@@ -1040,6 +1119,9 @@ function cmdCheck(o) {
   // mismatch pushes a MODEL-POLICY: problem (=> exit 2). Fable->Opus silent reroute (expected fable, actual
   // opus) is OK-with-note. Also honors the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 internally (belt &
   // suspenders: the gate already strips the flag, but a direct `check --enforce-role-models` must skip too).
+  // #1512 — resume-induced quality up-tier NOTEs (allowed, never silent — AC-3). Populated below, printed
+  // near the end alongside PROVENANCE (only reachable when the loop below does NOT push a BLOCK problem).
+  const resumeNotes = [];
   if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
     const { found, cfg } = loadRoleConfig();
     if (found) {
@@ -1071,6 +1153,29 @@ function cmdCheck(o) {
           continue;
         }
         if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+        // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
+        // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
+        // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
+        // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy. Anything that
+        // fails any of these three (a down-tier, a non-resume mismatch, or a resume whose pre-resume model
+        // ALSO didn't match policy) falls straight through to the hard BLOCK below — AC-2's scope guard.
+        if (isResumeUpTier(expected, actual)) {
+          const rb = resumeBoundaryModels(session, e.agentId);
+          if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
+            let note = 'RESUME-UPTIER: role ' + role + ' was resumed via SendMessage (not respawned) — its ' +
+              'transcript shows model ' + (rb.preResumeModel || '<none>') + ' (matching policy ' + expected +
+              ') BEFORE the resume boundary and ' + actualId + ' (' + actual + ') AFTER it. A resume-induced ' +
+              'up-tier is allowed-with-note: it preserves the resumed agent\'s accumulated context (the whole ' +
+              'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
+              'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+            if (actual === 'fable') {
+              note += ' FABLE-COST-CLIFF: Fable\'s subsidised usage bar expires ~July 7-8; after that a ' +
+                'Fable reroute bills out-of-pocket (~2x Opus) — surfaced here so the cost is never hidden.';
+            }
+            resumeNotes.push(note);
+            continue;
+          }
+        }
         problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
           ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
           ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
@@ -1092,6 +1197,9 @@ function cmdCheck(o) {
     for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
   }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  if (resumeNotes.length) {
+    console.log('NOTE: ' + resumeNotes.join(' | '));
+  }
   if (provenanceFlags.length) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
       ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
