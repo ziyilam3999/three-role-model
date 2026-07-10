@@ -198,4 +198,55 @@ OUT3r=$(checkLED --session sAC3b --task 1100 --require-provenance); C3r=$?
   && ok "AC3 --require-provenance -> missing stamp BLOCKs (opt-in strict)" \
   || bad "AC3 require-provenance should block (C3r=$C3r out=$OUT3r)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1495 — research seat ledger-visibility (non-gating, tier-audited). Widen ONLY the explicit `ROLE:`
+# alternation at `:104` to accept `research`; the keyword-classifier (`:107-113`) gains NO research keyword.
+# Fixture bodies are deliberately keyword-clean (no "build"/"implement"/"executor"/etc — F8 fixture hygiene).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ---- [proof] S-RESEARCH (the core bug): ROLE:research + keyword-clean body -> exactly 1 research line.
+#      RED on HEAD (no `research` arm at :104, keyword-classifier has no research keyword -> exit 0, 0 rows).
+#      GREEN post-fix (n=1). RED baseline independently hand-confirmed pre-edit via git-stash probe.
+TSR=$(mk_transcript sRSCH agR "3ROLE_TASK:1495 ROLE:research"$'\n'"You are the research seat. Investigate X.")
+run "$TSR" sRSCH agR
+n=$(ledger_count sRSCH 1495 research agR)
+{ [ "$RC" = "0" ] && [ "$n" = "1" ]; } && ok "[proof] S-RESEARCH: ROLE:research tagged brief -> 1 ledger line" || bad "[proof] S-RESEARCH should write 1 research line (rc=$RC n=$n out=$CAP)"
+
+# ---- [proof] S-RESEARCH-MODEL (green side, model fields): a research brief whose transcript ALSO carries a
+#      message.model line -> the written line's modelTier + modelVersion are both non-empty (resolveModelFields
+#      reached for free once cmdAppend's guard admits research). RED on HEAD: no row at all -> nothing to grep.
+TSRM_D="$PROJROOT/proj/sRSCHM/subagents"; mkdir -p "$TSRM_D"
+node -e '
+  const fs=require("fs");
+  const lines=[
+    JSON.stringify({isSidechain:true,agentId:"agRM",sessionId:"sRSCHM",type:"user",message:{role:"user",content:"3ROLE_TASK:1495 ROLE:research\nYou are the research seat. Investigate X."}}),
+    JSON.stringify({type:"assistant",agentId:"agRM",message:{model:"claude-sonnet-5",role:"assistant",content:[]}}),
+  ];
+  fs.writeFileSync(process.argv[1], lines.join("\n")+"\n");
+' "$TSRM_D/agent-agRM.jsonl"
+run "$TSRM_D/agent-agRM.jsonl" sRSCHM agRM
+RMFILE="$LEDGERDIR/sRSCHM/1495.jsonl"
+{ [ "$RC" = "0" ] && grep -q '"role":"research"' "$RMFILE" 2>/dev/null && grep -q '"modelTier":"sonnet"' "$RMFILE" 2>/dev/null && grep -q '"modelVersion":"claude-sonnet-5"' "$RMFILE" 2>/dev/null; } \
+  && ok "[proof] S-RESEARCH-MODEL: research line carries resolved modelTier+modelVersion" \
+  || bad "[proof] S-RESEARCH-MODEL should have modelTier+modelVersion (rc=$RC file=$(cat "$RMFILE" 2>/dev/null))"
+
+# ---- [control] S-UNTAGGED-ZERO (AC8, negative guard): 3ROLE_TASK present, NO ROLE: tag, body free of the
+#      keyword-classifier tokens -> ZERO rows (research AND executor both 0). PASSES on HEAD (untagged ->
+#      classifier misses -> exit 0, 0 rows) AND post-fix (research arm only matches explicit ROLE:research —
+#      widening the alternation must NOT start writing rows for untagged spawns).
+TUNT=$(mk_transcript sUNT agU "3ROLE_TASK:1495"$'\n'"You are a helper. Investigate topic X and summarize.")
+run "$TUNT" sUNT agU
+nr=$(ledger_count sUNT 1495 research agU); ne=$(ledger_count sUNT 1495 executor agU)
+{ [ "$RC" = "0" ] && [ "$nr" = "0" ] && [ "$ne" = "0" ]; } && ok "[control] S-UNTAGGED-ZERO: no ROLE: tag -> 0 rows (research not auto-classified)" || bad "[control] S-UNTAGGED-ZERO should write nothing (rc=$RC nr=$nr ne=$ne out=$CAP)"
+
+# ---- [control] S-FOUR-UNCHANGED (regression guard): ROLE:planner still writes exactly 1 planner line;
+#      ROLE:executor stays authoritative over a "review the plan" body. PASSES on HEAD AND post-fix.
+TFP=$(mk_transcript sFOURp agFP "3ROLE_TASK:1495 ROLE:planner"$'\n'"You are the planner. Author a plan.")
+run "$TFP" sFOURp agFP
+npl=$(ledger_count sFOURp 1495 planner agFP)
+TFE=$(mk_transcript sFOURe agFE "3ROLE_TASK:1495 ROLE:executor"$'\n'"Please review the plan thoroughly before you implement.")
+run "$TFE" sFOURe agFE
+nex=$(ledger_count sFOURe 1495 executor agFE); npr=$(ledger_count sFOURe 1495 plan-review agFE)
+{ [ "$npl" = "1" ] && [ "$nex" = "1" ] && [ "$npr" = "0" ]; } && ok "[control] S-FOUR-UNCHANGED: the four roles unregressed by widening the alternation" || bad "[control] S-FOUR-UNCHANGED broken (npl=$npl nex=$nex npr=$npr)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

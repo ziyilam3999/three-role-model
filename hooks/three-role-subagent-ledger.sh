@@ -103,7 +103,7 @@ read -r TASKID ROLE SELFAUTH < <(
     if (!mTask) process.exit(0);                 // untagged subagent -> no-op (parent prints "")
     const taskId = mTask[1];
     let role="";
-    const mRole = brief.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
+    const mRole = brief.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research)/i);
     if (mRole) { role = mRole[1].toLowerCase(); }
     else {
       // keyword-classify (CORROBORATION only) — longest/most-specific match first.
