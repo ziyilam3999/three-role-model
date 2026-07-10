@@ -382,6 +382,99 @@ CC_ROLES_ENV="$MFABO" node "$LED" resolve-role-model --role orchestrator 2>"$TMP
   && ok "M9 orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-COST-CLIFF warnings" || bad "M9 fable-on-orchestrator warnings missing (err=$(cat "$TMP/mfab.err"))"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1512 — resume-induced quality UP-TIER allow-with-note (completion-time arm), on a DEDICATED fixture
+# (mk_sub_resume, NEVER mk_sub_model) so a resume-boundary marker + a SECOND assistant model line are both
+# present. AC-2's scope guard requires the DANGEROUS direction (down-tier) and any NON-resume mismatch to
+# stay hard-blocked; AC-3 requires the allowance to be a machine-checkable NOTE, never silent.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# mk_sub_resume $session $agentId $preResumeModelId $postResumeModelId [$originKind]
+# Writes: a plain user line, an assistant line at $preResumeModelId, a resume-boundary marker
+# (type:"user", isMeta:true, origin.kind=$originKind — defaults to "coordinator", matching the real #1494
+# shape; the fix's detector also accepts "peer", verified live in the AC-0 probe artifact), then an
+# assistant line at $postResumeModelId. transcriptModel() reads the LAST assistant line (post-resume);
+# resumeBoundaryModels() reads BOTH (pre-resume anchor + hasResume).
+mk_sub_resume() {
+  local origin_kind="${5:-coordinator}"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  { printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$3";
+    printf '{"type":"user","isMeta":true,"agentId":"%s","origin":{"kind":"%s"},"message":{"role":"user","content":"The coordinator sent a message while you were working: ...NEEDS-WORK..."}}\n' "$2" "$origin_kind";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$4"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+# build a complete 4-role ledger with the executor transcript carrying a resume boundary:
+# model_ledger_resume <session> <task> <pre-model-id> <post-model-id> [origin-kind]
+model_ledger_resume() {
+  mk_sub "$1" mP; mk_sub "$1" mR; mk_sub_resume "$1" mE "$3" "$4" "${5:-coordinator}"; mk_sub "$1" mV
+  node "$LED" append --session "$1" --task "$2" --role planner         --agent mP --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role plan-review      --agent mR --artifact "$TMP/rev.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role executor         --agent mE --artifact "PR #9" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role execution-review --agent mV --artifact "$TMP/rev.md" >/dev/null
+}
+
+# R1. [proof] RED-then-GREEN: resume-induced UP-tier (executor pre-resume=sonnet matches policy, post-resume
+#     =opus, real resume boundary present) -> check --enforce-role-models exits 0 WITH a machine-checkable
+#     resume-reroute NOTE (AC-1 treatment shape + AC-3). This is the SYNTHETIC analogue of the real #1494
+#     transcript already exercised directly against pre-fix/post-fix code (see the executor's PR description
+#     for that live RED->GREEN run); here it proves the SAME shape is reachable from a hermetic fixture.
+model_ledger_resume msUP 9301 "claude-sonnet-5" "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUP --task 9301 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -qi "executor"; } \
+  && ok "[proof] R1 resume-induced up-tier (sonnet->opus, real boundary) -> exit 0 + RESUME-UPTIER NOTE (AC-1/AC-3)" \
+  || bad "R1 resume up-tier should allow-with-note (rc=$RC out=$OUT)"
+
+# R2. [proof] Same fixture, origin.kind="peer" (the second real shape the AC-0 probe surfaced) -> same
+#     allowance. Proves the detector matches the SHAPE (isMeta:true + non-empty origin.kind), not a
+#     hardcoded "coordinator" literal.
+model_ledger_resume msUPP 9302 "claude-sonnet-5" "claude-opus-4-8" "peer"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUPP --task 9302 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER"; } \
+  && ok "[proof] R2 resume-induced up-tier via origin.kind=peer -> exit 0 + NOTE (detector matches shape, not a literal)" \
+  || bad "R2 peer-origin resume up-tier should allow-with-note (rc=$RC out=$OUT)"
+
+# R3. [control] resume-induced DOWN-tier (pre-resume=opus matches an opus policy, post-resume=sonnet, real
+#     resume boundary present) -> MUST stay hard-blocked (AC-2's dangerous-direction guard). Uses a DEDICATED
+#     opus-policy config so pre-resume genuinely matches policy.
+MCFG_OPUS="$TMP/mcfg-opus.env"; printf 'CC_ROLE_EXECUTOR_MODEL=opus\n' > "$MCFG_OPUS"
+model_ledger_resume msDOWN 9303 "claude-opus-4-8" "claude-sonnet-5"
+OUT=$(CC_ROLES_ENV="$MCFG_OPUS" node "$LED" check --session msDOWN --task 9303 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R3 resume-induced DOWN-tier (opus->sonnet, real boundary) -> STILL exit 2 BLOCK (AC-2)" \
+  || bad "R3 resume down-tier must stay blocked, not allowed (rc=$RC out=$OUT)"
+
+# R4. [control] NON-resume mismatch (no resume boundary at all, plain mk_sub_model) -> MUST stay hard-blocked
+#     (AC-2's second guard: a resume boundary being ABSENT means the up-tier arm can never fire even though
+#     the observed tier IS a strict up-tier over policy).
+model_ledger msNORESUME 9304 "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msNORESUME --task 9304 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R4 non-resume mismatch (no boundary, same up-tier direction) -> STILL exit 2 BLOCK (AC-2, unchanged from M1)" \
+  || bad "R4 non-resume mismatch must stay blocked (rc=$RC out=$OUT)"
+
+# R5. [control] resume boundary present but PRE-resume model did NOT match policy either (a genuinely wrong
+#     spawn that ALSO got resumed) -> MUST stay hard-blocked — the up-tier arm requires the pre-resume model
+#     to have matched policy, proving the mismatch is resume-CAUSED, not a pre-existing wrong spawn.
+model_ledger_resume msWRONGSPAWN 9305 "claude-haiku-4-0" "claude-opus-4-8"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msWRONGSPAWN --task 9305 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control] R5 resume boundary present but pre-resume ALSO mismatched policy -> STILL exit 2 BLOCK (AC-2)" \
+  || bad "R5 pre-resume-mismatched-too case must stay blocked (rc=$RC out=$OUT)"
+
+# R6. [proof] FABLE sub-case (AC-3): resume-induced up-tier landing on fable -> NOTE carries the
+#     FABLE-COST-CLIFF substring in addition to the RESUME-UPTIER token (never hides the cost).
+model_ledger_resume msUPFAB 9306 "claude-sonnet-5" "claude-fable-1"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUPFAB --task 9306 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -q "FABLE-COST-CLIFF"; } \
+  && ok "[proof] R6 resume-induced up-tier landing on fable -> NOTE carries FABLE-COST-CLIFF (AC-3)" \
+  || bad "R6 fable sub-case must carry FABLE-COST-CLIFF in the NOTE (rc=$RC out=$OUT)"
+
+# R7. KILL-SWITCH: RED up-tier fixture but CC_ROLE_MODEL_GATE_OFF=1 -> exit 0 (whole leg off, no NOTE needed
+#     since the leg never ran).
+OUT=$(CC_ROLE_MODEL_GATE_OFF=1 CC_ROLES_ENV="$MCFG" node "$LED" check --session msUP --task 9301 --enforce-role-models 2>&1); RC=$?
+[ "$RC" = "0" ] && ok "R7 CC_ROLE_MODEL_GATE_OFF=1 over resume up-tier fixture -> exit 0 (kill-switch)" \
+  || bad "R7 kill-switch should allow (rc=$RC out=$OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1458 — MODEL-VERSION sub-leg (assert-latest / fail-on-drift), on a DEDICATED fixture (MVER_*, NEVER MCFG).
 # FIXTURE ISOLATION (the trap): MCFG (used by M1-M9 above) MUST STAY PIN-FREE — adding a CC_TIER_SONNET_VERSION
 # pin to MCFG would flip the pre-existing pin-free msGREEN "claude-sonnet-4-6" arm (M2) to exit 2. So every
