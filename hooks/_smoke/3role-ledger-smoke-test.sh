@@ -568,4 +568,87 @@ PRFILE_LINE_AFTER="$(grep -o '"role":"plan-review"[^}]*' "$RFFILE")"
 OUT_RF5=$(node "$LED" refresh-models --session "sess-1481-no-such-session" 2>&1); RC_RF5=$?
 [ "$RC_RF5" = "0" ] && ok "#1481 T1e: no ledger dir for session -> fail-open exit 0" || bad "#1481 T1e fail-open failed (rc=$RC_RF5 out=$OUT_RF5)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1495 — research seat ledger-visibility. cmdAppend's role guard now reads RECORDABLE_ROLES (= REQUIRED_ROLES
+# + 'research'), while REQUIRED_ROLES itself and all four completion-loops (cmdCheck / --enforce-role-models /
+# provenance / cmdRefreshModels) stay UNCHANGED — a research row is recorded but NEVER gates a close (G1).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+RSID="sess-1495-research"
+
+# ---- [proof] L-APPEND-RESEARCH: append --role research now succeeds. RED on HEAD: `:722`-era guard
+#      `REQUIRED_ROLES.includes('research')` is false -> exit 2, no line. GREEN post-fix: exit 0, one line.
+mk_sub "$RSID" r-agent1
+OUT=$(node "$LED" append --session "$RSID" --task 1495a --role research --agent r-agent1 2>&1); RC=$?
+RFILE_A="$THREE_ROLE_LEDGER_DIR/$RSID/1495a.jsonl"
+{ [ "$RC" = "0" ] && grep -q '"role":"research"' "$RFILE_A" 2>/dev/null; } \
+  && ok "[proof] L-APPEND-RESEARCH: append --role research -> exit 0, one role:research line" \
+  || bad "[proof] L-APPEND-RESEARCH failed (rc=$RC out=$OUT file=$(cat "$RFILE_A" 2>/dev/null))"
+
+# ---- [control] L-APPEND-BOGUS: an unrecordable role is STILL rejected (superset is controlled, not "anything").
+#      PASSES on HEAD (bogus already rejected) AND post-fix.
+OUT=$(node "$LED" append --session "$RSID" --task 1495b --role bogus --agent r-agent2 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } && ok "[control] L-APPEND-BOGUS: an unrecordable role still exits 2" || bad "[control] L-APPEND-BOGUS should exit 2 (rc=$RC out=$OUT)"
+
+# ---- [proof] L-PROVENANCE-RESEARCH (locks :899-class provenance loop — AC7): a FULL clean 4-role chain PLUS
+#      one research row with NO self_authored stamp -> check --require-provenance still exits 0 (the provenance
+#      loop iterates REQUIRED_ROLES only; a research row is never demanded to be self-authored).
+#      Unbuildable on HEAD (append rejects --role research, exit 2) -> the fixture itself cannot be built.
+mk_sub "$RSID" pr-p; mk_sub "$RSID" pr-r; mk_sub "$RSID" pr-e; mk_sub "$RSID" pr-v; mk_sub "$RSID" pr-rsch
+node "$LED" append --session "$RSID" --task 1495c --role planner         --agent pr-p --artifact "$TMP/plan.md" --self-authored >/dev/null
+node "$LED" append --session "$RSID" --task 1495c --role plan-review      --agent pr-r --artifact "$TMP/rev.md" --self-authored >/dev/null
+node "$LED" append --session "$RSID" --task 1495c --role executor         --agent pr-e --artifact "PR #1495c" --self-authored >/dev/null
+node "$LED" append --session "$RSID" --task 1495c --role execution-review --agent pr-v --artifact "$TMP/rev.md" --self-authored >/dev/null
+node "$LED" append --session "$RSID" --task 1495c --role research         --agent pr-rsch >/dev/null 2>&1; RESRC_C=$?   # NO self-authored — the point of this AC; capture append's own exit code (on HEAD this is 2 -> fixture unbuildable, the true RED)
+research_row_c=$(grep -c '"role":"research"' "$THREE_ROLE_LEDGER_DIR/$RSID/1495c.jsonl" 2>/dev/null)
+OUT=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$RSID" --task 1495c --require-provenance 2>&1); RC=$?
+{ [ "$RESRC_C" = "0" ] && [ "$research_row_c" = "1" ] && [ "$RC" = "0" ]; } && ok "[proof] L-PROVENANCE-RESEARCH: 4-clean-role chain + unstamped research row -> require-provenance still exit 0" \
+  || bad "[proof] L-PROVENANCE-RESEARCH failed (append_rc=$RESRC_C research_row=$research_row_c rc=$RC out=$OUT)"
+
+# ---- [proof] L-CLOSE-NO-ARTIFACT (anti-vacuity control arm — #1502 lesson): 4 required-role lines complete
+#      PLUS a research row with NO --artifact -> check --enforce-role-models still exits 0 (clean close). The
+#      REAL close gate is reachable-GREEN with a research row present, not merely "a row exists somewhere".
+#      Unbuildable on HEAD (append rejects the research line).
+mk_sub "$RSID" na-p; mk_sub "$RSID" na-r; mk_sub "$RSID" na-e; mk_sub "$RSID" na-v; mk_sub "$RSID" na-rsch
+node "$LED" append --session "$RSID" --task 1495d --role planner         --agent na-p --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495d --role plan-review      --agent na-r --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495d --role executor         --agent na-e --artifact "PR #1495d" >/dev/null
+node "$LED" append --session "$RSID" --task 1495d --role execution-review --agent na-v --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495d --role research         --agent na-rsch >/dev/null 2>&1; RESRC_D=$?   # NO --artifact; capture the append's own exit code — on HEAD this is 2 (rejected), making the fixture unbuildable, the true RED
+research_row_d=$(grep -c '"role":"research"' "$THREE_ROLE_LEDGER_DIR/$RSID/1495d.jsonl" 2>/dev/null)
+OUT=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$RSID" --task 1495d --enforce-role-models 2>&1); RC=$?
+{ [ "$RESRC_D" = "0" ] && [ "$research_row_d" = "1" ] && [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "[proof] L-CLOSE-NO-ARTIFACT: 4 required clean + artifact-less research row -> check exits 0 (reachable GREEN close)" \
+  || bad "[proof] L-CLOSE-NO-ARTIFACT failed (append_rc=$RESRC_D research_row=$research_row_d rc=$RC out=$OUT)"
+
+# ---- [proof] L-CLOSE-FABLE-WARN: 4 required lines matching their policy tiers PLUS an up-tiered `fable`
+#      research row (policy says sonnet) -> check --enforce-role-models still exits 0 and emits NO
+#      MODEL-POLICY: block for research (the enforce loop iterates REQUIRED_ROLES only -> research tier is
+#      NEVER compared -> an up-tiered fable research spawn cannot brick a close). Unbuildable on HEAD.
+FWCFG="$TMP/fw-cfg.env"; printf 'CC_ROLE_PLANNER_MODEL=opus\nCC_ROLE_PLAN_REVIEW_MODEL=opus\nCC_ROLE_EXECUTOR_MODEL=sonnet\nCC_ROLE_EXECUTION_REVIEW_MODEL=opus\nCC_ROLE_RESEARCH_MODEL=sonnet\n' > "$FWCFG"
+mk_sub_model "$RSID" fw-p "claude-opus-4-8"; mk_sub_model "$RSID" fw-r "claude-opus-4-8"
+mk_sub_model "$RSID" fw-e "claude-sonnet-5"; mk_sub_model "$RSID" fw-v "claude-opus-4-8"
+mk_sub_model "$RSID" fw-rsch "claude-fable-5"
+node "$LED" append --session "$RSID" --task 1495e --role planner         --agent fw-p --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495e --role plan-review      --agent fw-r --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495e --role executor         --agent fw-e --artifact "PR #1495e" >/dev/null
+node "$LED" append --session "$RSID" --task 1495e --role execution-review --agent fw-v --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495e --role research         --agent fw-rsch >/dev/null 2>&1; RESRC_E=$?   # capture append's own exit code — on HEAD this is 2 (rejected), making the fixture unbuildable, the true RED
+research_row_e=$(grep -c '"role":"research"' "$THREE_ROLE_LEDGER_DIR/$RSID/1495e.jsonl" 2>/dev/null)
+OUT=$(CC_ROLES_ENV="$FWCFG" node "$LED" check --session "$RSID" --task 1495e --enforce-role-models 2>&1); RC=$?
+{ [ "$RESRC_E" = "0" ] && [ "$research_row_e" = "1" ] && [ "$RC" = "0" ] && ! echo "$OUT" | grep -qiE 'MODEL-POLICY:.*research'; } \
+  && ok "[proof] L-CLOSE-FABLE-WARN: up-tiered fable research row -> exit 0, no MODEL-POLICY block for research (G1)" \
+  || bad "[proof] L-CLOSE-FABLE-WARN failed (append_rc=$RESRC_E research_row=$research_row_e rc=$RC out=$OUT)"
+
+# ---- [control] L-MISSING-REQUIRED-HARD-BLOCKS: a task missing one required role (execution-review) PLUS a
+#      present research line -> check still exits 2 (HARD BLOCK). Proves research does not "substitute" for a
+#      missing required role. PASSES on HEAD (already blocks) AND post-fix.
+mk_sub "$RSID" mb-p; mk_sub "$RSID" mb-r; mk_sub "$RSID" mb-e; mk_sub "$RSID" mb-rsch
+node "$LED" append --session "$RSID" --task 1495f --role planner    --agent mb-p --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495f --role plan-review --agent mb-r --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$RSID" --task 1495f --role executor   --agent mb-e --artifact "PR #1495f" >/dev/null
+node "$LED" append --session "$RSID" --task 1495f --role research   --agent mb-rsch >/dev/null   # NO execution-review at all
+OUT=$(node "$LED" check --session "$RSID" --task 1495f 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -qi "missing execution-review"; } \
+  && ok "[control] L-MISSING-REQUIRED-HARD-BLOCKS: missing execution-review + present research -> still BLOCK" \
+  || bad "[control] L-MISSING-REQUIRED-HARD-BLOCKS failed (rc=$RC out=$OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

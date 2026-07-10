@@ -163,6 +163,11 @@ const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude
 const PROJECTS_ROOT = process.env.THREE_ROLE_PROJECTS_ROOT || path.join(HOME, '.claude', 'projects');
 
 const REQUIRED_ROLES = ['planner', 'plan-review', 'executor', 'execution-review'];
+// #1495 — RECORDABLE_ROLES is a STRICT SUPERSET used ONLY by cmdAppend's role guard, so the ad-hoc
+// research/search seat can be ledger-visible (recorded) without ever becoming a required/gating role.
+// Every completion-time loop (cmdCheck, --enforce-role-models, provenance, cmdRefreshModels) MUST keep
+// iterating REQUIRED_ROLES, never this superset — that is what keeps a research row non-gating (G1).
+const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research'];
 // A plan is recognized by a MARKDOWN HEADING (2-4 `#`) naming an acceptance-criteria / ELI5 section.
 // Anchored to a heading-line start (`^#{2,4}` + `m` flag) so prose that merely contains the word
 // "acceptance" ("we await acceptance from QA") can NEVER match — only a real heading does. Accepts the
@@ -900,7 +905,7 @@ function overlayAppend(session, task, role, fields) {
 function cmdAppend(o) {
   const session = o.session, task = o.task, role = o.role;
   if (!session || !task || !role) { console.error('append: --session, --task, --role are required'); process.exit(2); }
-  if (!REQUIRED_ROLES.includes(role)) { console.error('append: --role must be one of ' + REQUIRED_ROLES.join(', ')); process.exit(2); }
+  if (!RECORDABLE_ROLES.includes(role)) { console.error('append: --role must be one of ' + RECORDABLE_ROLES.join(', ')); process.exit(2); }
   // Map the CLI flag names onto the canonical entry field names overlayAppend overlays.
   const fields = {};
   if ('agent' in o) fields.agentId = o.agent;
