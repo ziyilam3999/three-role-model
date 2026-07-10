@@ -24,10 +24,19 @@
 # Reference: parent-claude.md Invariant #2 ("the plan is reviewed by a STATELESS reviewer before execution"),
 # hooks/3role-ledger.mjs (ledger format + THREE_ROLE_LEDGER_DIR), the plan #851 Phase 3b.
 
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
 INPUT=$(cat)
 
 # Kill-switches.
-[ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
+if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-transition-gate" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
 [ "${SHIP_PIPELINE:-}" = "1" ] && exit 0
 
 # Parse tool_input.prompt (Agent) / fall back to tool_input.description (some Task shapes) + session_id, and

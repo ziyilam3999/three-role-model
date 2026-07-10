@@ -48,6 +48,12 @@
 # Reference: hooks/dogfood-artifact-gate.sh (resolve_path + parse mirrored), parent-claude.md Invariant #6,
 # skills/issue-to-ship/references/3role-perf-log-template.md (the cited card's shape).
 
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
 INPUT=$(cat)
 
 # Master kill-switch only (consistent with sibling hooks) — disables the WHOLE instrumentation gate family,
@@ -55,7 +61,10 @@ INPUT=$(cat)
 # must fire regardless of SHIP_PIPELINE (see the dedicated block below), so the payload must be PARSED before
 # any SHIP_PIPELINE short-circuit exists — the family's SHIP_PIPELINE exemption is now applied AFTER Leg A,
 # once TASKID/SESSION/MODELRUN are known (moved down from its old position right after this line).
-[ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
+if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-instrumentation-gate" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
 
 # Parse the update payload (node = the dep already required by sibling hooks).
 #   STATUS    — tool_input.status

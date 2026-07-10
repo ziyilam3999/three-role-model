@@ -34,10 +34,19 @@
 #
 # Env overrides (for the smoke): THREE_ROLE_LEDGER_DIR, THREE_ROLE_PROJECTS_ROOT are passed through to the helper.
 
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
 INPUT=$(cat)
 
 # Kill-switch (uniform with the sibling gates).
-[ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ] && exit 0
+if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-subagent-ledger" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
 
 # Parse the SubagentStop payload. The REAL payload carries TWO transcript fields: `agent_transcript_path` is the
 # stopping SUBAGENT's own transcript (…/subagents/agent-<id>.jsonl) and `transcript_path` is the MAIN session's
