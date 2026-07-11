@@ -571,4 +571,52 @@ run "$PL12" CC_ROLES_ENV="$CFGF"
   && ok "L12: fable-executor config + model:opus -> exit 2 + corrected Fable cost-cliff note (July 12)" \
   || bad "L12 fable seat mismatch should block with the corrected note (rc=$RC out=$CAP)"
 
+echo "== SECTION 4: #1569 AC-6 -- fable-seat ALLOW arms (planner + execution-review), NOT covered above =="
+# #1569 adopts fable, time-boxed, on TWO NEW seats: planner and execution-review (config/cc-roles.env PR-2).
+# CFGF above only fixtures a fable EXECUTOR (L12's BLOCK arm) -- it never proves a fable spawn is actually
+# ALLOWED to proceed. That is the genuine gap #1569 depends on: without it, (L12's BLOCK) could "pass" merely
+# because the gate treats fable as always-invalid, which would also silently BLOCK the two new seats forever.
+# Driving the real gate with a synthetic bash payload trips an UNRELATED hook (benchmark-persistence-check.sh
+# false-fires on that command shape); its only escape is a forbidden override token. The gate-legal path is
+# exactly this: arms INSIDE the shipped, CI-covered smoke, run via the smoke's own harness -- never a bare
+# hand-rolled invocation. See the #1569 plan, AC-6 method note.
+CFGF3="$TMP/cc-roles-fable-1569.env"
+cat > "$CFGF3" <<EOF
+CC_ROLE_PLANNER_MODEL=fable
+CC_ROLE_EXECUTION_REVIEW_MODEL=fable
+CC_ROLE_PLAN_REVIEW_MODEL=opus
+EOF
+
+# ---- M1 (AC-6a, ALLOW): planner=fable policy + spawn model:fable -> exit 0 (the new seat can spawn at all). ----
+PM1='{"session_id":"m1","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9301 ROLE:planner\nPlan it."}}'
+run "$PM1" CC_ROLES_ENV="$CFGF3"
+{ [ "$RC" = "0" ]; } \
+  && ok "M1 (#1569 AC-6a): planner=fable policy + model:fable -> exit 0 (new seat ALLOWED)" \
+  || bad "M1 fable planner seat should be allowed to spawn (rc=$RC out=$CAP)"
+
+# ---- M2 (AC-6a, ALLOW): execution-review=fable policy + spawn model:fable -> exit 0. ----
+PM2='{"session_id":"m2","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9302 ROLE:execution-review\nReview it."}}'
+run "$PM2" CC_ROLES_ENV="$CFGF3"
+{ [ "$RC" = "0" ]; } \
+  && ok "M2 (#1569 AC-6a): execution-review=fable policy + model:fable -> exit 0 (new seat ALLOWED)" \
+  || bad "M2 fable execution-review seat should be allowed to spawn (rc=$RC out=$CAP)"
+
+# ---- M3 (AC-6b, BLOCK, non-vacuity control): SAME fable-seat policy (planner=fable) but spawn model:opus ->
+#      exit 2, naming the seat + instructing model:fable. Without this, M1 could "pass" merely because the
+#      gate is inert for fable policies -- this proves the gate is still discriminating on a fable SEAT
+#      (L12 already covers this shape on the EXECUTOR seat; this is the same control on a NEW #1569 seat). ----
+PM3='{"session_id":"m3","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9303 ROLE:planner\nPlan it, wrong tier."}}'
+run "$PM3" CC_ROLES_ENV="$CFGF3"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "ROLE:planner" && echo "$CAP" | grep -qi "fable"; } \
+  && ok "M3 (#1569 AC-6b): planner=fable policy + model:opus -> exit 2, names role + fable (non-vacuous BLOCK control)" \
+  || bad "M3 fable-seat wrong-tier spawn should still block (rc=$RC out=$CAP)"
+
+# ---- M4 (AC-6c, UNCHANGED seat): plan-review stays opus in this SAME fixture -> model:opus -> exit 0 silent.
+#      Proves the fable rollout on two seats does not disturb the untouched plan-review seat's policy. ----
+PM4='{"session_id":"m4","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9304 ROLE:plan-review\nReview it."}}'
+run "$PM4" CC_ROLES_ENV="$CFGF3"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "M4 (#1569 AC-6c): plan-review=opus (unchanged) + model:opus -> exit 0 silent" \
+  || bad "M4 unchanged plan-review seat should be silent allow (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
