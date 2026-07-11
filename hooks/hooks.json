@@ -83,6 +83,11 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/three-role-transition-gate.sh\"",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/three-role-spawn-ledger.sh\"",
+            "timeout": 10
           }
         ]
       }

@@ -16,6 +16,11 @@
 //   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
 //                                        [--verdict V] [--self-authored]
 //                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
+//                                        [--closed-at ISO]                                       (#1516)
+//     --closed-at is an EXPLICIT overlay flag, written ONLY by three-role-subagent-ledger.sh (the sole
+//     writer that fires exclusively at SubagentStop/close) — never inferred, never defaulted. It is the
+//     research seat's punch-out signal for the agent-kanban board: a research row WITHOUT it is in-flight,
+//     WITH it is done. Optional + additive on every role (check/checkRole never reference it).
 //     Writes one JSONL line to <ledger-dir>/<S>/<T>.jsonl. Idempotent PER ROLE — re-appending the same
 //     role UPDATES the line (drops the prior one), never duplicates. A role agent self-recording its OWN
 //     line passes --artifact (and --verdict for review-roles) with NO --agent; the SubagentStop hook later
@@ -1049,6 +1054,12 @@ function overlayAppend(session, task, role, fields) {
   if ('verdict' in fields) entry.verdict = fields.verdict;
   // #1100 item 3: provenance stamp — overlay only when provided (back-compat: absent ⇒ unstamped).
   if ('self_authored' in fields) entry.self_authored = fields.self_authored;
+  // #1516 — the EXPLICIT close-stamp. Overlay only when provided (own-key "provided" discipline, same as
+  // every other field here). The ONLY writer that fires exclusively at close (three-role-subagent-ledger.sh,
+  // on SubagentStop) passes this — never the spawn-time hook — which is what makes "closedAt present" a
+  // trustworthy punch-out signal instead of a value that could land at dispatch. Optional + additive:
+  // check/checkRole never reference it, so a chain-role line gains it harmlessly too.
+  if ('closedAt' in fields) entry.closedAt = fields.closedAt;
   // #1465 — OPTIONAL model+effort provenance. Overlay only when this call resolved a value (own-key
   // presence is the "provided" signal, same discipline as every other field above); an unprovided key
   // PERSISTS the prior line's value, so "model resolved at spawn-time self-append" composes with
@@ -1065,7 +1076,7 @@ function overlayAppend(session, task, role, fields) {
   if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
-    delete entry.modelVersion; delete entry.modelTier; delete entry.effort;
+    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt;
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -1094,6 +1105,9 @@ function cmdAppend(o) {
   if ('effort' in o) fields.effort = o.effort;
   if ('model-version' in o) fields.modelVersion = o['model-version'];
   if ('model-tier' in o) fields.modelTier = o['model-tier'];
+  // #1516 — explicit close-stamp flag. ONLY three-role-subagent-ledger.sh (SubagentStop) passes this; every
+  // other caller omits it, so overlayAppend's per-key "provided" discipline leaves an unstamped line alone.
+  if ('closed-at' in o) fields.closedAt = o['closed-at'];
   // #1465 — CENTRALIZED best-effort MODEL capture (unchanged by #1466 — only the effort half below moved).
   // Runs on EVERY append (both a role's own self-append AND the SubagentStop hook's later --agent
   // re-append), so the stop-time re-append automatically backfills modelVersion/modelTier from the

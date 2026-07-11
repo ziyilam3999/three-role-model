@@ -33,6 +33,12 @@
 # when untagged).
 #
 # Env overrides (for the smoke): THREE_ROLE_LEDGER_DIR, THREE_ROLE_PROJECTS_ROOT are passed through to the helper.
+#
+# #1516 — this is also the ONLY writer that stamps the EXPLICIT `closedAt` field (an ISO timestamp, passed
+# via 3role-ledger.mjs's --closed-at flag) — because this hook fires exclusively at a real SubagentStop, it
+# is the one trustworthy place to say "this role is truly done". The research seat's agent-kanban board
+# punch-out depends on this stamp being close-exclusive (never inferred from agentId, which can also be
+# present at spawn/dispatch for a backgrounded role — see the #1516 plan's rationale).
 
 # #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
 # This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
@@ -168,5 +174,12 @@ SELF_FLAG=""
 # clobber. When present, this OBSERVED value OVERWRITES the ASSIGNED one (observed wins at close).
 EFFORT_FLAG=""
 [ -n "$PAYLOAD_EFFORT" ] && EFFORT_FLAG="--effort $PAYLOAD_EFFORT"
-node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG >/dev/null 2>&1
+# #1516 -- the EXPLICIT close-stamp. This hook is the ONLY writer that fires exclusively at close (a real
+# SubagentStop, gated above on "must resolve to a real /subagents/agent-*.jsonl transcript"), so it is the
+# ONE place a close-stamp can be trustworthy -- never inferred from agentId (which is also present at
+# spawn/dispatch for a backgrounded role, see the plan's "why explicit, not inferred" section). Stamped on
+# EVERY role's close (harmless additive field for the four chain roles; load-bearing for research's
+# board punch-out in agent-kanban).
+CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG --closed-at "$CLOSED_AT" >/dev/null 2>&1
 exit 0
