@@ -144,4 +144,47 @@ run "$P13" THREE_ROLE_INSTRUMENT_OFF=1
 f13b="$([ -f "$LEDGERDIR/s1354c/1354.jsonl" ] && echo yes || echo no)"; sync13b=$(printf '%s' "$CAP" | grep -c 'would-sync'); [ -n "$sync13b" ] || sync13b=0
 { [ "$f13a" = "no" ] && [ "$sync13a" = "0" ] && [ "$f13b" = "no" ] && [ "$sync13b" = "0" ]; } && ok "automated edge: kill-switch on POSITIVE payload -> NO ledger line AND NO would-sync (non-vacuous)" || bad "kill-switch should suppress BOTH halves (f13a=$f13a sync13a=$sync13a f13b=$f13b sync13b=$sync13b)"
 
+# ===== #1516 RESEARCH-SEAT PreToolUse EDGE: RED-first cases (empirically confirmed against the pre-#1516
+#       HEAD hook via git show — see the #1516 executor report — before being pinned here). =====
+
+# ---- 14. PreToolUse + ROLE:research -> writes exactly ONE research row (mid-flight visibility win).
+#          RED on pre-#1516: the old role alternation does not include "research" at all -> no-op always. ----
+P14='{"session_id":"s1516a","hook_event_name":"PreToolUse","tool_input":{"prompt":"3ROLE_TASK:1516 ROLE:research\nDo research."}}'
+run "$P14"
+n14=$(ledger_count s1516a 1516 research)
+{ [ "$RC" = "0" ] && [ "$n14" = "1" ]; } && ok "PreToolUse + ROLE:research -> writes exactly one research row" || bad "should write {research} at PreToolUse (rc=$RC n14=$n14 out=$CAP)"
+
+# ---- 15. PreToolUse + ROLE:plan-review -> writes NOTHING (BLOCKER-1 regression control). This is the
+#          load-bearing negative: it FAILS on a naive "just widen the role alternation, register PreToolUse,
+#          don't gate by event" implementation (confirmed against pre-#1516 HEAD: that shape DOES write a
+#          row here), and it is what keeps three-role-transition-gate.sh fail-closed (a plan-review row must
+#          never exist before the reviewer actually runs). ----
+P15='{"session_id":"s1516b","hook_event_name":"PreToolUse","tool_input":{"prompt":"3ROLE_TASK:1516 ROLE:plan-review\nReview it."}}'
+run "$P15"
+{ [ "$RC" = "0" ] && [ -z "$(ls -A "$LEDGERDIR/s1516b" 2>/dev/null)" ]; } && ok "PreToolUse + ROLE:plan-review -> writes NOTHING (BLOCKER-1 regression control)" || bad "PreToolUse chain-role payload must write nothing (rc=$RC out=$CAP)"
+
+# ---- 16. PreToolUse + ROLE:executor -> writes NOTHING (same control, second chain role, cheap extra coverage). ----
+P16='{"session_id":"s1516c","hook_event_name":"PreToolUse","tool_input":{"prompt":"3ROLE_TASK:1516 ROLE:executor\nImplement it."}}'
+run "$P16"
+{ [ "$RC" = "0" ] && [ -z "$(ls -A "$LEDGERDIR/s1516c" 2>/dev/null)" ]; } && ok "PreToolUse + ROLE:executor -> writes NOTHING (BLOCKER-1 regression control, 2nd chain role)" || bad "PreToolUse executor payload must write nothing (rc=$RC out=$CAP)"
+
+# ---- 17. PostToolUse (explicit hook_event_name) four-role behaviour is BYTE-UNCHANGED: still writes on the
+#          close/return edge exactly like fixtures 2-10 (which carry no hook_event_name at all). ----
+P17='{"session_id":"s1516d","hook_event_name":"PostToolUse","tool_input":{"prompt":"3ROLE_TASK:1516 ROLE:executor\nImplement it."},"tool_response":{"agentId":"agPost"}}'
+run "$P17"
+n17=$(ledger_count s1516d 1516 executor agPost)
+{ [ "$RC" = "0" ] && [ "$n17" = "1" ]; } && ok "PostToolUse (explicit) + ROLE:executor -> byte-unchanged, still writes" || bad "explicit PostToolUse chain-role should still write (rc=$RC n17=$n17 out=$CAP)"
+
+# ---- 18. PreToolUse + tool_input.subagent_type == cc-research, NO ROLE token -> still writes a research row
+#          (mechanism belt #2: a cc-research-typed spawn that omitted the ROLE tag is still filed). ----
+P18='{"session_id":"s1516e","hook_event_name":"PreToolUse","tool_input":{"prompt":"3ROLE_TASK:1516\nGo look this up.","subagent_type":"cc-research"}}'
+run "$P18"
+n18=$(ledger_count s1516e 1516 research)
+{ [ "$RC" = "0" ] && [ "$n18" = "1" ]; } && ok "PreToolUse + subagent_type=cc-research (no ROLE tag) -> writes research row" || bad "subagent_type fallback should still write (rc=$RC n18=$n18 out=$CAP)"
+
+# ---- 19. PreToolUse + untagged spawn -> writes NOTHING (no task tag at all). ----
+P19='{"session_id":"s1516f","hook_event_name":"PreToolUse","tool_input":{"prompt":"Just do some general work."}}'
+run "$P19"
+{ [ "$RC" = "0" ] && [ -z "$(ls -A "$LEDGERDIR/s1516f" 2>/dev/null)" ]; } && ok "PreToolUse + untagged -> writes NOTHING" || bad "PreToolUse untagged should write nothing (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

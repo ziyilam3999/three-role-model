@@ -460,8 +460,11 @@ fi
 { [ -n "$APLAN" ] && [ -f "$APLAN" ]; } || APLAN="$(ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1)"
 
 if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
-  # 4a — the planner's plan must carry a `cairn:` line. (PRESENCE check UNCHANGED.)
-  grep -Eiq '^[[:space:]]*cairn:' "$APLAN" 2>/dev/null \
+  # 4a — the planner's plan must carry a `cairn:` line. (PRESENCE check UNCHANGED.) #1518: the receipt may be
+  # DECORATED with a common markdown lead-in (bullet -/*/+, blockquote >, backtick, bold **, w/ leading
+  # whitespace) as long as it is still the line's OWN leading content (stays line-anchored — a mid-prose
+  # mention must still fail; see AC5's power test).
+  grep -Eiq '^[[:space:]]*[-*+>`]*[[:space:]]*cairn:' "$APLAN" 2>/dev/null \
     || block "the active plan ($APLAN) carries no \`cairn:\` citation line — prove the PLANNER searched memory (cairn/AWM/project-index). Add a \`cairn: \"<hit>\"\` or \`cairn: no hits for <q>\` line, then re-complete. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
 
   # 4b doc — resolve the plan-REVIEWER's review from the LEDGER's plan-review artifact_path for THIS task
@@ -479,11 +482,15 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # `## Review` scan (which EXCLUDES the planner's top-of-file cairn: line) so the planner's line can NEVER
   # satisfy 4b (the #1269 invariant — and STRICTER for the in-plan case, never looser).
   # Fail-OPEN only when NEITHER form exists (can't-tell); BLOCK when a review IS present but uncited.
+  # #1518: same decoration-prefix tolerance as the 4a leg above (still line-anchored — a mid-prose mention
+  # must still fail; see AC6c/AC7c's power tests).
   if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ] && [ "$AREVIEW" != "$APLAN" ]; then
-    grep -Eiq '^[[:space:]]*cairn:' "$AREVIEW" 2>/dev/null \
+    grep -Eiq '^[[:space:]]*[-*+>`]*[[:space:]]*cairn:' "$AREVIEW" 2>/dev/null \
       || block "the plan-review ($AREVIEW) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   elif grep -Eq '^## Review' "$APLAN" 2>/dev/null; then
-    awk '/^## Review/{r=1} r&&/^[[:space:]]*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
+    # N3 (POSIX-awk ERE, NOT the grep ERE above): `-` is placed FIRST in the bracket expression so it is
+    # literal, not a range operator; backtick/`*`/`+`/`>` are literal inside a bracket expression already.
+    awk '/^## Review/{r=1} r&&/^[[:space:]]*[-*+>`]*[[:space:]]*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
       || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   fi
 fi
