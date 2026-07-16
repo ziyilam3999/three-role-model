@@ -245,6 +245,25 @@ model: sonnet
 Executor role definition fixture (smoke-only; never installed).
 EOF
 
+# #1513 — SEPARATE per-AC agents dirs (plan-review non-blocking note 1): AC-RED/AC-RED-CLAUDE/AC-POS/AC-EMPTY/
+# AC-ONCE/AC-KILL need cc-planner.md PRESENT, but the existing AC-9/M1/M4 (ROLE:planner, tier-satisfied) need
+# it ABSENT to stay exit 0 — do NOT add cc-planner.md to the shared AGENTS_FIX above (that would flip AC-9/M1/M4).
+AGENTS_FULL="$TMP/agents_full"
+mkdir -p "$AGENTS_FULL"
+cat > "$AGENTS_FULL/cc-planner.md" <<'EOF'
+---
+name: cc-planner
+model: opus
+---
+Planner role definition fixture (smoke-only; never installed) — used ONLY by the #1513 effort-leg ACs.
+EOF
+
+# #1513 AC-NEG-DANGLING — a symlink whose target does NOT exist. `-f`/`-e` (never `-L`) must read this as
+# ABSENT, so a half-installed env is treated as the sanctioned general-purpose fallback, never false-blocked.
+AGENTS_DANGLING="$TMP/agents_dangling"
+mkdir -p "$AGENTS_DANGLING"
+ln -s "$AGENTS_DANGLING/cc-planner-target-does-not-exist.md" "$AGENTS_DANGLING/cc-planner.md"
+
 # ── Transcript fixtures (JSONL, mktemp-relative — no literal home paths) ──────────────────────────────────
 FABLE_TX="$TMP/fable.jsonl"
 printf '%s\n' \
@@ -618,5 +637,120 @@ run "$PM4" CC_ROLES_ENV="$CFGF3"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "M4 (#1569 AC-6c): plan-review=opus (unchanged) + model:opus -> exit 0 silent" \
   || bad "M4 unchanged plan-review seat should be silent allow (rc=$RC out=$CAP)"
+
+echo "== SECTION 5: #1513 subagent_type/effort-inert advisory sub-leg =="
+# The sub-leg lives ONLY on the tier-SATISFIED path (line ~179's silent-allow), so every payload below carries
+# a model: that MATCHES the role's policy tier — the pre-existing tier-mismatch arms above are untouched.
+
+# ---- AC-RED (the leak, must go from silent->fired): planner, subagent_type:general-purpose, model:opus,
+#      cc-planner.md PRESENT (AGENTS_FULL). RED proof: the pinned pre-fix snapshot (same one AC-8/AC-11 use —
+#      it has NO subagent_type-aware logic at all) exits 0 silent on this identical payload; the CURRENT hook
+#      exits 2 naming the inert-effort condition + the fix. ----
+PRED='{"session_id":"ac1513red","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+if [ "$HEAD_AVAILABLE" = "1" ]; then
+  run_head "$PRED" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+  { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+    && ok "AC-RED HEAD: planner+general-purpose+cc-planner.md-present on the PRE-#1513 hook -> exit 0 silent (the leak, reproduced)" \
+    || bad "AC-RED HEAD should silently pass (rc=$RC out=$CAP)"
+fi
+runh "$HOOK" "$PRED" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -qi "effort" && echo "$CAP" | grep -q "subagent_type: cc-planner"; } \
+  && ok "AC-RED post-fix: same payload -> exit 2, names EFFORT inertness + the fix (subagent_type: cc-planner)" \
+  || bad "AC-RED post-fix should block and name the inert-effort condition (rc=$RC out=$CAP)"
+
+# ---- AC-RED-CLAUDE (per-disjunct fixture): subagent_type:claude (not hardcoded to "general-purpose"). ----
+PREDC='{"session_id":"ac1513redclaude","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"claude"}}'
+runh "$HOOK" "$PREDC" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-planner"; } \
+  && ok "AC-RED-CLAUDE: subagent_type:claude (not general-purpose) + cc-planner.md present -> exit 2 (not hardcoded to one string)" \
+  || bad "AC-RED-CLAUDE should also fire on subagent_type:claude (rc=$RC out=$CAP)"
+
+# ---- AC-POS (positive control — right robot stays clean): subagent_type:cc-planner, cc-planner.md present -> exit 0, no marker. ----
+PPOS='{"session_id":"ac1513pos","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"cc-planner"}}'
+runh "$HOOK" "$PPOS" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-POS: subagent_type:cc-planner (the right robot) -> exit 0 clean, no inert-effort marker" \
+  || bad "AC-POS should stay silent when the dedicated def IS used (rc=$RC out=$CAP)"
+
+# ---- AC-NEG (sanctioned fallback — def absent must NOT fire): general-purpose, DEFAULT AGENTS_FIX (which
+#      lacks cc-planner.md) -> exit 0, no marker. This is the case the fix must never false-block. ----
+PNEG='{"session_id":"ac1513neg","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+run "$PNEG"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-NEG: cc-planner.md absent (sanctioned fallback) -> exit 0, never false-blocked" \
+  || bad "AC-NEG should never fire when the dedicated def is genuinely absent (rc=$RC out=$CAP)"
+
+# ---- AC-NEG-DANGLING (broken install reads as absent): cc-planner.md is a symlink to a missing target. ----
+PDANG='{"session_id":"ac1513dangling","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PDANG" CC_ROLE_AGENTS_DIR="$AGENTS_DANGLING"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-NEG-DANGLING: dangling symlink at cc-planner.md -> reads as ABSENT -> exit 0, never false-blocked" \
+  || bad "AC-NEG-DANGLING should treat a dangling def-symlink as absent (rc=$RC out=$CAP)"
+
+# ---- AC-EXECUTOR-TIER (non-opus seat, effort still asserted independent of tier): executor, model:sonnet
+#      (matches the sonnet policy), subagent_type:general-purpose, AGENTS_FIX (has cc-executor.md) -> exit 2. ----
+PTIER='{"session_id":"ac1513tier","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513 ROLE:executor\nGo.","subagent_type":"general-purpose"}}'
+run "$PTIER"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-executor"; } \
+  && ok "AC-EXECUTOR-TIER: tier-satisfied non-opus (sonnet) seat still fires the effort advisory" \
+  || bad "AC-EXECUTOR-TIER should not be opus-only (rc=$RC out=$CAP)"
+
+# ---- AC-RESEARCH (research never gated): ROLE:research resolves ROLE=- and fail-opens before the new logic
+#      even runs (belt-and-suspenders — the ROLE regex never matches "research"). ----
+PRESEARCH='{"session_id":"ac1513research","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:research\nLook it up.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PRESEARCH" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-RESEARCH: ROLE:research -> exit 0, never gated by the effort leg" \
+  || bad "AC-RESEARCH should fail-open before the effort leg runs (rc=$RC out=$CAP)"
+
+# ---- AC-INDEP (independent block-once — the marker-cannibalization trap, Design nuance C). SHARED session_id
+#      across both issues (so SIG collides): (1) tier-MISMATCH for {taskId:1513indep, ROLE:executor}
+#      (model:opus on the sonnet seat) -> fires the TIER advisory, writes $SIG.notified. (2) SAME
+#      session/taskId/role, tier-SATISFIED (model:sonnet) but subagent_type wrong + cc-executor.md present ->
+#      MUST still exit 2 via the effort advisory (NOT suppressed by the tier marker from step 1). ----
+PINDEP1='{"session_id":"ac1513indep","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement."}}'
+run "$PINDEP1"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "WRONG model tier"; } \
+  && ok "AC-INDEP step 1: tier-mismatch fires the TIER advisory + writes its marker" \
+  || bad "AC-INDEP step 1 should fire the tier advisory (rc=$RC out=$CAP)"
+PINDEP2='{"session_id":"ac1513indep","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement.","subagent_type":"general-purpose"}}'
+run "$PINDEP2"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-executor"; } \
+  && ok "AC-INDEP step 2: SAME session/taskId/role, tier now satisfied -> effort advisory STILL fires (independent marker, not cannibalized)" \
+  || bad "AC-INDEP step 2 should fire the effort advisory despite the tier marker from step 1 (rc=$RC out=$CAP)"
+
+# ---- AC-ONCE (block-once, self-clearing — proves advisory not wall): issue a FRESH effort-condition payload
+#      twice against the persistent shared STATE_DIR -> first exit 2, second exit 0. ----
+PONCE='{"session_id":"ac1513once","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513once ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PONCE" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_once1=$RC
+runh "$HOOK" "$PONCE" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_once2=$RC
+{ [ "$rc_once1" = "2" ] && [ "$rc_once2" = "0" ]; } \
+  && ok "AC-ONCE: effort advisory fires once then falls through on re-issue (rc1=$rc_once1 rc2=$rc_once2)" \
+  || bad "AC-ONCE should block-once and self-clear (rc1=$rc_once1 rc2=$rc_once2)"
+
+# ---- AC-EMPTY (boundary — empty subagent_type fail-opens; Design nuance E): def present, subagent_type:"" -> exit 0. ----
+PEMPTY='{"session_id":"ac1513empty","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":""}}'
+runh "$HOOK" "$PEMPTY" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-EMPTY: subagent_type:\"\" (malformed/edge payload) -> exit 0, fail-open" \
+  || bad "AC-EMPTY should fail-open on an empty subagent_type (rc=$RC out=$CAP)"
+
+# ---- AC-KILL (kill-switches honored) — each on a FRESH, otherwise-positive effort-condition payload. ----
+PKILLA='{"session_id":"ac1513killa","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PKILLA" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" CC_ROLE_MODEL_GATE_OFF=1; rc_killa=$RC
+PKILLB='{"session_id":"ac1513killb","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PKILLB" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" THREE_ROLE_INSTRUMENT_OFF=1; rc_killb=$RC
+PKILLC='{"session_id":"ac1513killc","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PKILLC" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" SHIP_PIPELINE=1; rc_killc=$RC
+PKILLD='{"session_id":"ac1513killd","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner [model-policy-ok]\nPlan it.","subagent_type":"general-purpose"}}'
+runh "$HOOK" "$PKILLD" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_killd=$RC
+{ [ "$rc_killa" = "0" ] && [ "$rc_killb" = "0" ] && [ "$rc_killc" = "0" ] && [ "$rc_killd" = "0" ]; } \
+  && ok "AC-KILL: kill-switches (CC_ROLE_MODEL_GATE_OFF / THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE) + inline bypass all -> exit 0 on an otherwise-positive effort-condition payload" \
+  || bad "AC-KILL escapes should suppress a real effort-leg block (rc_a=$rc_killa rc_b=$rc_killb rc_c=$rc_killc rc_d=$rc_killd)"
+
+# ---- AC-REGRESSION / AC-NONDECAY are the pre-existing SECTION 0-4 arms above (unaffected by the new sub-leg —
+#      AGENTS_FIX never contains cc-planner.md, so AC-9/M1/M4 stay silent; AC-16 already asserts non-decay).
+#      No separate row needed here — this whole file's [ "$fail" = "0" ] tally IS AC-REGRESSION's mechanical
+#      backstop, and it re-runs on every invocation.
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
