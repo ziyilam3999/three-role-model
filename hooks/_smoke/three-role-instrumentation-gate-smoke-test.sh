@@ -390,7 +390,16 @@ runC 12692 sC2 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 
 # ---- C3 (AC4a-negative-NO-OVERRIDE, the convention-dir FALLBACK witness). planner INLINE-SKIP -> resolve-artifact
 #      exits 1 -> 4a FALLS BACK to the CLAUDE_PROJECT_DIR convention dir holding a cairn-less plan -> BLOCK. ----
-ledger_complete sC3 12693; D="$TMP/c3realproj"; mkplan "$D" no
+#      #1580 NOTE: do NOT use ledger_complete here — its planner row is a COMPLETED real artifact (agentId +
+#      artifact_path), and under #1580's monotonic clear-list a bare skip over that is now correctly REFUSED
+#      (it would erase real evidence — exactly the class this ticket closes). Build the other three roles
+#      directly and inline-skip planner while it has NO prior row at all, so the skip lands cleanly and this
+#      fixture exercises the convention-dir fallback, not the (now-hardened) clear-list guard.
+mk_sub sC3 agR; mk_sub sC3 agE; mk_sub sC3 agV
+appendL --session sC3 --task 12693 --role plan-review      --agent agR --artifact "$LART_REV"
+appendL --session sC3 --task 12693 --role executor         --agent agE --artifact "branch feat/x"
+appendL --session sC3 --task 12693 --role execution-review --agent agV --artifact "$LART_REV"
+D="$TMP/c3realproj"; mkplan "$D" no
 appendL --session sC3 --task 12693 --role planner --skip-reason "planner was tightly coupled to live mid-edit session state, not briefable as a standalone plan"
 runC 12693 sC3 CLAUDE_PROJECT_DIR="$D"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "AC4a-NO-OVERRIDE: planner skip -> convention-dir fallback cairn-less plan -> BLOCK" || bad "AC4a-NO-OVERRIDE should block via convention fallback (rc=$RC out=$CAP)"

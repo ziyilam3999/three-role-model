@@ -753,6 +753,42 @@ const AFFIRMATIVE_VERDICTS = new Set(['PASS', 'APPROVE', 'APPROVE-WITH-NOTES']);
 // nonzero — the ledger file is untouched (the prior terminal row survives byte-for-byte).
 class GuardRejection extends Error {}
 
+// #1580 Fix A — TERMINAL-EVIDENCE PREDICATE, monotonic-by-construction. #1575 keyed its guard on
+// `prior.verdict` alone — correct for review roles (which are the only ones that ever carry a verdict) but
+// BLIND to a completed EXECUTOR row, which carries `agentId + artifact_path + closedAt + self_authored` and
+// NO verdict. This predicate is the full terminal-evidence CLASS #1575's one instance belonged to: verdict
+// OR closedAt OR self_authored OR oracle OR a completed-run (agentId AND artifact_path) pair — the last
+// disjunct is what catches the LEGACY orchestrator-writes-at-close shape (Invariant #6: `append --role
+// executor --artifact <path>` with no --closed-at/--self-authored, composing onto a spawn-time agentId via
+// #855 overlay — that row carries neither closedAt nor self_authored yet is fully "done"). Spawn-time
+// ASSIGNED provenance (modelVersion/modelTier/effort) is DELIBERATELY excluded (plan-review non-blocking
+// note 1) — a bare outcome-less spawn row (agentId + maybe assigned model/effort, nothing else) must remain
+// legitimately clearable by a skip; that is the AC-2 "upgrade survives" arm, not a downgrade.
+function priorHasTerminalEvidence(prior) {
+  if (!prior) return false;
+  if (prior.verdict) return true;
+  if (prior.closedAt) return true;
+  if (prior.self_authored) return true;
+  if (prior.oracle) return true;
+  if (prior.agentId && prior.artifact_path) return true;
+  return false;
+}
+
+// Human-readable summary of WHICH terminal field(s) triggered the guard — generalizes #1575's message
+// (which hardcoded "carries a completed verdict") to name whichever evidence is actually present, since a
+// completed executor row triggers this with NO verdict at all.
+function terminalEvidenceSummary(prior) {
+  const parts = [];
+  if (prior.verdict) parts.push('verdict "' + prior.verdict + '"');
+  if (prior.closedAt) parts.push('closedAt "' + prior.closedAt + '"');
+  if (prior.self_authored) parts.push('self_authored');
+  if (prior.oracle) parts.push('oracle "' + prior.oracle + '"');
+  if (prior.agentId && prior.artifact_path) {
+    parts.push('a completed run (agentId "' + prior.agentId + '" + artifact_path "' + prior.artifact_path + '")');
+  }
+  return parts.join(', ');
+}
+
 // Mirror the gate's resolve_path: absolute / ~ / CLAUDE_PROJECT_DIR / cwd / $HOME.
 function resolveArtifact(p) {
   if (!p) return '';
@@ -1112,37 +1148,62 @@ function overlayAppend(session, task, role, fields) {
   let lines = [];
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); } catch (e) { /* new file */ }
   const kept = [];
-  let prior = null;
+  // #1580 Fix B — retain EVERY earlier same-role row as HISTORY; only the LAST same-role row becomes
+  // `prior` (the row this call may merge onto, or supersede with a genuinely new round). Pre-#1580 this
+  // loop dropped ALL same-role lines unconditionally (only the last survived, as `prior`, itself about to
+  // be overwritten) — harmless when a role only ever had ONE round, but it silently destroyed round-1's
+  // evidence (e.g. its OBSERVED model) the instant a round-2 write landed. `olderRoundLines` are raw
+  // strings, re-emitted VERBATIM — never re-parsed, re-ordered, or mutated once superseded.
+  const priorSameRoleLines = [];
   for (const ln of lines) {
-    try { const j = JSON.parse(ln); if (j && j.role === role) { prior = j; continue; } kept.push(ln); }
-    catch (e) { kept.push(ln); }
+    try {
+      const j = JSON.parse(ln);
+      if (j && j.role === role) { priorSameRoleLines.push(ln); continue; }
+      kept.push(ln);
+    } catch (e) { kept.push(ln); }
   }
-  // #1575 1a — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: a terminal verdict is EVIDENCE, a bare
-  // re-append is an ASSERTION, and the weak must never erase the strong. Both clauses key on the SAME
-  // trigger — the resolved PRIOR row for (task, role) carries a `verdict` — and both protect EVERY role's
-  // rows UNIFORMLY (AC-4j forces this across all four REQUIRED_ROLES; execution-review gets the identical
-  // protection as plan-review — the ledger is shared). Runs BEFORE any field is overlaid onto `entry`, and
-  // THROWS (writes nothing) rather than silently no-op'ing or preserving-and-mangling — see the plan's
-  // "why reject rather than the alternatives" note.
-  if (prior && prior.verdict) {
+  let prior = null;
+  if (priorSameRoleLines.length) {
+    try { prior = JSON.parse(priorSameRoleLines[priorSameRoleLines.length - 1]); } catch (e) { prior = null; }
+  }
+  const olderRoundLines = priorSameRoleLines.slice(0, -1);
+  // #1575 1a / #1580 Fix A — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: terminal evidence is
+  // EVIDENCE, a bare re-append is an ASSERTION, and the weak must never erase the strong. #1580 widens the
+  // outer TRIGGER from "prior carries a verdict" to "prior carries ANY terminal evidence"
+  // (priorHasTerminalEvidence — see its doc comment) so a completed EXECUTOR row (no verdict, ever) gets
+  // the SAME protection a completed review row already had; this is one extended guard, not a second one.
+  // Runs BEFORE any field is overlaid onto `entry`, and THROWS (writes nothing) rather than silently
+  // no-op'ing or preserving-and-mangling.
+  if (priorHasTerminalEvidence(prior)) {
     // Clause 1 — verdict-LESS erasers are rejected. A skip_reason append (the clear-list below would erase
-    // verdict/agentId/closedAt) or an inherited_from overlay (provenance-swap) that carries NO verdict of
-    // its own cannot erase a completed verdict. Keyed on verdict PRESENCE, never the skip keyword — this
-    // closes the skip-eraser AND the inherit-eraser with one rule.
+    // verdict/agentId/artifact_path/closedAt/self_authored/oracle) or an inherited_from overlay
+    // (provenance-swap) that carries NO verdict of its own cannot erase ANY terminal evidence — not just a
+    // verdict. Keyed on terminal-evidence PRESENCE, never the skip keyword nor the verdict field alone —
+    // this closes the skip-eraser AND the inherit-eraser for EVERY terminal shape with one rule.
     if ((('skip_reason' in fields) || ('inherited_from' in fields)) && !('verdict' in fields)) {
+      // Backward-compatible phrasing: when the terminal evidence includes a verdict, keep #1575's exact
+      // "a completed verdict ..." substring (existing consumers, e.g. three-role-transition-gate-smoke-
+      // test.sh AC-4b(i), grep for it) — the #1580-widened trigger only changes WHEN this clause fires, not
+      // the wording of the pre-existing verdict case. A prior row with NO verdict (the new executor-shaped
+      // case this fix adds) gets the generalized terminal-evidence summary instead.
+      const evidenceLabel = prior.verdict
+        ? ('a completed verdict "' + prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : ''))
+        : ('terminal evidence — ' + terminalEvidenceSummary(prior));
       throw new GuardRejection(
-        'terminal-evidence guard (1a clause 1): role ' + role + ' already carries a completed verdict "' +
-        prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
-        ' — a verdict-LESS write (skip / inherit) cannot erase it. Run a new, genuinely bound review to ' +
+        'terminal-evidence guard (#1575/#1580): role ' + role + ' already carries ' + evidenceLabel +
+        ' — a verdict-LESS write (skip / inherit) cannot erase it. Run a new, genuinely bound review/run to ' +
         'supersede it honestly.'
       );
     }
-    // Clause 2 — verdict-CHANGING appends require NEW, ATTRIBUTED evidence. A DIFFERENT verdict value is
-    // accepted ONLY when the SAME command also cites (i) an --agent whose transcript is SPAWN-RECORD-bound
-    // to this exact (task, role) AND distinct from the prior row's agentId (when the prior row has one),
-    // AND (ii) a --closed-at strictly newer than the prior row's closedAt (when the prior row has one).
-    // Same-VALUE re-appends and verdict-less writes are untouched by this clause (checked above/below).
-    if (('verdict' in fields) && fields.verdict !== prior.verdict) {
+    // Clause 2 (UNCHANGED from #1575, still verdict-scoped — a "verdict change" is only a meaningful concept
+    // when a verdict exists to change) — verdict-CHANGING appends require NEW, ATTRIBUTED evidence. A
+    // DIFFERENT verdict value is accepted ONLY when the SAME command also cites (i) an --agent whose
+    // transcript is SPAWN-RECORD-bound to this exact (task, role) AND distinct from the prior row's agentId
+    // (when the prior row has one), AND (ii) a --closed-at strictly newer than the prior row's closedAt
+    // (when the prior row has one). Same-VALUE re-appends and verdict-less writes are untouched by this
+    // clause (checked above/below). A prior row with NO verdict (e.g. a completed executor row) has no
+    // verdict for this clause to guard — that row's protection is entirely clause 1's job.
+    if (prior.verdict && ('verdict' in fields) && fields.verdict !== prior.verdict) {
       const incomingAgent = ('agentId' in fields) ? fields.agentId : '';
       const boundNew = !!incomingAgent && agentBoundToTag(session, incomingAgent, task, role);
       const distinctAgent = !prior.agentId || (incomingAgent !== prior.agentId);
@@ -1160,10 +1221,26 @@ function overlayAppend(session, task, role, fields) {
       }
     }
   }
-  // Start from the prior line for this role and overlay ONLY the fields this call provides. Unprovided fields
-  // PERSIST from the prior line; role / session_id / ts always refresh. This is what lets "agentId at spawn"
-  // and "artifact_path at close" compose into ONE line, order-independent — neither writer clobbers the other.
-  const entry = { ...(prior || {}), role, session_id: sanitize(session), ts: new Date().toISOString() };
+  // #1580 Fix B — ROUND BOUNDARY. A NEW, DISTINCT --agent arriving over a prior row that ALREADY had an
+  // agentId is the unforgeable-ish signal of a genuinely NEW round (a fresh subagent spawn), not a
+  // same-round compose. When detected: retain the just-superseded round's row VERBATIM as history (pushed
+  // below, never touched again) and start this entry FRESH — carrying only what THIS call provides, not
+  // the old round's artifact_path/closedAt/verdict/self_authored/oracle (those belong to round-1's
+  // evidence, already safely retained in its own line). A close-only append (no --agent at all) or a
+  // same-agent re-append never triggers this, so the existing single-round spawn-then-close AND
+  // close-then-spawn compose (#855, AC-4) is unaffected: on close-then-spawn the FIRST write (the close) has
+  // no prior row yet, so when the spawn's --agent later arrives `prior.agentId` is still absent and this
+  // stays false — that write correctly MERGES onto the close, one round, one line.
+  const incomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  const isNewRound = !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
+  for (const ln of olderRoundLines) kept.push(ln);
+  if (isNewRound) kept.push(JSON.stringify(prior));
+  // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
+  // overlay ONLY the fields this call provides. Unprovided fields PERSIST from the base; role / session_id /
+  // ts always refresh. This is what lets "agentId at spawn" and "artifact_path at close" compose into ONE
+  // line within a round, order-independent — neither writer clobbers the other — while a genuinely new
+  // round starts its own line instead of Frankensteining onto the old one.
+  const entry = { ...(isNewRound ? {} : (prior || {})), role, session_id: sanitize(session), ts: new Date().toISOString() };
   if ('agentId' in fields) entry.agentId = fields.agentId;
   if ('artifact_path' in fields) entry.artifact_path = fields.artifact_path;
   if ('skip_reason' in fields) entry.skip_reason = fields.skip_reason;
