@@ -38,11 +38,20 @@
 #     what makes a research row genuinely MID-FLIGHT-visible: the badge renders the instant the spawn is
 #     sent, carrying the role's ASSIGNED {tier, effort, version}, not just at completion.
 #   Chain roles are DELIBERATELY excluded from the PreToolUse edge (a chain-role PreToolUse payload writes
-#   NOTHING — see the load-bearing `hookEvent==="PreToolUse" && role!=="research"` no-op above). Moving a
-#   chain role's row to dispatch-time would let a spawn's mere EXISTENCE satisfy
-#   three-role-transition-gate.sh's presence-only plan-review check before the review ever ran — defeating a
-#   fail-closed gate. Research has no such gate reading it (see the plan's "why a phantom research row is
-#   genuinely harmless" section), so it is the one role safe to move earlier.
+#   NOTHING — see the load-bearing `hookEvent==="PreToolUse" && role!=="research"` no-op above).
+#   #1575 CORRECTION (this comment was factually stale — the premise below no longer holds and is fixed
+#   here, not just retightened in wording): three-role-transition-gate.sh is NO LONGER a presence-only
+#   plan-review check (that was the #1575 defect). It now requires COMPLETION evidence — an affirmative
+#   verdict, a closedAt punch-out, and a spawn-record-bound agentId (or an equally-bound inherited row) —
+#   read via `gate-plan-review` in hooks/3role-ledger.mjs. A spawn-time {role}-only line from THIS hook (no
+#   verdict, no closedAt) could no longer satisfy that gate even if chain roles DID write at dispatch-time.
+#   Chain roles stay off the PreToolUse edge anyway, for a narrower, still-real reason: a dispatch-time row
+#   with no verdict/closedAt is a premature, potentially misleading "in-flight" signal for a role whose
+#   entire job IS to produce that verdict — writing it before the role starts adds no honest visibility (it
+#   would be overlay-merged away or left dangling on a crashed spawn) and needlessly conflates the
+#   dispatch-time hook's fail-open write policy with the fail-closed gate that later reads plan-review rows.
+#   Research has no such gate reading it (see the plan's "why a phantom research row is genuinely harmless"
+#   section) and its dispatch-time row IS its useful signal, so it remains the one role safe to move earlier.
 #
 # Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1 (uniform family switch) OR THREE_ROLE_SPAWN_LEDGER_OFF=1 (dedicated).
 # Tag regexes are the EXACT sibling enum-anchored forms (group [1]) — see three-role-transition-gate.sh:39-40

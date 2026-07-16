@@ -158,6 +158,25 @@
 //     "BLOCK: cannot inherit ..." to stderr, exits 3, and writes NOTHING. On success appends both parent
 //     entries (verbatim agentId + artifact_path, plus `inherited_from: P`) through the overlay-merge path so a
 //     later real per-leg review overwrites cleanly; prints "OK inherited ..." and exits 0.
+//     #1575 — THREE additional fail-closed preconditions (verify-then-write, before EITHER overlayAppend
+//     write): (1) the parent's PLANNER artifact must NAME the leg task id (parent-leg relation); (2) the
+//     parent's plan-review verdict must be AFFIRMATIVE (PASS|APPROVE|APPROVE-WITH-NOTES); (3) the LEG's own
+//     plan-review row must NOT already carry a verdict (leg terminality — a hand-me-down never papers over a
+//     completed per-leg review). The successful plan-review write now ALSO carries the parent's verdict (the
+//     gate's universal screen reads it).
+//   gate-plan-review --session S --task T                            (#1575)
+//     The TRANSITION GATE's entire plan-review-ADMISSION decision (hooks/three-role-transition-gate.sh shells
+//     out to this instead of re-implementing the contract). Evaluates the LAST PARSEABLE plan-review line in
+//     the task's ledger (last-match, not first-match — #1580-safe); fail-closed on any UNPARSEABLE line
+//     trailing it (junk-line class); runs a universal verdict ALLOWLIST screen (PASS|APPROVE|
+//     APPROVE-WITH-NOTES, never a denylist) FIRST, on every arm; then two sanctioned arms — (1) completed-
+//     review: affirmative verdict + closedAt + an agentId SPAWN-RECORD-bound (agentBoundToTag(), never
+//     resolveAgent()/newest-mtime) to `3ROLE_TASK:<task> ROLE:plan-review`; (2) inherited-review: the same
+//     binding test keyed on the row's own `inherited_from`. There is NO skip arm (operator decision — a
+//     deliberate skip never satisfies this gate). Exit 0 (ALLOW, silent) or exit 2 (BLOCK, stderr
+//     "BLOCK:<class>|<ledger-file-and-line>" naming one of seven classes: not-finished / no-verdict /
+//     negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent / deliberate-skip-closed /
+//     junk-line).
 //
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
 //   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
@@ -645,10 +664,37 @@ function agentResolves(session, agentId) {
   return false;
 }
 
-// #860: resolve the agentId of the NEWEST-mtime subagent transcript carrying the exact spawn tag
-// `3ROLE_TASK:<task> ROLE:<role>`. Returns the agentId string or '' when no transcript carries the tag.
-// Newest-mtime, not first-match: a tag can repeat across transcripts (an earlier probe/retry reusing a
-// role tag), so the most recent write is the real role spawn.
+// #1575 Lane 1c — extract the plain TEXT of a subagent transcript's FIRST record (the initial spawn-prompt
+// message). This is the SPAWN RECORD, as opposed to any LATER record (a Read tool-result, a pasted brief, a
+// review byline) that can carry a 3ROLE_TASK tag as a MENTION rather than a spawn (round-3 D1: a real
+// planner transcript ingests the plan-review tag via its own '## Review' byline, measured 4-of-7 on a real
+// session). Every predicate in this file that decides "is agentId X bound to (task, role)" is re-scoped to
+// test ONLY this first-record text — never `content.includes(tag)` over the whole file — so there is exactly
+// ONE tag-binding predicate in the module (resolveAgent, agentBoundToTag, tagFromSubagentTranscript below all
+// call this). Returns '' on any missing/unreadable/unparseable first line (fails closed to "no match").
+function firstRecordText(content) {
+  const firstLine = String(content == null ? '' : content).split('\n').find((l) => l.trim());
+  if (!firstLine) return '';
+  let rec;
+  try { rec = JSON.parse(firstLine); } catch (e) { return ''; }
+  const msg = (rec && rec.message) || {};
+  let text = '';
+  if (typeof msg.content === 'string') text = msg.content;
+  else if (Array.isArray(msg.content)) {
+    for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+  }
+  return text;
+}
+
+// #860 / #1575 D1: resolve the agentId of the NEWEST-mtime subagent transcript whose SPAWN RECORD (first
+// record, `firstRecordText()`) carries the exact spawn tag `3ROLE_TASK:<task> ROLE:<role>`. Returns the
+// agentId string or '' when no transcript's spawn record carries the tag. Newest-mtime, not first-match: a
+// tag can repeat across transcripts (an earlier probe/retry reusing a role tag), so the most recent write is
+// the real role spawn. NOTE (round-4 D1 fix, at source): the predicate used to be a WHOLE-FILE
+// `content.includes(tag)` — that binds to MENTIONS (a later record quoting the tag), not spawns; re-scoped
+// to the spawn record only. This resolver remains a SEARCH-ACROSS-ALL-TRANSCRIPTS + newest-mtime-WINNER
+// function — it is NOT the right predicate for verifying one SPECIFIC cited agentId's binding (a
+// contaminated newer sibling can steal the "winner" slot, W27); that is what `agentBoundToTag()` below is for.
 function resolveAgent(session, task, role) {
   const sess = sanitize(session);
   const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
@@ -668,12 +714,44 @@ function resolveAgent(session, task, role) {
       if (!st.isFile()) continue;
       let content;
       try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
-      if (!content.includes(tag)) continue;
+      if (!firstRecordText(content).includes(tag)) continue;
       if (!best || st.mtimeMs > best.mtimeMs) best = { agentId: m[1], mtimeMs: st.mtimeMs };
     }
   }
   return best ? best.agentId : '';
 }
+
+// #1575 — test whether ONE SPECIFIC cited agentId is bound to (task, role): open exactly THAT agent's own
+// transcript and test its spawn record. Unlike resolveAgent() (which SEARCHES every transcript and returns a
+// newest-mtime WINNER), this never lets a contaminated, newer sibling transcript decide another row's
+// binding (the W27 failure mode) — the correct predicate for verifying a ROW'S own claim (gate arm (1)/(2)
+// and the 1a clause-2 supersede check all use this, per the Traps note: never resolveAgent/newest-mtime here).
+function agentBoundToTag(session, agentId, task, role) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return false;
+  const sess = sanitize(session);
+  const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return false; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    if (firstRecordText(content).includes(tag)) return true;
+  }
+  return false;
+}
+
+// #1575 §1b — the gate's universal verdict screen vocabulary, ONE allowlist shared by the gate (via
+// `gate-plan-review`) and `cmdInherit`'s parent-verdict precondition ("the gate's own allowlist, one
+// vocabulary, not two"). ALLOWLIST, never a denylist (D3): membership admits, everything else — BLOCK,
+// SHIP-WITH-FIXES, a typo, an empty string, any novel token — blocks.
+const AFFIRMATIVE_VERDICTS = new Set(['PASS', 'APPROVE', 'APPROVE-WITH-NOTES']);
+
+// #1575 1a — thrown by overlayAppend when the terminal-EVIDENCE guard (clause 1 or clause 2) rejects a
+// write. Callers (cmdAppend, cmdInherit) catch this, print the reason to stderr, write NOTHING, and exit
+// nonzero — the ledger file is untouched (the prior terminal row survives byte-for-byte).
+class GuardRejection extends Error {}
 
 // Mirror the gate's resolve_path: absolute / ~ / CLAUDE_PROJECT_DIR / cwd / $HOME.
 function resolveArtifact(p) {
@@ -1039,6 +1117,49 @@ function overlayAppend(session, task, role, fields) {
     try { const j = JSON.parse(ln); if (j && j.role === role) { prior = j; continue; } kept.push(ln); }
     catch (e) { kept.push(ln); }
   }
+  // #1575 1a — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: a terminal verdict is EVIDENCE, a bare
+  // re-append is an ASSERTION, and the weak must never erase the strong. Both clauses key on the SAME
+  // trigger — the resolved PRIOR row for (task, role) carries a `verdict` — and both protect EVERY role's
+  // rows UNIFORMLY (AC-4j forces this across all four REQUIRED_ROLES; execution-review gets the identical
+  // protection as plan-review — the ledger is shared). Runs BEFORE any field is overlaid onto `entry`, and
+  // THROWS (writes nothing) rather than silently no-op'ing or preserving-and-mangling — see the plan's
+  // "why reject rather than the alternatives" note.
+  if (prior && prior.verdict) {
+    // Clause 1 — verdict-LESS erasers are rejected. A skip_reason append (the clear-list below would erase
+    // verdict/agentId/closedAt) or an inherited_from overlay (provenance-swap) that carries NO verdict of
+    // its own cannot erase a completed verdict. Keyed on verdict PRESENCE, never the skip keyword — this
+    // closes the skip-eraser AND the inherit-eraser with one rule.
+    if ((('skip_reason' in fields) || ('inherited_from' in fields)) && !('verdict' in fields)) {
+      throw new GuardRejection(
+        'terminal-evidence guard (1a clause 1): role ' + role + ' already carries a completed verdict "' +
+        prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
+        ' — a verdict-LESS write (skip / inherit) cannot erase it. Run a new, genuinely bound review to ' +
+        'supersede it honestly.'
+      );
+    }
+    // Clause 2 — verdict-CHANGING appends require NEW, ATTRIBUTED evidence. A DIFFERENT verdict value is
+    // accepted ONLY when the SAME command also cites (i) an --agent whose transcript is SPAWN-RECORD-bound
+    // to this exact (task, role) AND distinct from the prior row's agentId (when the prior row has one),
+    // AND (ii) a --closed-at strictly newer than the prior row's closedAt (when the prior row has one).
+    // Same-VALUE re-appends and verdict-less writes are untouched by this clause (checked above/below).
+    if (('verdict' in fields) && fields.verdict !== prior.verdict) {
+      const incomingAgent = ('agentId' in fields) ? fields.agentId : '';
+      const boundNew = !!incomingAgent && agentBoundToTag(session, incomingAgent, task, role);
+      const distinctAgent = !prior.agentId || (incomingAgent !== prior.agentId);
+      const closedAtOk = !prior.closedAt ||
+        (('closedAt' in fields) && !!fields.closedAt && String(fields.closedAt) > String(prior.closedAt));
+      if (!(boundNew && distinctAgent && closedAtOk)) {
+        throw new GuardRejection(
+          'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
+          prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
+          ' — superseding it requires a NEW, ATTRIBUTED review in the SAME command: an --agent whose ' +
+          'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
+          'prior agentId, AND a --closed-at strictly newer than the prior closedAt. A bare or same-agent ' +
+          'verdict flip is refused; spawn a genuinely NEW plan-review/review subagent and cite it.'
+        );
+      }
+    }
+  }
   // Start from the prior line for this role and overlay ONLY the fields this call provides. Unprovided fields
   // PERSIST from the prior line; role / session_id / ts always refresh. This is what lets "agentId at spawn"
   // and "artifact_path at close" compose into ONE line, order-independent — neither writer clobbers the other.
@@ -1145,7 +1266,13 @@ function cmdAppend(o) {
       'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
       'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
   }
-  const file = overlayAppend(session, task, role, fields);
+  let file;
+  try {
+    file = overlayAppend(session, task, role, fields);
+  } catch (e) {
+    if (e instanceof GuardRejection) { console.error('BLOCK: ' + e.message); process.exit(2); }
+    throw e;
+  }
   console.log('OK appended role=' + role + ' -> ' + file);
   process.exit(0);
 }
@@ -1186,12 +1313,159 @@ function cmdInherit(o) {
     const prob = checkRole(r, ent, session);
     if (prob) block(prob);
   }
+  // #1575 1a-2 — three additional fail-closed PRECONDITIONS (verify-THEN-write, exit 3, writes NOTHING),
+  // evaluated BEFORE either overlayAppend call below (round-4 D2: leg-terminality in particular must NOT be
+  // delegated to the 1a guard inside overlayAppend — cmdInherit writes the planner row first, so a
+  // guard-inside-the-overlay would fire only on the SECOND write, after the planner row already carries
+  // inherited_from, breaking the "writes NOTHING" contract).
+  const blockPrecond = (reason) => {
+    console.error('BLOCK: cannot inherit — ' + reason);
+    process.exit(3);
+  };
+  // Precondition 1 — PARENT-LEG RELATION: the parent's own ledgered PLANNER artifact (the reviewed plan
+  // file) must NAME the leg task id (a genuine leg is a sub-slice of the parent's plan; #1064 discipline).
+  {
+    const ap = resolveArtifact(planner.artifact_path);   // already existence+PLAN_RE-verified by checkRole above.
+    let content = '';
+    try { content = fs.readFileSync(ap, 'utf8'); } catch (e) { /* fall through -> relation test fails below */ }
+    const legToken = sanitize(task);
+    const legRe = new RegExp('(^|[^0-9A-Za-z._-])' + legToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9A-Za-z._-])');
+    if (!legToken || !legRe.test(content)) {
+      blockPrecond('parent planner artifact "' + ap + '" does not name leg task ' + legToken +
+        ' — a genuine leg must be listed in the parent plan (the #1064 discipline: tag CHILD ids, not the ' +
+        'epic\'s). Add the leg id to the plan (an honest, visible edit), or provide the correct --parent.');
+    }
+  }
+  // Precondition 2 — PARENT VERDICT condition: the parent's plan-review row must carry an AFFIRMATIVE
+  // verdict (the gate's own allowlist, one vocabulary, not two). Absent also refuses (fail-closed).
+  {
+    const v = typeof planReview.verdict === 'string' ? planReview.verdict.toUpperCase().trim() : '';
+    if (!AFFIRMATIVE_VERDICTS.has(v)) {
+      blockPrecond('parent plan-review verdict is ' + (v || '<absent>') + ' — inherit requires an AFFIRMATIVE ' +
+        'verdict (' + [...AFFIRMATIVE_VERDICTS].join('|') + '); the parent\'s remediation is a re-review, not a ' +
+        'silent inherit.');
+    }
+  }
+  // Precondition 3 — LEG TERMINALITY: if the LEG's OWN plan-review row already carries a verdict, refuse up
+  // front — a completed per-leg review is never papered over by a hand-me-down.
+  {
+    const legFile = ledgerFile(session, task);
+    let legLines = [];
+    try { legLines = fs.readFileSync(legFile, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { /* no leg ledger yet -> fine */ }
+    let legPlanReview = null;
+    for (const ln of legLines) { try { const j = JSON.parse(ln); if (j && j.role === 'plan-review') legPlanReview = j; } catch (e) { /* skip */ } }
+    if (legPlanReview && legPlanReview.verdict) {
+      blockPrecond('leg ' + sanitize(task) + ' already has a completed plan-review verdict "' + legPlanReview.verdict +
+        '"' + (legPlanReview.agentId ? ' (agentId ' + legPlanReview.agentId + ')' : '') +
+        ' — a hand-me-down inherit cannot paper over a completed per-leg review. Run a new, genuinely bound ' +
+        'review to supersede it honestly.');
+    }
+  }
   // Success: append both parent entries into the LEG ledger verbatim (same agentId + artifact_path) + an
-  // inherited_from marker, through the same overlay-merge path so a later real per-leg review overwrites clean.
-  overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) });
-  overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent) });
+  // inherited_from marker, through the same overlay-merge path so a later real per-leg review overwrites
+  // clean. The plan-review row ALSO carries the parent's verdict (the gate's universal screen reads it —
+  // arm (2) is only reachable when the inherited row itself carries an affirmative verdict). The 1a guard
+  // (clause 1/2) inside overlayAppend runs here too as a defense-in-depth BACKSTOP — unreachable in the
+  // sanctioned flow given precondition 3 above, but never bypassed.
+  try {
+    overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) });
+    overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict });
+  } catch (e) {
+    if (e instanceof GuardRejection) blockPrecond(e.message);
+    throw e;
+  }
   console.log('OK inherited plan-review from parent ' + sanitize(parent) + ' -> task ' + sanitize(task));
   process.exit(0);
+}
+
+// #1575 Lane 1b — the transition gate's plan-review ADMISSION decision, as a single reusable function. The
+// bash gate (three-role-transition-gate.sh) shells out to the `gate-plan-review` CLI below instead of
+// re-implementing this contract in a second language — ONE evaluator, exercised directly by node-level
+// smokes AND by the real gate. Returns { allow, class, detail }; `class` is '' when allow=true, else one of
+// the SEVEN named fail-closed classes the plan requires the block message to distinguish:
+//   not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent /
+//   deliberate-skip-closed / junk-line
+function evaluatePlanReviewGate(session, task) {
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    return { allow: false, class: 'not-finished', detail: file + ' (no ledger file — no plan-review has ever run for this task)' };
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  // Evaluate the LAST PARSEABLE plan-review line — explicitly last-match (#1580 will make >=2 lines normal;
+  // a first-match read would silently prefer a stale round-1 PASS over a round-2 BLOCK).
+  let lastIdx = -1;
+  let lastEntry = null;
+  const parsedOk = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    let j = null;
+    let ok = true;
+    try { j = JSON.parse(rawLines[i]); } catch (e) { ok = false; }
+    parsedOk.push(ok);
+    if (ok && j && j.role === 'plan-review') { lastIdx = i; lastEntry = j; }
+  }
+  if (lastIdx === -1) {
+    return { allow: false, class: 'not-finished', detail: file + ' (no parseable plan-review line)' };
+  }
+  // Trailing-junk rule (pinned round 4, fail-closed): any UNPARSEABLE line AFTER the last parseable
+  // plan-review line blocks — post-#1580 a "valid-PASS then junk" file is otherwise ambiguous between two
+  // readings, and fail-closed is the safe one.
+  for (let i = lastIdx + 1; i < parsedOk.length; i++) {
+    if (!parsedOk[i]) {
+      return { allow: false, class: 'junk-line', detail: file + ' (unparseable line ' + (i + 1) + ' follows the last plan-review line)' };
+    }
+  }
+  const e = lastEntry;
+  // Universal verdict screen (an ALLOWLIST in the code, never a denylist — D3): runs FIRST, on EVERY arm,
+  // regardless of any other field on the line.
+  const verdict = typeof e.verdict === 'string' ? e.verdict.toUpperCase().trim() : '';
+  if (!verdict) {
+    if ('skip_reason' in e && !e.agentId && !e.inherited_from) {
+      return { allow: false, class: 'deliberate-skip-closed', detail: file + ' (line ' + (lastIdx + 1) + ') — there is NO skip path for plan-review at this gate' };
+    }
+    return { allow: false, class: 'no-verdict', detail: file + ' (line ' + (lastIdx + 1) + ') — no verdict recorded yet' };
+  }
+  if (!AFFIRMATIVE_VERDICTS.has(verdict)) {
+    return { allow: false, class: 'negative-verdict', detail: file + ' (line ' + (lastIdx + 1) + ', verdict=' + verdict + ') — the review did not pass; re-plan, re-review' };
+  }
+  // Arm 1 — completed-review (primary): affirmative verdict (screened above) AND closedAt (the SubagentStop
+  // punch-out) AND agentId, AND that agentId is SPAWN-RECORD-bound to 3ROLE_TASK:<task> ROLE:plan-review.
+  if (e.closedAt && e.agentId && !e.inherited_from) {
+    if (agentBoundToTag(session, e.agentId, task, 'plan-review')) return { allow: true, class: '', detail: '' };
+    return {
+      allow: false, class: 'no-bound-reviewer-spawn',
+      detail: file + ' (line ' + (lastIdx + 1) + ') — agentId "' + e.agentId + '" is not spawn-record-bound to ' +
+        '3ROLE_TASK:' + task + ' ROLE:plan-review (its transcript\'s FIRST record does not carry that tag)',
+    };
+  }
+  // Arm 2 — inherited-review: inherited_from + agentId + artifact_path present, AND that agentId is
+  // PARENT-bound (spawn-record carries 3ROLE_TASK:<inherited_from> ROLE:plan-review).
+  if (e.inherited_from && e.agentId && e.artifact_path) {
+    if (agentBoundToTag(session, e.agentId, e.inherited_from, 'plan-review')) return { allow: true, class: '', detail: '' };
+    return {
+      allow: false, class: 'inherited-row-unbound-to-parent',
+      detail: file + ' (line ' + (lastIdx + 1) + ') — agentId "' + e.agentId + '" is not spawn-record-bound to ' +
+        'parent 3ROLE_TASK:' + e.inherited_from + ' ROLE:plan-review',
+    };
+  }
+  // Neither arm's structural shape is satisfied (missing closedAt/agentId, or an incomplete inherited row).
+  return {
+    allow: false, class: 'not-finished',
+    detail: file + ' (line ' + (lastIdx + 1) + ') — missing completed-review evidence (closedAt + bound agentId, ' +
+      'or a complete inherited row)',
+  };
+}
+
+// #1575: gate-plan-review --session S --task T -> exit 0 (ALLOW, silent) or exit 2 (BLOCK, stderr names the
+// evidence class + the ledger file/line). The transition gate's ENTIRE plan-review-admission decision lives
+// HERE (evaluatePlanReviewGate) — the bash hook is a thin caller, not a second implementation.
+function cmdGatePlanReview(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task) { console.error('gate-plan-review: --session and --task are required'); process.exit(2); }
+  const r = evaluatePlanReviewGate(session, task);
+  if (r.allow) { process.exit(0); }
+  console.error('BLOCK:' + r.class + '|' + r.detail);
+  process.exit(2);
 }
 
 function cmdCheck(o) {
@@ -1538,6 +1812,7 @@ function readStdinJSON() {
 }
 
 // Parse ONLY message.content text of the subagent transcript's FIRST record for the live 3ROLE_TASK tag.
+// #1575: reuses the shared firstRecordText() extractor (Lane 1c — ONE predicate, not a second copy).
 function tagFromSubagentTranscript(session, agentId) {
   const sess = sanitize(session);
   const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
@@ -1547,20 +1822,10 @@ function tagFromSubagentTranscript(session, agentId) {
   for (const slug of slugs) {
     const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
     if (!fileExists(f)) continue;
-    let firstLine;
-    try {
-      const content = fs.readFileSync(f, 'utf8');
-      firstLine = content.split('\n').find((l) => l.trim());
-    } catch (e) { continue; }
-    if (!firstLine) continue;
-    let rec;
-    try { rec = JSON.parse(firstLine); } catch (e) { continue; }
-    const msg = (rec && rec.message) || {};
-    let text = '';
-    if (typeof msg.content === 'string') text = msg.content;
-    else if (Array.isArray(msg.content)) {
-      for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
-    }
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    const text = firstRecordText(content);
+    if (!text) continue;
     const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
     if (m) return { task: m[1], role: m[2] };
   }
@@ -1657,13 +1922,15 @@ try {
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
+  else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|log-bypass> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts (check, #1509)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
+      '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)]');
     process.exit(2);
   }
