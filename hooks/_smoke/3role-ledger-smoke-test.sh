@@ -178,11 +178,15 @@ fi
 
 # ---------------------------------------------------------------------------
 # #860 — resolve-agent: newest-mtime tagged transcript wins; no-match -> empty + nonzero.
+# #1575 Lane 1c / AC-22 note (3) — FIXTURE STRENGTHENED to the realistic SPAWN-RECORD shape: the tag now
+# sits in the FIRST record (the spawn prompt), not a bare trailing raw-text line after a tagless metadata
+# line. resolveAgent()'s predicate is re-scoped to test ONLY the first record (firstRecordText()) -- a
+# fixture whose tag sits outside the first record no longer binds (that IS the D1 fix); this fixture is
+# updated to the real shape rather than widening the predicate back to whole-file.
 # ---------------------------------------------------------------------------
-# Build a tagged subagent transcript carrying the literal spawn tag `3ROLE_TASK:<task> ROLE:<role>`.
 mk_tagged() { # <session> <agentId> <task> <role>
   mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
-  printf '{"isSidechain":true,"agentId":"%s"}\n3ROLE_TASK:%s ROLE:%s\n' "$2" "$3" "$4" \
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4" \
     > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
 }
 
@@ -220,8 +224,15 @@ echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on
 VSID="sess-verdict"; VTASK="1036v"; VFILE="$THREE_ROLE_LEDGER_DIR/$VSID/$VTASK.jsonl"
 node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --agent ev1 --artifact "$TMP/rev.md" --verdict "APPROVE-WITH-NOTES" >/dev/null
 grep -q '"verdict":"APPROVE-WITH-NOTES"' "$VFILE" && ok "#1036 append --verdict persists the verdict" || bad "#1036 --verdict not persisted (got: $(tail -1 "$VFILE"))"
-node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --skip-reason "n/a" >/dev/null
-grep -q '"verdict"' "$VFILE" && bad "#1036 skip should clear verdict (got: $(tail -1 "$VFILE"))" || ok "#1036 skip_reason clears the verdict"
+# #1575 AC-22 note (4) — HARDENED-CONTRACT FIXTURE UPDATE (deliberate, not a regression): this case used to
+# assert the pre-fix clear-list mechanic (skip erases a completed verdict, exit 0). The 1a clause-1
+# terminal-evidence guard now REVERSES that on EVERY required role, execution-review included (AC-4j proves
+# the uniformity) -- the skip append onto this completed verdict now exits NONZERO and the verdict is
+# PRESERVED (mirrors AC-4b's sub-checks (i)/(ii): assert BOTH the nonzero exit AND the retained verdict).
+SKIP1036_OUT=$(node "$LED" append --session "$VSID" --task "$VTASK" --role execution-review --skip-reason "n/a" 2>&1); SKIP1036_RC=$?
+{ [ "$SKIP1036_RC" != "0" ] && grep -q '"verdict"' "$VFILE"; } \
+  && ok "#1036 skip append onto a completed execution-review verdict is REFUSED (nonzero exit, verdict PRESERVED -- AC-22 note 4)" \
+  || bad "#1036 skip should be refused with the verdict preserved (rc=$SKIP1036_RC got: $(tail -1 "$VFILE") err=$SKIP1036_OUT)"
 node "$LED" append --session "$VSID" --task "${VTASK}bc" --role planner --agent p9 --artifact "$TMP/plan.md" >/dev/null
 grep -q '"verdict"' "$THREE_ROLE_LEDGER_DIR/$VSID/${VTASK}bc.jsonl" && bad "#1036 no --verdict should mean no verdict field" || ok "#1036 absent --verdict -> no verdict field (back-compat)"
 
@@ -849,5 +860,40 @@ OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-arti
   && ok "[proof] 1509-AC2 GREEN: executor==planner (#1494-shaped historical convention, tracked) -> exit 0, NOT blocked, NOTE-EXECUTOR surfaces the executor row" \
   || bad "1509-AC2 executor==planner should not block + must surface NOTE (rc=$RC out=$OUT)"
 rm -rf "$GITROOT" 2>/dev/null
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1575 AC-4j (HERO) — per-role UNIFORMITY MATRIX for the 1a terminal-evidence guard. For EACH role R in
+# REQUIRED_ROLES (planner / plan-review / executor / execution-review, `3role-ledger.mjs:185`), build a
+# FRESH ledger fixture and run BOTH legs: (i) clause-1 (verdict-less ERASE via skip_reason) and (ii) clause-2
+# (bare verdict-FLIP). Every cell is buildable via the plain helper (no raw writes -- cmdAppend accepts
+# --verdict for any RECORDABLE role, the overlay has no role branch). This closes the whole class at once: a
+# role-scoped (e.g. plan-review-only) implementation of either clause is mechanically rejected the instant
+# ANY one role's cell exits 0 instead of NONZERO.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AC4J_ROLES="planner plan-review executor execution-review"
+for R in $AC4J_ROLES; do
+  # -- clause-1 leg: seed a completed BLOCK for role R, then a verdict-LESS skip append.
+  AJSID="sess-ac4j-c1-$R"; AJTASK="ac4j-c1"
+  AJFILE="$THREE_ROLE_LEDGER_DIR/$AJSID/$AJTASK.jsonl"
+  node "$LED" append --session "$AJSID" --task "$AJTASK" --role "$R" --agent "agR-$R" --closed-at "2026-07-11T00:00:00.000Z" --verdict BLOCK >/dev/null 2>&1
+  seedCount=$(grep -Ec '"verdict":"BLOCK"' "$AJFILE" 2>/dev/null)
+  SKIP_OUT=$(node "$LED" append --session "$AJSID" --task "$AJTASK" --role "$R" --skip-reason "a specific reason, twenty-plus characters long" 2>&1); SKIP_RC=$?
+  afterCount=$(grep -Ec '"verdict":"BLOCK"' "$AJFILE" 2>/dev/null)
+  ctrlCount=$(printf '%s\n' '{"role":"x","verdict":"BLOCK"}' | grep -Ec '"verdict":"BLOCK"')
+  { [ "$seedCount" = "1" ] && [ "$SKIP_RC" != "0" ] && [ "$afterCount" = "1" ] && [ "$ctrlCount" = "1" ]; } \
+    && ok "AC-4j clause-1 role=$R: verdict-less skip append onto a completed verdict is REFUSED, verdict preserved (positive control included)" \
+    || bad "AC-4j clause-1 role=$R FAILED (seed=$seedCount skipRc=$SKIP_RC after=$afterCount ctrl=$ctrlCount out=$SKIP_OUT)"
+
+  # -- clause-2 leg: same terminal fixture (fresh task id), then a bare verdict-flip (no --agent/--closed-at).
+  AJTASK2="ac4j-c2"
+  AJFILE2="$THREE_ROLE_LEDGER_DIR/$AJSID/$AJTASK2.jsonl"
+  node "$LED" append --session "$AJSID" --task "$AJTASK2" --role "$R" --agent "agR2-$R" --closed-at "2026-07-11T00:00:00.000Z" --verdict BLOCK >/dev/null 2>&1
+  FLIP_OUT=$(node "$LED" append --session "$AJSID" --task "$AJTASK2" --role "$R" --verdict PASS 2>&1); FLIP_RC=$?
+  blockCount=$(grep -Ec '"verdict":"BLOCK"' "$AJFILE2" 2>/dev/null)
+  passCount=$(grep -Ec '"verdict":"PASS"' "$AJFILE2" 2>/dev/null)
+  { [ "$FLIP_RC" != "0" ] && [ "$blockCount" = "1" ] && [ "$passCount" = "0" ]; } \
+    && ok "AC-4j clause-2 role=$R: bare verdict-flip is REFUSED, BLOCK survives, PASS never lands" \
+    || bad "AC-4j clause-2 role=$R FAILED (flipRc=$FLIP_RC block=$blockCount pass=$passCount out=$FLIP_OUT)"
+done
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
