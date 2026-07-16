@@ -1121,6 +1121,32 @@ function checkTrackedRole(role, e) {
   return null;   // tracked, staged, or can't-tell (fail-open) -> satisfied.
 }
 
+// ── #1537 — artifact PRIVACY scan over the SHIPPED, git-tracked 3-role artifacts ──────────────────────────
+// Sibling of Leg A directly above: Leg A proves the cited artifact is git-TRACKED; this leg proves that
+// TRACKED artifact's own PROSE is CLEAN of the three regulated token classes (home-path / personal-email /
+// brand — #1588: an artifact's OWN privacy-report table can itself quote the token). Reuses the SAME
+// resolveDiskPathForRole() Leg A already computes (one resolution site, no re-typed regex) and shells out to
+// the canonical `scripts/privacy-scan.sh --working <path>` (count-based, fail-CLOSED, never echoes the
+// matched bytes). The scanner's OWN absolute path is resolved ONCE by the BASH caller (which already
+// presence-guards it for the ai-brain-only / plugin-dormant discipline) and passed in via the PRIVACY_SCAN_BIN
+// env var — this file never hardcodes or re-derives that path.
+const PRIVACY_ROLES = TRACKED_ROLES;   // the same three disk-path roles Leg A already tracked-checks.
+
+// Run the canonical scanner over one resolved artifact path. Returns null when CLEAN (rc 0); otherwise a
+// count-only detail string covering BOTH "dirty" (scanner rc 1, its own count-summary stderr) and "can't-tell"
+// (scanner rc >=2 / spawn error) — #1266's fail-CLOSED discipline means BOTH outcomes BLOCK here, never wave
+// through a scan that could not run. NEVER reads or re-prints the artifact's own content — only the scanner's
+// own count-only stderr is captured.
+function scanArtifactPrivacy(absPath, scannerBin) {
+  const res = spawnSync(scannerBin, ['--working', absPath], {
+    encoding: 'utf8',
+    cwd: process.env.PRIVACY_SCAN_CWD || undefined,   // test-only isolation seam (#1537 AC6 email-source mutation); unset in production -> inherits the real process cwd (the primary clone), so `git config user.email` reads the REAL operator config there.
+  });
+  if (res.error) return 'privacy-scan could not run (' + res.error.message + ') — fail-closed, refusing to report clean';
+  if (res.status === 0) return null;
+  return (res.stderr || '').trim() || ('privacy-scan exited ' + res.status + ' with no detail — fail-closed');
+}
+
 // #1509 — the executor-cites-a-disk-path SURFACED NOTE (never a hard block; the #1494 shape). A measured
 // sweep of 246 real ledgers found executor==planner in 62 of them (a live, coexisting, doctrine-sanctioned
 // convention alongside the newer PR-URL citation) — so artifact_path alone cannot distinguish #1494's
@@ -1672,6 +1698,34 @@ function cmdCheck(o) {
     const execNote = executorDiskPathNote(byRole['executor']);
     if (execNote) executorNotes.push(execNote);
   }
+  // #1537 — artifact-privacy leg. Opt-in via --enforce-artifact-privacy (only the completion gate passes it).
+  // DORMANT (no problems pushed, no error) when PRIVACY_SCAN_BIN is unset/unresolvable — the ai-brain-only /
+  // plugin-safe discipline (the plugin ports this file but never the scanner, so a plugin install silently
+  // no-ops here exactly like the tracked-artifacts leg's HELPER-absence residual elsewhere in this file).
+  if ('enforce-artifact-privacy' in o) {
+    const scannerBin = process.env.PRIVACY_SCAN_BIN || '';
+    if (scannerBin && fileExists(scannerBin)) {
+      for (const role of PRIVACY_ROLES) {
+        const e = byRole[role];
+        if (!e) continue;                            // missing-role already reported by the base existence leg.
+        if (classifySkip(e).skip) continue;           // inline-skip has no artifact to scan.
+        const ap = resolveDiskPathForRole(role, e);
+        if (!ap) continue;                            // no resolvable disk path -> not this leg's problem.
+        const detail = scanArtifactPrivacy(ap, scannerBin);
+        if (detail) problems.push('PRIVACY: ' + role + ' artifact "' + ap + '" FAILED the privacy scan (' + detail + ')');
+      }
+      // The run's cited perf-log card (#1537 round-2 scope promotion). Boundary rule: IN scope ONLY when it
+      // resolves to a file that is git-tracked INSIDE the ai-brain repo (reuse isGitTracked — the SAME
+      // discriminator Leg A uses). Anything else (out-of-repo path, in-repo-but-untracked, unresolvable) is
+      // fail-OPEN here: not scanned, no error, no block — an ai-brain completion gate structurally has no
+      // jurisdiction over a file it cannot prove is a shipped ai-brain artifact.
+      const perfLog = o['perf-log'] || '';
+      if (perfLog && isGitTracked(perfLog) === true) {
+        const detail = scanArtifactPrivacy(perfLog, scannerBin);
+        if (detail) problems.push('PRIVACY: perf-log card "' + perfLog + '" FAILED the privacy scan (' + detail + ')');
+      }
+    }
+  }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
   if (resumeNotes.length) {
     console.log('NOTE: ' + resumeNotes.join(' | '));
@@ -2006,6 +2060,7 @@ try {
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts (check, #1509)] ' +
+      '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)]');
