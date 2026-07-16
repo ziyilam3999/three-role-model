@@ -36,10 +36,16 @@ node "$LED" append --session "$SID" --task "$TASK" --role plan-review --agent r1
 node "$LED" append --session "$SID" --task "$TASK" --role planner --agent p1 --artifact "$TMP/plan.md" >/dev/null
 [ "$(nlines)" = "2" ] && ok "re-append same role -> still 2 lines (idempotent)" || bad "idempotency broken (got $(nlines))"
 
-# 4. re-append same role, new agent -> UPDATE in place (still 2 lines, agent changed to p2)
+# 4. re-append same role, DIFFERENT agent -> #1580 Fix B ROUND BOUNDARY (deliberate contract change, not a
+#    regression — this exact "new agentId silently overwrites in place" was Bug B: a genuinely NEW spawn
+#    destroyed round-1's evidence). A distinct incoming agentId over a prior row that already had one now
+#    opens a NEW ROUND: round-1 (p1) is retained as HISTORY (its own line), and a fresh round-2 line for p2
+#    is appended — 3 total lines (plan-review + planner-round-1 + planner-round-2), NOT 2.
 node "$LED" append --session "$SID" --task "$TASK" --role planner --agent p2 --artifact "$TMP/plan.md" >/dev/null
-n=$(nlines); a=$(grep -c '"agentId":"p2"' "$LEDFILE")
-{ [ "$n" = "2" ] && [ "$a" = "1" ]; } && ok "re-append same role new agent -> update in place" || bad "update-in-place broken (n=$n a=$a)"
+n=$(nlines); pcount=$(grep -c '"role":"planner"' "$LEDFILE"); a=$(grep -c '"agentId":"p2"' "$LEDFILE"); a1=$(grep -c '"agentId":"p1"' "$LEDFILE")
+{ [ "$n" = "3" ] && [ "$pcount" = "2" ] && [ "$a" = "1" ] && [ "$a1" = "1" ]; } \
+  && ok "#1580 Fix B: re-append same role with a DISTINCT agent -> NEW ROUND (round-1 retained as history, round-2 appended, not overwritten in place)" \
+  || bad "round-boundary broken (n=$n planner-lines=$pcount p2=$a p1-retained=$a1)"
 
 # make the referenced agents resolvable
 mk_sub "$SID" p2; mk_sub "$SID" r1; mk_sub "$SID" e1; mk_sub "$SID" er1
@@ -62,8 +68,18 @@ OUT=$(node "$LED" check --session "$SID" --task "$TASK" 2>&1); RC=$?
 node "$LED" append --session "$SID" --task "$TASK" --role executor --agent e1 --artifact "PR #1" >/dev/null
 
 # 8. execution-review inline-skip is NEVER allowed -> BLOCK
-node "$LED" append --session "$SID" --task "$TASK" --role execution-review --skip-reason "no reviewer available right now" >/dev/null
-OUT=$(node "$LED" check --session "$SID" --task "$TASK" 2>&1); RC=$?
+#    #1580 NOTE: task $TASK's execution-review row is now a COMPLETED run (agentId+artifact_path, from test
+#    6) — under #1580 Fix A that is terminal evidence, so a bare skip over it is REJECTED by the
+#    terminal-evidence guard BEFORE checkRole's own "execution-review is never skippable" rule ever runs
+#    (a stronger, earlier-firing protection, but it means this scenario no longer isolates checkRole's own
+#    rule). Use a FRESH task with NO prior execution-review row (skip lands; Fix A only guards a REAL prior)
+#    so checkRole's independent "never inline-skippable" rule is what actually fires and is proven here.
+EN_TASK="700-execnever"
+node "$LED" append --session "$SID" --task "$EN_TASK" --role planner --agent p2 --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$SID" --task "$EN_TASK" --role plan-review --agent r1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$SID" --task "$EN_TASK" --role executor --agent e1 --artifact "PR #1" >/dev/null
+node "$LED" append --session "$SID" --task "$EN_TASK" --role execution-review --skip-reason "no reviewer available right now" >/dev/null
+OUT=$(node "$LED" check --session "$SID" --task "$EN_TASK" 2>&1); RC=$?
 { [ "$RC" = "2" ] && echo "$OUT" | grep -qi "never"; } && ok "execution-review skip -> BLOCK" || bad "exec-review skip should block (rc=$RC out=$OUT)"
 
 # 9. execution-review satisfied by an oracle that exists + has a PASS token -> ALLOW
@@ -73,11 +89,20 @@ OUT=$(node "$LED" check --session "$SID" --task "$TASK" 2>&1); RC=$?
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "execution-review oracle(exists+PASS) -> ALLOW" || bad "oracle should allow (rc=$RC out=$OUT)"
 
 # 10. planner inline-skip with a SPECIFIC reason -> ALLOW; empty reason -> BLOCK
-node "$LED" append --session "$SID" --task "$TASK" --role planner --skip-reason "plan was tightly coupled to live mid-edit session state, not briefable" >/dev/null
-OUT=$(node "$LED" check --session "$SID" --task "$TASK" 2>&1); RC=$?
+#     #1580 NOTE: task $TASK's planner row is now a COMPLETED run (agentId+artifact_path, from test 4's
+#     round-2) — terminal under Fix A, so a bare skip over it is REJECTED before checkRole's specific/empty
+#     reason distinction ever runs. Use a FRESH task with NO prior planner row (skip lands; the row stays
+#     non-terminal — skip_reason alone carries no terminal field — so the SECOND skip in this same test can
+#     still land too) so checkRole's own reason-validation logic is what is actually proven here.
+PS_TASK="700-plannerskip"
+node "$LED" append --session "$SID" --task "$PS_TASK" --role planner --skip-reason "plan was tightly coupled to live mid-edit session state, not briefable" >/dev/null
+node "$LED" append --session "$SID" --task "$PS_TASK" --role plan-review --agent r1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$SID" --task "$PS_TASK" --role executor --agent e1 --artifact "PR #1" >/dev/null
+node "$LED" append --session "$SID" --task "$PS_TASK" --role execution-review --agent er1 --artifact "$TMP/rev.md" >/dev/null
+OUT=$(node "$LED" check --session "$SID" --task "$PS_TASK" 2>&1); RC=$?
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "planner specific inline-skip -> ALLOW" || bad "planner skip should allow (rc=$RC out=$OUT)"
-node "$LED" append --session "$SID" --task "$TASK" --role planner --skip-reason "" >/dev/null
-OUT=$(node "$LED" check --session "$SID" --task "$TASK" 2>&1); RC=$?
+node "$LED" append --session "$SID" --task "$PS_TASK" --role planner --skip-reason "" >/dev/null
+OUT=$(node "$LED" check --session "$SID" --task "$PS_TASK" 2>&1); RC=$?
 { [ "$RC" = "2" ] && echo "$OUT" | grep -qi "empty"; } && ok "planner empty skip reason -> BLOCK" || bad "empty skip should block (rc=$RC out=$OUT)"
 
 # 11. check with no ledger file at all -> BLOCK
@@ -126,12 +151,19 @@ node "$LED" append --session "$SID" --task "$MT3" --role execution-review --agen
 OUT=$(node "$LED" check --session "$SID" --task "$MT3" 2>&1); RC=$?
 { [ "$hasskip" = "0" ] && [ "$hasagent" = "1" ] && [ "$RC" = "0" ]; } && ok "mutual-exclusion: --agent after a skip clears the stale skip -> RESOLVES" || bad "agent-after-skip should clear skip + resolve (skip=$hasskip agent=$hasagent rc=$RC out=$OUT)"
 
-# 15. MUTUAL-EXCLUSION reverse: --skip-reason after an --agent CLEARS inherited agentId/artifact_path.
+# 15. MUTUAL-EXCLUSION reverse, HARDENED under #1580 Fix A (deliberate contract change, not a regression —
+#     mirrors the #1036/AC-22-note-4 precedent below in this same file). Pre-#1580 a bare --skip-reason
+#     after a real agent+artifact_path silently CLEARED the completed run — that is precisely the Bug-A
+#     downgrade class (a weaker assertion erasing stronger evidence), just for a non-executor, non-verdict
+#     role. #1580's terminal-evidence guard now REFUSES this (nonzero exit, agentId/artifact_path PRESERVED)
+#     for every role uniformly, exactly like it already does for a completed verdict/executor row.
 MT4="855y"; MF4="$(mfile "$MT4")"
 node "$LED" append --session "$SID" --task "$MT4" --role planner --agent mp1 --artifact "$TMP/plan.md" >/dev/null
-node "$LED" append --session "$SID" --task "$MT4" --role planner --skip-reason "became inseparable from live session state" >/dev/null
-gone=$(grep -cE '"agentId"|"artifact_path"' "$MF4"); keptskip=$(grep -c '"skip_reason"' "$MF4")
-{ [ "$gone" = "0" ] && [ "$keptskip" = "1" ]; } && ok "mutual-exclusion: --skip after an agent clears inherited agentId/artifact" || bad "skip-after-agent should clear agent fields (agentFields=$gone skip=$keptskip)"
+SKIP15_OUT=$(node "$LED" append --session "$SID" --task "$MT4" --role planner --skip-reason "became inseparable from live session state" 2>&1); SKIP15_RC=$?
+survives=$(grep -cE '"agentId":"mp1"' "$MF4"); noskip=$(grep -c '"skip_reason"' "$MF4")
+{ [ "$SKIP15_RC" != "0" ] && [ "$survives" = "1" ] && [ "$noskip" = "0" ]; } \
+  && ok "#1580 Fix A: --skip-reason after a completed (agent+artifact) planner run is REFUSED, agentId/artifact_path PRESERVED" \
+  || bad "skip-after-completed-run should be refused with fields preserved (rc=$SKIP15_RC survives=$survives noskip=$noskip out=$SKIP15_OUT)"
 
 # 16. PLAN_RE broadened-accept (AC1): planner artifact whose ONLY heading is `## Binary acceptance criteria`
 #     (no `## ELI5`) -> planner check ALLOWs.
@@ -895,5 +927,136 @@ for R in $AC4J_ROLES; do
     && ok "AC-4j clause-2 role=$R: bare verdict-flip is REFUSED, BLOCK survives, PASS never lands" \
     || bad "AC-4j clause-2 role=$R FAILED (flipRc=$FLIP_RC block=$blockCount pass=$passCount out=$FLIP_OUT)"
 done
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1580 AC-2 — Bug A RESIDUAL closed: the clear-list is monotonic BY CONSTRUCTION (extends #1575's
+# prior.verdict-only trigger to the full terminal-evidence class — see priorHasTerminalEvidence()). Dedicated
+# EXECUTOR-COMPLETED-ROW case: executor rows NEVER carry a verdict, so #1575's guard was structurally BLIND
+# to them (`3role-ledger.mjs` line ~1126 pre-fix: `if (prior && prior.verdict)`).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AC2SID="sess-1580-ac2"
+mk_sub "$AC2SID" ac2e1
+
+# AC-2a (the RE-TARGETED RED, now GREEN): a completed executor row (agentId+artifact_path+closedAt+
+# self_authored, NO verdict) -> a skip_reason append is REJECTED (nonzero exit) and the terminal fields
+# SURVIVE untouched.
+AC2F="$THREE_ROLE_LEDGER_DIR/$AC2SID/ac2a.jsonl"
+node "$LED" append --session "$AC2SID" --task ac2a --role executor --agent ac2e1 --artifact "PR #1580" --closed-at "2026-07-16T00:00:00.000Z" --self-authored >/dev/null
+AC2A_OUT=$(node "$LED" append --session "$AC2SID" --task ac2a --role executor --skip-reason "no longer needed, superseded" 2>&1); AC2A_RC=$?
+{ [ "$AC2A_RC" != "0" ] && grep -q '"closedAt"' "$AC2F" && grep -q '"agentId":"ac2e1"' "$AC2F" && grep -q '"artifact_path"' "$AC2F"; } \
+  && ok "#1580 AC-2a: skip over a COMPLETED EXECUTOR row (no verdict) is REJECTED — terminal fields survive (Bug A residual closed)" \
+  || bad "#1580 AC-2a FAILED (rc=$AC2A_RC ledger=$(cat "$AC2F" 2>/dev/null) err=$AC2A_OUT)"
+
+# AC-2b: skip over a BARE outcome-less spawn (agentId only, no terminal field) still SUCCEEDS — the
+# legitimate clear/upgrade direction is preserved; this is not a blanket ban.
+mk_sub "$AC2SID" ac2e2
+AC2F2="$THREE_ROLE_LEDGER_DIR/$AC2SID/ac2b.jsonl"
+node "$LED" append --session "$AC2SID" --task ac2b --role executor --agent ac2e2 >/dev/null
+AC2B_OUT=$(node "$LED" append --session "$AC2SID" --task ac2b --role executor --skip-reason "spawn never produced a run, safe to clear" 2>&1); AC2B_RC=$?
+{ [ "$AC2B_RC" = "0" ] && grep -q '"skip_reason"' "$AC2F2" && ! grep -q '"agentId"' "$AC2F2"; } \
+  && ok "#1580 AC-2b: skip over a BARE outcome-less spawn (agentId only) still SUCCEEDS (upgrade direction preserved)" \
+  || bad "#1580 AC-2b FAILED (rc=$AC2B_RC ledger=$(cat "$AC2F2" 2>/dev/null) err=$AC2B_OUT)"
+
+# AC-2c (plan-review non-blocking note 1): spawn-time ASSIGNED provenance (modelVersion/modelTier/effort)
+# alone is NOT terminal — a skip over a row carrying ONLY agentId + assigned model/effort (no artifact/
+# closedAt/self_authored/oracle/verdict) still SUCCEEDS.
+mk_sub "$AC2SID" ac2e3
+AC2F3="$THREE_ROLE_LEDGER_DIR/$AC2SID/ac2c.jsonl"
+node "$LED" append --session "$AC2SID" --task ac2c --role executor --agent ac2e3 --model-version "claude-sonnet-5" --model-tier sonnet --effort high >/dev/null
+AC2C_OUT=$(node "$LED" append --session "$AC2SID" --task ac2c --role executor --skip-reason "assigned but never ran" 2>&1); AC2C_RC=$?
+{ [ "$AC2C_RC" = "0" ] && grep -q '"skip_reason"' "$AC2F3" && ! grep -q '"modelVersion"' "$AC2F3" && ! grep -q '"effort"' "$AC2F3"; } \
+  && ok "#1580 AC-2c: skip over ASSIGNED-only provenance (modelVersion/modelTier/effort, no other terminal field) still SUCCEEDS" \
+  || bad "#1580 AC-2c FAILED (rc=$AC2C_RC ledger=$(cat "$AC2F3" 2>/dev/null) err=$AC2C_OUT)"
+
+# AC-2d (no-duplicate-guard witness): #1575's own verdict-case skip-rejection is UNCHANGED by the widened
+# trigger (same guard, extended predicate — already exercised end-to-end by the pre-existing AC-4j block
+# above; this re-confirms in isolation that widening priorHasTerminalEvidence() didn't alter the verdict arm).
+AC2VSID="sess-1580-ac2-verdict"
+node "$LED" append --session "$AC2VSID" --task ac2v --role plan-review --agent ac2v1 --closed-at "2026-07-16T00:00:00.000Z" --verdict BLOCK >/dev/null 2>&1
+AC2V_OUT=$(node "$LED" append --session "$AC2VSID" --task ac2v --role plan-review --skip-reason "n/a" 2>&1); AC2V_RC=$?
+{ [ "$AC2V_RC" != "0" ] && grep -q '"verdict":"BLOCK"' "$THREE_ROLE_LEDGER_DIR/$AC2VSID/ac2v.jsonl"; } \
+  && ok "#1580 AC-2d: #1575's verdict-case skip-rejection is UNCHANGED (same guard, extended trigger)" \
+  || bad "#1580 AC-2d FAILED (rc=$AC2V_RC out=$AC2V_OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1580 AC-3 — Bug B closed: multi-round seat. Round-1 (agent RA1, verdict BLOCK, model M1) is superseded
+# by a genuinely NEW round-2 (distinct, spawn-record-BOUND agent RA2, verdict PASS, model M2, a strictly-
+# newer closedAt) satisfying BOTH #1575 clause 2's own attributed-supersede requirement AND #1580's
+# round-boundary signal (the plan's documented "Bug B <-> clause 2 interop" — never weakened). Both rounds'
+# observed models must remain RETRIEVABLE; the gate-state read must reflect only the LATEST round.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AC3SID="sess-1580-ac3"; AC3TASK="ac3round"
+AC3F="$THREE_ROLE_LEDGER_DIR/$AC3SID/$AC3TASK.jsonl"
+mk_tagged "$AC3SID" "ac3-ra1" "$AC3TASK" "plan-review"
+mk_tagged "$AC3SID" "ac3-ra2" "$AC3TASK" "plan-review"
+# round-1: spawn, then close with verdict BLOCK + model M1 (two separate calls — the real spawn-hook /
+# close-hook shape).
+node "$LED" append --session "$AC3SID" --task "$AC3TASK" --role plan-review --agent ac3-ra1 --model-version "MODEL-ONE" >/dev/null
+node "$LED" append --session "$AC3SID" --task "$AC3TASK" --role plan-review --agent ac3-ra1 --verdict BLOCK --closed-at "2026-07-16T00:00:00.000Z" --model-version "MODEL-ONE" >/dev/null
+# round-2: a genuinely NEW spawn (distinct, tag-bound agent), then close with verdict PASS + model M2 + a
+# strictly-newer closedAt.
+node "$LED" append --session "$AC3SID" --task "$AC3TASK" --role plan-review --agent ac3-ra2 --model-version "MODEL-TWO" >/dev/null
+AC3_OUT=$(node "$LED" append --session "$AC3SID" --task "$AC3TASK" --role plan-review --agent ac3-ra2 --verdict PASS --closed-at "2026-07-16T01:00:00.000Z" --model-version "MODEL-TWO" 2>&1); AC3_RC=$?
+lines3=$(grep -c '"role":"plan-review"' "$AC3F")
+{ [ "$AC3_RC" = "0" ] && [ "$lines3" = "2" ] && grep -q "MODEL-ONE" "$AC3F" && grep -q "MODEL-TWO" "$AC3F"; } \
+  && ok "#1580 AC-3: round-1 (M1/BLOCK) retained as history, round-2 (M2/PASS) is its own line — BOTH models retrievable" \
+  || bad "#1580 AC-3 retrievability FAILED (rc=$AC3_RC lines=$lines3 ledger=$(cat "$AC3F" 2>/dev/null) err=$AC3_OUT)"
+# gate-state = LATEST round: the shared byRole[j.role]=j last-wins read (cmdCheck/cmdInherit's own contract)
+# must see round-2's PASS, never round-1's stale BLOCK.
+LASTVERDICT=$(node -e '
+  const fs=require("fs");
+  const lines=fs.readFileSync(process.argv[1],"utf8").split("\n").filter(l=>l.trim());
+  const byRole={};
+  for (const ln of lines){ try { const j=JSON.parse(ln); if(j&&j.role) byRole[j.role]=j; } catch(e){} }
+  process.stdout.write(String((byRole["plan-review"]||{}).verdict||""));
+' "$AC3F")
+{ [ "$LASTVERDICT" = "PASS" ]; } \
+  && ok "#1580 AC-3: gate-state read (byRole last-wins, cmdCheck's own contract) reflects the LATEST round (PASS), not round-1's stale BLOCK" \
+  || bad "#1580 AC-3 gate-state FAILED (last-wins verdict=$LASTVERDICT)"
+GATE_OUT=$(node "$LED" gate-plan-review --session "$AC3SID" --task "$AC3TASK" 2>&1); GATE_RC=$?
+{ [ "$GATE_RC" = "0" ]; } \
+  && ok "#1580 AC-3: gate-plan-review ALLOWS on the latest (round-2 PASS) row" \
+  || bad "#1580 AC-3 gate-plan-review FAILED (rc=$GATE_RC out=$GATE_OUT)"
+
+# AC-3b (Bug B <-> #1575 clause 2 interop, SINGLE combined call): round-2's spawn+close arrive as ONE
+# command (--agent + --verdict + --closed-at together) directly over round-1's still-active BLOCK row —
+# proving the round-boundary transition and clause 2's bound/distinct/newer-closedAt check compose
+# correctly in the SAME write, not just across two separate calls.
+AC3BSID="sess-1580-ac3b"; AC3BTASK="ac3bround"
+AC3BF="$THREE_ROLE_LEDGER_DIR/$AC3BSID/$AC3BTASK.jsonl"
+mk_tagged "$AC3BSID" "ac3b-ra1" "$AC3BTASK" "plan-review"
+mk_tagged "$AC3BSID" "ac3b-ra2" "$AC3BTASK" "plan-review"
+node "$LED" append --session "$AC3BSID" --task "$AC3BTASK" --role plan-review --agent ac3b-ra1 --verdict BLOCK --closed-at "2026-07-16T00:00:00.000Z" --model-version "MODEL-ONE" >/dev/null
+AC3B_OUT=$(node "$LED" append --session "$AC3BSID" --task "$AC3BTASK" --role plan-review --agent ac3b-ra2 --verdict PASS --closed-at "2026-07-16T01:00:00.000Z" --model-version "MODEL-TWO" 2>&1); AC3B_RC=$?
+lines3b=$(grep -c '"role":"plan-review"' "$AC3BF")
+{ [ "$AC3B_RC" = "0" ] && [ "$lines3b" = "2" ] && grep -q '"verdict":"BLOCK"' "$AC3BF" && grep -q '"verdict":"PASS"' "$AC3BF"; } \
+  && ok "#1580 AC-3b: single-call round-2 (agent+verdict+closed-at together) over an active BLOCK row -> clause-2 bound-check AND round-boundary compose correctly" \
+  || bad "#1580 AC-3b FAILED (rc=$AC3B_RC lines=$lines3b ledger=$(cat "$AC3BF" 2>/dev/null) err=$AC3B_OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1580 AC-4 — compose regression (REQUIRED, #855 preserved): spawn-then-close AND close-then-spawn EACH
+# yield exactly ONE merged row for the role, order-independent. Plan-review non-blocking note 2: close-
+# then-spawn is the HARD direction for a "new distinct agentId opens a round" heuristic — a close arriving
+# BEFORE its spawn must still MERGE into the same round, never open a spurious second round.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AC4SID="sess-1580-ac4"
+
+# AC-4a: spawn-then-close, single round -> ONE line, both fields.
+mk_sub "$AC4SID" ac4e1
+node "$LED" append --session "$AC4SID" --task ac4a --role executor --agent ac4e1 >/dev/null
+node "$LED" append --session "$AC4SID" --task ac4a --role executor --artifact "PR #1580a" >/dev/null
+AC4AF="$THREE_ROLE_LEDGER_DIR/$AC4SID/ac4a.jsonl"
+n4a=$(grep -c '"role":"executor"' "$AC4AF"); both4a=$(both_on_line "$AC4AF" '"agentId":"ac4e1"' '"artifact_path":')
+{ [ "$n4a" = "1" ] && [ "$both4a" = "1" ]; } && ok "#1580 AC-4a: spawn-then-close -> ONE merged row" || bad "#1580 AC-4a FAILED (lines=$n4a both=$both4a)"
+
+# AC-4b (the HARD direction): close-then-spawn, single round -> STILL ONE line, both fields (the close's
+# artifact-only row must not be mistaken by the later spawn for "a prior round" — prior.agentId is absent,
+# so the round-boundary check never fires and the spawn correctly MERGES).
+mk_sub "$AC4SID" ac4e2
+node "$LED" append --session "$AC4SID" --task ac4b --role executor --artifact "PR #1580b" >/dev/null
+node "$LED" append --session "$AC4SID" --task ac4b --role executor --agent ac4e2 >/dev/null
+AC4BF="$THREE_ROLE_LEDGER_DIR/$AC4SID/ac4b.jsonl"
+n4b=$(grep -c '"role":"executor"' "$AC4BF"); both4b=$(both_on_line "$AC4BF" '"agentId":"ac4e2"' '"artifact_path":')
+{ [ "$n4b" = "1" ] && [ "$both4b" = "1" ]; } && ok "#1580 AC-4b (hard direction): close-then-spawn -> STILL ONE merged row (no spurious new round)" || bad "#1580 AC-4b FAILED (lines=$n4b both=$both4b)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
