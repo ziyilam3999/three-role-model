@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# PreToolUse(Agent|Task) hook — THREE-ROLE MODEL-POLICY GATE (#1448, effective-tier sensor #1494). A
-# LEADING-EDGE advisory sibling of three-role-attribution-gate.sh (same PreToolUse(Agent|Task) seam, same
-# BLOCK-ONCE shape). It catches a per-role model MISCONFIG at SPAWN time — before a whole role run is wasted
-# on the wrong tier — while the HARD, load-bearing enforcement stays at completion time
-# (three-role-instrumentation-gate.sh reads the forgery-resistant transcript model). Defense-in-depth, not the
-# primary block: a requested-model signal is weaker than the transcript, so this leg is advisory (block-once),
-# not a true wall.
+# PreToolUse(Agent|Task) hook — THREE-ROLE MODEL-POLICY GATE (#1448, effective-tier sensor #1494, subagent_type
+# effort-inert advisory #1513). A LEADING-EDGE advisory sibling of three-role-attribution-gate.sh (same
+# PreToolUse(Agent|Task) seam, same BLOCK-ONCE shape). It catches a per-role model MISCONFIG at SPAWN time —
+# before a whole role run is wasted on the wrong tier — while the HARD, load-bearing enforcement stays at
+# completion time (three-role-instrumentation-gate.sh reads the forgery-resistant transcript model).
+# Defense-in-depth, not the primary block: a requested-model signal is weaker than the transcript, so this leg
+# is advisory (block-once), not a true wall.
+#
+# #1513 SUB-LEG (on the tier-satisfied path only): asserts that a tagged chain-role spawn actually used
+# `subagent_type: cc-<ROLE>` when that dedicated definition IS installed. Per Invariant #6 lever 3, only the
+# dedicated agents/cc-<ROLE>.md definition carries the `effort:` frontmatter that overrides inherited session
+# effort — a chain role spawned as `general-purpose`/`claude` loads no such definition, so the role's
+# configured effort is silently INERT even though its model TIER is correct (this is how 57/63 measured
+# spawns rode the tier-satisfied silent-allow below undetected). CONDITIONAL on def-presence (`-f`, not `-L`
+# — a dangling symlink reads as absent, the doctrine-sanctioned general-purpose fallback, never false-blocked)
+# and INDEPENDENTLY KEYED ($SIG.effort-notified, distinct from $SIG.notified) so it can never be cannibalized
+# by the tier-mismatch marker on a re-issue. See the design nuances inline below the tier-satisfied check.
 #
 # POLICY: config/cc-roles.env maps each role -> a model TIER (Option A: Opus on planner + both review gates,
 # Sonnet on the executor). `resolve-role-model` reads it fail-SAFE to opus. So the violation condition is: the
@@ -183,8 +193,48 @@ EOF
   exit 2
 fi
 
-# Policy satisfied -> silent allow. This is what keeps a policy-matching seat quiet on an absent model.
-[ "$EFFECTIVE" = "$EXPECTED" ] && exit 0
+# Policy satisfied -> before silent-allowing, check the #1513 EFFORT-INERT sub-leg. A tagged chain-role spawn
+# whose subagent_type is NOT `cc-<ROLE>` never loads the dedicated agents/cc-<ROLE>.md definition, so the
+# role's configured EFFORT (Invariant #6 lever 3) is INERT -- the spawn silently runs at the SESSION's
+# inherited effort instead. This sub-leg is CONDITIONAL on the dedicated definition being detectably present
+# (`-f`, NOT `-L` -- a dangling/half-installed symlink must read as ABSENT, the sanctioned-fallback case, and
+# must NEVER false-block; nuance A) and is INDEPENDENTLY KEYED (its own block-once marker, `$SIG.effort-notified`,
+# distinct from `$SIG.notified` below) so a spawn that already fired the tier-mismatch advisory on a prior
+# issue of this SAME taskId+role is never suppressed on re-issue by that unrelated marker (nuance C / AC-INDEP).
+# An empty subagent_type is a malformed/edge payload -> fail-open, consistent with the hook's ambiguity-fail-
+# open philosophy (nuance E / AC-EMPTY). ROLE:research is already excluded upstream (ROLE regex never matches
+# it, so this line is unreached for research spawns -- nuance B / AC-RESEARCH).
+if [ "$EFFECTIVE" = "$EXPECTED" ]; then
+  CC_ROLE_DEF="$AGENTS_DIR/cc-$ROLE.md"
+  if [ -n "$SUBAGENT" ] && [ "$SUBAGENT" != "cc-$ROLE" ] && [ -f "$CC_ROLE_DEF" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    find "$STATE_DIR" -type f -mtime +"$TTL_DAYS" -delete 2>/dev/null   # bounded GC (shared with the tier marker).
+    EFFORT_MARKER="$STATE_DIR/$SIG.effort-notified"
+    # Already nudged for THIS taskId+role effort violation -> let the spawn proceed (block-once, not wedged).
+    [ -f "$EFFORT_MARKER" ] && exit 0
+    : > "$EFFORT_MARKER" 2>/dev/null
+    cat >&2 <<EOF
+<system-reminder>
+THREE-ROLE MODEL-POLICY GATE (three-role-model-policy-gate hook, #1513 effort-inert advisory): role subagent
+ROLE:${ROLE} for 3ROLE_TASK:${TASKID} is being spawned with subagent_type:${SUBAGENT}, which has NO
+agents/cc-${ROLE}.md definition to inherit from. The dedicated definition IS installed (detected at
+${CC_ROLE_DEF}), so this is a BYPASSED override, not the doctrine-sanctioned fallback. Because only the
+cc-${ROLE} definition carries the effort: frontmatter that overrides inherited session effort, this
+spawn's configured EFFORT${EFFORT:+ (${EFFORT})} is INERT -- it will silently run at the SESSION's inherited
+effort instead of the role's policy effort (Invariant #6 lever 3). Re-launch passing the dedicated agent
+definition:
+    subagent_type: cc-${ROLE}
+(keep model:${EXPECTED} and the 3ROLE_TASK:${TASKID} ROLE:${ROLE} tags). This is ADVISORY + block-once PER
+taskId+role, INDEPENDENTLY KEYED from the model-tier advisory (a tier fix and an effort fix never suppress
+each other): you will see this ONCE for this spawn. Escapes: inline bypass token [model-policy-ok] in the
+prompt for a deliberate one-off, or kill-switch CC_ROLE_MODEL_GATE_OFF=1 (or THREE_ROLE_INSTRUMENT_OFF=1 /
+SHIP_PIPELINE=1).
+</system-reminder>
+EOF
+    exit 2
+  fi
+  exit 0
+fi
 
 # --- per-signature block-once marker ---
 mkdir -p "$STATE_DIR" 2>/dev/null
