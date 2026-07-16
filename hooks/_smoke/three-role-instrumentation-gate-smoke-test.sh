@@ -1041,4 +1041,216 @@ CAP=$(printf '%s' '{"session_id":"'"$TAGSID"'","tool_input":{"taskId":"1509h2","
   || bad "1509-H4 master kill-switch failed (rc=$RC out=$CAP)"
 rm -rf "$GITROOT_H" 2>/dev/null
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1537 — artifact-PRIVACY leg (Binary AC1-AC12 of the plan). Sibling of the #1509 Leg-A block above: same
+# scratch-git-repo pattern (isGitTracked must see REAL verdicts), extended with (a) three dirty-class plan
+# fixtures, (b) a clean/dirty perf-log-card pair inside the SAME scratch repo (round-2 scope promotion), (c)
+# an out-of-repo perf card under bare $TMP (never a git repo) for the fail-open boundary test, and (d) three
+# isolated one-off git repos whose LOCAL user.email is a synthetic value, so the EMAIL class can be exercised
+# and MUTATED without ever touching the real operator's email.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+GITROOT_P="$(mktemp -d)"
+( cd "$GITROOT_P" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$GITROOT_P/.ai-workspace/plans" "$GITROOT_P/.ai-workspace/reviews" "$GITROOT_P/.ai-workspace/perf-logs"
+
+SID_P="sess-1537p"
+mk_sub "$SID_P" pp1; mk_sub "$SID_P" pr1; mk_sub "$SID_P" pe1; mk_sub "$SID_P" pv1
+
+# clean plan/review (also satisfy the cairn-citation legs' shape: `## ELI5`+`cairn:`+`### Binary AC`, `## Review`+`cairn:`+`verdict:`).
+printf '## ELI5\nplan\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_P/.ai-workspace/plans/1537p-plan-clean.md"
+printf '## Review\ncairn: "synth reviewer hit"\nverdict: PASS\n' > "$GITROOT_P/.ai-workspace/reviews/1537p-rev-clean.md"
+# one dirty fixture PER CLASS — otherwise identical to the clean plan, so ONLY the targeted class fires.
+printf '## ELI5\nplan with a leak /Users/synthuser/secret\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+printf '## ELI5\nplan with a leak SYNTHBRANDTOKEN1537\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_P/.ai-workspace/plans/1537p-plan-brand.md"
+printf '## ELI5\nplan with a leak synth-user-1537@example.test\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_P/.ai-workspace/plans/1537p-plan-email.md"
+# perf-log cards, clean + dirty, INSIDE the scratch ai-brain-shaped repo (round-2 scope promotion).
+printf '# perf log\n## rounds for #1537p1 #1537p2 #1537p3 #1537p4 #1537p6 #1537p8 #1537p9 #1537p10 #1537p11 #1537p12 #1537p13 #1537p14 #1537p15\n' > "$GITROOT_P/.ai-workspace/perf-logs/1537p-perf-clean.md"
+printf '# perf log\n## rounds for #1537p5\nleak: /Users/synthuser/perf-leak\n' > "$GITROOT_P/.ai-workspace/perf-logs/1537p-perf-dirty.md"
+( cd "$GITROOT_P" && git add -A && git commit -q -m "fixture: #1537 privacy-leg artifacts" )
+
+# isolated one-off repos whose LOCAL user.email is a synthetic value (never the real operator's). Never a
+# committed fixture — PRIVACY_SCAN_CWD points the spawned scanner's cwd here so `git config user.email`
+# resolves it live at scan time, proving the needle is SOURCED from git config (AC6), not a hardcoded literal.
+EMAILGIT_A="$(mktemp -d)"; ( cd "$EMAILGIT_A" && git init -q && git config user.email "synth-user-1537@example.test" )
+EMAILGIT_B="$(mktemp -d)"; ( cd "$EMAILGIT_B" && git init -q && git config user.email "synth-other-1537@example.test" )
+EMAILGIT_EMPTY="$(mktemp -d)"; ( cd "$EMAILGIT_EMPTY" && git init -q )   # no user.email configured at all -> empty needle -> SKIP
+
+# ledger builder: role artifacts default to the CLEAN plan/review unless overridden. taskid [planPath] [reviewPath]
+ledgerP() {
+  local t="$1" plan="${2:-$GITROOT_P/.ai-workspace/plans/1537p-plan-clean.md}" rev="${3:-$GITROOT_P/.ai-workspace/reviews/1537p-rev-clean.md}"
+  appendL --session "$SID_P" --task "$t" --role planner          --agent pp1 --artifact "$plan"
+  appendL --session "$SID_P" --task "$t" --role plan-review       --agent pr1 --artifact "$rev"
+  appendL --session "$SID_P" --task "$t" --role executor          --agent pe1 --artifact "PR #$t"
+  appendL --session "$SID_P" --task "$t" --role execution-review  --agent pv1 --artifact "$rev"
+}
+privPayload() { printf '{"session_id":"%s","tool_input":{"taskId":"%s","status":"completed","metadata":{"model_run":"r","model_perf_log":"%s","outcome_eval":"achieved","outcome_evidence":"%s"}}}' "$SID_P" "$1" "$2" "$OEV"; }
+runP() { local payload="$1"; shift; CAP=$(printf '%s' "$payload" | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" "$@" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
+CLEANPERF="$GITROOT_P/.ai-workspace/perf-logs/1537p-perf-clean.md"
+
+# ---- AC1a: dirty HOME-PATH plan artifact -> BLOCK, all three classes covered (this sub-case: home-path) ----
+ledgerP 1537p1 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+runP "$(privPayload 1537p1 "$CLEANPERF")"
+CAP_HP="$CAP"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "artifact-privacy leg FAILED" && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC1a: dirty home-path plan artifact -> BLOCK" || bad "AC1a home-path dirty should block (rc=$RC out=$CAP)"
+
+# ---- AC1b: dirty BRAND plan artifact -> BLOCK (sanctioned PRIVACY_SCAN_TEST_PATTERN hook, no real brand token) ----
+ledgerP 1537p2 "$GITROOT_P/.ai-workspace/plans/1537p-plan-brand.md"
+runP "$(privPayload 1537p2 "$CLEANPERF")" PRIVACY_SCAN_TEST_PATTERN=SYNTHBRANDTOKEN1537
+CAP_BRAND="$CAP"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC1b: dirty brand plan artifact -> BLOCK" || bad "AC1b brand dirty should block (rc=$RC out=$CAP)"
+
+# ---- AC1c: dirty EMAIL plan artifact (isolated synthetic git env, config matches the fixture) -> BLOCK ----
+ledgerP 1537p3 "$GITROOT_P/.ai-workspace/plans/1537p-plan-email.md"
+runP "$(privPayload 1537p3 "$CLEANPERF")" PRIVACY_SCAN_CWD="$EMAILGIT_A"
+CAP_EMAIL="$CAP"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC1c: dirty email plan artifact (isolated synthetic env) -> BLOCK" || bad "AC1c email dirty should block (rc=$RC out=$CAP)"
+
+# ---- AC2: clean plan/review + clean perf card -> PASS (hook exit 0, ledger note present) ----
+ledgerP 1537p4
+runP "$(privPayload 1537p4 "$CLEANPERF")"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC2: clean plan/review artifacts -> PASS" || bad "AC2 clean should pass (rc=$RC out=$CAP)"
+
+# ---- AC3a: dirty TRACKED perf-log card (clean plan/review) -> BLOCK ----
+ledgerP 1537p5
+runP "$(privPayload 1537p5 "$GITROOT_P/.ai-workspace/perf-logs/1537p-perf-dirty.md")"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:" && echo "$CAP" | grep -q "perf-log card"; } \
+  && ok "AC3a: dirty tracked ai-brain perf-log card -> BLOCK" || bad "AC3a dirty perf card should block (rc=$RC out=$CAP)"
+
+# ---- AC3b: clean TRACKED perf-log card -> the privacy leg does not fire (hook ALLOWs) ----
+ledgerP 1537p6
+runP "$(privPayload 1537p6 "$CLEANPERF")"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC3b: clean tracked ai-brain perf-log card -> ALLOW" || bad "AC3b clean perf card should allow (rc=$RC out=$CAP)"
+
+# ---- AC3c: perf card path resolves OUTSIDE the ai-brain repo (bare $TMP is not a git repo) -> fail-OPEN
+#      (not scanned, no block) EVEN THOUGH it carries a dirty synthetic home-path token -- the boundary rule
+#      is keyed on git-tracked-INSIDE-ai-brain, never fail-open-on-everything (AC3a's IN-repo dirty card
+#      still blocks above). ----
+PERF_OUTSIDE="$TMP/1537p-perf-outside-dirty.md"
+printf '# perf log (out of repo)\n## rounds for #1537p7\nleak: /Users/synthuser/outside-leak\n' > "$PERF_OUTSIDE"
+ledgerP 1537p7
+runP "$(privPayload 1537p7 "$PERF_OUTSIDE")"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC3c: out-of-repo dirty perf card -> fail-OPEN (not scanned, hook ALLOWs)" || bad "AC3c out-of-repo should fail-open (rc=$RC out=$CAP)"
+
+# ---- AC4: positive control MUST fire for EACH class (direct scanner-level proof, independent of ledger plumbing) ----
+SCANNER_BIN="$DIR/../scripts/privacy-scan.sh"
+"$SCANNER_BIN" --working "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md" >/tmp/1537-ac4-hp.err 2>&1
+{ [ "$?" = "1" ] && grep -q "home-path matches=1" /tmp/1537-ac4-hp.err; } \
+  && ok "AC4a: home-path positive control fires (count=1)" || bad "AC4a home-path control did not fire"
+PRIVACY_SCAN_TEST_PATTERN=SYNTHBRANDTOKEN1537 "$SCANNER_BIN" --working "$GITROOT_P/.ai-workspace/plans/1537p-plan-brand.md" >/tmp/1537-ac4-bt.err 2>&1
+{ [ "$?" = "1" ] && grep -q "brand matches=1" /tmp/1537-ac4-bt.err; } \
+  && ok "AC4b: brand positive control fires (count=1, sanctioned test pattern)" || bad "AC4b brand control did not fire"
+( cd "$EMAILGIT_A" && "$SCANNER_BIN" --working "$GITROOT_P/.ai-workspace/plans/1537p-plan-email.md" >/tmp/1537-ac4-em.err 2>&1 )
+{ [ "$?" = "1" ] && grep -q "email matches=1" /tmp/1537-ac4-em.err; } \
+  && ok "AC4c: email positive control fires (count=1, isolated synthetic env)" || bad "AC4c email control did not fire"
+rm -f /tmp/1537-ac4-hp.err /tmp/1537-ac4-bt.err /tmp/1537-ac4-em.err
+
+# ---- AC5: home-path needle SOURCED from hooks/lib-privacy-ere.sh, proven by mutation (BLOCK -> ALLOW flip) ----
+MUT="$TMP/1537-mutated-scanner"
+mkdir -p "$MUT/scripts" "$MUT/hooks" "$MUT/lib"
+cp "$DIR/../scripts/privacy-scan.sh" "$MUT/scripts/privacy-scan.sh"
+cp "$DIR/../scripts/privacy-denylist-count.mjs" "$MUT/scripts/privacy-denylist-count.mjs"
+cp "$DIR/../lib/privacy-denylist.mjs" "$MUT/lib/privacy-denylist.mjs"
+printf 'PRIVACY_HOMEPATH_ERE="NEVERMATCHXYZ_IMPOSSIBLE_1537_PATTERN"\n' > "$MUT/hooks/lib-privacy-ere.sh"
+chmod +x "$MUT/scripts/privacy-scan.sh"
+ledgerP 1537p8 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+runP "$(privPayload 1537p8 "$CLEANPERF")" THREE_ROLE_PRIVACY_SCANNER="$MUT/scripts/privacy-scan.sh"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC5: home-path needle sourced from the lib (neutered-ERE mutation flips BLOCK->ALLOW)" \
+  || bad "AC5 mutation should flip to ALLOW (rc=$RC out=$CAP)"
+
+# ---- AC6: email needle SOURCED from \`git config user.email\`, proven by mutation (SAME dirty-email fixture,
+#      config value Y != the fixture's X -> the email class does not fire -> ALLOW; task 1537p3 above already
+#      proved config value X (matching) -> BLOCK, so the verdict TRACKS the config value). ----
+ledgerP 1537p9 "$GITROOT_P/.ai-workspace/plans/1537p-plan-email.md"
+runP "$(privPayload 1537p9 "$CLEANPERF")" PRIVACY_SCAN_CWD="$EMAILGIT_B"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC6: email needle sourced from git config (mismatched synthetic config -> ALLOW; matched config #1537p3 -> BLOCK)" \
+  || bad "AC6 mismatched email config should allow (rc=$RC out=$CAP)"
+
+# ---- AC7: the block report never quotes the matched secret bytes (captured from AC1a/AC1b/AC1c above) ----
+{ ! printf '%s' "$CAP_HP" | grep -qF "synthuser/secret"; } \
+  && ok "AC7a: home-path block report does not quote the matched bytes" || bad "AC7a leaked the home-path needle: $CAP_HP"
+{ ! printf '%s' "$CAP_BRAND" | grep -qF "SYNTHBRANDTOKEN1537"; } \
+  && ok "AC7b: brand block report does not quote the matched bytes" || bad "AC7b leaked the brand needle: $CAP_BRAND"
+{ ! printf '%s' "$CAP_EMAIL" | grep -qF "synth-user-1537@example.test"; } \
+  && ok "AC7c: email block report does not quote the matched bytes" || bad "AC7c leaked the email needle: $CAP_EMAIL"
+
+# ---- AC8: SHIP_PIPELINE-proof — a dirty TRACKED artifact still BLOCKs under SHIP_PIPELINE=1 (no route-around) ----
+ledgerP 1537p10 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+CAP=$(printf '%s' "$(privPayload 1537p10 "$CLEANPERF")" \
+  | SHIP_PIPELINE=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC8: SHIP_PIPELINE=1 over a dirty tracked artifact -> STILL BLOCK (no route-around)" \
+  || bad "AC8 SHIP_PIPELINE hardening failed (rc=$RC out=$CAP)"
+
+# ---- AC9: exactly ONE new kill-switch, works both ways, + no other new *_OFF/*_OVERRIDE token ----
+ledgerP 1537p11 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+runP "$(privPayload 1537p11 "$CLEANPERF")" THREE_ROLE_ARTIFACT_PRIVACY_OFF=1
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC9a: THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 over a dirty artifact -> ALLOW (leg-only kill-switch)" \
+  || bad "AC9a leg kill-switch failed (rc=$RC out=$CAP)"
+CAP=$(printf '%s' "$(privPayload 1537p11 "$CLEANPERF")" \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC9b: THREE_ROLE_INSTRUMENT_OFF=1 (master) over the SAME dirty artifact -> allow silent" \
+  || bad "AC9b master kill-switch failed (rc=$RC out=$CAP)"
+NEWTOKENS="$(grep -ohE '[A-Z_]+_(OFF|OVERRIDE)' "$DIR/three-role-instrumentation-gate.sh" "$DIR/3role-ledger.mjs" "$DIR/../scripts/privacy-scan.sh" 2>/dev/null | sort -u)"
+{ echo "$NEWTOKENS" | grep -qx "THREE_ROLE_ARTIFACT_PRIVACY_OFF" \
+  && [ "$(echo "$NEWTOKENS" | grep -c 'ARTIFACT_PRIVACY')" = "1" ]; } \
+  && ok "AC9c: grep proves THREE_ROLE_ARTIFACT_PRIVACY_OFF is the ONE new privacy kill-switch token" \
+  || bad "AC9c unexpected privacy-related *_OFF/*_OVERRIDE token set: $NEWTOKENS"
+
+# ---- AC10: dormant when the scanner is unavailable -> no error, does NOT block on the privacy leg (other legs decide) ----
+ledgerP 1537p12 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+runP "$(privPayload 1537p12 "$CLEANPERF")" THREE_ROLE_PRIVACY_SCANNER=/nonexistent/1537-privacy-scan.sh
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK" && ! echo "$CAP" | grep -qi "privacy"; } \
+  && ok "AC10: scanner unavailable -> DORMANT (no error, privacy leg does not block; other legs decide)" \
+  || bad "AC10 dormant-scanner case failed (rc=$RC out=$CAP)"
+
+# ---- AC11a: fail-CLOSED on can't-tell (scanner cannot produce a valid count -> BLOCK, never reports clean) ----
+MUTBROKEN="$TMP/1537-mutated-scanner-broken"
+mkdir -p "$MUTBROKEN/scripts"
+cp "$DIR/../scripts/privacy-scan.sh" "$MUTBROKEN/scripts/privacy-scan.sh"
+chmod +x "$MUTBROKEN/scripts/privacy-scan.sh"
+# deliberately NO hooks/lib-privacy-ere.sh anywhere the script can resolve -> PRIVACY_HOMEPATH_ERE stays unset -> ABORT rc 2.
+ledgerP 1537p13
+runP "$(privPayload 1537p13 "$CLEANPERF")" THREE_ROLE_PRIVACY_SCANNER="$MUTBROKEN/scripts/privacy-scan.sh"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC11a: forced-abort can't-tell -> BLOCK (fail-closed, never reports clean)" \
+  || bad "AC11a forced-abort should fail-closed to BLOCK (rc=$RC out=$CAP)"
+
+# ---- AC11b: empty git-config user.email is SKIP-not-block (no false block from an empty needle); home-path
+#      and brand STILL block on a dirty fixture when email is empty (monotonicity: the weak email-skip cannot
+#      erase the strong classes). ----
+ledgerP 1537p14 "$GITROOT_P/.ai-workspace/plans/1537p-plan-email.md"
+runP "$(privPayload 1537p14 "$CLEANPERF")" PRIVACY_SCAN_CWD="$EMAILGIT_EMPTY"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "AC11b-i: empty git-config email -> SKIP the email class (no false block)" \
+  || bad "AC11b-i empty-email should skip, not block (rc=$RC out=$CAP)"
+ledgerP 1537p15 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
+runP "$(privPayload 1537p15 "$CLEANPERF")" PRIVACY_SCAN_CWD="$EMAILGIT_EMPTY"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "PRIVACY:"; } \
+  && ok "AC11b-ii: home-path STILL BLOCKs on a dirty fixture when email is empty (monotonicity holds)" \
+  || bad "AC11b-ii home-path should still block with empty email (rc=$RC out=$CAP)"
+
+# ---- AC12: this smoke (carrying the privacy-leg AC1-AC11 assertions above) is enumerated by the plugin-sync
+#      SSOT, so it runs in CI. ----
+SYNC_SCRIPT="$DIR/../scripts/sync-three-role-plugin.mjs"
+if [ -f "$SYNC_SCRIPT" ]; then
+  SYNC_COUNT="$(node "$SYNC_SCRIPT" --list 2>/dev/null | grep -c 'three-role-instrumentation-gate-smoke-test.sh')"
+  { [ "${SYNC_COUNT:-0}" -ge 1 ]; } \
+    && ok "AC12: this smoke is enumerated by scripts/sync-three-role-plugin.mjs --list (runs in CI)" \
+    || bad "AC12 smoke not found in the plugin-sync SSOT list (count=$SYNC_COUNT)"
+else
+  bad "AC12 cannot verify — scripts/sync-three-role-plugin.mjs not found"
+fi
+
+rm -rf "$GITROOT_P" "$EMAILGIT_A" "$EMAILGIT_B" "$EMAILGIT_EMPTY" "$MUT" "$MUTBROKEN" "$PERF_OUTSIDE" 2>/dev/null
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

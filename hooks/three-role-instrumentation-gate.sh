@@ -151,6 +151,23 @@ MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD
 # flag on this leg by design (parent-claude.md #1509: a `*_OFF` here would reopen the leak) — the only escapes
 # are (a) git add + commit the cited artifact, or (b) the pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 above
 # (which disables the whole family, not a Leg-A-specific bypass).
+# Resolve a cited path: absolute as-is; else relative to CLAUDE_PROJECT_DIR, then cwd, then $HOME (perf-log
+# cards usually live under ~/.claude/agent-working-memory/...). Echoes "" if not found. MOVED UP here (was
+# previously defined after the family's SHIP_PIPELINE short-circuit below) so the #1537 privacy leg — which,
+# like Leg A, must run BEFORE that short-circuit and NOT honor SHIP_PIPELINE — can resolve the cited perf-log
+# CARD path this early too. Pure function, no side effects; safe to define before it is first used.
+resolve_path(){
+  local p="$1"
+  case "$p" in
+    /*) [ -f "$p" ] && printf '%s' "$p" ;;
+    \~/*) [ -f "$HOME/${p#\~/}" ] && printf '%s' "$HOME/${p#\~/}" ;;
+    *)  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/$p" ]; then printf '%s' "$CLAUDE_PROJECT_DIR/$p"
+        elif [ -f "$PWD/$p" ]; then printf '%s' "$PWD/$p"
+        elif [ -f "$HOME/$p" ]; then printf '%s' "$HOME/$p"
+        elif [ -f "$p" ]; then printf '%s' "$p"; fi ;;
+  esac
+}
+
 # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
 # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
@@ -158,9 +175,30 @@ if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-led
 else
   LEDGER_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
 fi
+# #1537 — canonical privacy scanner, presence-guarded (ai-brain-only / plugin-dormant: the plugin ports this
+# hook file but never scripts/privacy-scan.sh, so a plugin install silently no-ops the privacy leg below).
+# THREE_ROLE_PRIVACY_SCANNER is a TEST-ONLY override seam (mirrors the CC_ROLES_ENV isolation pattern already
+# used elsewhere in this file's ecosystem) — unset in production, so production always resolves the real
+# co-located scanner; the smoke uses it to point at a deliberately-mutated copy (AC5 home-path sourcing proof,
+# AC11a forced-abort proof) without touching the real scanner.
+PRIVACY_SCANNER="${THREE_ROLE_PRIVACY_SCANNER:-$(dirname "${BASH_SOURCE[0]}")/../scripts/privacy-scan.sh}"
 if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
   if [ -f "$LEDGER_HELPER" ]; then
-    TRACKED_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" --enforce-tracked-artifacts 2>&1)"; TRC=$?
+    LEGA_ARGS=(check --session "$SESSION" --task "$TASKID" --enforce-tracked-artifacts)
+    PRIVACY_ON=0
+    if [ "${THREE_ROLE_ARTIFACT_PRIVACY_OFF:-}" != "1" ] && [ -f "$PRIVACY_SCANNER" ]; then
+      LEGA_ARGS+=(--enforce-artifact-privacy)
+      PRIVACY_ON=1
+      if [ -n "$PERFPATH" ]; then
+        PRIV_CARD="$(resolve_path "$PERFPATH")"
+        [ -n "$PRIV_CARD" ] && LEGA_ARGS+=(--perf-log "$PRIV_CARD")
+      fi
+    fi
+    if [ "$PRIVACY_ON" = "1" ]; then
+      TRACKED_OUT="$(PRIVACY_SCAN_BIN="$PRIVACY_SCANNER" node "$LEDGER_HELPER" "${LEGA_ARGS[@]}" 2>&1)"; TRC=$?
+    else
+      TRACKED_OUT="$(node "$LEDGER_HELPER" "${LEGA_ARGS[@]}" 2>&1)"; TRC=$?
+    fi
     case "$TRACKED_OUT" in
       *TRACKED:*)
         {
@@ -173,6 +211,21 @@ if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
           echo "  Fix: git add + commit the cited artifact (from a Rule-12 worktree), then re-complete. This leg has NO"
           echo "  grace/bypass flag by design — not even SHIP_PIPELINE=1 skips it (adding one would reopen the leak)."
           echo "  Master kill-switch (disables the WHOLE instrumentation gate, not just this leg): THREE_ROLE_INSTRUMENT_OFF=1."
+        } >&2
+        exit 2
+        ;;
+      *PRIVACY:*)
+        {
+          echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+          echo "  artifact-privacy leg FAILED (#1537 — SHIP_PIPELINE does NOT exempt this leg): $TRACKED_OUT"
+          echo "  A tagged 3-role completion's SHIPPED, git-tracked planner / plan-review / execution-review artifacts —"
+          echo "  AND this run's cited perf-log card, when it is git-tracked inside ai-brain — must be CLEAN of three"
+          echo "  regulated token classes: a home-absolute-path, the operator's personal email, or a frozen brand token"
+          echo "  (the #1588 class: an artifact's OWN prose, including its own privacy-report table, can itself carry"
+          echo "  the leak). Counts only above — the matched bytes are never re-printed (scanning the scanner's own"
+          echo "  output would itself be a second leak)."
+          echo "  Fix: scrub the token from the cited artifact, git add + commit it, then re-complete."
+          echo "  Kill-switch (this leg ONLY): THREE_ROLE_ARTIFACT_PRIVACY_OFF=1. Master (whole family): THREE_ROLE_INSTRUMENT_OFF=1."
         } >&2
         exit 2
         ;;
@@ -214,20 +267,6 @@ MODEL_FLAG="--enforce-role-models"
 # exactly how inline-orchestrator code-work slipped both gates): they are routed through the untagged
 # fail-CLOSED branch below (defined after the helpers it calls). Only a TRIVIAL untagged completion (no
 # objective code-work evidence) still fails open there.
-
-# Resolve a cited path: absolute as-is; else relative to CLAUDE_PROJECT_DIR, then cwd, then $HOME (perf-log
-# cards usually live under ~/.claude/agent-working-memory/...). Echoes "" if not found.
-resolve_path(){
-  local p="$1"
-  case "$p" in
-    /*) [ -f "$p" ] && printf '%s' "$p" ;;
-    \~/*) [ -f "$HOME/${p#\~/}" ] && printf '%s' "$HOME/${p#\~/}" ;;
-    *)  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/$p" ]; then printf '%s' "$CLAUDE_PROJECT_DIR/$p"
-        elif [ -f "$PWD/$p" ]; then printf '%s' "$PWD/$p"
-        elif [ -f "$HOME/$p" ]; then printf '%s' "$HOME/$p"
-        elif [ -f "$p" ]; then printf '%s' "$p"; fi ;;
-  esac
-}
 
 block(){
   {
