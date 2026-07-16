@@ -9,8 +9,9 @@ ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
 HOOK="$ROOT/hooks/three-role-instrumentation-gate.sh"
 
 fail=0
-ok()  { echo "PASS: $1"; }
-bad() { echo "FAIL: $1"; fail=1; }
+ok()   { echo "PASS: $1"; }
+bad()  { echo "FAIL: $1"; fail=1; }
+skip() { echo "SKIP: $1"; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 SID="sess-847"
@@ -1049,6 +1050,17 @@ rm -rf "$GITROOT_H" 2>/dev/null
 # isolated one-off git repos whose LOCAL user.email is a synthetic value, so the EMAIL class can be exercised
 # and MUTATED without ever touching the real operator's email.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# PORTABILITY GUARD: this whole #1537 block is ai-brain-ONLY. Every BLOCK assertion below needs
+# scripts/privacy-scan.sh (+ its denylist libs + hooks/lib-privacy-ere.sh + scripts/sync-three-role-plugin.mjs)
+# to be present so the leg can actually scan. In the three-role-model PLUGIN those files are deliberately
+# ABSENT and the gate's privacy leg ships DORMANT (presence-guarded) — so a dirty fixture would ALLOW, not
+# BLOCK, and the assertions would false-fail. Guard the entire block on scanner presence: ai-brain CI runs it
+# in full (scanner present -> real coverage, unchanged); plugin CI skips it cleanly (leg is dormant there by
+# design). This is the same presence-guard the gate itself uses — its absence exactly defines the dormant
+# context. AC4/AC5/AC6 invoke the scanner directly, so ai-brain coverage stays real, never vacuous.
+if [ ! -f "$DIR/../scripts/privacy-scan.sh" ]; then
+  skip "#1537 artifact-privacy leg (AC1-AC12): scripts/privacy-scan.sh absent (three-role-model plugin dormant context) -> ai-brain-only, skipped"
+else
 GITROOT_P="$(mktemp -d)"
 ( cd "$GITROOT_P" && git init -q && git config user.email t@t.co && git config user.name t )
 mkdir -p "$GITROOT_P/.ai-workspace/plans" "$GITROOT_P/.ai-workspace/reviews" "$GITROOT_P/.ai-workspace/perf-logs"
@@ -1252,5 +1264,6 @@ else
 fi
 
 rm -rf "$GITROOT_P" "$EMAILGIT_A" "$EMAILGIT_B" "$EMAILGIT_EMPTY" "$MUT" "$MUTBROKEN" "$PERF_OUTSIDE" 2>/dev/null
+fi  # end #1537 artifact-privacy-leg portability guard (scanner-present -> ran; absent -> skipped)
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
