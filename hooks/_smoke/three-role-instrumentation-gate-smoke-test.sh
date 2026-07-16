@@ -509,7 +509,7 @@ runC 12702 sC12 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 # prove the widening did not become vacuous (an unanchored `cairn:`-anywhere fix would wrongly ALLOW S7/S10/S13).
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 cat >> "$TMP/perf-1269.md" <<EOF
-## rounds for #12703 #12704 #12705 #12706 #12707 #12708 #12709 #12710 #12711 #12712 #12713 #12714 #12715
+## rounds for #12703 #12704 #12705 #12706 #12707 #12708 #12709 #12710 #12711 #12712 #12713 #12714 #12715 #12716 #12717 #12718 #12719
 EOF
 
 # ---- S1 (AC1, RED->GREEN). 4a plan's ONLY receipt is a decorated BULLET: '- cairn: "hit"' -> ALLOW post-fix ----
@@ -617,6 +617,54 @@ appendL --session sS13 --task 12715 --role planner     --agent agP --artifact "$
 appendL --session sS13 --task 12715 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
 runC 12715 sS13 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "plan-reviewer must independently search memory"; } && ok "AC7c[B1]: 4b-in-plan-awk-mid-prose-blocks (anchor power test) -> BLOCK" || bad "AC7c[B1] 4b-in-plan-awk-mid-prose-blocks should block (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1607 — cairn: RECEIPT SHAPE-TOLERANCE (ALTERNATING decoration+whitespace, still line-anchored). Widens the
+# #1518 single-decoration-run tolerance to an ALTERNATING run of decoration+whitespace (e.g. bullet, THEN a
+# space, THEN bold: '- **cairn:**') across all three #1269 check-sites. LIVE EVIDENCE: #1590's own plan +
+# plan-review artifacts both carried this exact shape and both false-blocked. S14-S16 are the RED->GREEN
+# alternating-decoration-ALLOW set (blocked under the pre-fix single-run regex, allowed post-fix); S17 is a
+# stable-block anti-vacuity power test (decoration THEN prose, not decoration then cairn:) proving the
+# widening did not become an unanchored anywhere-in-line match.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ---- S14 (#1607 AC1/AC3, RED->GREEN). 4a plan's ONLY receipt is ALTERNATING decoration '- **cairn:**'
+#      (bullet, space, THEN bold) -> BLOCKED under the pre-fix single-decoration-run regex (RED), ALLOW
+#      post-fix (GREEN). This is the exact #1590 false-block shape. ----
+ledger_complete sS14 12716; D="$TMP/s14"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n- **cairn:** "hit"\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS14 --task 12716 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12716 sS14 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1607 AC1/AC3: alternating-decoration-4a '- **cairn:**' -> ALLOW" || bad "#1607 AC1/AC3 alternating-decoration-4a '- **cairn:**' should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S15 (#1607 AC1/AC4, RED->GREEN). 4a plan valid (plain cairn:); 4b SEPARATE reviews/<id>.md's ONLY
+#      receipt is ALTERNATING decoration '- **cairn:**' -> ALLOW post-fix (blocked pre-fix). ----
+ledger_complete sS15 12717; D="$TMP/s15"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\n- **cairn:** "reviewer hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/12717.md"
+appendL --session sS15 --task 12717 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS15 --task 12717 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/12717.md"
+runC 12717 sS15 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1607 AC1/AC4: alternating-decoration-4b-review-file '- **cairn:**' -> ALLOW" || bad "#1607 AC1/AC4 alternating-decoration-4b-review-file should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S16 (#1607 AC1/AC5, RED->GREEN). planner->plan w/ plain cairn:, plan-review->SAME plan file
+#      (AREVIEW==APLAN -> awk route); ## Review section's ONLY receipt is ALTERNATING decoration
+#      '- **cairn:**' -> ALLOW post-fix (blocked pre-fix). ----
+ledger_complete sS16 12718; D="$TMP/s16"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\n- **cairn:** "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS16 --task 12718 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sS16 --task 12718 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+runC 12718 sS16 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1607 AC1/AC5: alternating-decoration-4b-in-plan-awk '- **cairn:**' -> ALLOW" || bad "#1607 AC1/AC5 alternating-decoration-4b-in-plan-awk should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- S17 (#1607 AC6, stable-block, ANTI-VACUITY power test). 4a plan's ONLY cairn: occurrence is DECORATION
+#      THEN PROSE (a bullet lead-in, but 'cairn:' is NOT the decoration's immediate next content) -> BLOCK
+#      pre- AND post-fix. Proves the alternating widening stayed line-anchored: the decoration group must be
+#      immediately followed by 'cairn:', not just precede it somewhere on the line. ----
+ledger_complete sS17 12719; D="$TMP/s17"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n- some note cairn: X\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sS17 --task 12719 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 12719 sS17 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "#1607 AC6: decoration-then-prose-4a-still-blocks (anti-vacuity power test) -> BLOCK" || bad "#1607 AC6 decoration-then-prose-4a-still-blocks should block (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1276 — VACUOUS-ORACLE guard. The gate now opts the ledger `check` into --reject-vacuous-oracle: an
