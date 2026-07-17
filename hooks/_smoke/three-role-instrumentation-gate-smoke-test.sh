@@ -1282,4 +1282,78 @@ fi
 rm -rf "$GITROOT_P" "$EMAILGIT_A" "$EMAILGIT_B" "$EMAILGIT_EMPTY" "$MUT" "$MUTBROKEN" "$PERF_OUTSIDE" 2>/dev/null
 fi  # end #1537 artifact-privacy-leg portability guard (scanner-present -> ran; absent -> skipped)
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1532 — executor artifact-KIND leg, wired onto the MAIN ledger `check` call site (this file's
+# line ~447, unconditional — not the Leg-A/privacy branch above), so a REAL tagged completion actually
+# fires it (AC-6 live-fire proof, plan-review non-blocking note 2). Same scratch-git-repo pattern as the
+# #1509-H block (isGitTracked needs a real repo; every non-KIND fixture above lives under bare $TMP).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+GITROOT_K="$(mktemp -d)"
+( cd "$GITROOT_K" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$GITROOT_K/.ai-workspace/plans" "$GITROOT_K/.ai-workspace/reviews"
+printf '## ELI5\nplan\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$GITROOT_K/.ai-workspace/plans/1532k-plan.md"
+printf '## Review\ncairn: "synth reviewer hit"\nverdict: PASS\n' > "$GITROOT_K/.ai-workspace/reviews/1532k-rev.md"
+( cd "$GITROOT_K" && git add -A && git commit -q -m "fixture: #1532 KIND-leg artifacts" )
+cat > "$TMP/perf-1532.md" <<EOF
+# 3-role performance log — #1532 KIND-leg smoke
+## rounds for #1532kred #1532kgreen
+EOF
+
+TAGSID_K="sess-1532k"
+mk_sub "$TAGSID_K" kp1; mk_sub "$TAGSID_K" kr1; mk_sub "$TAGSID_K" ke1; mk_sub "$TAGSID_K" kv1
+appendL --session "$TAGSID_K" --task 1532kred --role planner          --agent kp1 --artifact "$GITROOT_K/.ai-workspace/plans/1532k-plan.md"
+appendL --session "$TAGSID_K" --task 1532kred --role plan-review       --agent kr1 --artifact "$GITROOT_K/.ai-workspace/reviews/1532k-rev.md"
+# the #1494 shape: executor re-cites the PLANNER's own plan file instead of a ship reference.
+appendL --session "$TAGSID_K" --task 1532kred --role executor          --agent ke1 --artifact "$GITROOT_K/.ai-workspace/plans/1532k-plan.md"
+appendL --session "$TAGSID_K" --task 1532kred --role execution-review  --agent kv1 --artifact "$GITROOT_K/.ai-workspace/reviews/1532k-rev.md"
+
+# ---- K1 [proof] RED, real seam: a REAL tagged completion whose executor row is the #1494 shape ->
+#      BLOCKed by the KIND leg at the MAIN ledger check call site (line ~447), routed to block_kind. ----
+run '{"session_id":"'"$TAGSID_K"'","tool_input":{"taskId":"1532kred","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1532.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "executor artifact-KIND leg FAILED" && echo "$CAP" | grep -q "KIND:"; } \
+  && ok "[proof] 1532-K1 RED: real tagged completion, #1494-shaped executor row -> KIND leg BLOCK (block_kind, real seam)" \
+  || bad "1532-K1 RED failed (rc=$RC out=$CAP)"
+
+# ---- K2 [proof] GREEN: an otherwise-identical tagged completion whose executor row cites a real PR URL ->
+#      ALLOWED (the KIND leg never touches a ship reference). ----
+mk_sub "$TAGSID_K" ke2
+appendL --session "$TAGSID_K" --task 1532kgreen --role planner          --agent kp1 --artifact "$GITROOT_K/.ai-workspace/plans/1532k-plan.md"
+appendL --session "$TAGSID_K" --task 1532kgreen --role plan-review       --agent kr1 --artifact "$GITROOT_K/.ai-workspace/reviews/1532k-rev.md"
+appendL --session "$TAGSID_K" --task 1532kgreen --role executor          --agent ke2 --artifact "https://github.com/owner/repo/pull/1532"
+appendL --session "$TAGSID_K" --task 1532kgreen --role execution-review  --agent kv1 --artifact "$GITROOT_K/.ai-workspace/reviews/1532k-rev.md"
+run '{"session_id":"'"$TAGSID_K"'","tool_input":{"taskId":"1532kgreen","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1532.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}'
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "[proof] 1532-K2 GREEN: real tagged completion, PR-URL executor row -> ALLOWED (KIND leg never touches a ship reference)" \
+  || bad "1532-K2 GREEN failed (rc=$RC out=$CAP)"
+
+# ---- K3 [control] the pre-existing MASTER kill-switch still disables the KIND leg too
+#      (THREE_ROLE_INSTRUMENT_OFF=1 over the SAME RED fixture as K1). This leg carries no bypass flag of
+#      its OWN by design (mirrors Leg A) — proves the one pre-existing escape still reaches it. ----
+CAP=$(printf '%s' '{"session_id":"'"$TAGSID_K"'","tool_input":{"taskId":"1532kred","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1532.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+  | THREE_ROLE_INSTRUMENT_OFF=1 THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "[control] 1532-K3: THREE_ROLE_INSTRUMENT_OFF=1 (whole-family master switch) over the SAME RED KIND fixture -> allow silent" \
+  || bad "1532-K3 master kill-switch failed (rc=$RC out=$CAP)"
+
+# ---- K4 [proof] AC-6 LIVE-FIRE through the INSTALLED symlink (readlink -f resolved), not just the in-tree
+#      script — proves the fix is live, not inert in-tree only. ----
+INSTALLED_GATE_K="$HOME/.claude/hooks/three-role-instrumentation-gate.sh"
+if [ -L "$INSTALLED_GATE_K" ] || [ -f "$INSTALLED_GATE_K" ]; then
+  RESOLVED_GATE_K="$(readlink -f "$INSTALLED_GATE_K" 2>/dev/null)"
+  RESOLVED_SELF_K="$(readlink -f "$HOOK" 2>/dev/null)"
+  if [ -n "$RESOLVED_GATE_K" ] && [ "$RESOLVED_GATE_K" = "$RESOLVED_SELF_K" ]; then
+    CAP=$(printf '%s' '{"session_id":"'"$TAGSID_K"'","tool_input":{"taskId":"1532kred","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-1532.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+      | THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" bash "$INSTALLED_GATE_K" 2>&1 >/dev/null); RC=$?
+    { [ "$RC" = "2" ] && echo "$CAP" | grep -q "executor artifact-KIND leg FAILED"; } \
+      && ok "[proof] 1532-K4 AC-6: LIVE-FIRE through the INSTALLED symlink ($INSTALLED_GATE_K -> $RESOLVED_GATE_K) -> KIND leg BLOCK" \
+      || bad "1532-K4 AC-6 live-fire failed (rc=$RC out=$CAP)"
+  else
+    skip "1532-K4 AC-6 live-fire: installed hook does not resolve to this repo's copy (resolved=$RESOLVED_GATE_K, self=$RESOLVED_SELF_K) — not this machine's canonical checkout"
+  fi
+else
+  skip "1532-K4 AC-6 live-fire: $INSTALLED_GATE_K not present on this machine (setup.sh not run here)"
+fi
+
+rm -rf "$GITROOT_K" 2>/dev/null
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

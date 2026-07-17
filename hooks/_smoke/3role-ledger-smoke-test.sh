@@ -908,6 +908,96 @@ OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-arti
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -q "NOTE-EXECUTOR:" && echo "$OUT" | grep -qi "1509-collide-plan.md"; } \
   && ok "[proof] 1509-AC2 GREEN: executor==planner (#1494-shaped historical convention, tracked) -> exit 0, NOT blocked, NOTE-EXECUTOR surfaces the executor row" \
   || bad "1509-AC2 executor==planner should not block + must surface NOTE (rc=$RC out=$OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1532 — executor artifact-KIND leg (`check --enforce-artifact-role-kind`). Reuses the SAME GITROOT +
+# $COLLIDE fixture the #1509 block above already built (still alive — the rm -rf below is now AFTER this
+# block). AC labels below map to the plan's Binary AC-0..AC-5.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# AC-0 / AC-1 RED-both-ends (predicate a, the EXACT #1494 shape): reuse TSID4/1509ex2 built directly above —
+# its executor row's artifact_path is LITERALLY the planner's own resolved path ($COLLIDE). Base `check`
+# (no flag) exits 0 TODAY (the bug is genuinely live); the SAME fixture under --enforce-artifact-role-kind
+# exits 2 with a KIND: problem naming the executor + the #1494 shape.
+OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1532-AC1 RED: #1494-shaped executor==planner fixture -> base check (no flag) still exit 0 (bug genuinely live)" \
+  || bad "1532-AC1 RED failed (rc=$RC out=$OUT)"
+OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "KIND:" && echo "$OUT" | grep -qi "executor" && echo "$OUT" | grep -qi "1494"; } \
+  && ok "[proof] 1532-AC0/AC1 GREEN: SAME #1494-shaped fixture -> --enforce-artifact-role-kind exit 2, KIND: names executor + the #1494 shape" \
+  || bad "1532-AC0/AC1 GREEN failed (rc=$RC out=$OUT)"
+
+# AC-1 predicate (b): executor cites a DIFFERENT plan-kind file (not literally the planner's own path, but
+# still on a /.ai-workspace/plans/ segment) -> also KIND-blocked.
+printf '## ELI5\na DIFFERENT plan-kind doc, not the planner row\n### Binary AC\n- AC1\n' > "$GITROOT/.ai-workspace/plans/1532-other-plan.md"
+( cd "$GITROOT" && git add .ai-workspace/plans/1532-other-plan.md && git commit -q -m "fixture: 1532 predicate-b plan-kind doc" )
+TSID5="sess-1532-predb"
+mk_sub "$TSID5" bp1; mk_sub "$TSID5" br1; mk_sub "$TSID5" be1; mk_sub "$TSID5" bv1
+node "$LED" append --session "$TSID5" --task 1532b --role planner --agent bp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID5" --task 1532b --role plan-review --agent br1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID5" --task 1532b --role executor --agent be1 --artifact "$GITROOT/.ai-workspace/plans/1532-other-plan.md" >/dev/null
+node "$LED" append --session "$TSID5" --task 1532b --role execution-review --agent bv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID5" --task 1532b --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "KIND:" && echo "$OUT" | grep -qi "plans"; } \
+  && ok "[proof] 1532-AC1 predicate-b: executor cites a DIFFERENT plans/-segment doc (not literally the planner's path) -> KIND BLOCK" \
+  || bad "1532-AC1 predicate-b failed (rc=$RC out=$OUT)"
+
+# AC-2 GREEN (hard constraint): executor cites a valid PR URL -> --enforce-artifact-role-kind exit 0, no
+# KIND:/TRACKED: problem for the executor (the leg must NEVER existence-/git-check a real ship reference).
+TSID6="sess-1532-prurl"
+mk_sub "$TSID6" up1; mk_sub "$TSID6" ur1; mk_sub "$TSID6" ue1; mk_sub "$TSID6" uv1
+node "$LED" append --session "$TSID6" --task 1532c --role planner --agent up1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID6" --task 1532c --role plan-review --agent ur1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID6" --task 1532c --role executor --agent ue1 --artifact "https://github.com/owner/repo/pull/1140" >/dev/null
+node "$LED" append --session "$TSID6" --task 1532c --role execution-review --agent uv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID6" --task 1532c --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! echo "$OUT" | grep -q "KIND:"; } \
+  && ok "[proof] 1532-AC2 GREEN: PR-URL executor -> exit 0, never KIND-checked (hard constraint)" \
+  || bad "1532-AC2 PR-URL executor should never be KIND-blocked (rc=$RC out=$OUT)"
+
+# AC-3 GREEN: executor cites a bare commit-sha-shaped / "PR #N" string -> exit 0, never KIND-checked.
+TSID7="sess-1532-sha"
+mk_sub "$TSID7" sp1; mk_sub "$TSID7" sr1; mk_sub "$TSID7" se1; mk_sub "$TSID7" sv1
+node "$LED" append --session "$TSID7" --task 1532d --role planner --agent sp1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID7" --task 1532d --role plan-review --agent sr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID7" --task 1532d --role executor --agent se1 --artifact "a1b2c3d4e5f6789012345678901234567890abcd" >/dev/null
+node "$LED" append --session "$TSID7" --task 1532d --role execution-review --agent sv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID7" --task 1532d --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! echo "$OUT" | grep -q "KIND:"; } \
+  && ok "[proof] 1532-AC3 GREEN: bare commit-sha executor -> exit 0, never KIND-checked" \
+  || bad "1532-AC3 commit-sha executor should never be KIND-blocked (rc=$RC out=$OUT)"
+OUT=$(node "$LED" check --session "$TSID3" --task 1509pr --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! echo "$OUT" | grep -q "KIND:"; } \
+  && ok "[proof] 1532-AC3b GREEN: \"PR #1509\" string executor -> exit 0, never KIND-checked" \
+  || bad "1532-AC3b PR-string executor should never be KIND-blocked (rc=$RC out=$OUT)"
+
+# AC-4 GREEN (false-positive guard): a genuinely executor-authored NON-plan disk doc (SKILL.md-shaped, no
+# PLAN_RE heading, off any /.ai-workspace/plans/ segment) -> exit 0, NOT blocked (guards against an over-broad
+# "block any disk path" regression that would brick the ~42 historical executor-authored doc rows).
+mkdir -p "$GITROOT/skills/foo"
+printf 'A skill doc the executor genuinely wrote.\nNo plan heading here — just prose.\n' > "$GITROOT/skills/foo/SKILL.md"
+( cd "$GITROOT" && git add skills/foo/SKILL.md && git commit -q -m "fixture: 1532-AC4 executor-authored non-plan doc" )
+TSID8="sess-1532-ac4"
+mk_sub "$TSID8" np1; mk_sub "$TSID8" nr1; mk_sub "$TSID8" ne1; mk_sub "$TSID8" nv1
+node "$LED" append --session "$TSID8" --task 1532e --role planner --agent np1 --artifact "$COLLIDE" >/dev/null
+node "$LED" append --session "$TSID8" --task 1532e --role plan-review --agent nr1 --artifact "$GITROOT/.ai-workspace/reviews/1515-planreview.md" >/dev/null
+node "$LED" append --session "$TSID8" --task 1532e --role executor --agent ne1 --artifact "$GITROOT/skills/foo/SKILL.md" >/dev/null
+node "$LED" append --session "$TSID8" --task 1532e --role execution-review --agent nv1 --artifact "$GITROOT/.ai-workspace/reviews/1515-execreview.md" >/dev/null
+OUT=$(node "$LED" check --session "$TSID8" --task 1532e --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! echo "$OUT" | grep -q "KIND:"; } \
+  && ok "[proof] 1532-AC4 GREEN: executor-authored non-plan SKILL.md (off plans/, no PLAN_RE heading) -> exit 0, NOT blocked" \
+  || bad "1532-AC4 false-positive guard failed (rc=$RC out=$OUT)"
+
+# AC-5(a): the KIND leg is executor-SCOPED — planner / plan-review / execution-review rows are untouched by
+# it (already implicitly proven by every ALLOW case above still resolving to exit 0/OK under the flag).
+# AC-5(b): the REJECTED "no two roles cite the same path" rule was deliberately NOT built — reuse TSID3/1509pr
+# (the plan-review==planner collision fixture built in the #1509 block above) WITH the new flag on.
+OUT=$(node "$LED" check --session "$TSID3" --task 1509pr --enforce-artifact-role-kind 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1532-AC5: plan-review==planner collision under --enforce-artifact-role-kind -> STILL exit 0 (the same-path rule was NOT built; the leg is executor-only)" \
+  || bad "1532-AC5 same-path-rule-not-built proof failed (rc=$RC out=$OUT)"
+
 rm -rf "$GITROOT" 2>/dev/null
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════

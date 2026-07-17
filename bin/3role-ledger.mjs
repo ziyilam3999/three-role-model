@@ -70,6 +70,22 @@
 //     kind/authorship discrimination is #1532). No grace/bypass flag on this leg by design (a `*_OFF` here
 //     would reopen the #1509 leak); the ONLY escapes are (a) `git add`+commit the cited artifact, or (b) the
 //     pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 that already disables the whole gate family.
+//   check --session S --task T --enforce-artifact-role-kind                                    (#1532)
+//     Executor artifact-KIND leg — the #1494 fix. Opt-in (only the instrumentation gate passes this flag on
+//     the tagged completion path). Catches an executor row whose artifact_path resolves to the PLANNER's
+//     plan-kind document instead of a real ship reference (PR URL / commit sha / branch) — #1494's exact
+//     shape, previously only a silently-dropped "NOTE-EXECUTOR:" line (#1509). HARD CONSTRAINT: engages ONLY
+//     when the executor artifact_path resolves to an EXISTING DISK PATH (resolveArtifact) — a PR-URL/commit/
+//     branch never resolves to disk, so it short-circuits out before either predicate below runs; this leg
+//     can never existence- or git-check a legitimate ship-reference executor row. Among disk-resolving
+//     executor rows, "plan-kind" (=> a "KIND:" problem, exit 2) is evidenced by EITHER (a) the resolved path
+//     equals THIS task's planner row's resolved path (the exact #1494 shape), OR (b) the resolved path lies
+//     on a `/.ai-workspace/plans/` segment (any other plan-kind document). A disk-resolving executor artifact
+//     satisfying NEITHER (e.g. a genuinely executor-authored SKILL.md/.mjs off any plans/ path) is NOT
+//     plan-kind and passes — guards against an over-broad "block any disk path" regression. Deliberately does
+//     NOT implement "no two roles may cite the same path" (rejected on measured evidence: 43+ legitimate
+//     planner==plan-review collisions — the doctrine-sanctioned reviewer-writes-into-the-plan-file pattern).
+//     Same no-new-bypass-token discipline as Leg A above: THREE_ROLE_INSTRUMENT_OFF=1 is the only escape.
 //   resolve-agent --session S --task T --role R
 //     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
 //     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
@@ -1162,6 +1178,33 @@ function executorDiskPathNote(e) {
     'branch reference (the #1494 shape) — lower-fidelity, not blocked; kind/authorship verification is #1532.';
 }
 
+// #1532 — executor artifact-KIND leg. Returns null when satisfied (not an executor row, inline-skipped,
+// missing artifact_path — the base existence leg already reports those — or a ship reference / a
+// disk-resolving-but-non-plan-kind artifact), else a problem string. See the `check --enforce-artifact-
+// role-kind` doc comment above for the full discrimination + the hard-constraint safety property.
+function executorKindProblem(byRole) {
+  const e = byRole['executor'];
+  if (!e) return null;                              // missing-role already reported by the base existence leg.
+  if (classifySkip(e).skip) return null;             // inline-skip has no artifact to KIND-check.
+  const raw = String(e.artifact_path == null ? '' : e.artifact_path).trim();
+  if (!raw) return null;                             // base existence leg already reports this.
+  const ap = resolveArtifact(raw);
+  if (!ap) return null;                              // NOT an existing disk path -> a PR-URL/commit/branch
+                                                      // ship reference -> the hard constraint: never touched.
+  const plannerRow = byRole['planner'];
+  const plannerRaw = plannerRow ? String(plannerRow.artifact_path == null ? '' : plannerRow.artifact_path).trim() : '';
+  const plannerPath = plannerRaw ? resolveArtifact(plannerRaw) : '';
+  const sameAsPlanner = !!plannerPath && ap === plannerPath;          // predicate (a) — the exact #1494 shape.
+  const onPlansSegment = /(^|\/)\.ai-workspace\/plans\//.test(ap);    // predicate (b) — any other plan-kind doc.
+  if (!sameAsPlanner && !onPlansSegment) return null;   // disk-resolving but NOT plan-kind -> AC-4 pass.
+  const why = sameAsPlanner
+    ? 'equals the planner\'s own artifact_path (the exact #1494 shape — the executor re-cited the planner\'s ' +
+      'plan file instead of citing its own ship reference)'
+    : 'lies on a /.ai-workspace/plans/ path segment (a plan-kind document, not a ship reference)';
+  return 'executor artifact_path "' + raw + '" resolves to a DISK PATH (' + ap + ') that ' + why + '. An ' +
+    'executor\'s real artifact is a PR URL / commit sha / branch — never a plan document; cite the actual PR/commit.';
+}
+
 // OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
 // path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
 // `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
@@ -1720,6 +1763,14 @@ function cmdCheck(o) {
     const execNote = executorDiskPathNote(byRole['executor']);
     if (execNote) executorNotes.push(execNote);
   }
+  // #1532 — executor artifact-KIND leg. Opt-in via --enforce-artifact-role-kind (only the instrumentation
+  // gate passes it on the tagged completion path). See executorKindProblem() above for the discrimination;
+  // this is a hard BLOCK (pushed to problems[], routed to the same exit-2 path below), not a note — it
+  // upgrades the #1509 NOTE-EXECUTOR advisory into a real gate for the #1494 shape.
+  if ('enforce-artifact-role-kind' in o) {
+    const kp = executorKindProblem(byRole);
+    if (kp) problems.push('KIND: ' + kp);
+  }
   // #1537 — artifact-privacy leg. Opt-in via --enforce-artifact-privacy (only the completion gate passes it).
   // DORMANT (no problems pushed, no error) when PRIVACY_SCAN_BIN is unset/unresolvable — the ai-brain-only /
   // plugin-safe discipline (the plugin ports this file but never the scanner, so a plugin install silently
@@ -2082,6 +2133,7 @@ try {
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts (check, #1509)] ' +
+      '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
