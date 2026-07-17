@@ -532,11 +532,20 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # mention must still fail; see AC5's power test). #1607: the decoration may be an ALTERNATING run of
   # decoration+whitespace groups (e.g. bullet, space, THEN bold: `- **cairn:**`), not just a single run —
   # still line-anchored (a mid-prose / decoration-then-prose mention must still fail; see AC6's power test).
-  grep -Eiq '^[[:space:]]*([-*+>`]+[[:space:]]*)*cairn:' "$APLAN" 2>/dev/null \
+  # #1628: `#` was added to the decoration char-class so a markdown-HEADING receipt (`### cairn: "..."`,
+  # 1-6 hashes + optional space) is also accepted — the colon after `cairn` is still mandatory, so a bare
+  # `## cairn` section title (no colon) still fails; still line-anchored (a heading-then-prose mention must
+  # still fail; see AC2/AC3's power tests).
+  grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn:' "$APLAN" 2>/dev/null \
     || block "the active plan ($APLAN) carries no \`cairn:\` citation line — prove the PLANNER searched memory (cairn/AWM/project-index). Add a \`cairn: \"<hit>\"\` or \`cairn: no hits for <q>\` line, then re-complete. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
 
   # 4b doc — resolve the plan-REVIEWER's review from the LEDGER's plan-review artifact_path for THIS task
   # (#1303), then fall back to the convention reviews dir (reviews/<taskId>.md, else the newest reviews/*.md).
+  # #1628 AC8: the gate scans a SEPARATE `reviews/<id>.md` file when the ledger's plan-review `artifact_path`
+  # resolves to one; ELSE (artifact_path == the plan, i.e. AREVIEW == APLAN below) it scans the plan's OWN
+  # `## Review` section instead. So when the reviewer's genuine `cairn:` line lives only in the separate
+  # review file, RE-POINTING the ledger's artifact_path at that file (rather than editing the plan) is a
+  # legitimate, gate-legal fix — not a workaround (this is exactly how #1585 and #1535 were closed honestly).
   AREVIEW=""
   if [ -f "$LEDGER_HELPER" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
     AREVIEW="$(node "$LEDGER_HELPER" resolve-artifact --session "$SESSION" --task "$TASKID" --role plan-review 2>/dev/null)"
@@ -552,15 +561,20 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # Fail-OPEN only when NEITHER form exists (can't-tell); BLOCK when a review IS present but uncited.
   # #1518: same decoration-prefix tolerance as the 4a leg above (still line-anchored — a mid-prose mention
   # must still fail; see AC6c/AC7c's power tests). #1607: same ALTERNATING decoration+whitespace widening as
-  # the 4a leg above (still line-anchored — see #1607 AC6's power test).
+  # the 4a leg above (still line-anchored — see #1607 AC6's power test). #1628: same `#`-heading widening as
+  # the 4a leg above (colon after `cairn` still mandatory; see AC1b's power test).
   if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ] && [ "$AREVIEW" != "$APLAN" ]; then
-    grep -Eiq '^[[:space:]]*([-*+>`]+[[:space:]]*)*cairn:' "$AREVIEW" 2>/dev/null \
+    grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn:' "$AREVIEW" 2>/dev/null \
       || block "the plan-review ($AREVIEW) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   elif grep -Eq '^## Review' "$APLAN" 2>/dev/null; then
     # N3 (POSIX-awk ERE, NOT the grep ERE above): `-` is placed FIRST in the bracket expression so it is
     # literal, not a range operator; backtick/`*`/`+`/`>` are literal inside a bracket expression already.
     # #1607: `+` sits INSIDE the group (not a nested star) so the group itself repeats as an alternating run.
-    awk '/^## Review/{r=1} r&&/^[[:space:]]*([-*+>`]+[[:space:]]*)*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
+    # #1628 (Rule 18, live-verified): `#` was appended to the SAME bracket expression. Inside an awk `/.../`
+    # regex CONSTANT (and inside a bracket expression generally), `#` is a LITERAL character, NOT a comment
+    # introducer — the comment-introducer reading only applies to bare awk PROGRAM text outside a regex/string
+    # literal. So this stays a single-quoted, byte-exact widen with no risk of truncating the program.
+    awk '/^## Review/{r=1} r&&/^[[:space:]]*([-*+>`#]+[[:space:]]*)*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
       || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   fi
 fi

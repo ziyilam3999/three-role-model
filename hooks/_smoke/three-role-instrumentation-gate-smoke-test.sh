@@ -1356,4 +1356,69 @@ fi
 
 rm -rf "$GITROOT_K" 2>/dev/null
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1628 — cairn: RECEIPT SHAPE-TOLERANCE (markdown HEADING lead-in, still line-anchored, colon still
+# required). The 5th line-anchored-receipt sighting (cf #1518 backtick/decoration, #1607 alternating-bold).
+# Widens the #1607 decoration char-class to also accept `#{1,6}` heading marks (e.g. `### cairn: "hit"`) at
+# ALL THREE #1269 check-sites (4a grep, 4b separate-file grep, 4b in-plan `## Review` AWK route). H1-H3 are
+# the RED->GREEN heading-ALLOW set (blocked under the pre-fix char-class, allowed post-fix) — H3 is the
+# CRITICAL proof that the AWK-dialect route (a different regex engine than grep) also accepts `#` as a
+# literal decoration char, not an awk comment introducer. H4 proves the receipt CONTRACT (the `cairn:`
+# colon) is still mandatory — a bare heading section title with NO colon is NOT a receipt. H5 is a stable-
+# block anti-vacuity power test (heading lead-in THEN prose, not heading-then-cairn:) proving the widening
+# did not become an unanchored "cairn: appears anywhere on a heading line" match.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+cat >> "$TMP/perf-1269.md" <<EOF
+## rounds for #14601 #14602 #14603 #14604 #14605
+EOF
+
+# ---- H1 (#1628 AC1a, RED->GREEN). 4a plan's ONLY receipt is a markdown HEADING '### cairn: "hit"'
+#      -> BLOCKED under the pre-fix decoration char-class (RED), ALLOW post-fix (GREEN). ----
+ledger_complete sH1 14601; D="$TMP/h1"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n### cairn: "hit"\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sH1 --task 14601 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 14601 sH1 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1628 AC1a: heading-receipt-4a '### cairn: \"hit\"' -> ALLOW" || bad "#1628 AC1a heading-receipt-4a should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- H2 (#1628 AC1b, RED->GREEN). 4a plan valid (plain cairn:); 4b SEPARATE reviews/<id>.md's ONLY
+#      receipt is a markdown HEADING '### cairn: ...' -> ALLOW post-fix (blocked pre-fix). ----
+ledger_complete sH2 14602; D="$TMP/h2"; mkplan "$D" yes
+mkdir -p "$D/.ai-workspace/reviews"; printf '## Review\n### cairn: "reviewer hit"\nverdict: PASS\n' > "$D/.ai-workspace/reviews/14602.md"
+appendL --session sH2 --task 14602 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sH2 --task 14602 --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/14602.md"
+runC 14602 sH2 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1628 AC1b: heading-receipt-4b-review-file '### cairn:' -> ALLOW" || bad "#1628 AC1b heading-receipt-4b-review-file should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- H3 (#1628 AC1c [CRITICAL — the AWK-dialect route], RED->GREEN). planner->plan w/ plain cairn:,
+#      plan-review->SAME plan file (AREVIEW==APLAN -> awk route); ## Review section's ONLY receipt is a
+#      markdown HEADING '### cairn: ...' -> ALLOW post-fix (blocked pre-fix). Proves `#` is literal inside
+#      the awk `/.../ ` bracket expression on THIS host's awk, not a comment introducer (Rule 18). ----
+ledger_complete sH3 14603; D="$TMP/h3"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\n### cairn: "reviewer hit"\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sH3 --task 14603 --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+appendL --session sH3 --task 14603 --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+runC 14603 sH3 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#1628 AC1c: heading-receipt-4b-in-plan-awk '### cairn:' -> ALLOW (awk-dialect # is literal)" || bad "#1628 AC1c heading-receipt-4b-in-plan-awk should allow post-fix (rc=$RC out=$CAP)"
+
+# ---- H4 (#1628 AC3, colon-required scope guard, stable-block pre- AND post-fix). 4a plan's ONLY
+#      cairn-ish line is a bare heading with NO colon '## cairn' (a section TITLE, not a receipt) ->
+#      BLOCK. Proves the fix widened only the DECORATION (heading lead-in), never the receipt CONTRACT
+#      (the `cairn:` colon stays mandatory). ----
+ledger_complete sH4 14604; D="$TMP/h4"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n## cairn\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sH4 --task 14604 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 14604 sH4 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "#1628 AC3: no-colon-heading-4a '## cairn' still-blocks (colon-contract power test) -> BLOCK" || bad "#1628 AC3 no-colon-heading-4a should block (rc=$RC out=$CAP)"
+
+# ---- H5 (#1628 AC2, stable-block, ANTI-VACUITY power test for the HEADING widening specifically).
+#      4a plan's ONLY cairn: occurrence is HEADING lead-in THEN PROSE ('# TODO cairn: later' — a hash,
+#      then non-decoration prose 'TODO', THEN 'cairn:') -> BLOCK pre- AND post-fix. Proves the heading
+#      widening did not become "cairn: appears anywhere on a heading-shaped line" — the decoration group
+#      must be IMMEDIATELY followed by 'cairn:', not just precede it somewhere on the line. ----
+ledger_complete sH5 14605; D="$TMP/h5"; mkdir -p "$D/.ai-workspace/plans"
+printf '## ELI5\nplan\n# TODO cairn: later\n### Binary AC\n- AC1\n\nbody\n' > "$D/.ai-workspace/plans/p.md"
+appendL --session sH5 --task 14605 --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+runC 14605 sH5 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "#1628 AC2: heading-then-prose-4a '# TODO cairn: later' still-blocks (anti-vacuity power test) -> BLOCK" || bad "#1628 AC2 heading-then-prose-4a should block (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
