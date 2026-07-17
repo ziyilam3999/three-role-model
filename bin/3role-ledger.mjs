@@ -1644,9 +1644,17 @@ function cmdCheck(o) {
         // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
         // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
         // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
-        // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy. Anything that
-        // fails any of these three (a down-tier, a non-resume mismatch, or a resume whose pre-resume model
-        // ALSO didn't match policy) falls straight through to the hard BLOCK below — AC-2's scope guard.
+        // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy.
+        // #1624 (operator decision 2026-07-17): model-cost is enforced at booking/spawn time (the leading-edge
+        // gate), not at close — by close the spend is already SUNK, so blocking a role that ran on a STRICTLY
+        // more-capable tier than policy does nothing for cost control, it only withholds a quality win. So ANY
+        // strict up-tier (isResumeUpTier===true) is now allowed-with-note at close, WITH or WITHOUT a resume
+        // boundary. The resume-matched shape above keeps its own RESUME-UPTIER wording (it is telling a true,
+        // more specific story — a resumed role, not a fresh spawn); every OTHER strict-up-tier shape (no resume
+        // boundary at all, or a resume boundary whose pre-resume model didn't match policy) falls to the
+        // CLOSE-UPTIER branch below — a DISTINCT, honestly-worded note (plan-review F1): it must never claim a
+        // resume boundary that didn't happen. A DOWN-tier (isResumeUpTier===false) never reaches either branch
+        // and still falls straight through to the hard BLOCK below — the guardrail this change does not relax.
         if (isResumeUpTier(expected, actual)) {
           const rb = resumeBoundaryModels(session, e.agentId);
           if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
@@ -1663,6 +1671,20 @@ function cmdCheck(o) {
             resumeNotes.push(note);
             continue;
           }
+          // #1624 — no resume boundary (or a resume boundary whose PRE-resume model didn't match policy, so it
+          // cannot honestly be attributed to the resume). Either way the role's ACTUAL tier is a strict quality
+          // up-tier over policy; the spend is already sunk at close. Allow-with-note using a token that does NOT
+          // claim a resume boundary happened (F1 — the resume wording would be a false statement here).
+          let closeNote = 'CLOSE-UPTIER: role ' + role + ' ran on a MORE-capable tier than policy — a quality ' +
+            'up-tier; the cost is already sunk at close (transcript model ' + actualId + ' (' + actual + ') vs ' +
+            'policy ' + expected + '). Model cost is enforced at booking/spawn time, not at close. ' +
+            'Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+          if (actual === 'fable') {
+            closeNote += ' FABLE-COST-CLIFF: Fable\'s subsidised usage bar expires ~July 7-8; after that a ' +
+              'Fable reroute bills out-of-pocket (~2x Opus) — surfaced here so the cost is never hidden.';
+          }
+          resumeNotes.push(closeNote);
+          continue;
         }
         problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
           ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
