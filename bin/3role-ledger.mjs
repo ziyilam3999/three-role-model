@@ -70,6 +70,18 @@
 //     kind/authorship discrimination is #1532). No grace/bypass flag on this leg by design (a `*_OFF` here
 //     would reopen the #1509 leak); the ONLY escapes are (a) `git add`+commit the cited artifact, or (b) the
 //     pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 that already disables the whole gate family.
+//   check --session S --task T --enforce-tracked-artifacts --perf-log P                        (#1544)
+//     Perf-log tracked-check, riding the SAME Leg A flag (git-only, always-on — NOT the privacy leg, so
+//     THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 cannot erase it — monotonicity, #1590). JURISDICTION-KEYED (the fix
+//     for the #1544 false-blocker BLOCKER): a "TRACKED:" problem fires ONLY when P resolves to a file whose
+//     containing-repo toplevel EQUALS the ai-brain toplevel (derived from this ledger file's own resolved
+//     location, symlink-aware) AND that file is untracked. Any other outcome fails OPEN (exit 0, no
+//     problem): a different real git repo (a legitimate perf-log home outside ai-brain), a non-repo path (the
+//     template's real home, `~/.claude/agent-working-memory/...`, is NOT a git worktree), or an unresolvable
+//     path (nothing to check). This is deliberate — the gate has no jurisdiction over a file it cannot prove
+//     is a shipped ai-brain artifact. No grace/bypass flag by design (mirrors Leg A above); the only escapes
+//     are (a) `git add`+commit the cited perf-log (when it does live in ai-brain), or (b) the master
+//     THREE_ROLE_INSTRUMENT_OFF=1.
 //   check --session S --task T --enforce-artifact-role-kind                                    (#1532)
 //     Executor artifact-KIND leg — the #1494 fix. Opt-in (only the instrumentation gate passes this flag on
 //     the tagged completion path). Catches an executor row whose artifact_path resolves to the PLANNER's
@@ -1109,6 +1121,59 @@ function isGitTracked(absPath) {
 // branch string), never by guessing at the value's shape.
 const TRACKED_ROLES = ['planner', 'plan-review', 'execution-review'];
 
+// ── #1544 — perf-log jurisdiction key (ai-brain-toplevel membership) ───────────────────────────────────────
+// `isGitTracked(perfLog) === false` alone is jurisdiction-BLIND: it fires for an untracked file inside ANY
+// real git repo, not only ai-brain (verified 2026-07-17 — a hermetic `git init` temp dir + untracked file
+// also returns `false`). Blocking on that would be a false-BLOCKER (the one error class with no reviewer) for
+// a perf-log that legitimately lives in a DIFFERENT repo (the template's real home,
+// `~/.claude/agent-working-memory/...`, is NOT a git worktree at all — non-repo -> null -> already fail-open;
+// but a sibling git-tracked working-memory clone, or any other real repo, is NOT automatically safe without
+// this key). The fix: key the block on ai-brain-repo TOPLEVEL MEMBERSHIP, not bare tracked-ness.
+
+// Resolve the ai-brain toplevel from THIS ledger file's own resolved location (symlink-aware — reuses
+// selfDir()'s realpathSync trick so a ~/.claude/hooks/3role-ledger.mjs symlink install still resolves to the
+// real repo, not the dangling ~/.claude/hooks dir). Memoized (git spawnSync is not free); null when this
+// file itself somehow isn't inside a git repo (can't-tell -> every jurisdiction check below fails open).
+let _aiBrainToplevelCache;
+function aiBrainToplevel() {
+  if (_aiBrainToplevelCache !== undefined) return _aiBrainToplevelCache;
+  try {
+    const res = spawnSync('git', ['-C', selfDir(), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    _aiBrainToplevelCache = (res.status === 0) ? (res.stdout || '').trim() : null;
+  } catch (e) { _aiBrainToplevelCache = null; }
+  return _aiBrainToplevelCache;
+}
+
+// Resolve the git toplevel containing absPath's directory. null when absPath is not inside any real git repo
+// (exit 128), or on any spawn error / unexpected exit — the SAME can't-tell -> fail-open contract as
+// isGitTracked() above (never a false block on an environment hiccup).
+function repoToplevelFor(absPath) {
+  try {
+    const res = spawnSync('git', ['-C', path.dirname(absPath), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    return (res.status === 0) ? (res.stdout || '').trim() : null;
+  } catch (e) { return null; }
+}
+
+// The #1544 perf-log tracked-check. Returns null when satisfied (out of jurisdiction, can't-tell, or
+// genuinely tracked/staged), else a "TRACKED:"-caller-prefixed problem string (the caller adds the prefix,
+// mirroring checkTrackedRole()'s contract). BLOCKS only when perfLogPath resolves to a file whose containing
+// repo's toplevel EQUALS the ai-brain toplevel (jurisdiction) AND that file is untracked. Every other
+// outcome — a different real repo, a non-repo path, an unresolvable path, or this ledger's own toplevel
+// being undeterminable — fails OPEN by design (#1544 BLOCKER 1 fix; see the doc comment above TRACKED_ROLES).
+function checkPerfLogTracked(perfLogPath) {
+  if (!perfLogPath) return null;
+  const abTop = aiBrainToplevel();
+  if (!abTop) return null;                          // can't determine our own jurisdiction -> fail open.
+  const fileTop = repoToplevelFor(perfLogPath);
+  if (!fileTop || fileTop !== abTop) return null;    // different repo / non-repo / unresolvable -> OUT of jurisdiction.
+  if (isGitTracked(perfLogPath) === false) {
+    return 'perf-log "' + perfLogPath + '" exists on disk inside the ai-brain repo but is NOT git-tracked ' +
+      '(present-but-untracked — it will never ship with the PR; the #1544 class, the same #861/#1509 leak one ' +
+      'surface over). git add + commit it (from a Rule-12 worktree), then re-complete.';
+  }
+  return null;   // tracked, staged, or can't-tell -> satisfied.
+}
+
 // Resolve the disk path Leg A should tracked-check for one of the TRACKED_ROLES entry, mirroring exactly
 // what checkRole() already resolves for that role (oracle wins for execution-review, else artifact_path).
 // Returns '' when there is no resolvable on-disk path for this role (nothing for Leg A to check — the base
@@ -1762,6 +1827,14 @@ function cmdCheck(o) {
     }
     const execNote = executorDiskPathNote(byRole['executor']);
     if (execNote) executorNotes.push(execNote);
+    // #1544 — perf-log jurisdiction-keyed tracked-check, riding the SAME Leg A flag (git-only, always-on).
+    // NOT gated on --enforce-artifact-privacy — that is the monotonicity fix (#1590): the perf-log's
+    // tracked-ness must not be silenceable by THREE_ROLE_ARTIFACT_PRIVACY_OFF=1.
+    const perfLogTracked = o['perf-log'] || '';
+    if (perfLogTracked) {
+      const pp = checkPerfLogTracked(perfLogTracked);
+      if (pp) problems.push('TRACKED: ' + pp);
+    }
   }
   // #1532 — executor artifact-KIND leg. Opt-in via --enforce-artifact-role-kind (only the instrumentation
   // gate passes it on the tagged completion path). See executorKindProblem() above for the discrimination;
@@ -2132,7 +2205,7 @@ try {
     console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
-      '[--enforce-tracked-artifacts (check, #1509)] ' +
+      '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
       '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +

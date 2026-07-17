@@ -1059,6 +1059,91 @@ CAP=$(printf '%s' '{"session_id":"'"$TAGSID"'","tool_input":{"taskId":"1509h2","
 rm -rf "$GITROOT_H" 2>/dev/null
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1544 — perf-log jurisdiction-keyed tracked-check through the REAL gate seam (AC4/AC4b/AC5b). --perf-log
+# is now resolved + passed UNCONDITIONALLY (out of the PRIVACY_ON-gated block) whenever PERFPATH resolves,
+# so the perf-log's TRACKED-ness rides the always-on Leg A (--enforce-tracked-artifacts), independent of the
+# privacy switch (#1590 monotonicity). This block needs a REAL "ai-brain" (or, when this SAME synced smoke
+# runs ported inside the three-role-model plugin, a real "plugin repo") whose toplevel the running
+# 3role-ledger.mjs resolves to — reuses the SAME hermetic-copy technique as #1544's ledger-level smoke
+# (hooks/3role-ledger-smoke-test.sh): a throwaway git repo carrying COPIES (not symlinks) of BOTH the real
+# hook script AND the real ledger script, so the gate's own LEDGER_HELPER resolution AND the ledger's
+# aiBrainToplevel() both resolve inside the throwaway repo — never touching this smoke's own real running
+# repo. LAYOUT-AGNOSTIC (load-bearing for cross-repo parity): ai-brain keeps both files as hooks/ siblings,
+# but the plugin-ported hook resolves its ledger at "../bin/3role-ledger.mjs" (the sync tool's
+# HELPER_RE transform) — a hardcoded "both under hooks/" copy would silently dogleg to "ledger unavailable
+# -> fail-open" the instant this smoke is ported, turning AC4/AC4b into a false ALLOW there. So the paths
+# HOOK/LED already resolved (correct for whichever repo is actually running) are mirrored into the
+# hermetic copy at the SAME position relative to their own repo's toplevel, computed dynamically (node
+# path.relative) rather than assumed — this fixture never needs its own sync-tool transform entry.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AB_HERMETIC_PL="$(mktemp -d)"
+( cd "$AB_HERMETIC_PL" && git init -q && git config user.email t@t.co && git config user.name t )
+REALROOT_PL="$(cd "$(dirname "$HOOK")" && git rev-parse --show-toplevel)"
+HOOKREL_PL="$(node -e 'const path=require("path");process.stdout.write(path.relative(process.argv[1],process.argv[2]))' "$REALROOT_PL" "$HOOK")"
+LEDREL_PL="$(node -e 'const path=require("path");process.stdout.write(path.relative(process.argv[1],process.argv[2]))' "$REALROOT_PL" "$LED")"
+mkdir -p "$AB_HERMETIC_PL/$(dirname "$HOOKREL_PL")" "$AB_HERMETIC_PL/$(dirname "$LEDREL_PL")" "$AB_HERMETIC_PL/.ai-workspace/plans" "$AB_HERMETIC_PL/.ai-workspace/reviews" "$AB_HERMETIC_PL/.ai-workspace/perf-logs"
+cp "$LED" "$AB_HERMETIC_PL/$LEDREL_PL"
+cp "$HOOK" "$AB_HERMETIC_PL/$HOOKREL_PL"
+LED_PL="$AB_HERMETIC_PL/$LEDREL_PL"
+HOOK_PL="$AB_HERMETIC_PL/$HOOKREL_PL"
+printf '## ELI5\nplan\ncairn: "synth hit"\n### Binary AC\n- AC1\n' > "$AB_HERMETIC_PL/.ai-workspace/plans/1544pl-plan.md"
+printf '## Review\ncairn: "synth reviewer hit"\nverdict: PASS\n' > "$AB_HERMETIC_PL/.ai-workspace/reviews/1544pl-rev.md"
+( cd "$AB_HERMETIC_PL" && git add -A && git commit -q -m "fixture: #1544 hermetic ai-brain (gate-level)" )
+
+PLLEDGERDIR="$TMP/ledger-1544pl"; PLPROJROOT="$TMP/projects-1544pl"
+mk_sub_pl() { mkdir -p "$PLPROJROOT/proj/$1/subagents"; printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1" > "$PLPROJROOT/proj/$1/subagents/agent-$2.jsonl"; }
+appendL_pl() { THREE_ROLE_LEDGER_DIR="$PLLEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PLPROJROOT" node "$LED_PL" append "$@" >/dev/null 2>&1; }
+
+TAGSID_PL="sess-1544pl"
+mk_sub_pl "$TAGSID_PL" plp1; mk_sub_pl "$TAGSID_PL" plr1; mk_sub_pl "$TAGSID_PL" ple1; mk_sub_pl "$TAGSID_PL" plv1
+appendL_pl --session "$TAGSID_PL" --task 1544pl --role planner          --agent plp1 --artifact "$AB_HERMETIC_PL/.ai-workspace/plans/1544pl-plan.md"
+appendL_pl --session "$TAGSID_PL" --task 1544pl --role plan-review       --agent plr1 --artifact "$AB_HERMETIC_PL/.ai-workspace/reviews/1544pl-rev.md"
+appendL_pl --session "$TAGSID_PL" --task 1544pl --role executor          --agent ple1 --artifact "PR #1544pl"
+appendL_pl --session "$TAGSID_PL" --task 1544pl --role execution-review  --agent plv1 --artifact "$AB_HERMETIC_PL/.ai-workspace/reviews/1544pl-rev.md"
+
+PLPERF="$AB_HERMETIC_PL/.ai-workspace/perf-logs/untracked.md"
+printf '# perf log\n## rounds for #1544pl\n' > "$PLPERF"
+
+run1544pl() {
+  # CLAUDE_PLUGIN_ROOT= (empty, explicitly overridden) forces the hook's dirname-relative LEDGER_HELPER
+  # fallback deterministically, regardless of any ambient CLAUDE_PLUGIN_ROOT the smoke happens to inherit
+  # (mirrors the sync tool's own NOHELPDIR pattern, scripts/sync-three-role-plugin.mjs).
+  CAP=$(printf '%s' '{"session_id":"'"$TAGSID_PL"'","tool_input":{"taskId":"1544pl","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$PLPERF"'","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+    | CLAUDE_PLUGIN_ROOT= THREE_ROLE_LEDGER_DIR="$PLLEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PLPROJROOT" CLAUDE_PROJECT_DIR="$AB_HERMETIC_PL" "$@" bash "$HOOK_PL" 2>&1 >/dev/null); RC=$?
+}
+
+# ---- AC4 RED: untracked in-ai-brain perf-log, fed through the REAL gate seam -> Leg A BLOCK, names it. ----
+run1544pl
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "TRACKED:" && echo "$CAP" | grep -q "untracked.md"; } \
+  && ok "[proof] 1544-AC4 RED: real gate seam, untracked in-repo perf-log -> Leg A BLOCK (names the perf-log)" \
+  || bad "1544-AC4 RED failed (rc=$RC out=$CAP)"
+
+# ---- AC4b / AC5b no-bypass (POWER, run THROUGH THE GATE per the r2 plan-review non-blocking note — a pure
+#      ledger-level invocation never reads either env var, so the env-var clause is inert there): the SAME
+#      RED payload with THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 STILL exits 2 -- proves the hook feeds --perf-log
+#      into the ALWAYS-ON tracked leg (Leg A), not only the privacy branch (#1590 monotonicity). ----
+run1544pl env THREE_ROLE_ARTIFACT_PRIVACY_OFF=1
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1544-AC4b/AC5b no-bypass: THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 over the SAME RED payload -> STILL BLOCK (weaker privacy switch cannot erase the stronger tracked-ness block)" \
+  || bad "1544-AC4b/AC5b no-bypass failed (rc=$RC out=$CAP)"
+
+# ---- control: the ONLY recognised escape, THREE_ROLE_INSTRUMENT_OFF=1 (master switch), over the SAME RED
+#      payload -> ALLOW. Proves the block above is real (not vacuously unblockable) and pins the ONE escape. ----
+run1544pl env THREE_ROLE_INSTRUMENT_OFF=1
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "[control] 1544: THREE_ROLE_INSTRUMENT_OFF=1 (master switch, the ONLY recognised escape) over the SAME RED payload -> ALLOW" \
+  || bad "1544 master kill-switch control failed (rc=$RC out=$CAP)"
+
+# ---- AC4 GREEN: git add + commit the SAME perf-log inside the hermetic ai-brain -> ALLOW. ----
+( cd "$AB_HERMETIC_PL" && git add .ai-workspace/perf-logs/untracked.md && git commit -q -m "track perf" )
+run1544pl
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } \
+  && ok "[proof] 1544-AC4 GREEN: same perf-log committed -> ALLOW" \
+  || bad "1544-AC4 GREEN failed (rc=$RC out=$CAP)"
+
+rm -rf "$AB_HERMETIC_PL"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1537 — artifact-PRIVACY leg (Binary AC1-AC12 of the plan). Sibling of the #1509 Leg-A block above: same
 # scratch-git-repo pattern (isGitTracked must see REAL verdicts), extended with (a) three dirty-class plan
 # fixtures, (b) a clean/dirty perf-log-card pair inside the SAME scratch repo (round-2 scope promotion), (c)

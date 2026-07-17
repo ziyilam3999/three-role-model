@@ -151,6 +151,9 @@ MODELRUN="$(dec "$MODELRUN")"; PERFPATH="$(dec "$PERFPATH")"; PCWD="$(dec "$PCWD
 # flag on this leg by design (parent-claude.md #1509: a `*_OFF` here would reopen the leak) — the only escapes
 # are (a) git add + commit the cited artifact, or (b) the pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 above
 # (which disables the whole family, not a Leg-A-specific bypass).
+# #1544 — Leg A ALSO now tracked-checks the cited perf-log (--perf-log, appended below UNCONDITIONALLY,
+# out of the PRIVACY_ON block), jurisdiction-keyed on ai-brain-toplevel membership (see 3role-ledger.mjs's own
+# #1544 doc comment). Same no-bypass discipline: THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 no longer silences it.
 # Resolve a cited path: absolute as-is; else relative to CLAUDE_PROJECT_DIR, then cwd, then $HOME (perf-log
 # cards usually live under ~/.claude/agent-working-memory/...). Echoes "" if not found. MOVED UP here (was
 # previously defined after the family's SHIP_PIPELINE short-circuit below) so the #1537 privacy leg — which,
@@ -185,14 +188,20 @@ PRIVACY_SCANNER="${THREE_ROLE_PRIVACY_SCANNER:-$(dirname "${BASH_SOURCE[0]}")/..
 if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
   if [ -f "$LEDGER_HELPER" ]; then
     LEGA_ARGS=(check --session "$SESSION" --task "$TASKID" --enforce-tracked-artifacts)
+    # #1544 — resolve + pass --perf-log UNCONDITIONALLY, OUT of the PRIVACY_ON-gated block below, whenever
+    # PERFPATH resolves to a real on-disk file. This is BLOCKER 2's fix (monotonicity, #1590): the perf-log's
+    # TRACKED-ness is now consumed by the always-on --enforce-tracked-artifacts leg (Leg A), so
+    # THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 (which only gates --enforce-artifact-privacy below) can no longer
+    # silently erase the perf-log tracked-ness requirement. PRIV_CARD is reused by the privacy leg's own
+    # perf-log content scan (unchanged) when privacy is on.
+    if [ -n "$PERFPATH" ]; then
+      PRIV_CARD="$(resolve_path "$PERFPATH")"
+      [ -n "$PRIV_CARD" ] && LEGA_ARGS+=(--perf-log "$PRIV_CARD")
+    fi
     PRIVACY_ON=0
     if [ "${THREE_ROLE_ARTIFACT_PRIVACY_OFF:-}" != "1" ] && [ -f "$PRIVACY_SCANNER" ]; then
       LEGA_ARGS+=(--enforce-artifact-privacy)
       PRIVACY_ON=1
-      if [ -n "$PERFPATH" ]; then
-        PRIV_CARD="$(resolve_path "$PERFPATH")"
-        [ -n "$PRIV_CARD" ] && LEGA_ARGS+=(--perf-log "$PRIV_CARD")
-      fi
     fi
     if [ "$PRIVACY_ON" = "1" ]; then
       TRACKED_OUT="$(PRIVACY_SCAN_BIN="$PRIVACY_SCANNER" node "$LEDGER_HELPER" "${LEGA_ARGS[@]}" 2>&1)"; TRC=$?

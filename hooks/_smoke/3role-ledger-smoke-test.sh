@@ -910,6 +910,77 @@ OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-arti
   || bad "1509-AC2 executor==planner should not block + must surface NOTE (rc=$RC out=$OUT)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1544 — perf-log JURISDICTION-KEYED tracked-check, riding the SAME --enforce-tracked-artifacts flag (Leg
+# A) via a NEW --perf-log argument. AC1(RED)/AC2(GREEN) need the perf-log's containing repo to equal the
+# ai-brain toplevel; AC3a(POWER) needs it OUTSIDE that jurisdiction. Since aiBrainToplevel() derives from
+# wherever the RUNNING hooks/3role-ledger.mjs file itself lives (git -C <that dir> rev-parse
+# --show-toplevel), this smoke builds a fully HERMETIC "ai-brain" analog: a throwaway git repo carrying a
+# COPY (not a symlink — a symlink would realpath straight back to THIS repo and defeat the isolation) of
+# the real ledger script, so aiBrainToplevel() resolves to the throwaway repo. This keeps the whole #1544
+# block hermetic (never touches this smoke's own real running repo), exactly like #1509/#1537 above.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AB_HERMETIC="$(mktemp -d)"
+( cd "$AB_HERMETIC" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$AB_HERMETIC/hooks" "$AB_HERMETIC/.ai-workspace/plans" "$AB_HERMETIC/.ai-workspace/reviews" "$AB_HERMETIC/.ai-workspace/perf-logs"
+cp "$LED" "$AB_HERMETIC/hooks/3role-ledger.mjs"
+LED_AB="$AB_HERMETIC/hooks/3role-ledger.mjs"
+printf '## ELI5\nplan\n### Binary AC\n- AC1\n' > "$AB_HERMETIC/.ai-workspace/plans/1544-plan.md"
+printf '## Review\nverdict: PASS\n' > "$AB_HERMETIC/.ai-workspace/reviews/1544-rev.md"
+printf 'tests: 3 passed — PASS\n' > "$AB_HERMETIC/oracle.txt"
+( cd "$AB_HERMETIC" && git add hooks .ai-workspace oracle.txt && git commit -q -m "fixture: #1544 hermetic ai-brain" )
+
+TSID5="sess-1544-jur"
+mk_sub "$TSID5" jp1; mk_sub "$TSID5" jr1; mk_sub "$TSID5" je1; mk_sub "$TSID5" jv1
+node "$LED_AB" append --session "$TSID5" --task 1544j --role planner --agent jp1 --artifact "$AB_HERMETIC/.ai-workspace/plans/1544-plan.md" >/dev/null
+node "$LED_AB" append --session "$TSID5" --task 1544j --role plan-review --agent jr1 --artifact "$AB_HERMETIC/.ai-workspace/reviews/1544-rev.md" >/dev/null
+node "$LED_AB" append --session "$TSID5" --task 1544j --role executor --agent je1 --artifact "PR #1544j" >/dev/null
+node "$LED_AB" append --session "$TSID5" --task 1544j --role execution-review --agent jv1 --oracle "$AB_HERMETIC/oracle.txt" >/dev/null
+
+# 1544-AC1 RED: untracked perf-log EXISTS under the hermetic ai-brain's .ai-workspace/perf-logs/ -> exit 2,
+# TRACKED: names it. (Proves --perf-log is now consumed by the TRACKED leg, not only the privacy leg.)
+PERF1544="$AB_HERMETIC/.ai-workspace/perf-logs/untracked.md"
+printf 'card\n' > "$PERF1544"
+OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$PERF1544" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "TRACKED:" && echo "$OUT" | grep -q "untracked.md"; } \
+  && ok "[proof] 1544-AC1 RED: in-ai-brain untracked perf-log -> --enforce-tracked-artifacts exit 2, names the perf-log" \
+  || bad "1544-AC1 RED failed (rc=$RC out=$OUT)"
+
+# 1544-AC2 GREEN: git add + commit the SAME perf-log -> exit 0. Toggling ONLY the git-add flips AC1<->AC2.
+( cd "$AB_HERMETIC" && git add .ai-workspace/perf-logs/untracked.md && git commit -q -m "fixture: track the 1544j perf-log" )
+OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$PERF1544" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 1544-AC2 GREEN: same perf-log committed -> --enforce-tracked-artifacts exit 0" \
+  || bad "1544-AC2 GREEN failed (rc=$RC out=$OUT)"
+
+# 1544-AC3a POWER (the discriminating case): an untracked file inside a DIFFERENT real git repo (NOT
+# ai-brain) -> exit 0, NOT blocked. A naive `isGitTracked===false -> block` impl WOULD block this case
+# (isGitTracked alone is jurisdiction-blind); the ai-brain-toplevel jurisdiction key must fail-open here.
+OTHER_REPO_1544="$(mktemp -d)"
+( cd "$OTHER_REPO_1544" && git init -q && git config user.email t@t.co && git config user.name t )
+PERF3A_1544="$OTHER_REPO_1544/perf.md"; printf 'card\n' > "$PERF3A_1544"
+OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$PERF3A_1544" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1544-AC3a POWER: untracked perf-log inside a DIFFERENT real (non-ai-brain) git repo -> exit 0 (ai-brain-toplevel jurisdiction key, not bare isGitTracked)" \
+  || bad "1544-AC3a POWER failed (rc=$RC out=$OUT)"
+rm -rf "$OTHER_REPO_1544"
+
+# 1544-AC3b (not-a-repo residual): a perf-log path under bare $TMP (never a git repo, mirrors the real
+# template home ~/.claude/agent-working-memory/... which is likewise not a git worktree) -> exit 0.
+PERF3B_1544="$TMP/notarepo-perf-1544.md"; printf 'card\n' > "$PERF3B_1544"
+OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$PERF3B_1544" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1544-AC3b: non-repo perf-log path -> exit 0 (can't-tell, fail-open)" \
+  || bad "1544-AC3b failed (rc=$RC out=$OUT)"
+
+# 1544-AC3c (unresolvable): a --perf-log path that does not exist on disk at all -> exit 0 (nothing to check).
+OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$TMP/does-not-exist-1544.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
+  && ok "[proof] 1544-AC3c: unresolvable perf-log path -> exit 0" \
+  || bad "1544-AC3c failed (rc=$RC out=$OUT)"
+
+rm -rf "$AB_HERMETIC"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1532 — executor artifact-KIND leg (`check --enforce-artifact-role-kind`). Reuses the SAME GITROOT +
 # $COLLIDE fixture the #1509 block above already built (still alive — the rm -rf below is now AFTER this
 # block). AC labels below map to the plan's Binary AC-0..AC-5.
