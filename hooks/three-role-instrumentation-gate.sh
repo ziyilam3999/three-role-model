@@ -343,6 +343,27 @@ block_version(){
   exit 2
 }
 
+# #1532 executor artifact-KIND leg block message: the executor row's artifact_path resolves to a DISK PATH
+# that is plan-kind (equals the planner's own artifact_path — the exact #1494 shape — or lies on a
+# /.ai-workspace/plans/ segment) instead of a real ship reference. $1 carries the ledger `check` output
+# (names the executor's raw + resolved path and which predicate fired). This upgrades the prior
+# #1509 NOTE-EXECUTOR advisory into a hard block for this specific shape; a legit PR-URL/commit/branch
+# executor row is NEVER touched by this leg (it never resolves to a disk path in the first place).
+block_kind(){
+  {
+    echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+    echo "  executor artifact-KIND leg FAILED (#1532): $1"
+    echo "  An executor's real artifact is a SHIP REFERENCE (a PR URL, a commit sha, or a branch) — never a plan"
+    echo "  document. This row's artifact_path resolves to an on-disk plan-kind file (the #1494 shape: the executor"
+    echo "  re-cited the planner's plan file instead of citing what it actually shipped)."
+    echo "  Fix: re-append the executor's ledger line citing the actual PR URL / commit sha / branch:"
+    echo "    node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" append --session ${SESSION} --task ${TASKID} --role executor --artifact <PR-url-or-commit>"
+    echo "  No dedicated bypass for this leg by design (mirrors Leg A, #1509) — the only escape is the master"
+    echo "  THREE_ROLE_INSTRUMENT_OFF=1 (disables the whole instrumentation gate family)."
+  } >&2
+  exit 2
+}
+
 # outcome_eval leg (VEI #1430) block message: the post-ship OUTCOME verdict is missing/unknown, or its evidence
 # is non-specific. Metadata-only (no card read) => genuinely fail-CLOSED. An honest `missed`/`partial` verdict
 # WITH specific evidence is ACCEPTED (it ALLOWS the close) — this block fires ONLY on a missing/unknown verdict
@@ -459,17 +480,23 @@ fi
 # missing; the perf-card leg already passed by this point.
 if [ -f "$LEDGER_HELPER" ]; then
   # #1448: $MODEL_FLAG adds the per-role MODEL-POLICY enforcement (empty when CC_ROLE_MODEL_GATE_OFF=1).
-  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG $MODEL_FLAG 2>&1)"; LRC=$?
+  # #1532: --enforce-artifact-role-kind adds the executor artifact-KIND leg (the #1494 fix — an executor row
+  # citing the planner's plan-kind artifact instead of a real ship reference). No dedicated kill-switch by
+  # design (mirrors Leg A's --enforce-tracked-artifacts above) — the only escape is the master
+  # THREE_ROLE_INSTRUMENT_OFF=1 / SHIP_PIPELINE=1, both of which already short-circuited before this point.
+  LEDGER_OUT="$(node "$LEDGER_HELPER" check --session "$SESSION" --task "$TASKID" $VAC_FLAG $MODEL_FLAG --enforce-artifact-role-kind 2>&1)"; LRC=$?
   if [ "$LRC" != "0" ]; then
     # Route to a MODEL-specific block message when the failure is a model-policy mismatch (the ledger prefixes
-    # those problems with `MODEL-POLICY:`); otherwise the role-presence/ledger message.
+    # those problems with `MODEL-POLICY:`); a `KIND:`-prefixed problem gets its own #1532 message; otherwise
+    # the role-presence/ledger message.
     case "$LEDGER_OUT" in
       *MODEL-VERSION:*) block_version "$LEDGER_OUT" ;;
       *MODEL-POLICY:*)  block_model "$LEDGER_OUT" ;;
+      *KIND:*)          block_kind "$LEDGER_OUT" ;;
       *)                block_ledger "${LEDGER_OUT:-role-ledger check failed}" ;;
     esac
   fi
-  LEDGER_NOTE=" + ledger OK${MODEL_FLAG:+ + model-policy OK}"
+  LEDGER_NOTE=" + ledger OK${MODEL_FLAG:+ + model-policy OK} + kind OK"
 else
   LEDGER_NOTE=" + ledger SKIPPED (helper unavailable — fail-open)"
 fi
