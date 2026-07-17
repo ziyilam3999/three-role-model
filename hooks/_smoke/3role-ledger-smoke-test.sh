@@ -376,11 +376,15 @@ model_ledger() {
   node "$LED" append --session "$1" --task "$2" --role execution-review --agent mV --artifact "$TMP/rev.md" >/dev/null
 }
 
-# M1. RED: executor transcript=opus, config=sonnet -> check --enforce-role-models exits 2, names role+expected+actual.
+# M1. GREEN (#1624, reverses the prior RED): executor transcript=opus, config=sonnet, NO resume boundary -> a
+#     STRICT quality up-tier at CLOSE time is now allowed-with-note (operator decision 2026-07-17: model-cost
+#     is enforced at booking/spawn time, not at close — by close the spend is already sunk). Asserts the NEW,
+#     DISTINCT CLOSE-UPTIER token and that it does NOT reuse the resume branch's RESUME-UPTIER wording (F1 —
+#     that would be a false "was resumed" statement for a role that was never resumed).
 model_ledger msRED 9101 "claude-opus-4-8"
 OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msRED --task 9101 --enforce-role-models 2>&1); RC=$?
-{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && echo "$OUT" | grep -qi "executor" && echo "$OUT" | grep -qi "sonnet" && echo "$OUT" | grep -qi "opus"; } \
-  && ok "M1 RED: executor=opus vs config=sonnet -> exit 2 (names role+expected+actual)" || bad "M1 wrong model should block (rc=$RC out=$OUT)"
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && echo "$OUT" | grep -qE "NOTE:.*CLOSE-UPTIER" && echo "$OUT" | grep -qi "executor" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "M1 GREEN (#1624): non-resume up-tier (executor=opus vs config=sonnet) -> exit 0 CLOSE-UPTIER note, never RESUME-UPTIER (F1)" || bad "M1 non-resume up-tier should allow-with-note (rc=$RC out=$OUT)"
 
 # M2. GREEN: executor transcript=sonnet, config=sonnet -> exit 0.
 model_ledger msGREEN 9102 "claude-sonnet-4-6"
@@ -485,23 +489,36 @@ OUT=$(CC_ROLES_ENV="$MCFG_OPUS" node "$LED" check --session msDOWN --task 9303 -
   && ok "[control] R3 resume-induced DOWN-tier (opus->sonnet, real boundary) -> STILL exit 2 BLOCK (AC-2)" \
   || bad "R3 resume down-tier must stay blocked, not allowed (rc=$RC out=$OUT)"
 
-# R4. [control] NON-resume mismatch (no resume boundary at all, plain mk_sub_model) -> MUST stay hard-blocked
-#     (AC-2's second guard: a resume boundary being ABSENT means the up-tier arm can never fire even though
-#     the observed tier IS a strict up-tier over policy).
+# R4. [allow, #1624 reverses the prior RED-control] NON-resume mismatch (no resume boundary at all, plain
+#     mk_sub_model) is still a STRICT quality up-tier over policy, so it is NOW allowed-with-note at close —
+#     the up-tier decision no longer depends on a resume boundary existing at all. Asserts the CLOSE-UPTIER
+#     token, never RESUME-UPTIER (F1 — no resume boundary exists in this fixture).
 model_ledger msNORESUME 9304 "claude-opus-4-8"
 OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msNORESUME --task 9304 --enforce-role-models 2>&1); RC=$?
-{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
-  && ok "[control] R4 non-resume mismatch (no boundary, same up-tier direction) -> STILL exit 2 BLOCK (AC-2, unchanged from M1)" \
-  || bad "R4 non-resume mismatch must stay blocked (rc=$RC out=$OUT)"
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*CLOSE-UPTIER" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[allow, #1624] R4 non-resume up-tier (no boundary, same direction as M1) -> exit 0 CLOSE-UPTIER note" \
+  || bad "R4 non-resume up-tier should allow-with-note (rc=$RC out=$OUT)"
 
-# R5. [control] resume boundary present but PRE-resume model did NOT match policy either (a genuinely wrong
-#     spawn that ALSO got resumed) -> MUST stay hard-blocked — the up-tier arm requires the pre-resume model
-#     to have matched policy, proving the mismatch is resume-CAUSED, not a pre-existing wrong spawn.
+# R5. [allow, #1624 reverses the prior RED-control] resume boundary present but PRE-resume model did NOT match
+#     policy either (a genuinely wrong spawn that ALSO got resumed) -> the OBSERVED (post-resume) tier is still
+#     a strict quality up-tier over policy, so it is allowed-with-note too (the up-tier decision no longer
+#     depends on the pre-resume model). Uses the CLOSE-UPTIER token, NOT RESUME-UPTIER (F1) — this fixture
+#     cannot honestly claim "resumed FROM a policy-matching model", so it must not borrow that wording.
 model_ledger_resume msWRONGSPAWN 9305 "claude-haiku-4-0" "claude-opus-4-8"
 OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msWRONGSPAWN --task 9305 --enforce-role-models 2>&1); RC=$?
-{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
-  && ok "[control] R5 resume boundary present but pre-resume ALSO mismatched policy -> STILL exit 2 BLOCK (AC-2)" \
-  || bad "R5 pre-resume-mismatched-too case must stay blocked (rc=$RC out=$OUT)"
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*CLOSE-UPTIER" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[allow, #1624] R5 resume boundary present but pre-resume ALSO mismatched policy -> exit 0 CLOSE-UPTIER (not RESUME-UPTIER, F1)" \
+  || bad "R5 pre-resume-mismatched-too case should allow-with-note via CLOSE-UPTIER (rc=$RC out=$OUT)"
+
+# R8. [control, #1624 NEW] non-resume DOWN-tier (policy sonnet, actual haiku, no resume boundary) -> MUST STILL
+#     hard-block. This is the corner-cut the relaxation must never touch: isResumeUpTier(sonnet,haiku)===false,
+#     so this fixture never reaches either up-tier branch and falls straight through to MODEL-POLICY BLOCK,
+#     proving the gate keeps power against a genuine quality regression even after #1624.
+model_ledger msDOWNNORESUME 9307 "claude-haiku-4-0"
+OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msDOWNNORESUME --task 9307 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -q "MODEL-POLICY" && ! echo "$OUT" | grep -q "CLOSE-UPTIER" && ! echo "$OUT" | grep -q "RESUME-UPTIER"; } \
+  && ok "[control, #1624] R8 non-resume DOWN-tier (haiku vs policy sonnet) -> STILL exit 2 BLOCK (down-tier never allowed)" \
+  || bad "R8 non-resume down-tier must stay blocked (rc=$RC out=$OUT)"
 
 # R6. [proof] FABLE sub-case (AC-3): resume-induced up-tier landing on fable -> NOTE carries the
 #     FABLE-COST-CLIFF substring in addition to the RESUME-UPTIER token (never hides the cost).

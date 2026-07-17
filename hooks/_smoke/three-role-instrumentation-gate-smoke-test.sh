@@ -878,7 +878,7 @@ CAP=$(printf '%s' '{"session_id":"sO10","tool_input":{"taskId":"14310","status":
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 cat > "$TMP/perf-1448.md" <<EOF
 # 3-role performance log — #1448 per-role model-policy leg
-## rounds for #14481 #14482 #14483 #14484 #14485
+## rounds for #14481 #144811 #14482 #14483 #14484 #14485
 EOF
 # a transcript fixture carrying an assistant message.model line (the model leg reads it): mk_sub_model <s> <id> <model-id>
 mk_sub_model() {
@@ -903,30 +903,46 @@ runM() {
 }
 MODCFG="$TMP/cc-roles-mod.env"; printf 'CC_ROLE_EXECUTOR_MODEL=sonnet\nCC_ROLE_EXECUTOR_EFFORT=medium\n' > "$MODCFG"
 
-# ---- MDL1 (model BLOCK). executor transcript=opus vs config=sonnet -> MODEL-POLICY mismatch -> block_model exit 2 ----
-ledger_execmodel sMDL1 14481 "claude-opus-4-8"
+# ---- MDL1 (model BLOCK, #1624 RE-POINTED to a genuine DOWN-tier). executor transcript=haiku vs config=sonnet
+#      -> a strict quality DOWN-tier (never allowed, #1624 does not relax this direction) -> MODEL-POLICY
+#      mismatch -> block_model exit 2. (Pre-#1624 this fixture used opus-vs-sonnet, an UP-tier direction that
+#      #1624 now allows-with-note at close -- see MDL1b below; re-pointing here keeps MDL1 a real down-tier RED
+#      so the gate's blocking power against a genuine corner-cut is still proven, not silently vacated.)
+ledger_execmodel sMDL1 14481 "claude-haiku-4-0"
 runM 14481 sMDL1 CC_ROLES_ENV="$MODCFG"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "model-policy leg FAILED"; } && ok "MDL1 executor=opus vs config=sonnet -> BLOCK (model-policy leg)" || bad "MDL1 wrong model should block via model leg (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "model-policy leg FAILED"; } && ok "MDL1 executor=haiku vs config=sonnet (down-tier) -> BLOCK (model-policy leg, #1624 re-pointed)" || bad "MDL1 down-tier wrong model should block via model leg (rc=$RC out=$CAP)"
+
+# ---- MDL1b (model ALLOW-WITH-NOTE, #1624 NEW). executor transcript=opus vs config=sonnet, NO resume boundary
+#      -> a strict quality UP-tier at close -> allowed-with-note (operator decision 2026-07-17: model cost is
+#      enforced at booking/spawn, not at close). Proves the relaxation reaches through the instrumentation
+#      gate's model-policy leg, not just the bare `3role-ledger.mjs check` call exercised directly elsewhere.
+ledger_execmodel sMDL1b 144811 "claude-opus-4-8"
+runM 144811 sMDL1b CC_ROLES_ENV="$MODCFG"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "model-policy OK"; } && ok "MDL1b executor=opus vs config=sonnet, no resume (#1624 up-tier) -> ALLOW (model-policy OK note)" || bad "MDL1b non-resume up-tier should allow via model leg (rc=$RC out=$CAP)"
 
 # ---- MDL2 (model ALLOW). executor transcript=sonnet matches config=sonnet -> ledger OK + model-policy OK -> exit 0 ----
 ledger_execmodel sMDL2 14482 "claude-sonnet-4-6"
 runM 14482 sMDL2 CC_ROLES_ENV="$MODCFG"
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "model-policy OK"; } && ok "MDL2 executor=sonnet matches config -> ALLOW (+ model-policy OK note)" || bad "MDL2 matching model should allow (rc=$RC out=$CAP)"
 
-# ---- MDL3 (feature kill-switch). MDL1 red fixture + CC_ROLE_MODEL_GATE_OFF=1 -> model leg NOT enforced -> exit 0 ----
-ledger_execmodel sMDL3 14483 "claude-opus-4-8"
+# ---- MDL3 (feature kill-switch, #1624 re-pointed to the DOWN-tier MDL1 fixture so the kill-switch is
+#      genuinely load-bearing -- an up-tier fixture would ALLOW even without the switch post-#1624, which
+#      would prove nothing). MDL1 (down-tier) red fixture + CC_ROLE_MODEL_GATE_OFF=1 -> model leg NOT
+#      enforced -> exit 0 ----
+ledger_execmodel sMDL3 14483 "claude-haiku-4-0"
 runM 14483 sMDL3 CC_ROLES_ENV="$MODCFG" CC_ROLE_MODEL_GATE_OFF=1
-{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "MDL3 CC_ROLE_MODEL_GATE_OFF=1 over wrong-model -> ALLOW (feature kill-switch)" || bad "MDL3 kill-switch should allow (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "MDL3 CC_ROLE_MODEL_GATE_OFF=1 over down-tier wrong-model -> ALLOW (feature kill-switch)" || bad "MDL3 kill-switch should allow (rc=$RC out=$CAP)"
 
 # ---- MDL4 (no-config). executor transcript=opus but CC_ROLES_ENV=/nonexistent -> model enforcement SKIPPED -> exit 0 ----
 ledger_execmodel sMDL4 14484 "claude-opus-4-8"
 runM 14484 sMDL4 CC_ROLES_ENV=/nonexistent
 { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "ledger OK"; } && ok "MDL4 no-config -> model enforcement skipped -> ALLOW (no false-block)" || bad "MDL4 no-config should allow (rc=$RC out=$CAP)"
 
-# ---- MDL5 (master kill-switch). MDL1 red fixture + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent (short-circuits) ----
-ledger_execmodel sMDL5 14485 "claude-opus-4-8"
+# ---- MDL5 (master kill-switch, #1624 re-pointed to the DOWN-tier MDL1 fixture -- same rationale as MDL3).
+#      MDL1 (down-tier) red fixture + THREE_ROLE_INSTRUMENT_OFF=1 -> allow silent (short-circuits) ----
+ledger_execmodel sMDL5 14485 "claude-haiku-4-0"
 runM 14485 sMDL5 CC_ROLES_ENV="$MODCFG" THREE_ROLE_INSTRUMENT_OFF=1
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "MDL5 THREE_ROLE_INSTRUMENT_OFF=1 over wrong-model -> allow silent (master bypass)" || bad "MDL5 master kill-switch should allow silent (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "MDL5 THREE_ROLE_INSTRUMENT_OFF=1 over down-tier wrong-model -> allow silent (master bypass)" || bad "MDL5 master kill-switch should allow silent (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1458 — MODEL-VERSION completion-seam leg (assert-latest / fail-on-drift). Same shape as MDL1-MDL5 above
