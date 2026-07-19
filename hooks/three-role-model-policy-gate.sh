@@ -251,10 +251,10 @@ case "$SRCTOKEN" in
   *)         SRC="$SRCTOKEN" ;;
 esac
 
-# Fable cost-cliff note when either side of the comparison is fable.
+# Fable cap-budget note when either side of the comparison is fable.
 FABLE_NOTE=""
 if [ "$EXPECTED" = "fable" ] || [ "$REQMODEL" = "fable" ]; then
-  FABLE_NOTE="  Fable note: ~2x Opus and its subsidised bar expires ~July 12 — after that a Fable seat bills out-of-pocket. Use it only for the hardest one-off plans."
+  FABLE_NOTE="  Fable note: a capped seat (up to 50% of the weekly limit, not a deadline) at ~2x Opus API/usage-credit-billing rate. Use it for the highest-leverage plans, never a high-volume grunt seat."
 fi
 
 cat >&2 <<EOF

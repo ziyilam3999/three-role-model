@@ -349,7 +349,8 @@ function roleVersionFromCfg(cfg, role, expectedTier) {
 // check + every spawn-hook call). Call ONCE per invocation (loud, not 5x). THREE warn classes:
 //   1. INVALID-MODEL — a present *_MODEL whose value is not a known tier (typo / empty). The silent-overpay guard.
 //   2. FABLE-ON-ORCHESTRATOR — the always-on seat pinned to fable (never-pin; refuse/warn).
-//   3. FABLE-COST-CLIFF — any VALID *_MODEL=fable (post-July-7 subsidy-cliff cost warning).
+//   3. FABLE-CAP-BUDGET — any VALID *_MODEL=fable (cap-budget reminder: up to 50% of the weekly limit, not a
+//      deadline — see the "Planner" comment block in cc-roles.env for the full corrected framing).
 function lintRoleConfig(cfg) {
   for (const k of Object.keys(cfg)) {
     const m = k.match(/^CC_ROLE_(.+)_MODEL$/);
@@ -364,12 +365,13 @@ function lintRoleConfig(cfg) {
     if (val === 'fable') {
       if (m[1] === 'ORCHESTRATOR') {
         process.stderr.write('FABLE-ON-ORCHESTRATOR cc-roles.env: ' + k + '=fable — refusing to pin the ' +
-          'always-on orchestrator seat to Fable (2x Opus, high-frequency; burns the subsidised bar fast). ' +
-          'The orchestrator is documented opus-only.\n');
+          'always-on orchestrator seat to Fable (2x Opus API-billing rate, high-frequency; burns the weekly ' +
+          'cap fast). The orchestrator is documented opus-only.\n');
       }
-      process.stderr.write('FABLE-COST-CLIFF cc-roles.env: ' + k + '=fable — Fable\'s subsidised usage bar ' +
-        'expires ~July 7-8; after that a Fable-pinned seat bills out-of-pocket (~2x Opus). Use Fable only for ' +
-        'the hardest one-off plans, never a standing seat.\n');
+      process.stderr.write('FABLE-CAP-BUDGET cc-roles.env: ' + k + '=fable — Fable is a capped seat: up to ' +
+        '50% of the weekly limit, not a deadline (no expiry — the previously-claimed one was voided). Budget ' +
+        'it for the highest-leverage work (design, hard research), never a high-volume grunt seat. The ' +
+        '~2x-Opus-per-token figure applies to API/usage-credit billing only, not Max-plan-included usage.\n');
     }
   }
   // #1458 INVALID-VERSION — a present CC_TIER_*_VERSION or CC_ROLE_*_MODEL_VERSION pin whose non-empty value
@@ -1773,8 +1775,9 @@ function cmdCheck(o) {
               'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
               'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
             if (actual === 'fable') {
-              note += ' FABLE-COST-CLIFF: Fable\'s subsidised usage bar expires ~July 7-8; after that a ' +
-                'Fable reroute bills out-of-pocket (~2x Opus) — surfaced here so the cost is never hidden.';
+              note += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+                'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
+                'Max-plan-included usage — surfaced here so the cost is never hidden.';
             }
             resumeNotes.push(note);
             continue;
@@ -1788,8 +1791,9 @@ function cmdCheck(o) {
             'policy ' + expected + '). Model cost is enforced at booking/spawn time, not at close. ' +
             'Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
           if (actual === 'fable') {
-            closeNote += ' FABLE-COST-CLIFF: Fable\'s subsidised usage bar expires ~July 7-8; after that a ' +
-              'Fable reroute bills out-of-pocket (~2x Opus) — surfaced here so the cost is never hidden.';
+            closeNote += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+              'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
+              'Max-plan-included usage — surfaced here so the cost is never hidden.';
           }
           resumeNotes.push(closeNote);
           continue;

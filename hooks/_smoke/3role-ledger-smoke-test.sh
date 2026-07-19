@@ -423,10 +423,10 @@ OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" resolve-role-model --role executor 2>"$TM
 OUT=$(CC_ROLES_ENV=/nonexistent node "$LED" resolve-role-model --role executor)
 [ "$OUT" = "opus" ] && ok "M8 resolve-role-model missing config -> opus (fail-safe)" || bad "M8 missing config should be opus (out=$OUT)"
 
-# M9. Fable config lint: orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-COST-CLIFF on stderr.
+# M9. Fable config lint: orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-CAP-BUDGET on stderr.
 CC_ROLES_ENV="$MFABO" node "$LED" resolve-role-model --role orchestrator 2>"$TMP/mfab.err" >/dev/null
-{ [ "$(grep -Ec 'FABLE-ON-ORCHESTRATOR' "$TMP/mfab.err")" -ge 1 ] && [ "$(grep -Ec 'FABLE-COST-CLIFF' "$TMP/mfab.err")" -ge 1 ]; } \
-  && ok "M9 orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-COST-CLIFF warnings" || bad "M9 fable-on-orchestrator warnings missing (err=$(cat "$TMP/mfab.err"))"
+{ [ "$(grep -Ec 'FABLE-ON-ORCHESTRATOR' "$TMP/mfab.err")" -ge 1 ] && [ "$(grep -Ec 'FABLE-CAP-BUDGET' "$TMP/mfab.err")" -ge 1 ]; } \
+  && ok "M9 orchestrator=fable -> FABLE-ON-ORCHESTRATOR + FABLE-CAP-BUDGET warnings" || bad "M9 fable-on-orchestrator warnings missing (err=$(cat "$TMP/mfab.err"))"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1512 — resume-induced quality UP-TIER allow-with-note (completion-time arm), on a DEDICATED fixture
@@ -521,12 +521,12 @@ OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msDOWNNORESUME --task 930
   || bad "R8 non-resume down-tier must stay blocked (rc=$RC out=$OUT)"
 
 # R6. [proof] FABLE sub-case (AC-3): resume-induced up-tier landing on fable -> NOTE carries the
-#     FABLE-COST-CLIFF substring in addition to the RESUME-UPTIER token (never hides the cost).
+#     FABLE-CAP-BUDGET substring in addition to the RESUME-UPTIER token (never hides the cost).
 model_ledger_resume msUPFAB 9306 "claude-sonnet-5" "claude-fable-1"
 OUT=$(CC_ROLES_ENV="$MCFG" node "$LED" check --session msUPFAB --task 9306 --enforce-role-models 2>&1); RC=$?
-{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -q "FABLE-COST-CLIFF"; } \
-  && ok "[proof] R6 resume-induced up-tier landing on fable -> NOTE carries FABLE-COST-CLIFF (AC-3)" \
-  || bad "R6 fable sub-case must carry FABLE-COST-CLIFF in the NOTE (rc=$RC out=$OUT)"
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qE "NOTE:.*RESUME-UPTIER" && echo "$OUT" | grep -q "FABLE-CAP-BUDGET"; } \
+  && ok "[proof] R6 resume-induced up-tier landing on fable -> NOTE carries FABLE-CAP-BUDGET (AC-3)" \
+  || bad "R6 fable sub-case must carry FABLE-CAP-BUDGET in the NOTE (rc=$RC out=$OUT)"
 
 # R7. KILL-SWITCH: RED up-tier fixture but CC_ROLE_MODEL_GATE_OFF=1 -> exit 0 (whole leg off, no NOTE needed
 #     since the leg never ran).

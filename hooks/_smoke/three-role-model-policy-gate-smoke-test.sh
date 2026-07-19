@@ -176,10 +176,10 @@ MARKER="$STATE_DIR/$SIG.notified"
 [ -f "$MARKER" ] && exit 0
 : > "$MARKER" 2>/dev/null
 
-# Fable cost-cliff note when either side of the comparison is fable.
+# Fable cap-budget note when either side of the comparison is fable.
 FABLE_NOTE=""
 if [ "$EXPECTED" = "fable" ] || [ "$REQMODEL" = "fable" ]; then
-  FABLE_NOTE="  Fable note: ~2x Opus and its subsidised bar expires ~July 7-8 — after that a Fable seat bills out-of-pocket. Use it only for the hardest one-off plans."
+  FABLE_NOTE="  Fable note: a capped seat (up to 50% of the weekly limit, not a deadline) at ~2x Opus API/usage-credit-billing rate. Use it for the highest-leverage plans, never a high-volume grunt seat."
 fi
 
 cat >&2 <<EOF
@@ -229,7 +229,7 @@ CC_ROLE_EXECUTOR_MODEL=sonnet
 CC_ROLE_EXECUTOR_EFFORT=medium
 CC_ROLE_EXECUTION_REVIEW_MODEL=opus
 EOF
-# A fable-executor config to exercise the cost-cliff note.
+# A fable-executor config to exercise the cap-budget note.
 CFGF="$TMP/cc-roles-fable.env"
 printf 'CC_ROLE_EXECUTOR_MODEL=fable\n' > "$CFGF"
 
@@ -583,11 +583,11 @@ PL11='{"session_id":"l11","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9210
 run "$PL11" CC_ROLES_ENV=/nonexistent
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L11: no-config executor+opus -> exit 0 (fail-safe opus, no false-block)" || bad "L11 no-config should fail-safe to opus (rc=$RC out=$CAP)"
 
-# ---- L12. FABLE config: executor=fable, spawn model:opus -> exit 2 with the (corrected) Fable cost-cliff note. ----
+# ---- L12. FABLE config: executor=fable, spawn model:opus -> exit 2 with the (corrected) Fable cap-budget note. ----
 PL12='{"session_id":"l12","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9211 ROLE:executor\nfable policy."}}'
 run "$PL12" CC_ROLES_ENV="$CFGF"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "Fable" && echo "$CAP" | grep -q "July 12"; } \
-  && ok "L12: fable-executor config + model:opus -> exit 2 + corrected Fable cost-cliff note (July 12)" \
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "Fable" && echo "$CAP" | grep -q "50% of the weekly limit"; } \
+  && ok "L12: fable-executor config + model:opus -> exit 2 + corrected Fable cap-budget note (50% of the weekly limit)" \
   || bad "L12 fable seat mismatch should block with the corrected note (rc=$RC out=$CAP)"
 
 echo "== SECTION 4: #1569 AC-6 -- fable-seat ALLOW arms (planner + execution-review), NOT covered above =="
