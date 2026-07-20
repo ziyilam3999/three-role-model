@@ -1479,6 +1479,36 @@ function cmdAppend(o) {
       'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
       'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
   }
+  // #1769: a BARE repoint (no --agent, no --verdict, no --skip-reason — i.e. only artifact_path and/or the
+  // best-effort model fields are being provided) merges onto overlayAppend's "prior" row: whichever line was
+  // written LAST for this (task, role), NOT necessarily the review event the caller has in mind. When one
+  // 3ROLE_TASK id has been reused across MULTIPLE independent reviews of this role (a compound ticket bundling
+  // several PRs, each execution-reviewed separately), "prior" may already belong to a LATER, unrelated review
+  // by the time this repoint runs — silently cross-attributing this artifact_path to the wrong agentId with no
+  // error anywhere in the pipeline (live incident 2026-07-20, #1749: a follow-up archival reviewer's own
+  // self-append became "prior" before an artifact-only repoint landed on it). Detect: count prior same-role
+  // lines for this task BEFORE this call; if >1 exist and this call supplies NEITHER --agent NOR --verdict
+  // NOR --skip-reason, the merge target is ambiguous — warn (do not block; the caller may genuinely intend
+  // the latest row).
+  {
+    const isBareRepoint = !('agent' in o) && !('verdict' in o) && !('skip-reason' in o);
+    if (isBareRepoint) {
+      let priorSameRoleCount = 0;
+      try {
+        const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
+        for (const ln of raw) { try { const j = JSON.parse(ln); if (j && j.role === role) priorSameRoleCount++; } catch (e) { /* skip */ } }
+      } catch (e) { /* no ledger file yet -> priorSameRoleCount stays 0 */ }
+      if (priorSameRoleCount > 1) {
+        console.error('WARN (3role-ledger #1769): AMBIGUOUS repoint target — role ' + role + ' already has ' +
+          priorSameRoleCount + ' prior lines for task ' + sanitize(task) + ' (this task id has been reused ' +
+          'across multiple independent reviews of this role). This bare append (no --agent/--verdict/' +
+          '--skip-reason) will merge onto whichever row is CURRENTLY LAST — possibly a DIFFERENT review than ' +
+          'the one you mean to repoint. Pass --agent <the specific reviewer\'s agentId> explicitly (plus ' +
+          '--verdict/--effort/--self-authored/--closed-at to preserve them — an agent-change starts a FRESH ' +
+          'row, not a merge) to pin the target unambiguously.');
+      }
+    }
+  }
   let file;
   try {
     file = overlayAppend(session, task, role, fields);
