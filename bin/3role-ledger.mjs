@@ -2221,6 +2221,196 @@ function cmdLogBypass(o) {
   void agentType;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1640 M0 — Model Router SSOT v2: resolve-route / identify-model / lint-routes (build-slices S1-S4).
+//
+// ADDITIVE ONLY: nothing above this block is touched. The frozen `resolve-role-model` contract (roleModelFromCfg,
+// lintRoleConfig, modelIdToTier, resolveConfigPath/loadRoleConfig, CC_ROLES_ENV) is untouched — AC0.3/AC0.4 prove
+// byte-for-byte zero behavior change. Nothing in the existing chain consumes any of this yet (M0 is a
+// zero-behavior-change milestone; config/cc-roles.env stays authoritative for the interactive chain until M1/S13).
+// See `.ai-workspace/plans/2026-07-17-fable-router.md` (parent, milestone M0) and its decomposition
+// `.ai-workspace/plans/2026-07-17-fable-1640-router-build-slices.md` (S1-S5).
+
+// Resolve config/cc-routes.json's path. Mirrors resolveConfigPath()'s CC_ROLES_ENV pattern exactly:
+//   CC_ROUTES_JSON, when SET, is AUTHORITATIVE + TERMINAL (unreadable/absent path => not-found, same shape as
+//   CC_ROLES_ENV=/nonexistent above) — this is what every M0 fixture uses to point at a bundled red/green file
+//   without touching the shipped config/cc-routes.json. Unset => config/cc-routes.json next to this file,
+//   walked through fs.realpathSync (symlink-safe — same defect-1b rationale as resolveConfigPath()).
+function resolveRoutesConfigPath() {
+  if ('CC_ROUTES_JSON' in process.env) {
+    const p = process.env.CC_ROUTES_JSON;
+    return (p && fileExists(p)) ? p : '';
+  }
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const cand = path.join(selfDir, '..', 'config', 'cc-routes.json');
+  return fileExists(cand) ? cand : '';
+}
+
+// Load + parse the routes SSOT. Never throws: { ok, routes, error, configPath }. A missing file, an unreadable
+// file, and unparseable JSON are all distinct, honestly-labeled ROUTE-* errors (never a silent {}).
+function loadRoutesConfig() {
+  const configPath = resolveRoutesConfigPath();
+  if (!configPath) return { ok: false, routes: null, error: 'ROUTE-NOT-FOUND: no config/cc-routes.json resolved (checked CC_ROUTES_JSON / config/cc-routes.json)', configPath: '' };
+  let raw;
+  try { raw = fs.readFileSync(configPath, 'utf8'); }
+  catch (e) { return { ok: false, routes: null, error: 'ROUTE-READ-ERROR: ' + configPath + ': ' + (e && e.message ? e.message : e), configPath }; }
+  let routes;
+  try { routes = JSON.parse(raw); }
+  catch (e) { return { ok: false, routes: null, error: 'ROUTE-PARSE-ERROR: ' + configPath + ': ' + (e && e.message ? e.message : e), configPath }; }
+  return { ok: true, routes, error: '', configPath };
+}
+
+// Credential-hygiene lint (AC0.6, #1640 S1). Every `auth`/`*credential*`-class field on a provider row must be
+// an env:/keychain: indirection — no literal credential value, no "non-secret literal" escape (review B3 deleted
+// that escape; endpoint URLs are not credential-class and are covered by the smoke's separate count-based scans,
+// not this lint). Returns an array of problem strings naming the offending key (empty = clean).
+function lintRoutesConfig(routes) {
+  const problems = [];
+  if (!routes || typeof routes !== 'object') return problems;
+  const providers = routes.providers || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    if (!row || typeof row !== 'object') continue;
+    for (const key of Object.keys(row)) {
+      if (!/^auth$/i.test(key) && !/credential/i.test(key)) continue;
+      const val = row[key];
+      if (typeof val !== 'string') continue;
+      if (!/^(env:|keychain:)/.test(val)) {
+        problems.push('ROUTE-SECRET-LITERAL: providers.' + pid + '.' + key + ' is not an env:/keychain: indirection');
+      }
+    }
+  }
+  return problems;
+}
+
+// C-2 capability guard (resolve-time, parent AC0.2 / S2). Fail-closed on a missing OR unknown task_class,
+// treated as the MOST restrictive class (sustained-agentic) — never silently permissive. Three-part refusal
+// shape is assembled by the caller (nonzero exit + this reason on stderr + empty stdout); this function only
+// decides ok/reason.
+const MOST_RESTRICTIVE_TASK_CLASS = 'sustained-agentic';
+function checkCapability(routes, seatRow) {
+  const taskClasses = (routes && routes.task_classes) || {};
+  const rawClass = seatRow && seatRow.task_class;
+  const effectiveClass = (rawClass && Object.prototype.hasOwnProperty.call(taskClasses, rawClass))
+    ? rawClass : MOST_RESTRICTIVE_TASK_CLASS;
+  const classDef = taskClasses[effectiveClass];
+  const provider = seatRow && seatRow.provider;
+  const allowed = (classDef && Array.isArray(classDef.allowed_providers)) ? classDef.allowed_providers : [];
+  if (!allowed.includes(provider)) {
+    return { ok: false, reason: 'ROUTE-FEASIBILITY: provider "' + provider + '" is not allowed for task_class "' +
+      effectiveClass + '" (seat declared: ' + (rawClass || '<missing>') + ')' };
+  }
+  return { ok: true, reason: '' };
+}
+
+// C-3 data-sensitivity guard (resolve-time, parent AC0.8 / S3). Fail-closed on a missing seat sensitivity
+// (treated operator-private) AND on a missing/unverified/unrecognized provider posture (treated
+// unverified-or-trains) — an unverified external fact can only over-restrict, never leak. The lattice's middle
+// class (no-training-default) clears `internal` but REFUSES `operator-private` — the review-B2 boundary.
+const DATA_POSTURE_CLASSES = ['local', 'zdr-enforced', 'anthropic-baseline', 'no-training-default', 'unverified-or-trains'];
+const DATA_SENSITIVITY_CLEARANCE = {
+  'operator-private': ['local', 'zdr-enforced', 'anthropic-baseline'],
+  'internal': ['local', 'zdr-enforced', 'anthropic-baseline', 'no-training-default'],
+  'public': null, // bounded only by C-2 — every posture clears
+};
+function checkDataSensitivity(routes, seatRow) {
+  const providers = (routes && routes.providers) || {};
+  const rawSensitivity = seatRow && seatRow.data_sensitivity;
+  const sensitivity = Object.prototype.hasOwnProperty.call(DATA_SENSITIVITY_CLEARANCE, rawSensitivity)
+    ? rawSensitivity : 'operator-private';
+  const provider = seatRow && seatRow.provider;
+  const providerRow = providers[provider];
+  const rawPosture = providerRow && providerRow.data_posture && providerRow.data_posture.class;
+  const posture = (rawPosture && DATA_POSTURE_CLASSES.includes(rawPosture)) ? rawPosture : 'unverified-or-trains';
+  const clearance = DATA_SENSITIVITY_CLEARANCE[sensitivity];
+  if (clearance !== null && !clearance.includes(posture)) {
+    return { ok: false, reason: 'ROUTE-DATA-SENSITIVITY: seat sensitivity "' + sensitivity + '" (declared: ' +
+      (rawSensitivity || '<missing>') + ') is not cleared for provider "' + provider + '" posture "' + posture +
+      '" (declared: ' + (rawPosture || '<missing>') + ')' };
+  }
+  return { ok: true, reason: '' };
+}
+
+// Model-identity vocabulary query (AC0.9, S4 — the ROOT fix for stack break 1: modelIdToTier() returns '' for
+// any non-claude-* id today). Given a model id, returns its SSOT-declared provider + tier-equivalent; an
+// undeclared id refuses (caller emits nonzero exit + empty stdout, no fabricated match).
+function identifyModel(routes, modelId) {
+  const providers = (routes && routes.providers) || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    const vocab = (row && row.model_vocabulary) || {};
+    if (Object.prototype.hasOwnProperty.call(vocab, modelId)) {
+      const entry = vocab[modelId] || {};
+      return { ok: true, provider: pid, tierEquivalent: entry.tier_equivalent || '' };
+    }
+  }
+  return { ok: false, provider: '', tierEquivalent: '' };
+}
+
+// Seat resolution: look up the seat row, then run BOTH resolve-time guards in order (C-2 then C-3) — both are
+// enforced again at invoke-time in M2 with the resolver out of the loop; this is the resolve-time half only.
+function resolveRoute(routes, seatKey) {
+  const seats = (routes && routes.seats) || {};
+  const seatRow = seats[seatKey];
+  if (!seatRow) return { ok: false, reason: 'ROUTE-SEAT-NOT-FOUND: no seat "' + seatKey + '" in the SSOT' };
+  const cap = checkCapability(routes, seatRow);
+  if (!cap.ok) return { ok: false, reason: cap.reason };
+  const sens = checkDataSensitivity(routes, seatRow);
+  if (!sens.ok) return { ok: false, reason: sens.reason };
+  return { ok: true, seatKey, seat: seatRow };
+}
+
+// resolve-route --seat <domain.seat> [--json]
+function cmdResolveRoute(opts) {
+  const seatKey = opts.seat;
+  if (!seatKey) { console.log('BLOCK: resolve-route requires --seat <domain.seat>'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const result = resolveRoute(loaded.routes, seatKey);
+  if (!result.ok) { process.stderr.write(result.reason + '\n'); process.exit(2); }
+  if ('json' in opts) {
+    console.log(JSON.stringify(Object.assign({ seat: seatKey }, result.seat)));
+  } else {
+    console.log(seatKey + ' -> ' + result.seat.provider + ' / ' + (result.seat.model || ''));
+  }
+  process.exit(0);
+}
+
+// identify-model --id <model-id> [--json]
+function cmdIdentifyModel(opts) {
+  const modelId = opts.id;
+  if (!modelId) { console.log('BLOCK: identify-model requires --id <model-id>'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const result = identifyModel(loaded.routes, modelId);
+  if (!result.ok) {
+    process.stderr.write('ROUTE-MODEL-UNDECLARED: "' + modelId + '" is not in any provider\'s declared vocabulary\n');
+    process.exit(2);
+  }
+  if ('json' in opts) {
+    console.log(JSON.stringify({ id: modelId, provider: result.provider, tierEquivalent: result.tierEquivalent }));
+  } else {
+    console.log(result.provider + ' ' + result.tierEquivalent);
+  }
+  process.exit(0);
+}
+
+// lint-routes — credential-hygiene lint over the resolved routes file (AC0.6). Exit 0 clean; exit 2 + the
+// offending key(s) on stderr otherwise.
+function cmdLintRoutes(opts) {
+  void opts;
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const problems = lintRoutesConfig(loaded.routes);
+  if (problems.length) {
+    for (const p of problems) process.stderr.write(p + '\n');
+    process.exit(2);
+  }
+  console.log('OK: routes lint clean (' + loaded.configPath + ')');
+  process.exit(0);
+}
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
 try {
@@ -2235,8 +2425,11 @@ try {
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
+  else if (cmd === 'resolve-route') cmdResolveRoute(opts);
+  else if (cmd === 'identify-model') cmdIdentifyModel(opts);
+  else if (cmd === 'lint-routes') cmdLintRoutes(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
@@ -2244,7 +2437,8 @@ try {
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
-      '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)]');
+      '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
+      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)]');
     process.exit(2);
   }
 } catch (e) {
