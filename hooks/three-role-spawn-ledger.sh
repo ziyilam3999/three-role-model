@@ -182,10 +182,15 @@ ASSIGNED_FLAGS=""
 # ONLY when an agentId was extracted; otherwise the degraded {role}-only line (SubagentStop fills agentId).
 # Always pass the ASSIGNED_FLAGS resolved above (when resolvable) so the badge renders the instant this line
 # lands, carrying the role's OWN policy values.
+# #1640 S11 — the reroute-stamp RECORDER edge. --sense-reroute asks the helper to sense THIS process's own
+# inherited ANTHROPIC_BASE_URL (a run-time signal at the spawn edge, never re-derived later at check-time) and,
+# only when it resolves to an SSOT-declared non-Anthropic provider for this role's OWN seat, stamp a
+# {provider, resolvedAt} reroute field onto the line. Fail-open: an ordinary Anthropic session resolves
+# nothing, so this flag is a harmless no-op on every non-declared spawn.
 if [ -n "$AGENTID" ] && [ "$AGENTID" != "-" ]; then
-  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $ASSIGNED_FLAGS >/dev/null 2>&1
+  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $ASSIGNED_FLAGS --sense-reroute >/dev/null 2>&1
 else
-  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" $ASSIGNED_FLAGS >/dev/null 2>&1
+  node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" $ASSIGNED_FLAGS --sense-reroute >/dev/null 2>&1
 fi
 
 # Both append branches merge here. Resync the live board on this AUTOMATED write

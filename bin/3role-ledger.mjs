@@ -351,7 +351,24 @@ function roleVersionFromCfg(cfg, role, expectedTier) {
 //   2. FABLE-ON-ORCHESTRATOR — the always-on seat pinned to fable (never-pin; refuse/warn).
 //   3. FABLE-CAP-BUDGET — any VALID *_MODEL=fable (cap-budget reminder: up to 50% of the weekly limit, not a
 //      deadline — see the "Planner" comment block in cc-roles.env for the full corrected framing).
-function lintRoleConfig(cfg) {
+// #1640 S8(b) — OPTIONAL 2nd param `routes` (an already-loaded SSOT object, or null/undefined). Every EXISTING
+// call site passes ONE arg (routes===undefined), so vocabHint stays '' and the INVALID-MODEL message is
+// BYTE-IDENTICAL to before (the frozen `resolve-role-model` contract never passes a 2nd arg — see its own call
+// sites below, unchanged). ONLY the completion gate's `--enforce-role-models` leg passes a loaded SSOT, so an
+// inexpressible/typo legacy value ALSO names the SSOT-declared vocabulary the author may have meant, instead of
+// a typo silently reading as "no such thing as a declared switch exists."
+function lintRoleConfig(cfg, routes) {
+  let vocabHint = '';
+  if (routes && typeof routes === 'object' && routes.providers) {
+    const tokens = [];
+    for (const [pid, row] of Object.entries(routes.providers)) {
+      const vocab = (row && row.model_vocabulary) || {};
+      for (const [mid, entry] of Object.entries(vocab)) {
+        tokens.push(pid + '/' + mid + ' (' + ((entry && entry.tier_equivalent) || '?') + ')');
+      }
+    }
+    if (tokens.length) vocabHint = ' SSOT-declared provider vocabulary you may have meant (config/cc-routes.json): ' + tokens.join(', ') + '.';
+  }
   for (const k of Object.keys(cfg)) {
     const m = k.match(/^CC_ROLE_(.+)_MODEL$/);
     if (!m) continue;
@@ -359,7 +376,7 @@ function lintRoleConfig(cfg) {
     if (!ROLE_MODELS.includes(val)) {
       process.stderr.write('INVALID-MODEL cc-roles.env: ' + k + '="' + val + '" is not a known tier ' +
         '(opus|sonnet|haiku|fable) — falling back to opus (you are paying OPUS rates while thinking you set "' +
-        val + '").\n');
+        val + '").' + vocabHint + '\n');
       continue;   // an invalid value is not also a fable warning.
     }
     if (val === 'fable') {
@@ -580,11 +597,19 @@ function lastAssistantModelFromFile(filePath, opts) {
 
 // A `--model` value may be a bare TIER ALIAS (the normal spawn convention — "opus"/"sonnet"/"fable"/"haiku")
 // or, defensively, a concrete claude-* id. Returns '' when neither form resolves (caller treats as unknown).
+// #1640 S11 — WIDENED to also consult the SSOT vocabulary (identifyModelViaSSOT, defined in the M0 section
+// below — forward reference; hoisted `function` declarations make this safe) when the value is neither a
+// tier alias nor a claude-* id: a genuinely-declared non-Anthropic id (e.g. a qwen/gemma tag) now resolves to
+// its SSOT tier_equivalent instead of falling through to 'unknown'. STRICTLY ADDITIVE — a value that resolved
+// via the tier-alias or claude-* branch is UNCHANGED, and a value in NEITHER the alias list, NOR claude-*, NOR
+// any provider's declared vocabulary still correctly returns '' (unknown) exactly as before.
 function modelIdOrAliasToTier(v) {
   const s = String(v == null ? '' : v).trim().toLowerCase();
   if (!s) return '';
   if (ROLE_MODELS.includes(s)) return s;
-  return modelIdToTier(s);
+  const legacy = modelIdToTier(s);
+  if (legacy) return legacy;
+  return identifyModelViaSSOT(v);
 }
 
 // resolveEffectiveTier — the reusable "who is this really?" reader (#1494; #1497 Key-1 consumes this, does
@@ -641,7 +666,14 @@ function resolveEffectiveTier(o) {
         if (modelId) {
           const t = modelIdToTier(modelId);
           if (t) { out.tier = t; out.source = 'session'; }
-          // else: a resolved model id with an unrecognized tier prefix -> stays unknown/unknown (can't-tell).
+          else {
+            // #1640 S11 — widen: a session-inherited non-Anthropic model id (e.g. the whole session is running
+            // under a rerouted ANTHROPIC_BASE_URL gateway) resolves via the SSOT vocabulary instead of falling
+            // through to 'unknown'. A model id in NEITHER claude-* form NOR any declared provider vocabulary
+            // still correctly stays unknown/unknown below (can't-tell) — this only WIDENS what resolves.
+            const w = identifyModelViaSSOT(modelId);
+            if (w) { out.tier = w; out.source = 'session'; }
+          }
         }
       }
     }
@@ -839,6 +871,11 @@ function resolveArtifact(p) {
 // to fall back to resolveAgent's tag search) returns {} when no model is resolvable yet (fail-open,
 // can't-tell), else {modelVersion[, modelTier]} (modelTier omitted only if the id doesn't map to a known
 // tier prefix — modelIdToTier's own fail-open contract).
+// #1640 S12 — the `modelTier` fallback WIDENS to the SSOT vocabulary (identifyModelViaSSOT) when the observed
+// id is not a claude-* id, so the badge-driving field carries the declared tier_equivalent (e.g. 'local-agentic')
+// for an in-vocabulary non-Anthropic model instead of staying ABSENT (the #1481/#1494 silent-misattribution
+// class the cairn stone names — a blank/lingering-Anthropic badge). `modelVersion` (the raw observed id) is
+// UNCHANGED — it was already recorded regardless of tier resolution.
 function resolveModelFields(session, task, role, explicitAgent) {
   try {
     const agentIdForModel = explicitAgent || resolveAgent(session, task, role);
@@ -846,7 +883,7 @@ function resolveModelFields(session, task, role, explicitAgent) {
     const modelId = transcriptModel(session, agentIdForModel);
     if (!modelId) return {};
     const fields = { modelVersion: modelId };
-    const tier = modelIdToTier(modelId);
+    const tier = modelIdToTier(modelId) || identifyModelViaSSOT(modelId);
     if (tier) fields.modelTier = tier;
     return fields;
   } catch (e) { return {}; }   // fail-open: a resolution error must never wedge the caller.
@@ -1401,16 +1438,26 @@ function overlayAppend(session, task, role, fields) {
   if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
   if ('modelTier' in fields) entry.modelTier = fields.modelTier;
   if ('effort' in fields) entry.effort = fields.effort;
+  // #1640 S11 — the RUN-TIME reroute stamp. Overlay only when THIS call's --sense-reroute actually resolved
+  // one (own-key "provided" discipline, same as every field above): the spawn edge (three-role-spawn-ledger.sh)
+  // and the SubagentStop edge (three-role-subagent-ledger.sh) both pass --sense-reroute on every call, but
+  // senseReroute() returns null (no field set) whenever the session's ANTHROPIC_BASE_URL is empty, or the seat
+  // isn't SSOT-declared to a non-Anthropic provider, or the base-url doesn't resolve to any declared provider
+  // row — so an ordinary Anthropic-only role's line NEVER gains a reroute field. This is the ONLY writer of
+  // `reroute`; the completion gate (cmdCheck) only ever READS it, never senses env/base-url itself (S10
+  // anti-spoof — the stamp must be a run-time RECORD, not a check-time re-derivation).
+  if ('reroute' in fields) entry.reroute = fields.reroute;
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
   // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
-  // otherwise resurrect) — modelVersion/modelTier/effort join that clear-list too (#1465): they are
-  // provenance OF a real spawn's transcript, so a skip line must not carry a stale claimed model.
+  // otherwise resurrect) — modelVersion/modelTier/effort/reroute join that clear-list too (#1465/#1640): they
+  // are provenance OF a real spawn's transcript/session, so a skip line must not carry a stale claimed model
+  // or a stale declared-reroute stamp.
   if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
-    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt;
+    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -1461,6 +1508,16 @@ function cmdAppend(o) {
     const modelFields = resolveModelFields(session, task, role, explicitAgent);
     if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
     if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
+  }
+  // #1640 S11 — the reroute-stamp RECORDER. Opt-in via --sense-reroute (only the spawn edge
+  // three-role-spawn-ledger.sh and the SubagentStop edge three-role-subagent-ledger.sh pass it); reads ONLY
+  // this process's OWN environment (the session's inherited ANTHROPIC_BASE_URL) at RUN-TIME, resolved against
+  // the SSOT's declared provider rows for THIS role's seat — never at check-time (see cmdCheck's declared
+  // sensor, which reads ONLY the field this writes). senseReroute() fails closed to null (field omitted) on
+  // any ambiguity, so an ordinary Anthropic session never gains a stamp.
+  if ('sense-reroute' in o) {
+    const r = senseReroute(role);
+    if (r) fields.reroute = r;
   }
   // #1466 — the #1465 AMBIENT `process.env.CLAUDE_EFFORT` auto-capture that used to sit here is REMOVED. It
   // stamped the ORCHESTRATOR's session effort on EVERY append — including a close-out `--artifact`-only call
@@ -1749,88 +1806,189 @@ function cmdCheck(o) {
   }
   if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
     const { found, cfg } = loadRoleConfig();
+    // #1640 S8/S10 — SSOT consultation for the expected side + the declared-reroute contract. Mirrors
+    // cmdResolveRoleModel's precedence EXACTLY: an explicit CC_ROLES_ENV override is AUTHORITATIVE + TERMINAL,
+    // so it short-circuits SSOT consultation entirely — every PRE-#1640 fixture in this file sets CC_ROLES_ENV
+    // and is therefore COMPLETELY UNAFFECTED by anything below (routesLoaded.ok stays false for them, exactly
+    // reproducing today's roleModelFromCfg-only comparison).
+    const routesLoaded = ('CC_ROLES_ENV' in process.env) ? { ok: false, routes: null, configPath: '' } : loadRoutesConfig();
     if (found) {
-      lintRoleConfig(cfg);   // defect-3 visibility: fires on stderr on every enforce read (loud, once).
+      lintRoleConfig(cfg, routesLoaded.ok ? routesLoaded.routes : null);   // S8(b): SSOT-vocabulary hint, additive-only.
+      // #1640 S10 binding point 4 — an enforcement run under a caller-supplied CC_ROUTES_JSON audits itself
+      // ONCE per invocation, naming the task, regardless of whether any individual role turns out declared.
+      if (('CC_ROUTES_JSON' in process.env) && routesLoaded.ok) {
+        writeBypassLog('3role-ledger-enforce-role-models', 'ROUTES-OVERRIDE', 'PERMIT',
+          { task: sanitize(task), route_config: routesLoaded.configPath });
+      }
       for (const role of REQUIRED_ROLES) {
         const e = byRole[role];
         if (!e || ('skip_reason' in e)) continue;              // no transcript to read for a missing / inline-skip role
         if (!agentResolves(session, e.agentId)) continue;      // presence already reported above; can't-tell here
-        // #1458: resolve the tier + the version PIN (if any) BEFORE reading the actual transcript model, so the
-        // version sub-leg's fail-closed-on-can't-tell can fire even on the TIER can't-tell path below.
-        const expected = roleModelFromCfg(cfg, role);
-        const pin = roleVersionFromCfg(cfg, role, expected);
-        if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
-          writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
-        }
-        const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
+
+        // #1640 S8 — the SSOT-aware expected side (viaSSOT=false and IDENTICAL to today's roleModelFromCfg
+        // whenever CC_ROLES_ENV is set, the role has no declared SSOT seat, or the seat's model is undeclared).
+        const expectedSide = resolveExpectedSide(routesLoaded, cfg, role);
+
         const actualId = transcriptModel(session, e.agentId);   // concrete id, '' if no assistant model line
-        const actual = modelIdToTier(actualId);                 // tier, '' if empty/unknown-prefix
-        if (!actual) {                                          // TIER can't-tell (existing fail-open) ...
+        const actualAnthropicTier = modelIdToTier(actualId);     // '' unless actualId is a claude-* id
+
+        if (!actualAnthropicTier && !(routesLoaded.ok && identifyModel(routesLoaded.routes, actualId).ok)) {
+          // TIER can't-tell (existing fail-open, UNCHANGED) — neither a claude-* id nor SSOT-declared anywhere.
+          // The version-pin sub-leg is keyed to the LEGACY expected tier (roleModelFromCfg), exactly as before
+          // #1640 — a declared non-Anthropic seat never even reaches a CC_TIER_*_VERSION pin (no such pin
+          // exists for a non-Anthropic tier name), so this branch's behavior is byte-identical pre/post-#1640.
+          const legacyExpected = roleModelFromCfg(cfg, role);
+          const pin = roleVersionFromCfg(cfg, role, legacyExpected);
+          if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
+            writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
+          }
+          const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
           if (versionOn) problems.push('MODEL-VERSION: role ' + role + ' — the transcript model is unreadable/' +
-            'unparseable (' + (actualId || '<none>') + ') so the ' + expected + ' pin ' + pin + ' CANNOT be ' +
+            'unparseable (' + (actualId || '<none>') + ') so the ' + legacyExpected + ' pin ' + pin + ' CANNOT be ' +
             'verified (fail-closed: a configured pin means we do not wave through can\'t-tell). ' +
             'Kill-switch: CC_ROLE_VERSION_GATE_OFF=1 (or CC_ROLE_MODEL_GATE_OFF=1).');
           continue;                                              // ... but a pin fail-CLOSES the version sub-leg
         }
-        if (actual === expected) {                               // tier match => OK; check the version sub-leg
-          if (versionOn && actualId !== pin) problems.push('MODEL-VERSION: role ' + role + ' ran on ' + actualId +
-            ' but cc-roles.env pins ' + expected + ' -> ' + pin + ' (ASSERT-LATEST drift: the tier latest may ' +
-            'have moved, or the role ran on an unexpected version). If ' + actualId + ' is the new blessed ' +
-            'latest, update CC_TIER_' + expected.toUpperCase() + '_VERSION (or CC_ROLE_' + roleKeyStem(role) +
-            '_MODEL_VERSION), then re-run the plugin sync; else investigate. Kill-switch: CC_ROLE_VERSION_GATE_OFF=1.');
-          continue;
-        }
-        if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
-        // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
-        // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
-        // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
-        // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy.
-        // #1624 (operator decision 2026-07-17): model-cost is enforced at booking/spawn time (the leading-edge
-        // gate), not at close — by close the spend is already SUNK, so blocking a role that ran on a STRICTLY
-        // more-capable tier than policy does nothing for cost control, it only withholds a quality win. So ANY
-        // strict up-tier (isResumeUpTier===true) is now allowed-with-note at close, WITH or WITHOUT a resume
-        // boundary. The resume-matched shape above keeps its own RESUME-UPTIER wording (it is telling a true,
-        // more specific story — a resumed role, not a fresh spawn); every OTHER strict-up-tier shape (no resume
-        // boundary at all, or a resume boundary whose pre-resume model didn't match policy) falls to the
-        // CLOSE-UPTIER branch below — a DISTINCT, honestly-worded note (plan-review F1): it must never claim a
-        // resume boundary that didn't happen. A DOWN-tier (isResumeUpTier===false) never reaches either branch
-        // and still falls straight through to the hard BLOCK below — the guardrail this change does not relax.
-        if (isResumeUpTier(expected, actual)) {
-          const rb = resumeBoundaryModels(session, e.agentId);
-          if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
-            let note = 'RESUME-UPTIER: role ' + role + ' was resumed via SendMessage (not respawned) — its ' +
-              'transcript shows model ' + (rb.preResumeModel || '<none>') + ' (matching policy ' + expected +
-              ') BEFORE the resume boundary and ' + actualId + ' (' + actual + ') AFTER it. A resume-induced ' +
-              'up-tier is allowed-with-note: it preserves the resumed agent\'s accumulated context (the whole ' +
-              'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
-              'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+
+        // #1640 S10 binding point 1 — the DECLARED sensor. READ-ONLY: consults ONLY the role's OWN already-
+        // recorded ledger stamp (e.reroute, written by S11's spawn/SubagentStop recorder edges) — NEVER
+        // process.env.ANTHROPIC_BASE_URL, NEVER a base-url, NEVER a routes-file override, at THIS (check) time.
+        // An exported base-url in the check's OWN environment blesses NOTHING (the anti-spoof fixture, AC1.8(e)).
+        const stamp = (e.reroute && e.reroute.provider) ? e.reroute : null;
+        const seatDeclaredNonAnthropic = !!(expectedSide.viaSSOT && expectedSide.provider && expectedSide.provider !== 'anthropic');
+        const declared = !!(stamp && seatDeclaredNonAnthropic && stamp.provider === expectedSide.provider);
+
+        if (actualAnthropicTier) {
+          // #1640 S10 binding point 2 — an ANTHROPIC OBSERVATION keeps FULL tier+version enforcement, declared
+          // or not: the comparison is against the role's ORDINARY (legacy) policy tier, never the SSOT's
+          // declared non-Anthropic tier (which an Anthropic observation could never equal anyway). This is
+          // BYTE-IDENTICAL to the pre-#1640 comparison for every role whose seat is not SSOT-declared non-
+          // Anthropic (expectedSide.tier === legacyExpected in that case).
+          const expected = roleModelFromCfg(cfg, role);
+          const pin = roleVersionFromCfg(cfg, role, expected);
+          if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
+            writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
+          }
+          const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
+          const actual = actualAnthropicTier;
+          if (actual === expected) {                               // tier match => OK; check the version sub-leg
+            if (versionOn && actualId !== pin) problems.push('MODEL-VERSION: role ' + role + ' ran on ' + actualId +
+              ' but cc-roles.env pins ' + expected + ' -> ' + pin + ' (ASSERT-LATEST drift: the tier latest may ' +
+              'have moved, or the role ran on an unexpected version). If ' + actualId + ' is the new blessed ' +
+              'latest, update CC_TIER_' + expected.toUpperCase() + '_VERSION (or CC_ROLE_' + roleKeyStem(role) +
+              '_MODEL_VERSION), then re-run the plugin sync; else investigate. Kill-switch: CC_ROLE_VERSION_GATE_OFF=1.');
+            continue;
+          }
+          if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+          // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
+          // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
+          // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
+          // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy.
+          // #1624 (operator decision 2026-07-17): model-cost is enforced at booking/spawn time (the leading-edge
+          // gate), not at close — by close the spend is already SUNK, so blocking a role that ran on a STRICTLY
+          // more-capable tier than policy does nothing for cost control, it only withholds a quality win. So ANY
+          // strict up-tier (isResumeUpTier===true) is now allowed-with-note at close, WITH or WITHOUT a resume
+          // boundary. The resume-matched shape above keeps its own RESUME-UPTIER wording (it is telling a true,
+          // more specific story — a resumed role, not a fresh spawn); every OTHER strict-up-tier shape (no resume
+          // boundary at all, or a resume boundary whose pre-resume model didn't match policy) falls to the
+          // CLOSE-UPTIER branch below — a DISTINCT, honestly-worded note (plan-review F1): it must never claim a
+          // resume boundary that didn't happen. A DOWN-tier (isResumeUpTier===false) never reaches either branch
+          // and still falls straight through to the hard BLOCK below — the guardrail this change does not relax.
+          if (isResumeUpTier(expected, actual)) {
+            const rb = resumeBoundaryModels(session, e.agentId);
+            if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
+              let note = 'RESUME-UPTIER: role ' + role + ' was resumed via SendMessage (not respawned) — its ' +
+                'transcript shows model ' + (rb.preResumeModel || '<none>') + ' (matching policy ' + expected +
+                ') BEFORE the resume boundary and ' + actualId + ' (' + actual + ') AFTER it. A resume-induced ' +
+                'up-tier is allowed-with-note: it preserves the resumed agent\'s accumulated context (the whole ' +
+                'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
+                'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+              if (actual === 'fable') {
+                note += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+                  'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
+                  'Max-plan-included usage — surfaced here so the cost is never hidden.';
+              }
+              resumeNotes.push(note);
+              continue;
+            }
+            // #1624 — no resume boundary (or a resume boundary whose PRE-resume model didn't match policy, so it
+            // cannot honestly be attributed to the resume). Either way the role's ACTUAL tier is a strict quality
+            // up-tier over policy; the spend is already sunk at close. Allow-with-note using a token that does NOT
+            // claim a resume boundary happened (F1 — the resume wording would be a false statement here).
+            let closeNote = 'CLOSE-UPTIER: role ' + role + ' ran on a MORE-capable tier than policy — a quality ' +
+              'up-tier; the cost is already sunk at close (transcript model ' + actualId + ' (' + actual + ') vs ' +
+              'policy ' + expected + '). Model cost is enforced at booking/spawn time, not at close. ' +
+              'Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
             if (actual === 'fable') {
-              note += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+              closeNote += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
                 'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
                 'Max-plan-included usage — surfaced here so the cost is never hidden.';
             }
-            resumeNotes.push(note);
+            resumeNotes.push(closeNote);
             continue;
           }
-          // #1624 — no resume boundary (or a resume boundary whose PRE-resume model didn't match policy, so it
-          // cannot honestly be attributed to the resume). Either way the role's ACTUAL tier is a strict quality
-          // up-tier over policy; the spend is already sunk at close. Allow-with-note using a token that does NOT
-          // claim a resume boundary happened (F1 — the resume wording would be a false statement here).
-          let closeNote = 'CLOSE-UPTIER: role ' + role + ' ran on a MORE-capable tier than policy — a quality ' +
-            'up-tier; the cost is already sunk at close (transcript model ' + actualId + ' (' + actual + ') vs ' +
-            'policy ' + expected + '). Model cost is enforced at booking/spawn time, not at close. ' +
-            'Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
-          if (actual === 'fable') {
-            closeNote += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
-              'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
-              'Max-plan-included usage — surfaced here so the cost is never hidden.';
-          }
-          resumeNotes.push(closeNote);
+          problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
+            ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
+            ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.' +
+            (declared ? ' (NOTE: this role is DECLARED to non-Anthropic provider ' + expectedSide.provider +
+              ', but the OBSERVED model is Anthropic and mismatches the ordinary policy tier — declaration ' +
+              'never waves an Anthropic mismatch through.)' : ''));
           continue;
         }
-        problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
-          ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
-          ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+
+        // ── Non-Anthropic observation (actualId resolves via the SSOT vocabulary to SOME provider/tier). ──
+        const obsIdent = routesLoaded.ok ? identifyModel(routesLoaded.routes, actualId) : { ok: false };
+        const actualProvider = obsIdent.ok ? obsIdent.provider : '';
+        const actualTier = obsIdent.ok ? obsIdent.tierEquivalent : '';
+
+        if (!declared) {
+          // #1640 S10 binding point 1 — an UNDECLARED non-Anthropic model HARD-BLOCKS, regardless of whether
+          // the observed id happens to be a real, SSOT-declared vocabulary entry (S10(b): "catches a sensor
+          // that would declare on ANY non-claude id" — a valid-looking vocabulary match is NOT itself a
+          // declaration; only a recorded run-time stamp is).
+          problems.push('MODEL-POLICY: role ' + role + ' ran on a non-Anthropic model (' + actualId +
+            (actualTier ? ', tier_equivalent ' + actualTier : '') + (actualProvider ? ', provider ' + actualProvider : '') +
+            ') with NO recorded run-time reroute stamp on its own ledger line — an undeclared non-Anthropic ' +
+            'model is hard-blocked (the gate catching an off-policy model is it working). If this is a ' +
+            'deliberate declared switch, the role must be spawned/closed through the recorder edges ' +
+            '(three-role-spawn-ledger.sh / three-role-subagent-ledger.sh) while the session\'s inherited ' +
+            'ANTHROPIC_BASE_URL resolves to a declared SSOT provider row. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+          continue;
+        }
+
+        // declared === true from here (stamp present, seat SSOT-declared non-Anthropic, stamp names that seat's
+        // OWN declared provider). Binding point 2's fail-closed half: the observed id must be IN-VOCABULARY for
+        // the DECLARED provider specifically — a stamp naming provider X never blesses an id from provider Y.
+        if (!actualProvider || actualProvider !== expectedSide.provider || actualTier !== expectedSide.tier) {
+          problems.push('MODEL-POLICY: role ' + role + ' is DECLARED to provider ' + expectedSide.provider +
+            ' (' + expectedSide.model + ', tier_equivalent ' + expectedSide.tier + ') but the OBSERVED model ' +
+            actualId + ' resolves to ' + (actualProvider ? 'provider ' + actualProvider + ' / tier_equivalent ' + actualTier : 'no declared provider') +
+            ' — off-vocabulary for the declared provider; fail-closed (declaration never waves through an ' +
+            'off-vocabulary observation). Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+          continue;
+        }
+
+        // #1640 S9 — DECLARED ALLOW. The version-pin sub-leg is DORMANT for this observation (per-OBSERVATION,
+        // never per-session — an Anthropic observation on this SAME declared role would still hit the fully-
+        // enforced branch above): a non-Anthropic observed id can never equal a claude-* version pin, so
+        // silently NOT checking it here (rather than always-mismatching) is the correct dormancy, not a gap.
+        // #1640 S10 binding point 3 — every declared allow writes the unified audit log (SESSION-REROUTE),
+        // naming the task + role + resolved provider; a DATA-SENSITIVITY note rides along when the flipped-to
+        // provider does not clear the seat's declared sensitivity class. Read the note text back (parent M1
+        // verification): it names the provider row resolved, satisfying S8(a)'s expected-side probe too (the
+        // SAME fixture — a declared, in-vocabulary, matching seat — is what makes the expected side observable
+        // via THIS surface; see the plan's Advisory A1 gradeability clause).
+        const liveSeat = (routesLoaded.routes.seats || {})[role] || {};
+        const sensClearance = checkDataSensitivity(routesLoaded.routes, Object.assign({}, liveSeat, { provider: expectedSide.provider }));
+        let reroteNote = 'SESSION-REROUTE: role ' + role + ' DECLARED to provider ' + expectedSide.provider +
+          ' (model ' + expectedSide.model + ', tier_equivalent ' + expectedSide.tier + ') — allowed with note; ' +
+          'audit logged; MODEL-VERSION sub-leg dormant for this observation.';
+        if (!sensClearance.ok) {
+          reroteNote += ' DATA-SENSITIVITY: ' + sensClearance.reason;
+        }
+        resumeNotes.push(reroteNote);
+        writeBypassLog('3role-ledger-enforce-role-models', 'SESSION-REROUTE', 'PERMIT',
+          { task: sanitize(task), role, provider: expectedSide.provider });
       }
     }
   }
@@ -2228,7 +2386,17 @@ function rule12LogPath() {
 // honest "no Claude Code session context" case as post-commit-auto-push.sh's native-git-hook path —
 // so they correctly fall to the orchestrator sentinel (AC-8: never a fabricated role). Best-effort,
 // never throws — a logging failure must never affect the caller's gate decision.
-function writeBypassLog(hookName, varName, decision) {
+// #1640 S10 point 3/4 — OPTIONAL 4th param `extra` ({task, role, provider, route_config}), overlaid onto the
+// record only when the caller supplies it. Every PRE-#1640 call site (the *_OFF/*_OVERRIDE kill-switch bypass
+// logging elsewhere in this file) passes 3 args, so `extra` is undefined and the record keeps writing EXACTLY
+// the pre-#1640 8-key shape (see docs/rule-12-overrides-log-schema.md) — additive-only, never a behavior change
+// for those writers. The declared-reroute `SESSION-REROUTE`/`ROUTES-OVERRIDE` audit lines (cmdCheck's enforce
+// leg, below) are the only callers that pass `extra`, naming the task/role/resolved-provider so the printed
+// note's claim ("allowed with note; audit logged") is independently checkable in the log file itself — never a
+// second, quieter log (the parent's binding point 3).  Also widens the `var` sanitizer to allow `-` (unchanged
+// for every existing all-underscore *_OFF/*_OVERRIDE varName; needed so 'SESSION-REROUTE'/'ROUTES-OVERRIDE'
+// survive intact for the grep-based ACs).
+function writeBypassLog(hookName, varName, decision, extra) {
   try {
     const record = {
       ts: new Date().toISOString(),
@@ -2237,9 +2405,15 @@ function writeBypassLog(hookName, varName, decision) {
       task: '',
       role: 'orchestrator',
       hook: sanitize(hookName),
-      var: String(varName || '').replace(/[^A-Za-z0-9_]/g, ''),
+      var: String(varName || '').replace(/[^A-Za-z0-9_-]/g, ''),
       decision: (String(decision).toUpperCase() === 'DENY') ? 'DENY' : 'PERMIT',
     };
+    if (extra && typeof extra === 'object') {
+      if (extra.task) record.task = sanitize(extra.task);
+      if (extra.role) record.role = sanitize(extra.role);
+      if (extra.provider) record.provider = sanitize(extra.provider);
+      if (extra.route_config) record.route_config = String(extra.route_config);
+    }
     const logPath = rule12LogPath();
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
@@ -2420,6 +2594,88 @@ function identifyModel(routes, modelId) {
     }
   }
   return { ok: false, provider: '', tierEquivalent: '' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1640 M1 (S8-S13) — expected-side expressibility, provider-scoped version pins, the DECLARED-REROUTE
+// contract, the spawn-gate sensor + recorder, and board-badge honesty. Every helper below is a NEW consumer of
+// the M0 primitives above (identifyModel / loadRoutesConfig) — nothing in M0 (S1-S5) or the frozen S6/S7
+// `resolve-role-model` path is edited. See .ai-workspace/plans/2026-07-23-1640-s8-s13.md.
+
+// Best-effort bridge: resolve a model id's SSOT tier_equivalent, or '' on ANY failure (no SSOT resolvable, id
+// undeclared in every provider's vocabulary, read/parse error). Used to WIDEN several pre-existing "claude-*
+// only" tier readers (modelIdOrAliasToTier, resolveEffectiveTier's session-read branch, resolveModelFields)
+// so a genuinely SSOT-declared non-Anthropic id resolves instead of falling through to 'unknown'/absent. Never
+// throws; never invents a match the SSOT does not declare.
+function identifyModelViaSSOT(modelId) {
+  try {
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return '';
+    const ident = identifyModel(rl.routes, modelId);
+    return (ident.ok && ident.tierEquivalent) ? ident.tierEquivalent : '';
+  } catch (e) { return ''; }
+}
+
+// #1640 S10/S11 — resolve a provider id from a base-url via `providers.<id>.endpoint` (a Lane-I FIXTURE-ONLY
+// schema field in this PR — the live config/cc-routes.json provider rows carry no endpoint yet; see the plan's
+// advisory A2 / `## Deferred-follow-ups`, S18 populates the live rows). Returns '' when the url is empty or
+// matches no provider row.
+function resolveProviderByEndpoint(routes, baseUrl) {
+  const url = String(baseUrl == null ? '' : baseUrl).trim();
+  if (!url) return '';
+  const providers = (routes && routes.providers) || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    if (row && typeof row.endpoint === 'string' && row.endpoint && row.endpoint === url) return pid;
+  }
+  return '';
+}
+
+// #1640 S11 — the RUN-TIME reroute SENSOR (the "declared" stamp's ONLY producer). Called EXCLUSIVELY at RUN
+// edges — the PostToolUse spawn-ledger hook and the SubagentStop subagent-ledger hook, via `append
+// --sense-reroute` — NEVER at CHECK time (S10 binding point 1: the completion gate reads only the recorded
+// stamp it produces, never re-senses `process.env.ANTHROPIC_BASE_URL` itself; `cmdCheck` below never calls this
+// function). Reads the CURRENT environment's inherited `ANTHROPIC_BASE_URL` (the two-var gateway switch — see
+// the plan's precondition note) at THIS moment, resolves it to an SSOT provider row, and — ONLY when the role's
+// OWN SSOT seat is BOTH `session-reroutable:true` AND itself provider-non-anthropic (the seat's declared
+// intent) — returns a stamp `{provider, resolvedAt}`. Returns null (no stamp recorded — the role stays
+// UNDECLARED, the correct fail-closed default) on any ineligible/unresolvable combination: no base-url
+// inherited, the SSOT unreadable, the role has no declared seat, the seat is not session-reroutable, the seat's
+// own declared provider IS anthropic (nothing to declare), or the base-url resolves to no provider row.
+function senseReroute(role) {
+  try {
+    const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+    if (!baseUrl) return null;
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return null;
+    const seat = (rl.routes.seats || {})[role];
+    if (!seat || !seat['session-reroutable']) return null;
+    if (!seat.provider || seat.provider === 'anthropic') return null;
+    const pid = resolveProviderByEndpoint(rl.routes, baseUrl);
+    if (!pid) return null;
+    return { provider: pid, resolvedAt: new Date().toISOString() };
+  } catch (e) { return null; }
+}
+
+// #1640 S8 — the completion gate's SSOT-aware EXPECTED-side resolver (the enforce/gate consumer S8 adds — NOT
+// `cmdResolveRoleModel`, which stays frozen; see the file's #1640 S6/S7 section and the plan's "Critical
+// constraints" clause). Mirrors `cmdResolveRoleModel`'s precedence STRUCTURALLY (SSOT-first; an explicit
+// `CC_ROLES_ENV` override is authoritative+terminal so `routesLoaded` is pre-computed by the caller honoring
+// that precedence) but returns a RICHER shape {tier, provider, model, viaSSOT} — S9/S10 need the declared
+// PROVIDER to bind a run-time reroute stamp, not merely a tier token. Falls back to the frozen
+// `roleModelFromCfg` (byte-unchanged legacy resolver) whenever the SSOT is not consulted, the role has no
+// declared seat, or the seat's model is not in any provider's declared vocabulary (S8(b)'s inexpressible-value
+// path) — this is what preserves `roleModelFromCfg`'s existing behavior for every pre-#1640 fixture.
+function resolveExpectedSide(routesLoaded, cfg, role) {
+  if (routesLoaded && routesLoaded.ok) {
+    const seat = (routesLoaded.routes.seats || {})[role];
+    if (seat) {
+      const ident = identifyModel(routesLoaded.routes, seat.model);
+      if (ident.ok && ident.tierEquivalent) {
+        return { tier: ident.tierEquivalent, provider: ident.provider, model: seat.model, viaSSOT: true };
+      }
+    }
+  }
+  return { tier: roleModelFromCfg(cfg, role), provider: '', model: '', viaSSOT: false };
 }
 
 // Seat resolution: look up the seat row, then run BOTH resolve-time guards in order (C-2 then C-3) — both are
