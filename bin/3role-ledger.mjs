@@ -2023,20 +2023,36 @@ function cmdRefreshModels(o) {
   }
 }
 
-// #1448: resolve-role-model --role <role> [--with-effort]
+// #1448: resolve-role-model --role <role> [--with-effort] [--with-version]
 // Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
 // fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
 // "<model> <effort>". Lints the config on read (defect-3 stderr visibility). Always exits 0 — a resolver error
 // must never wedge a spawn; opus is the safe answer.
-function cmdResolveRoleModel(o) {
-  const role = o.role;
-  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research)'); process.exit(2); }
-  const { found, cfg } = loadRoleConfig();
-  if (found) lintRoleConfig(cfg);
-  const model = found ? roleModelFromCfg(cfg, role) : 'opus';
-  const effort = found ? roleEffortFromCfg(cfg, role) : '';
-  const withEffort = ('with-effort' in o);
-  const withVersion = ('with-version' in o);
+//
+// #1640 S6/S7 — SSOT-first read path, presence-guarded fallback (SKIP-not-FAIL, #1619). This is the ONLY
+// consumer of config/cc-routes.json for role->model resolution — `check --enforce-role-models`'s own
+// roleModelFromCfg() call (below) is UNTOUCHED, still 100% the legacy path; widening it is out of scope here
+// and would risk the byte-frozen hooks/3role-ledger-smoke-test.sh (its M1-M9 arms, AC1.3). Precedence, in
+// priority order (each short-circuits the ones below it):
+//   1. SSOT PRESENT but CORRUPT (unparseable JSON / unreadable) -> UNCONDITIONAL fail-safe to opus for the
+//      requested role, regardless of CC_ROLES_ENV — never a silent fall-through to a possibly-stale legacy
+//      view (S7 AC1.5 a-control: a present, differently-configured env view must NOT rescue a broken SSOT —
+//      the safety-critical case). The lint (routesLoaded.error) names the offending file on stderr.
+//   2. CC_ROLES_ENV explicitly SET in process.env -> an explicit legacy-only override, extending the
+//      existing AUTHORITATIVE+TERMINAL test/debug-isolation semantic (#1448, resolveConfigPath() above) to
+//      also mean "skip SSOT" — resolves via TODAY'S frozen legacy path verbatim. This is what keeps the
+//      byte-frozen smoke's CC_ROLES_ENV-driven arms (M1-M9, always explicitly set) passing unedited (AC1.3).
+//   3. SSOT PRESENT + VALID + CC_ROLES_ENV unset -> the real SSOT-first path (S6): look up
+//      routes.seats[role]; a MISSING key fail-safes JUST that role to opus (S7 AC1.5 b — proves per-role
+//      isolation, not a global crash); a PRESENT seat resolves its declared model's tier via identifyModel().
+//      Effort/version are enriched from the legacy cfg (same default candidate chain) when resolvable — the
+//      SSOT schema doesn't carry per-role effort/version yet, and this keeps a real, unguarded invocation's
+//      output identical to today's (the two sources agree on every role's TIER as of the S1 import / #1813
+//      re-verify — hand-verified byte-identical for all six roles across all three flag shapes at S6 time —
+//      so this branch is provably a no-op on THIS repo's checked-in files today, AC1.1).
+//   4. SSOT genuinely ABSENT (ROUTE-NOT-FOUND) -> presence-guarded SKIP-not-FAIL (S6/AC1.2): fall back 100%
+//      to today's frozen legacy path — a consumer that hasn't adopted the SSOT yet must not break.
+function printRoleModel(model, effort, version, withEffort, withVersion) {
   if (!withEffort && !withVersion) { console.log(model); process.exit(0); }
   if (withEffort && !withVersion) {
     // #1448 shape, UNCHANGED for back-compat (three-role-model-policy-gate.sh does `read -r EXPECTED EFFORT`):
@@ -2044,14 +2060,73 @@ function cmdResolveRoleModel(o) {
     console.log(model + (effort ? ' ' + effort : ''));
     process.exit(0);
   }
-  // #1466 — version requested (alone, or together with effort). roleVersionFromCfg's per-role/per-tier pin,
-  // falling back to the tier alias itself when unset, so `version` is NEVER empty — a spawn-time badge stamp
-  // must always have something non-blank to show. When effort is ALSO requested but unresolved, use a `-`
-  // sentinel (not '') so a plain `read -r A B C` over the space-joined line always yields exactly 3 tokens.
-  const version = (found && roleVersionFromCfg(cfg, role, model)) || model;
-  const tokens = withEffort ? [model, effort || '-', version] : [model, version];
+  // #1466 — version requested (alone, or together with effort). `version` is NEVER empty — a spawn-time
+  // badge stamp must always have something non-blank to show. When effort is ALSO requested but unresolved,
+  // use a `-` sentinel (not '') so a plain `read -r A B C` over the space-joined line always yields exactly
+  // 3 tokens.
+  const tokens = withEffort ? [model, effort || '-', version || model] : [model, version || model];
   console.log(tokens.join(' '));
   process.exit(0);
+}
+
+// TODAY'S frozen resolution — byte-identical to the pre-#1640-S6 `cmdResolveRoleModel` body. Used both as the
+// CC_ROLES_ENV-explicit-override branch and as the SSOT-genuinely-absent fallback branch.
+function legacyResolveRoleModel(role, withEffort, withVersion) {
+  const { found, cfg } = loadRoleConfig();
+  if (found) lintRoleConfig(cfg);
+  const model = found ? roleModelFromCfg(cfg, role) : 'opus';
+  const effort = found ? roleEffortFromCfg(cfg, role) : '';
+  const version = (found && roleVersionFromCfg(cfg, role, model)) || model;
+  printRoleModel(model, effort, version, withEffort, withVersion);
+}
+
+function cmdResolveRoleModel(o) {
+  const role = o.role;
+  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research)'); process.exit(2); }
+  const withEffort = ('with-effort' in o);
+  const withVersion = ('with-version' in o);
+
+  // Step 1 — corrupt/unreadable SSOT: unconditional fail-safe, checked BEFORE any CC_ROLES_ENV override
+  // (S7 a-control: a present, differently-configured legacy view must NEVER rescue a broken SSOT).
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok && /^ROUTE-(PARSE|READ)-ERROR/.test(routesLoaded.error)) {
+    process.stderr.write(routesLoaded.error + '\n');
+    printRoleModel('opus', '', 'opus', withEffort, withVersion);
+    return;
+  }
+
+  // Step 2 — explicit legacy-only override (see precedence note above).
+  if ('CC_ROLES_ENV' in process.env) {
+    return legacyResolveRoleModel(role, withEffort, withVersion);
+  }
+
+  // Step 3 — SSOT present + valid + no override: the real SSOT-first path (S6).
+  if (routesLoaded.ok) {
+    const seat = (routesLoaded.routes.seats || {})[role];
+    if (!seat) {
+      process.stderr.write('ROUTE-ROLE-MISSING: routes.seats.' + role + ' not declared in ' + routesLoaded.configPath +
+        ' -- falling back to opus fail-safe (this role only).\n');
+      printRoleModel('opus', '', 'opus', withEffort, withVersion);
+      return;
+    }
+    const ident = identifyModel(routesLoaded.routes, seat.model);
+    if (!ident.ok || !ident.tierEquivalent) {
+      process.stderr.write('ROUTE-MODEL-UNDECLARED: routes.seats.' + role + '.model "' + seat.model +
+        '" is not in any provider\'s declared vocabulary -- falling back to opus fail-safe (this role only).\n');
+      printRoleModel('opus', '', 'opus', withEffort, withVersion);
+      return;
+    }
+    const tier = ident.tierEquivalent;
+    const { found: legacyFound, cfg: legacyCfg } = loadRoleConfig();
+    if (legacyFound) lintRoleConfig(legacyCfg);
+    const effort = legacyFound ? roleEffortFromCfg(legacyCfg, role) : '';
+    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || seat.model || tier;
+    printRoleModel(tier, effort, version, withEffort, withVersion);
+    return;
+  }
+
+  // Step 4 — SSOT genuinely ABSENT (ROUTE-NOT-FOUND): presence-guarded SKIP-not-FAIL (S6/AC1.2).
+  return legacyResolveRoleModel(role, withEffort, withVersion);
 }
 
 // #1494: resolve-effective-tier --model M --subagent-type T --transcript P [--session S] [--agents-dir D]
