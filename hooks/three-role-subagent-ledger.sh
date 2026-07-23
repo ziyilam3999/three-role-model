@@ -181,5 +181,8 @@ EFFORT_FLAG=""
 # EVERY role's close (harmless additive field for the four chain roles; load-bearing for research's
 # board punch-out in agent-kanban).
 CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG --closed-at "$CLOSED_AT" >/dev/null 2>&1
+# #1640 S11 -- re-sense the reroute stamp at CLOSE too (not just at spawn): a role resumed mid-session under a
+# base-url that changed since spawn gets its stamp refreshed at its own authoritative close edge. Same
+# fail-open semantics as the spawn edge (see three-role-spawn-ledger.sh) -- a no-op for an ordinary session.
+node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG --closed-at "$CLOSED_AT" --sense-reroute >/dev/null 2>&1
 exit 0
