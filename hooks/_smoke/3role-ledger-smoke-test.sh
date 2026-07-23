@@ -722,6 +722,188 @@ OUT_RF5=$(node "$LED" refresh-models --session "sess-1481-no-such-session" 2>&1)
 [ "$RC_RF5" = "0" ] && ok "#1481 T1e: no ledger dir for session -> fail-open exit 0" || bad "#1481 T1e fail-open failed (rc=$RC_RF5 out=$OUT_RF5)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1229 — `reconcile-spawns --session S` MISSING-ROW backfill. AC-0 through AC-6 per
+# .ai-workspace/plans/2026-07-23-1229-kanban-board-visibility.md. A tagged transcript carrying the spawn-record
+# tag in its FIRST record is the oracle (mk_tagged, defined above); resolve-agent's newest-mtime resolver and
+# resolveModelFields() are REUSED (never re-implemented).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+mk_tagged_model() { # <session> <agentId> <task> <role> <modelId>
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  { printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$5"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+# A tagged transcript that ALSO shows the agent self-appending its own line for --role R (the exact predicate
+# three-role-subagent-ledger.sh scans for) -- used by the AC-1b self_authored arm.
+mk_tagged_selfauthored() { # <session> <agentId> <task> <role> <modelId>
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  { printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session %s --task %s --role %s --artifact \\"x\\""}}]}}\n' \
+      "$2" "$5" "$1" "$3" "$4"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+
+# ---- AC-1a: row ABSENT -> row CREATED with {role, agentId, modelVersion, modelTier}. ----
+SID_RC="sess-1229-rc"; TASK_RCa="1229a"
+RCFILE_A="$THREE_ROLE_LEDGER_DIR/$SID_RC/$TASK_RCa.jsonl"
+mk_tagged_model "$SID_RC" rc-e1 "$TASK_RCa" executor "claude-sonnet-5"
+OUT_RC1=$(node "$LED" reconcile-spawns --session "$SID_RC" 2>&1); RC_RC1=$?
+{ [ "$RC_RC1" = "0" ] && echo "$OUT_RC1" | grep -q "changed=1" \
+  && grep -q '"agentId":"rc-e1"' "$RCFILE_A" && grep -q '"modelVersion":"claude-sonnet-5"' "$RCFILE_A" && grep -q '"modelTier":"sonnet"' "$RCFILE_A"; } \
+  && ok "#1229 AC-1a: absent row -> CREATED with agentId+modelVersion+modelTier (rc=$RC_RC1)" \
+  || bad "#1229 AC-1a failed (rc=$RC_RC1 out=$OUT_RC1 ledger=$(cat "$RCFILE_A" 2>/dev/null))"
+
+# ---- AC-0 (delete-the-input-oracle, live-proof power): removing the fixture transcript + re-running on a
+#      FRESH (session,task) with no ledger yet produces NO backfill (no ledger file created at all). ----
+SID_RC0="sess-1229-ac0"; TASK_RC0="1229ac0"
+mk_tagged_model "$SID_RC0" rc0-e1 "$TASK_RC0" executor "claude-sonnet-5"
+rm -f "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC0/subagents/agent-rc0-e1.jsonl"
+OUT_RC0=$(node "$LED" reconcile-spawns --session "$SID_RC0" 2>&1); RC_RC0=$?
+RC0FILE="$THREE_ROLE_LEDGER_DIR/$SID_RC0/$TASK_RC0.jsonl"
+{ [ "$RC_RC0" = "0" ] && [ ! -f "$RC0FILE" ]; } \
+  && ok "#1229 AC-0: removing the input transcript before the FIRST run -> NO backfill (power proof: the sweep's power comes from the transcript)" \
+  || bad "#1229 AC-0 failed (rc=$RC_RC0 out=$OUT_RC0 ledger-exists=$([ -f "$RC0FILE" ] && echo yes || echo no))"
+
+# ---- AC-2 (idempotent): re-running on the AC-1a ledger reports changed=0 and leaves the file byte-identical.
+#      Bump the transcript's mtime (simulating fresh tool activity) so the watermark short-circuit does NOT
+#      mask a real no-op scan -- this exercises the "scanned>0, changed=0" path, not just the watermark path.
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC/subagents/agent-rc-e1.jsonl"
+BEFORE_RC2="$(cat "$RCFILE_A")"
+OUT_RC2=$(node "$LED" reconcile-spawns --session "$SID_RC" 2>&1); RC_RC2=$?
+AFTER_RC2="$(cat "$RCFILE_A")"
+{ [ "$RC_RC2" = "0" ] && echo "$OUT_RC2" | grep -q "changed=0" && [ "$BEFORE_RC2" = "$AFTER_RC2" ]; } \
+  && ok "#1229 AC-2: re-running reconcile-spawns is idempotent (changed=0, ledger byte-identical)" \
+  || bad "#1229 AC-2 idempotency failed (rc=$RC_RC2 out=$OUT_RC2 before=$BEFORE_RC2 after=$AFTER_RC2)"
+
+# ---- AC-2b (watermark short-circuit): a SECOND immediate re-run with NO transcript mtime advance also
+#      reports success + fail-open with the ledger untouched (the cheap-guard path).
+BEFORE_RC2B="$(cat "$RCFILE_A")"
+OUT_RC2B=$(node "$LED" reconcile-spawns --session "$SID_RC" 2>&1); RC_RC2B=$?
+AFTER_RC2B="$(cat "$RCFILE_A")"
+{ [ "$RC_RC2B" = "0" ] && [ "$BEFORE_RC2B" = "$AFTER_RC2B" ]; } \
+  && ok "#1229 AC-2b: watermark short-circuit run -> exit 0, ledger untouched" \
+  || bad "#1229 AC-2b watermark short-circuit failed (rc=$RC_RC2B out=$OUT_RC2B)"
+
+# ---- AC-1b: row present with {role, artifact_path} but NO agentId (the self-append-only shape) ->
+#      agentId+model backfilled, artifact_path UNCHANGED; self_authored:true appears IFF the transcript shows
+#      the agent's own `append --role <role>` call.
+SID_RC1B="sess-1229-rc1b"; TASK_RC1B="1229b"
+RC1BFILE="$THREE_ROLE_LEDGER_DIR/$SID_RC1B/$TASK_RC1B.jsonl"
+mk_tagged_selfauthored "$SID_RC1B" rc1b-e1 "$TASK_RC1B" executor "claude-sonnet-5"
+node "$LED" append --session "$SID_RC1B" --task "$TASK_RC1B" --role executor --artifact "PR #1229b" >/dev/null
+OUT_RC1B=$(node "$LED" reconcile-spawns --session "$SID_RC1B" 2>&1); RC_RC1B=$?
+{ [ "$RC_RC1B" = "0" ] \
+  && grep -q '"agentId":"rc1b-e1"' "$RC1BFILE" \
+  && grep -q '"artifact_path":"PR #1229b"' "$RC1BFILE" \
+  && grep -q '"self_authored":true' "$RC1BFILE"; } \
+  && ok "#1229 AC-1b: self-append-only row -> agentId+model+self_authored backfilled, artifact_path UNCHANGED (rc=$RC_RC1B)" \
+  || bad "#1229 AC-1b failed (rc=$RC_RC1B out=$OUT_RC1B ledger=$(cat "$RC1BFILE" 2>/dev/null))"
+
+# ---- AC-1c (no false self_authored): the SAME shape but WITHOUT the self-append Bash call in the transcript
+#      -> agentId+model backfilled, self_authored NEVER appears.
+SID_RC1C="sess-1229-rc1c"; TASK_RC1C="1229c"
+RC1CFILE="$THREE_ROLE_LEDGER_DIR/$SID_RC1C/$TASK_RC1C.jsonl"
+mk_tagged_model "$SID_RC1C" rc1c-e1 "$TASK_RC1C" executor "claude-sonnet-5"
+node "$LED" append --session "$SID_RC1C" --task "$TASK_RC1C" --role executor --artifact "PR #1229c" >/dev/null
+node "$LED" reconcile-spawns --session "$SID_RC1C" >/dev/null 2>&1
+{ grep -q '"agentId":"rc1c-e1"' "$RC1CFILE" && ! grep -q '"self_authored"' "$RC1CFILE"; } \
+  && ok "#1229 AC-1c: no self-append call in transcript -> self_authored NEVER stamped (no blind stamp)" \
+  || bad "#1229 AC-1c failed (ledger=$(cat "$RC1CFILE" 2>/dev/null))"
+
+# ---- AC-3a: a row already carrying a DIFFERENT real agentId is left byte-UNCHANGED even when a newer tagged
+#      transcript for the same (task,role) shows up (the #1580 round-boundary trap; simulates a stray retry). ----
+SID_RC3="sess-1229-rc3"; TASK_RC3="1229d"
+RC3FILE="$THREE_ROLE_LEDGER_DIR/$SID_RC3/$TASK_RC3.jsonl"
+mk_sub "$SID_RC3" rc3-real1
+node "$LED" append --session "$SID_RC3" --task "$TASK_RC3" --role planner --agent rc3-real1 --artifact "$TMP/plan.md" >/dev/null
+BEFORE_RC3="$(cat "$RC3FILE")"
+mk_tagged "$SID_RC3" rc3-stray1 "$TASK_RC3" planner
+OUT_RC3=$(node "$LED" reconcile-spawns --session "$SID_RC3" 2>&1); RC_RC3=$?
+AFTER_RC3="$(cat "$RC3FILE")"
+{ [ "$RC_RC3" = "0" ] && [ "$BEFORE_RC3" = "$AFTER_RC3" ]; } \
+  && ok "#1229 AC-3a: a row with a DIFFERENT real agentId is left byte-unchanged (never disturbs a genuine row)" \
+  || bad "#1229 AC-3a failed (rc=$RC_RC3 out=$OUT_RC3 before=$BEFORE_RC3 after=$AFTER_RC3)"
+
+# ---- AC-3b: an inline-skip row (skip_reason, no transcript match otherwise) is NEVER touched even when a
+#      tagged transcript for that same (task,role) shows up. ----
+SID_RC3B="sess-1229-rc3b"; TASK_RC3B="1229e"
+RC3BFILE="$THREE_ROLE_LEDGER_DIR/$SID_RC3B/$TASK_RC3B.jsonl"
+node "$LED" append --session "$SID_RC3B" --task "$TASK_RC3B" --role planner --skip-reason "not briefable this round" >/dev/null
+BEFORE_RC3B="$(cat "$RC3BFILE")"
+mk_tagged "$SID_RC3B" rc3b-e1 "$TASK_RC3B" planner
+node "$LED" reconcile-spawns --session "$SID_RC3B" >/dev/null 2>&1
+AFTER_RC3B="$(cat "$RC3BFILE")"
+[ "$BEFORE_RC3B" = "$AFTER_RC3B" ] && ok "#1229 AC-3b: an inline-skip row is NEVER touched even when a transcript later appears" || bad "#1229 AC-3b failed (before=$BEFORE_RC3B after=$AFTER_RC3B)"
+
+# ---- AC-3c: a transcript with NO 3ROLE_TASK tag produces NO row. (The session's ledger DIR may still be
+#      created as a side effect of the watermark bookkeeping -- that is not a "row"; assert no *.jsonl task
+#      file exists, which is the actual AC-3 property: no board-visible row.) ----
+SID_RC3C="sess-1229-rc3c"
+mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC3C/subagents"
+printf '{"type":"user","message":{"role":"user","content":"just an ordinary message, no tag here"}}\n' \
+  > "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC3C/subagents/agent-rc3c-e1.jsonl"
+node "$LED" reconcile-spawns --session "$SID_RC3C" >/dev/null 2>&1
+rc3c_rows=$(find "$THREE_ROLE_LEDGER_DIR/$SID_RC3C" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+[ "$rc3c_rows" = "0" ] && ok "#1229 AC-3c: an untagged transcript produces NO row" || bad "#1229 AC-3c: an untagged transcript should create NO row (found $rc3c_rows)"
+
+# ---- (D) role-enum discipline (plan-review fold-in): a malformed `ROLE:foobar` tag is REJECTED, never filed
+#      as a garbage-role row. Validated against the SAME RECORDABLE_ROLES enum cmdAppend's role guard uses.
+#      (Same dir-vs-row caveat as AC-3c above -- assert no *.jsonl task file, not "no dir".) ----
+SID_RCBAD="sess-1229-rcbad"
+mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RCBAD/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:1229z ROLE:foobar -- do the work"}}\n' \
+  > "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RCBAD/subagents/agent-rcbad-e1.jsonl"
+node "$LED" reconcile-spawns --session "$SID_RCBAD" >/dev/null 2>&1
+rcbad_rows=$(find "$THREE_ROLE_LEDGER_DIR/$SID_RCBAD" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+[ "$rcbad_rows" = "0" ] && ok "#1229 (D): malformed ROLE:foobar tag REJECTED (RECORDABLE_ROLES enum validation) -- no row filed" || bad "#1229 (D): a malformed ROLE:foobar tag should never file a row (found $rcbad_rows)"
+
+# ---- AC-4a (fail-open): a nonexistent session -> exit 0, no throw. ----
+OUT_RC4A=$(node "$LED" reconcile-spawns --session "sess-1229-no-such-session" 2>&1); RC_RC4A=$?
+[ "$RC_RC4A" = "0" ] && ok "#1229 AC-4a: nonexistent session -> fail-open exit 0" || bad "#1229 AC-4a failed (rc=$RC_RC4A out=$OUT_RC4A)"
+
+# ---- AC-4b (fail-open): an unreadable/absent projects root -> exit 0, no throw. ----
+OUT_RC4B=$(THREE_ROLE_PROJECTS_ROOT="$TMP/does-not-exist-root-1229" node "$LED" reconcile-spawns --session "$SID_RC" 2>&1); RC_RC4B=$?
+[ "$RC_RC4B" = "0" ] && ok "#1229 AC-4b: unreadable projects root -> fail-open exit 0" || bad "#1229 AC-4b failed (rc=$RC_RC4B out=$OUT_RC4B)"
+
+# ---- AC-4c (fail-open): a malformed (non-JSON) transcript never crashes the scan. ----
+SID_RC4C="sess-1229-rc4c"
+mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC4C/subagents"
+printf 'not valid json {{{\n' > "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC4C/subagents/agent-rc4c-e1.jsonl"
+OUT_RC4C=$(node "$LED" reconcile-spawns --session "$SID_RC4C" 2>&1); RC_RC4C=$?
+[ "$RC_RC4C" = "0" ] && ok "#1229 AC-4c: malformed transcript -> fail-open exit 0, no crash" || bad "#1229 AC-4c failed (rc=$RC_RC4C out=$OUT_RC4C)"
+
+# ---- AC-5 (resync only on change): a run that backfills >=1 row fires kanban-resync.sh exactly once; a
+#      no-change run fires it zero times. fireResyncBackground() spawns a DETACHED child with stdio 'ignore'
+#      (never inherits this process's stdout), and resolves the script via THIS FILE's own realpath -- so the
+#      hermetic proof copies 3role-ledger.mjs (like the #1544 AB_HERMETIC pattern above) into a throwaway dir
+#      alongside a STUB kanban-resync.sh that appends "would-sync" to a MARKER FILE (a real side effect,
+#      unaffected by stdio:'ignore') instead of echoing to a swallowed stdout.
+AC5_DIR="$(mktemp -d)"; mkdir -p "$AC5_DIR/hooks"
+cp "$LED" "$AC5_DIR/hooks/3role-ledger.mjs"
+cat > "$AC5_DIR/hooks/kanban-resync.sh" <<'RESYNCSTUB'
+#!/usr/bin/env bash
+echo "would-sync" >> "$RESYNC_MARKER_1229"
+exit 0
+RESYNCSTUB
+chmod +x "$AC5_DIR/hooks/kanban-resync.sh"
+LED_AC5="$AC5_DIR/hooks/3role-ledger.mjs"
+export RESYNC_MARKER_1229="$AC5_DIR/resync.log"; : > "$RESYNC_MARKER_1229"
+
+SID_RC5="sess-1229-rc5"; TASK_RC5="1229f"
+mk_tagged_model "$SID_RC5" rc5-e1 "$TASK_RC5" executor "claude-sonnet-5"
+node "$LED_AC5" reconcile-spawns --session "$SID_RC5" >/dev/null 2>&1
+sleep 0.3
+n5a=$(grep -c . "$RESYNC_MARKER_1229" 2>/dev/null); [ -n "$n5a" ] || n5a=0
+[ "$n5a" = "1" ] && ok "#1229 AC-5: a backfilling run fires kanban-resync exactly once" || bad "#1229 AC-5 backfill-fires-once failed (n=$n5a)"
+
+: > "$RESYNC_MARKER_1229"
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$SID_RC5/subagents/agent-rc5-e1.jsonl"
+node "$LED_AC5" reconcile-spawns --session "$SID_RC5" >/dev/null 2>&1
+sleep 0.3
+n5b=$(grep -c . "$RESYNC_MARKER_1229" 2>/dev/null); [ -n "$n5b" ] || n5b=0
+[ "$n5b" = "0" ] && ok "#1229 AC-5: a no-change run fires kanban-resync zero times" || bad "#1229 AC-5 no-change-fires-zero failed (n=$n5b)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #1495 — research seat ledger-visibility. cmdAppend's role guard now reads RECORDABLE_ROLES (= REQUIRED_ROLES
 # + 'research'), while REQUIRED_ROLES itself and all four completion-loops (cmdCheck / --enforce-role-models /
 # provenance / cmdRefreshModels) stay UNCHANGED — a research row is recorded but NEVER gates a close (G1).
