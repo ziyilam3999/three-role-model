@@ -137,6 +137,40 @@
 //     (backgrounded, fail-open) exactly ONCE per invocation, and ONLY when >=1 role actually flipped
 //     absent->present (no-change scans never resync — bounds the extra board-upload cost). ALWAYS exits 0
 //     (fail-open) — a refresh error must never wedge its caller (a backgrounded hook trigger).
+//   reconcile-spawns --session S                                    (#1229)
+//     MISSING-ROW backfill for the dropped-harness-event gap: for a meaningful fraction of background Agent
+//     dispatches, NEITHER the spawn-ledger hook (PostToolUse) NOR the SubagentStop ledger hook fires, even
+//     though the subagent's own transcript genuinely exists at <PROJECTS_ROOT>/*/<S>/subagents/agent-<id>.jsonl
+//     and its spawn record carries a `3ROLE_TASK:<task> ROLE:<role>` tag — so the ledger row is ABSENT
+//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above). Walks
+//     every subagent transcript under <PROJECTS_ROOT>/*/<S>/subagents/agent-*.jsonl, extracts each transcript's
+//     spawn-record tag via the SAME firstRecordText()+`/3ROLE_TASK:(\S+) ROLE:(\S+)/` shape
+//     tagFromSubagentTranscript() uses (reuse, not a new parser), validates the extracted role against the
+//     SAME RECORDABLE_ROLES enum cmdAppend's own role guard uses (a malformed `ROLE:foobar` tag is REJECTED,
+//     never filed as a garbage-role row), groups by (task, role), and resolves the AUTHORITATIVE agentId per
+//     group via the existing resolveAgent() newest-mtime resolver (the #860 stale-probe defense — reused, not
+//     re-implemented). For each group: reads the current ledger row; a row already carrying a DIFFERENT real
+//     agentId is left byte-untouched (never disturb a genuine row — the #1580 round-boundary trap); an
+//     inline-skipped row (skip_reason present) is never touched (mirrors cmdRefreshModels's own
+//     `if ('skip_reason' in e) continue`); otherwise backfills ONLY agentId (absent->present), modelVersion/
+//     modelTier (via the SAME resolveModelFields() helper cmdAppend/cmdRefreshModels use), and
+//     self_authored:true (ONLY when an honest provenance scan of the resolved agent's OWN transcript shows its
+//     own `3role-ledger.mjs ... append ... --role <role>` Bash tool_use call — reproducing
+//     three-role-subagent-ledger.sh's exact predicate, never a blind stamp) through the SAME overlayAppend()
+//     path append/refresh-models use — inheriting idempotency, per-key "provided" discipline, and
+//     terminal-evidence monotonicity for free. NEVER stamps `closedAt` (a transcript existing on disk does not
+//     prove the subagent STOPPED — that stays close-exclusive to the real SubagentStop hook) and NEVER passes
+//     `artifact_path` (so a swept row can never launder a completion). Idempotent: a group with nothing left to
+//     add (agentId already matches, model already resolved, self_authored already stamped) makes NO
+//     overlayAppend call at all — not even a no-op re-append — so the ledger file stays byte-identical on a
+//     second run (a bare re-append would still refresh `ts` and break byte-identity). A per-session,
+//     mtime-based watermark short-circuits to a cheap readdir/stat-only scan (no per-transcript read, no
+//     writes) when no subagent transcript has advanced past the last sweep. Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed (mirrors
+//     refresh-models). Every per-row overlayAppend call is individually wrapped — one row's failure is
+//     logged-and-skipped, never fatal. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook
+//     call it rides (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models
+//     already uses).
 //   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
 //     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
@@ -2181,6 +2215,149 @@ function cmdRefreshModels(o) {
   }
 }
 
+// #1229 — reproduces three-role-subagent-ledger.sh's EXACT self_authored provenance predicate (never a
+// blind stamp): an ASSISTANT message in the agent's OWN transcript containing a Bash tool_use whose command
+// invokes `3role-ledger.mjs ... append ...` AND names `--role <role>`. Fail-open: any read/parse trouble
+// returns false (never fabricates a stamp on a can't-tell path).
+function transcriptSelfAuthored(file, role) {
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) { return false; }
+  const roleRe = new RegExp('--role\\s+' + role);
+  for (const ln of content.split('\n')) {
+    if (!ln.trim()) continue;
+    let j;
+    try { j = JSON.parse(ln); } catch (e) { continue; }
+    const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+    if (!isAsst) continue;
+    const c = j.message && j.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const blk of c) {
+      if (!blk || blk.type !== 'tool_use') continue;
+      if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+      const cmd = String((blk.input && blk.input.command) || '');
+      if (/3role-ledger\.mjs[\s\S]*?\bappend\b/.test(cmd) && roleRe.test(cmd)) return true;
+    }
+  }
+  return false;
+}
+
+// #1229: reconcile-spawns --session S — MISSING-ROW backfill (see the file-header doc block above for the
+// full design rationale). Walks every subagent transcript for the session, discovers tagged (task, role)
+// pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
+// agentId, modelVersion/modelTier, self_authored. Never touches artifact_path/closedAt/verdict/skip_reason.
+// ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides.
+function cmdReconcileSpawns(o) {
+  try {
+    const session = o.session;
+    if (!session) { console.log('OK reconcile-spawns: no --session given (fail-open, nothing to do)'); process.exit(0); }
+    const sess = sanitize(session);
+
+    let slugs = [];
+    try { slugs = fs.readdirSync(PROJECTS_ROOT); }
+    catch (e) { console.log('OK reconcile-spawns: no projects root'); process.exit(0); }
+
+    // Discover every subagent transcript for this session across all project slugs (cheap: readdir + stat
+    // only in this pass — the per-transcript READ happens below, gated by the watermark short-circuit).
+    let newestMtime = 0;
+    const transcripts = []; // {agentId, file, mtimeMs}
+    for (const slug of slugs) {
+      const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
+      let files = [];
+      try { files = fs.readdirSync(dir); } catch (e) { continue; }
+      for (const fn of files) {
+        const m = fn.match(/^agent-(.+)\.jsonl$/);
+        if (!m) continue;
+        const f = path.join(dir, fn);
+        let st;
+        try { st = fs.statSync(f); } catch (e) { continue; }
+        if (!st.isFile()) continue;
+        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs });
+        if (st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
+      }
+    }
+    if (transcripts.length === 0) { console.log('OK reconcile-spawns: no subagent transcripts for session ' + sess); process.exit(0); }
+
+    // Cheap per-session watermark: short-circuits to the readdir/stat scan above (no per-transcript read, no
+    // writes) when no transcript has advanced past the last sweep. Stored as a hidden file inside the
+    // session's ledger dir (kept out of the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use).
+    const watermarkFile = path.join(LEDGER_DIR, sess, '.reconcile-watermark');
+    let lastWatermark = 0;
+    try { lastWatermark = Number(fs.readFileSync(watermarkFile, 'utf8').trim()) || 0; } catch (e) { lastWatermark = 0; }
+    if (newestMtime > 0 && newestMtime <= lastWatermark) {
+      console.log('OK reconcile-spawns: session=' + sess + ' no new transcript activity since last sweep (watermark)');
+      process.exit(0);
+    }
+
+    // Extract + validate the spawn-record tag per transcript (reuse firstRecordText() — the SAME predicate
+    // tagFromSubagentTranscript()/resolveAgent() use — never a new/looser parser). Role is validated against
+    // RECORDABLE_ROLES (the SAME enum cmdAppend's own role guard uses) so a malformed `ROLE:foobar` tag is
+    // REJECTED rather than filed as a garbage-role row.
+    const groups = new Set(); // "task role"
+    for (const t of transcripts) {
+      let content;
+      try { content = fs.readFileSync(t.file, 'utf8'); } catch (e) { continue; }
+      const text = firstRecordText(content);
+      if (!text) continue;
+      const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
+      if (!m) continue;
+      const task = sanitize(m[1]);
+      const role = m[2];
+      if (!task || !RECORDABLE_ROLES.includes(role)) continue;
+      groups.add(task + ' ' + role);
+    }
+
+    let scanned = 0;
+    let changed = 0;
+    for (const key of groups) {
+      const [task, role] = key.split(' ');
+      scanned++;
+      // Authoritative agentId: reuse resolveAgent()'s own newest-mtime resolver (the #860 stale-probe
+      // defense) rather than re-deriving a winner from the walk above.
+      const agentId = resolveAgent(sess, task, role);
+      if (!agentId) continue; // fail-open: shouldn't happen given groups was built from a real tagged hit.
+
+      const file = ledgerFile(sess, task);
+      let lines = [];
+      try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { /* no ledger yet */ }
+      let prior = null;
+      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) prior = j; } catch (e) { /* skip */ } }
+
+      // Never disturb an inline-skip row (mirrors cmdRefreshModels's own `if ('skip_reason' in e) continue`).
+      if (prior && ('skip_reason' in prior)) continue;
+      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) —
+      // write ONLY when the row is absent, its agentId is absent, or its agentId equals the resolved one.
+      if (prior && prior.agentId && prior.agentId !== agentId) continue;
+
+      // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
+      // call at all (idempotency — AC-2: a bare re-append would still refresh `ts` and break byte-identity).
+      const fields = {};
+      let hasChange = false;
+      if (!prior || !prior.agentId) { fields.agentId = agentId; hasChange = true; }
+
+      const modelFields = resolveModelFields(sess, task, role, agentId);
+      if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
+      if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
+
+      if (!prior || !prior.self_authored) {
+        const tr = transcripts.find((t) => t.agentId === agentId);
+        if (tr && transcriptSelfAuthored(tr.file, role)) { fields.self_authored = true; hasChange = true; }
+      }
+
+      if (!hasChange) continue;
+      try { overlayAppend(sess, task, role, fields); changed++; }
+      catch (e) { /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
+    }
+
+    try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
+    if (changed > 0) fireResyncBackground();
+    console.log('OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed);
+    process.exit(0);
+  } catch (e) {
+    console.log('OK reconcile-spawns: error (fail-open): ' + (e && e.message ? e.message : e));
+    process.exit(0);
+  }
+}
+
 // #1448: resolve-role-model --role <role> [--with-effort] [--with-version]
 // Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
 // fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
@@ -2749,6 +2926,7 @@ try {
   else if (cmd === 'check') cmdCheck(opts);
   else if (cmd === 'heartbeat') cmdHeartbeat(opts);
   else if (cmd === 'refresh-models') cmdRefreshModels(opts);
+  else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
@@ -2760,9 +2938,9 @@ try {
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
-      '[--session S (refresh-models)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
+      '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
       '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
