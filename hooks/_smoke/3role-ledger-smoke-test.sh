@@ -1423,49 +1423,44 @@ n4b=$(grep -c '"role":"executor"' "$AC4BF"); both4b=$(both_on_line "$AC4BF" '"ag
 # #1590 — MONOTONICITY TRIPWIRE. THE RULE (census `.ai-workspace/reviews/1590-monotonicity-census.md`):
 # a bare assertion (skip_reason) must NEVER erase attributable, checkable evidence (agentId+artifact_path,
 # closedAt, oracle, verdict, self_authored). Both-ends-boolean, proven against TWO code snapshots:
-#   RED  -- the PINNED pre-#1580 blob (`git show 0ba0e4233:hooks/3role-ledger.mjs`, the exact master SHA
-#           the #1590 census probed live): overlayAppend's clear-list unconditionally erases those fields
-#           on ANY skip_reason append, no guard existed for a verdict-less completed row.
-#   GREEN -- current code: #1580's terminal-evidence guard REFUSES the same append (nonzero exit),
-#           evidence fields PRESERVED.
+#   RED  -- a COMMITTED STATIC FIXTURE (#1833 Bundle 1A, hooks/_fixtures/3role-ledger-pre1580-overlay.mjs):
+#           a minimal, in-pocket port of the pre-#1580 overlayAppend, byte-behavior-verified against the
+#           pinned SHA 0ba0e4233 — its terminal-evidence guard is keyed ONLY on prior.verdict, so a
+#           completed EXECUTOR row (agentId+artifact_path+closedAt, no verdict) is erased by a bare
+#           skip_reason append. NO git dependency: does not call `git show`/`cat-file`, does not require any
+#           ancestor SHA to be reachable — always runs for real (full clone, shallow CI, and the
+#           three-role-model plugin repo's own independent commit graph, alike). #1833's whole point: the
+#           OLD acquisition (a `cat-file -e <pinned-SHA>:<path>` existence guard around a `show
+#           <pinned-SHA>:<path>` extraction, pinned SHA = the ai-brain master ancestor the #1590 census
+#           probed live) fail-opened to a vacuous informational SKIP the instant that ancestor was
+#           unreachable — this fixture removes that failure mode entirely by carrying the pre-fix behavior
+#           in its own pocket instead of fetching it.
+#   GREEN -- current code: #1580's terminal-evidence guard (priorHasTerminalEvidence: verdict OR closedAt OR
+#           self_authored OR oracle OR a completed agentId+artifact_path pair) REFUSES the same append
+#           (nonzero exit), evidence fields PRESERVED.
 # A third fixture (named literally `run-supersedes-skip`, AC6) proves the guard does NOT false-fire on
 # the legitimate UPGRADE arm -- a real run clearing a stale skip is SUPERSESSION (legal per THE RULE) and
-# must stay green on BOTH code snapshots. #1590 does not edit 3role-ledger.mjs (AC8 scope fence) -- this
-# section only RUNS it (current + a `git show`-extracted read-only snapshot of the pinned pre-fix blob).
+# must stay green on BOTH the pre-fix fixture and current code. #1590 does not edit 3role-ledger.mjs (AC8
+# scope fence) -- this section only RUNS it (current code + the committed pre-fix fixture, never a git ref).
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-# The pinned pre-#1580 blob is looked up in THIS repo's own git history -- honest by construction: in the
-# ai-brain canonical repo, 0ba0e4233 is a real reachable ancestor of master (the exact SHA the #1590 census
-# probed live), so the RED-power proof below is authoritative there. In the three-role-model PLUGIN repo
-# (a separate GitHub repo with its OWN commit graph -- this file is a byte-identical deterministic PORT, not
-# a git-history fork), that SHA is legitimately unreachable, so the RED leg fails OPEN to an informational
-# SKIP rather than a false FAIL -- mirrors this file's existing can't-tell fail-open style (e.g. isGitTracked
-# returning null on a non-repo/128 exit). The GREEN leg and the run-supersedes-skip POST leg are
-# repo-independent and always run for real in both repos.
-REPO_ROOT="$(cd "$DIR/.." && pwd)"
-MONO_PREFIX_SHA="0ba0e4233"
-MONO_PREFIX_LED="$TMP/3role-ledger-prefix-$MONO_PREFIX_SHA.mjs"
-MONO_PREFIX_AVAILABLE=0
-if git -C "$REPO_ROOT" cat-file -e "$MONO_PREFIX_SHA:hooks/3role-ledger.mjs" >/dev/null 2>&1; then
-  git -C "$REPO_ROOT" show "$MONO_PREFIX_SHA:hooks/3role-ledger.mjs" > "$MONO_PREFIX_LED" 2>/dev/null
-  [ -s "$MONO_PREFIX_LED" ] && MONO_PREFIX_AVAILABLE=1
-fi
+MONO_FIXTURE="$DIR/_fixtures/3role-ledger-pre1580-overlay.mjs"
 
 # monotonicity-tripwire-red / monotonicity-tripwire-green: the erasure fixture.
-if [ "$MONO_PREFIX_AVAILABLE" = "1" ]; then
+if [ -s "$MONO_FIXTURE" ]; then
   MONODIR_PRE="$TMP/mono-erasure-pre"
   ( export THREE_ROLE_LEDGER_DIR="$MONODIR_PRE"; export THREE_ROLE_PROJECTS_ROOT="$TMP/mono-projects-pre"
-    node "$MONO_PREFIX_LED" append --session mono --task erasure-red --role executor \
+    node "$MONO_FIXTURE" append --session mono --task erasure-red --role executor \
       --agent monoAgentPre --artifact "tmp/mono.md" --closed-at "2026-07-15T10:00:00Z" >/dev/null 2>&1
-    node "$MONO_PREFIX_LED" append --session mono --task erasure-red --role executor \
+    node "$MONO_FIXTURE" append --session mono --task erasure-red --role executor \
       --skip-reason "ran it inline myself" >/dev/null 2>&1
   )
   MONO_PRE_FILE="$MONODIR_PRE/mono/erasure-red.jsonl"
   mono_pre_survived=$(grep -c '"agentId":"monoAgentPre"' "$MONO_PRE_FILE" 2>/dev/null); mono_pre_survived="${mono_pre_survived:-0}"
   { [ "$mono_pre_survived" = "0" ]; } \
-    && ok "#1590 monotonicity-tripwire-red (pinned pre-#1580 blob $MONO_PREFIX_SHA): a bare skip_reason ERASES a completed executor row's agentId/artifact_path/closedAt -- the live erasure this ticket targets, RED power proven on the pinned SHA today" \
-    || bad "#1590 monotonicity-tripwire-red should show erasure on the pinned pre-#1580 blob (agentId survived=$mono_pre_survived, expected 0) -- pre-fix blob behavior drifted, re-verify the $MONO_PREFIX_SHA pin"
+    && ok "#1590 monotonicity-tripwire-red (committed pre-#1580 fixture, no git dependency): a bare reason-only append ERASES a completed executor row's agentId/artifact_path/closedAt -- the live erasure this ticket targets, RED power proven hermetically today" \
+    || bad "#1590 monotonicity-tripwire-red should show erasure on the pre-#1580 fixture (agentId survived=$mono_pre_survived, expected 0) -- fixture behavior drifted, re-verify hooks/_fixtures/3role-ledger-pre1580-overlay.mjs against pinned SHA 0ba0e4233"
 else
-  ok "#1590 monotonicity-tripwire-red: SKIP -- pinned pre-#1580 blob ($MONO_PREFIX_SHA:hooks/3role-ledger.mjs) not reachable in this repo's git history (expected in the plugin-synced copy, a separate repo whose commit graph does not carry ai-brain's SHAs; the RED-power proof is authoritative in the ai-brain canonical repo)"
+  bad "#1590 monotonicity-tripwire-red: FIXTURE MISSING at $MONO_FIXTURE -- this fixture is committed and must always be present (it replaced the old git-object acquisition; its absence means the RED leg cannot prove pre-#1580 erasure at all)"
 fi
 
 MONODIR_POST="$TMP/mono-erasure-post"
@@ -1480,31 +1475,35 @@ MONO_POST_FILE="$MONODIR_POST/mono/erasure-green.jsonl"
 mono_post_rc=$(cat "$TMP/mono-post-skip.rc" 2>/dev/null || echo 1)
 mono_post_survived=$(grep -c '"agentId":"monoAgentPost"' "$MONO_POST_FILE" 2>/dev/null); mono_post_survived="${mono_post_survived:-0}"
 { [ "$mono_post_rc" != "0" ] && [ "$mono_post_survived" = "1" ]; } \
-  && ok "#1590 monotonicity-tripwire-green (current code): terminal-evidence guard REFUSES the same skip_reason append (rc=$mono_post_rc), agentId/artifact_path/closedAt PRESERVED" \
+  && ok "#1590 monotonicity-tripwire-green (current code): terminal-evidence guard REFUSES the same reason-only append (rc=$mono_post_rc), agentId/artifact_path/closedAt PRESERVED" \
   || bad "#1590 monotonicity-tripwire-green should refuse the skip + preserve evidence on current code (rc=$mono_post_rc survived=$mono_post_survived out=$(cat "$TMP/mono-post-skip.out" 2>/dev/null))"
 
+# AC3 -- NON-DECAY GUARD (#1833). The pre-#1580 fixture MUST behave DIFFERENTLY from current code (erasure
+# vs preserve) on the identical completed-executor-row + skip-reason inputs. If a future edit ever
+# regenerated the fixture from live code (accidentally adopting the priorHasTerminalEvidence guard), the
+# RED and GREEN arms would collapse to the SAME outcome -- a fixed-vs-fixed tautology, green but proving
+# nothing. This assertion is the tripwire for that decay.
+{ [ "$mono_pre_survived" != "$mono_post_survived" ]; } \
+  && ok "#1833 AC3 non-decay guard: pre-#1580 fixture erasure (agentId survived=$mono_pre_survived) differs from current-code preservation (agentId survived=$mono_post_survived) -- the RED/GREEN split still has power, has not decayed into a tautology" \
+  || bad "#1833 AC3 non-decay guard: the pre-#1580 fixture and current code produced the SAME survival outcome (both=$mono_pre_survived) -- the fixture has decayed into a fixed-vs-fixed tautology; do NOT regenerate hooks/_fixtures/3role-ledger-pre1580-overlay.mjs from live code"
+
 # run-supersedes-skip (AC6): the legitimate UPGRADE arm -- a real run clearing a stale skip -- must stay
-# GREEN on BOTH the pinned pre-#1580 blob and current code (the guard must never false-fire on the correct
+# GREEN on BOTH the pre-#1580 fixture and current code (the guard must never false-fire on the correct
 # sibling arm at overlayAppend, the mutual-exclusion clear at `if (agentId||oracle) delete skip_reason`).
-# Vacuously true when the pre-fix blob isn't available in this repo's history (the plugin-repo case above)
-# -- there is nothing dishonest here: the upgrade arm being "untested pre-fix" in the plugin repo is not a
-# failure, it's the same repo-independence the RED leg already fails open on. When available (ai-brain), it
-# is REQUIRED to actually pass -- default is only the escape hatch, never silently overridden when testable.
-mono_upgrade_pre_ok=1
-if [ "$MONO_PREFIX_AVAILABLE" = "1" ]; then
-  mono_upgrade_pre_ok=0
-  UPGDIR_PRE="$TMP/mono-run-supersedes-skip-pre"
-  ( export THREE_ROLE_LEDGER_DIR="$UPGDIR_PRE"; export THREE_ROLE_PROJECTS_ROOT="$TMP/mono-projects-upg-pre"
-    node "$MONO_PREFIX_LED" append --session mono --task run-supersedes-skip-pre --role planner \
-      --skip-reason "not yet started" >/dev/null 2>&1
-    node "$MONO_PREFIX_LED" append --session mono --task run-supersedes-skip-pre --role planner \
-      --agent monoUpgPre --artifact "$TMP/plan.md" >/dev/null 2>&1
-  )
-  UPG_PRE_FILE="$UPGDIR_PRE/mono/run-supersedes-skip-pre.jsonl"
-  upg_pre_agent=$(grep -c '"agentId":"monoUpgPre"' "$UPG_PRE_FILE" 2>/dev/null); upg_pre_agent="${upg_pre_agent:-0}"
-  upg_pre_skip=$(grep -c '"skip_reason"' "$UPG_PRE_FILE" 2>/dev/null); upg_pre_skip="${upg_pre_skip:-0}"
-  { [ "$upg_pre_agent" = "1" ] && [ "$upg_pre_skip" = "0" ]; } && mono_upgrade_pre_ok=1
-fi
+# The fixture is committed and always in-pocket (no reachability escape hatch any more) -- REQUIRED to pass.
+UPGDIR_PRE="$TMP/mono-run-supersedes-skip-pre"
+( export THREE_ROLE_LEDGER_DIR="$UPGDIR_PRE"; export THREE_ROLE_PROJECTS_ROOT="$TMP/mono-projects-upg-pre"
+  node "$MONO_FIXTURE" append --session mono --task run-supersedes-skip-pre --role planner \
+    --skip-reason "not yet started" >/dev/null 2>&1
+  node "$MONO_FIXTURE" append --session mono --task run-supersedes-skip-pre --role planner \
+    --agent monoUpgPre --artifact "$TMP/plan.md" >/dev/null 2>&1
+)
+UPG_PRE_FILE="$UPGDIR_PRE/mono/run-supersedes-skip-pre.jsonl"
+upg_pre_agent=$(grep -c '"agentId":"monoUpgPre"' "$UPG_PRE_FILE" 2>/dev/null); upg_pre_agent="${upg_pre_agent:-0}"
+upg_pre_skip=$(grep -c '"skip_reason"' "$UPG_PRE_FILE" 2>/dev/null); upg_pre_skip="${upg_pre_skip:-0}"
+mono_upgrade_pre_ok=0
+{ [ "$upg_pre_agent" = "1" ] && [ "$upg_pre_skip" = "0" ]; } && mono_upgrade_pre_ok=1
+
 UPGDIR_POST="$TMP/mono-run-supersedes-skip-post"
 ( export THREE_ROLE_LEDGER_DIR="$UPGDIR_POST"; export THREE_ROLE_PROJECTS_ROOT="$TMP/mono-projects-upg-post"
   node "$LED" append --session mono --task run-supersedes-skip-post --role planner \
@@ -1515,10 +1514,8 @@ UPGDIR_POST="$TMP/mono-run-supersedes-skip-post"
 UPG_POST_FILE="$UPGDIR_POST/mono/run-supersedes-skip-post.jsonl"
 upg_post_agent=$(grep -c '"agentId":"monoUpgPost"' "$UPG_POST_FILE" 2>/dev/null); upg_post_agent="${upg_post_agent:-0}"
 upg_post_skip=$(grep -c '"skip_reason"' "$UPG_POST_FILE" 2>/dev/null); upg_post_skip="${upg_post_skip:-0}"
-MONO_UPG_SCOPE="on BOTH the pinned pre-#1580 blob and current code"
-[ "$MONO_PREFIX_AVAILABLE" = "1" ] || MONO_UPG_SCOPE="on current code (pre-#1580 blob leg N/A in this repo, see the RED-leg SKIP above)"
 { [ "$mono_upgrade_pre_ok" = "1" ] && [ "$upg_post_agent" = "1" ] && [ "$upg_post_skip" = "0" ]; } \
-  && ok "#1590 run-supersedes-skip: the legitimate UPGRADE arm (a real run clearing a stale skip) stays GREEN $MONO_UPG_SCOPE -- the guard does not false-fire on SUPERSESSION" \
-  || bad "#1590 run-supersedes-skip should pass $MONO_UPG_SCOPE (pre-ok=$mono_upgrade_pre_ok post-agent=$upg_post_agent post-skip=$upg_post_skip)"
+  && ok "#1590 run-supersedes-skip: the legitimate UPGRADE arm (a real run clearing a stale skip) stays GREEN on BOTH the pre-#1580 fixture and current code -- the guard does not false-fire on SUPERSESSION" \
+  || bad "#1590 run-supersedes-skip should pass on both the pre-#1580 fixture and current code (pre-ok=$mono_upgrade_pre_ok post-agent=$upg_post_agent post-skip=$upg_post_skip)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
