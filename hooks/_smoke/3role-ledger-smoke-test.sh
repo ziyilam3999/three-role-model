@@ -295,6 +295,19 @@ grep -q '"artifact_path":"/' "$NF" && ok "#1199 cross-cwd: relative artifact sto
 OUT=$( cd "$CWDY" && env -u CLAUDE_PROJECT_DIR node "$LED" check --session "$SID" --task 1199x 2>&1 ); RC=$?
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } && ok "#1199 cross-cwd: check from a DIFFERENT cwd resolves the stored absolute path (GREEN)" || bad "#1199 cross-cwd check from Y should resolve (rc=$RC out=$OUT)"
 
+# 21b. (#1868) WRONG-CWD append: the SAME relative `.ai-workspace/`-prefixed artifact, appended from cwd Y
+#     where the file does NOT exist (a role's Bash cwd landed in the wrong repo). On the pre-#1868 code this
+#     silently resolved to an ABSOLUTE path under Y anyway (no existence check on this branch) -- a
+#     plausible-looking but WRONG-REPO path that a later `check` can never find. The fix falls back to
+#     storing the value VERBATIM, deferring resolution to check-time (which may run from the right cwd).
+mk_sub "$SID" ypl
+( cd "$CWDY" && env -u CLAUDE_PROJECT_DIR node "$LED" append --session "$SID" --task 1199y --role planner \
+    --agent ypl --artifact ".ai-workspace/reviews/plan.md" >/dev/null )
+YF="$THREE_ROLE_LEDGER_DIR/$SID/1199y.jsonl"
+grep -q '"artifact_path":".ai-workspace/reviews/plan.md"' "$YF" \
+  && ok "#1868 wrong-cwd append: non-existent-under-cwd artifact stored VERBATIM (not mangled into a wrong-repo absolute path)" \
+  || bad "#1868 wrong-cwd append should store verbatim, not a bogus absolute path (got: $(cat "$YF"))"
+
 # 22. (back-compat) a PRE-FIX RELATIVE ledger entry (hand-written) still resolves from its origin cwd via
 #     the UNCHANGED resolveArtifact fallback chain. Prove resolveArtifact was NOT touched.
 mkdir -p "$THREE_ROLE_LEDGER_DIR/$SID"

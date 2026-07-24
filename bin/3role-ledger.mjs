@@ -1056,7 +1056,11 @@ function isVacuousOracle(filePath) {
 // slash but are NOT files: a branch (`feat/1199-x`) and a PR URL (`https://github.com/...`). So:
 //   - URL scheme (`http(s)://`, `git://`, `ssh://`, ...) → verbatim.
 //   - already a portable home-tilde path (`~/...`) → verbatim (no username, resolves from any cwd).
-//   - explicit path shape (`/`, `./`, `../`, `.claude/`, `.ai-workspace/`) → resolve to absolute.
+//   - explicit path shape (`/`, `./`, `../`, `.claude/`, `.ai-workspace/`) → resolve to absolute ONLY if
+//     the resolved candidate EXISTS on disk (#1868 — the calling agent's cwd is not necessarily the
+//     artifact's own repo; a wrong-cwd resolution must not be stored as a plausible-looking-but-wrong
+//     absolute path). No file at the resolved candidate → store verbatim, deferring to resolveArtifact()'s
+//     cwd/CLAUDE_PROJECT_DIR/$HOME candidate chain at check-time (which may run from the right cwd).
 //   - an ambiguous slashed token (`src/llm/generate.ts` vs `feat/x`) → treat as a path ONLY if it resolves
 //     to a file that EXISTS on disk (a real executor SOURCE artifact does; a branch never does).
 //   - no slash (`PR #123`, a sha, `shipped`) → verbatim.
@@ -1075,7 +1079,16 @@ function normalizeArtifact(raw) {
   if (v.startsWith('/')) {
     abs = v;
   } else if (/^(\.\/|\.\.\/|\.claude\/|\.ai-workspace\/)/.test(v)) {
-    abs = path.resolve(process.cwd(), v);               // explicit relative path shape → resolve.
+    // #1868 — explicit relative shape still resolves against the CALLING agent's cwd, which is not
+    // necessarily the artifact's own repo (a role can be spawned with its Bash cwd in a different
+    // repo than the one it wrote into). Verify the resolved candidate is real before trusting it,
+    // mirroring the ambiguous-slash branch below — a wrong-repo resolution falls back to verbatim
+    // so a later `check` can re-resolve it from a cwd that actually matches (resolveArtifact()'s
+    // CLAUDE_PROJECT_DIR/cwd/$HOME candidate chain), instead of silently storing a plausible-looking
+    // absolute path that points into the wrong repo entirely.
+    const cand = path.resolve(process.cwd(), v);
+    if (fileExists(cand)) abs = cand;                   // resolves under this cwd — verify it's real.
+    else return v;                                      // cwd/repo mismatch → defer to check-time resolution.
   } else if (v.includes('/')) {
     const cand = path.resolve(process.cwd(), v);
     if (fileExists(cand)) abs = cand;                   // real source artifact (exists on disk).
