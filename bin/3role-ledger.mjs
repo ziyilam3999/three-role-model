@@ -2026,12 +2026,24 @@ function cmdCheck(o) {
         // SAME fixture — a declared, in-vocabulary, matching seat — is what makes the expected side observable
         // via THIS surface; see the plan's Advisory A1 gradeability clause).
         const liveSeat = (routesLoaded.routes.seats || {})[role] || {};
-        const sensClearance = checkDataSensitivity(routesLoaded.routes, Object.assign({}, liveSeat, { provider: expectedSide.provider }));
+        const seatForSensCheck = Object.assign({}, liveSeat, { provider: expectedSide.provider });
+        const sensClearance = checkDataSensitivity(routesLoaded.routes, seatForSensCheck);
         let reroteNote = 'SESSION-REROUTE: role ' + role + ' DECLARED to provider ' + expectedSide.provider +
           ' (model ' + expectedSide.model + ', tier_equivalent ' + expectedSide.tier + ') — allowed with note; ' +
           'audit logged; MODEL-VERSION sub-leg dormant for this observation.';
         if (!sensClearance.ok) {
-          reroteNote += ' DATA-SENSITIVITY: ' + sensClearance.reason;
+          // #1880 intent 6/7a -- the advisory is NOT silenced by an acceptance; it is REWORDED. A matching
+          // acceptance names itself (never claims a refusal that isn't happening); a drifted/absent/mismatched
+          // acceptance behaves EXACTLY as if none were present -- the plain uncleared DATA-SENSITIVITY note.
+          const acc = checkAcceptance(routesLoaded.routes, seatForSensCheck);
+          if (acc.ok) {
+            const a = acc.acceptance;
+            reroteNote += ' DATA-SENSITIVITY-ACCEPTED: seat ' + role + ' provider ' + a.provider +
+              ' posture-at-decision ' + a.posture_at_decision + ' decided ' + a.decided + ' authority ' + a.authority +
+              ' — accepted risk, not a refusal.';
+          } else {
+            reroteNote += ' DATA-SENSITIVITY: ' + sensClearance.reason;
+          }
         }
         resumeNotes.push(reroteNote);
         writeBypassLog('3role-ledger-enforce-role-models', 'SESSION-REROUTE', 'PERMIT',
@@ -2771,6 +2783,39 @@ function checkDataSensitivity(routes, seatRow) {
   return { ok: true, reason: '' };
 }
 
+// C-3W — the accepted-disclosure last-resort check (#1880, Intent 3/3a). Consulted ONLY when C-3 has already
+// refused (resolveRoute/checkEnvelope both gate this behind a failed checkDataSensitivity — C-3W can never
+// touch C-2, never widen C-3's own lattice, and never apply to a provider it does not name). Clears a C-3
+// refusal for a seat ONLY when `seatRow.accepted_disclosure` (an array) contains a record whose `provider`,
+// `sensitivity_at_decision`, and `posture_at_decision` all match — EXACTLY, three-way — the seat's declared
+// provider and the RAW DECLARED values `checkDataSensitivity` reads BEFORE normalising them (never the
+// normalised `operator-private`/`unverified-or-trains` fallback locals): a typo'd/omitted/unrecognised
+// sensitivity, or a missing/deleted/changed posture, therefore matches no record and the C-3 refusal stands.
+// Never throws on absent/malformed/wrong-typed input — a crash is not a refusal (AC-7 arms (d)/(f3)).
+const ROUTE_ACCEPTED_RISK_TOKEN = 'ROUTE-ACCEPTED-RISK';
+const ACCEPTANCE_REQUIRED_FIELDS = ['provider', 'sensitivity_at_decision', 'posture_at_decision', 'decided', 'authority'];
+function checkAcceptance(routes, seatRow) {
+  const providers = (routes && routes.providers) || {};
+  const rawSensitivity = seatRow && seatRow.data_sensitivity;
+  const provider = seatRow && seatRow.provider;
+  const providerRow = providers[provider];
+  const rawPosture = providerRow && providerRow.data_posture && providerRow.data_posture.class;
+  const records = Array.isArray(seatRow && seatRow.accepted_disclosure) ? seatRow.accepted_disclosure : [];
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) continue; // wrong-type entry -- skip, never throw
+    let hasAllRequired = true;
+    for (const f of ACCEPTANCE_REQUIRED_FIELDS) {
+      if (typeof rec[f] !== 'string' || rec[f].length === 0) { hasAllRequired = false; break; }
+    }
+    if (!hasAllRequired) continue; // missing/blank required field -- invalid record, skip
+    if (rec.provider !== provider) continue; // wrong-provider record -- never leaks across providers
+    if (rec.sensitivity_at_decision !== rawSensitivity) continue; // matched against the RAW string, not the normalised fallback
+    if (rec.posture_at_decision !== rawPosture) continue; // matched against the RAW string, not the normalised fallback
+    return { ok: true, acceptance: rec };
+  }
+  return { ok: false, acceptance: null };
+}
+
 // Model-identity vocabulary query (AC0.9, S4 — the ROOT fix for stack break 1: modelIdToTier() returns '' for
 // any non-claude-* id today). Given a model id, returns its SSOT-declared provider + tier-equivalent; an
 // undeclared id refuses (caller emits nonzero exit + empty stdout, no fabricated match).
@@ -2877,8 +2922,11 @@ function resolveRoute(routes, seatKey) {
   const cap = checkCapability(routes, seatRow);
   if (!cap.ok) return { ok: false, reason: cap.reason };
   const sens = checkDataSensitivity(routes, seatRow);
-  if (!sens.ok) return { ok: false, reason: sens.reason };
-  return { ok: true, seatKey, seat: seatRow };
+  if (sens.ok) return { ok: true, seatKey, seat: seatRow, acceptance: null };
+  // C-3 refused -- C-3W (#1880) gets exactly one more chance, never ahead of C-2, never widening C-3 itself.
+  const acc = checkAcceptance(routes, seatRow);
+  if (acc.ok) return { ok: true, seatKey, seat: seatRow, acceptance: acc.acceptance };
+  return { ok: false, reason: sens.reason };
 }
 
 // resolve-route --seat <domain.seat> [--json]
@@ -2889,8 +2937,18 @@ function cmdResolveRoute(opts) {
   if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
   const result = resolveRoute(loaded.routes, seatKey);
   if (!result.ok) { process.stderr.write(result.reason + '\n'); process.exit(2); }
+  if (result.acceptance) {
+    // #1880 intent 5 -- a route allowed only because of an acceptance must be observably different from one
+    // that clears normally. Emitted on stderr at exit 0 (breaks no existing consumer -- stdout is unchanged
+    // and the probe/CLI callers that discard stderr on success are unaffected).
+    const a = result.acceptance;
+    process.stderr.write(ROUTE_ACCEPTED_RISK_TOKEN + ': seat ' + seatKey + ' provider ' + a.provider +
+      ' posture-at-decision ' + a.posture_at_decision + ' decided ' + a.decided + ' authority ' + a.authority + '\n');
+  }
   if ('json' in opts) {
-    console.log(JSON.stringify(Object.assign({ seat: seatKey }, result.seat)));
+    const payload = Object.assign({ seat: seatKey }, result.seat);
+    if (result.acceptance) payload.accepted_disclosure_applied = result.acceptance;
+    console.log(JSON.stringify(payload));
   } else {
     console.log(seatKey + ' -> ' + result.seat.provider + ' / ' + (result.seat.model || ''));
   }
