@@ -1608,6 +1608,12 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
   && ok "#1947 AC-11(c) well-formed plan-review row (SSOT-declared, first-record tag+nonce, served model matches, nonce in artifact) -> check exits 0" \
   || bad "#1947 AC-11(c) well-formed row should exit 0 (rc=$RC out=$OUT)"
+# M-B (execution-review round-2 FAIL): the SAME well-formed pass must LABEL the row distinctly in check's own
+# output, on the success path -- D2 promised "check output labels these rows distinctly"; previously the
+# string appeared only in comments/BLOCK-reason text, never announced on a genuine pass.
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "role=plan-review dispatch=subprocess-openrouter"; } \
+  && ok "#1947 M-B AC-11(c): check's OWN stdout labels the passing subprocess row 'role=plan-review dispatch=subprocess-openrouter' (D2's disclosure promise, not just an exit code)" \
+  || bad "#1947 M-B AC-11(c) should print the dispatch=subprocess-openrouter label on the success path (rc=$RC out=$OUT)"
 
 # (d) regression control: a leading {"type":"ai-title",...} bookkeeping record before the real enqueue record
 #     must NOT defeat the tag+nonce binding (measured live on #1947 AC-6, session bd8c0aec-...) -> still 0.
@@ -1626,5 +1632,34 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
   && ok "#1947 AC-11 regression(d): a leading ai-title bookkeeping record before the real enqueue record does not defeat the M2 tag+nonce binding -> still exits 0" \
   || bad "#1947 AC-11 regression(d) should still exit 0 with a leading ai-title record (rc=$RC out=$OUT)"
+
+# (e) M-A monotonicity control (execution-review round-2 FAIL): a STALE, self-declared
+#     dispatch=subprocess-openrouter marker must NEVER outrank a harness-signed, RESOLVING agentId on the SAME
+#     row -- reproduces D3's bounded-fallback shape end-to-end: a subprocess plan-review dispatch stamps
+#     dispatch/transcript_path/nonce; that Kimi review gets REJECTED (D3's third fallback trigger, "a failed
+#     gate check of the plan's AC"); the bounded Anthropic Opus fallback then self-appends a REAL agentId + its
+#     OWN artifact + verdict=PASS onto the SAME row. Before the fix, checkSubprocessProvenance kept
+#     re-evaluating the SUPERSEDED subprocess evidence (the fallback's artifact never contains the earlier
+#     dispatch's nonce) and false-BLOCKed a genuinely-completed plan-review.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixE --task t --role planner --skip-reason "fixture: not under test in AC-11(e)" >/dev/null
+  node "$LED" append --session orFixE --task t --role executor --skip-reason "fixture: not under test in AC-11(e)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-e.md"
+  node "$LED" append --session orFixE --task t --role execution-review --oracle "$OR_FIX/artifacts/er-e.md" >/dev/null
+  # Step 1: the subprocess dispatch's OWN spawn-time stamp (a real, validly-bound transcript; nonce N-PR-ORIG).
+  mk_or_transcript "$OR_FIX/transcripts/fixE.jsonl" "N-PR-ORIG" "moonshotai/kimi-k3" 0
+  node "$LED" append --session orFixE --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixE.jsonl" --nonce "N-PR-ORIG" >/dev/null
+  # Step 2: that dispatch was REJECTED -- the bounded Anthropic Opus FALLBACK self-appends a REAL, resolving
+  #    agentId + its own artifact + verdict=PASS onto the SAME row (mirrors mk_sub's real-transcript pattern).
+  mk_sub orFixE fallback-agent-e
+  printf '## Review\nDecision: PASS\n' > "$OR_FIX/artifacts/plan-e-fallback.md"
+  node "$LED" append --session orFixE --task t --role plan-review --agent fallback-agent-e \
+    --artifact "$OR_FIX/artifacts/plan-e-fallback.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixE --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#1947 M-A AC-11(e): a harness-signed, RESOLVING agentId + real artifact + verdict on the SAME row always OUTRANKS a stale subprocess dispatch/transcript/nonce stamp (D3's bounded-fallback shape) -> check exits 0, never a false BLOCK from superseded residue" \
+  || bad "#1947 M-A AC-11(e) should exit 0 -- a stale subprocess marker must never outrank a resolving agentId (rc=$RC out=$OUT)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

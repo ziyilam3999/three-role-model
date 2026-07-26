@@ -1233,10 +1233,21 @@ function subprocessFirstRecordBound(firstText, task, role, nonce) {
 //   ''    -> admissible AND fully verified -> treat as a pass.
 //   <str> -> admissible but verification FAILED -> this string is the block reason.
 function checkSubprocessProvenance(role, e, session, task) {
-  void session;   // the subprocess arm has no Agent-subagent transcript to resolve via session/agentId.
   if (!e || e.dispatch !== 'subprocess-openrouter') return null;
   const decl = seatDispatchIsSubprocess(role);
   if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
+
+  // #1947 M-A (execution-review round-2 FAIL) — a harness-signed, RESOLVING agentId on the SAME row must
+  // ALWAYS outrank a stale/self-declared subprocess marker; the stronger provenance must win a tie. This is
+  // the #1590-class monotonicity fix: D3's bounded fallback (a subprocess dispatch that stamped
+  // dispatch/transcript_path/nonce, then got rejected, then a bounded Anthropic Agent-tool retry self-appends
+  // a REAL agentId + its own artifact + verdict) previously left the STALE dispatch marker in place, so this
+  // function kept re-evaluating the SUPERSEDED subprocess evidence and false-BLOCKed the genuinely-completed
+  // fallback. Belt-and-braces alongside the overlayAppend clear-list fix below (which is the PRIMARY fix — a
+  // genuine agentId/oracle append now also clears dispatch/transcript_path/nonce, so this branch is normally
+  // unreachable for a correctly-composed row) — this tie-break covers any row that somehow still carries BOTH
+  // fields (e.g. an out-of-band ledger edit, or a compose path this round didn't anticipate).
+  if (e.agentId && agentResolves(session, e.agentId)) return null;
 
   const info = subprocessTranscriptInfo(e.transcript_path);
   if (!info.exists) {
@@ -1669,7 +1680,20 @@ function overlayAppend(session, task, role, fields) {
   // otherwise resurrect) — modelVersion/modelTier/effort/reroute join that clear-list too (#1465/#1640): they
   // are provenance OF a real spawn's transcript/session, so a skip line must not carry a stale claimed model
   // or a stale declared-reroute stamp. dispatch/transcript_path/nonce (#1947) join it for the same reason.
-  if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
+  // #1947 M-A (execution-review round-2 FAIL) — a genuine, harness-signed agentId/oracle is STRICTLY
+  // STRONGER evidence than a self-declared subprocess-openrouter marker (no harness signs that marker at
+  // all), so it must supersede it the SAME way it supersedes a stale skip_reason: an agentId/oracle append
+  // now ALSO clears any inherited dispatch/transcript_path/nonce. Without this, D3's bounded fallback (a
+  // rejected subprocess dispatch stamped dispatch/transcript_path/nonce, then a bounded Anthropic retry
+  // self-appends a real agentId+artifact+verdict onto the SAME row) left the stale marker in place, and
+  // checkSubprocessProvenance kept re-evaluating the SUPERSEDED subprocess evidence against the FALLBACK's
+  // own artifact — which of course never contains the superseded dispatch's nonce — false-BLOCKing a
+  // genuinely-completed role. This is the primary fix; checkSubprocessProvenance's own agentId tie-break
+  // above is the belt-and-braces backstop for a row that reaches it with both fields still present.
+  if (('agentId' in fields) || ('oracle' in fields)) {
+    delete entry.skip_reason;
+    delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+  }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
@@ -2009,11 +2033,24 @@ function cmdCheck(o) {
   // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
   const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o) };
   const problems = [];
+  // #1947 M-B (execution-review round-2 FAIL) — D2 promised "check output labels these rows distinctly", but
+  // the string `dispatch=subprocess-openrouter` previously appeared ONLY in comments and in BLOCK-reason
+  // text — never on the success path, so a subprocess-verified row was indistinguishable in `check`'s output
+  // from an ordinary harness-signed pass. Collected here and printed unconditionally (success or not, so it
+  // is visible even when other roles still have problems) — see the DISPATCH: print near the end.
+  const dispatchLabels = [];
   for (const role of REQUIRED_ROLES) {
     const e = byRole[role];
     if (!e) { problems.push('missing ' + role + ' ledger line'); continue; }
     const r = checkRole(role, e, session, checkOpts, task);
-    if (r) problems.push(r);
+    if (r) { problems.push(r); continue; }
+    // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
+    // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
+    // subprocess-openrouter arm, not the ordinary agentId arm.
+    if (checkSubprocessProvenance(role, e, session, task) === '') {
+      const decl = seatDispatchIsSubprocess(role);
+      dispatchLabels.push('role=' + role + ' dispatch=subprocess-openrouter model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
+    }
   }
   // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
   // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.
@@ -2301,6 +2338,12 @@ function cmdCheck(o) {
     }
   }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  // #1947 M-B — print AFTER the problems-guard (so it only reaches stdout on genuine roles-satisfied paths,
+  // matching AC-5(d)/AC-6(d)'s "check exits 0 AND its output labels the row" contract) but BEFORE the final
+  // OK: line, honestly distinct from a harness-signed pass exactly as D2 promised.
+  if (dispatchLabels.length) {
+    console.log('DISPATCH: ' + dispatchLabels.join(' | '));
+  }
   if (resumeNotes.length) {
     console.log('NOTE: ' + resumeNotes.join(' | '));
   }
