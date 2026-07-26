@@ -867,6 +867,10 @@ function priorHasTerminalEvidence(prior) {
   if (prior.self_authored) return true;
   if (prior.oracle) return true;
   if (prior.agentId && prior.artifact_path) return true;
+  // #1947 — a completed subprocess-openrouter dispatch has no agentId (no Agent-subagent transcript exists),
+  // so the disjunct above is blind to it; a completed run (dispatch marker + artifact_path) is the same
+  // terminal-evidence SHAPE one provenance kind over (mirrors the agentId+artifact_path disjunct exactly).
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) return true;
   return false;
 }
 
@@ -881,6 +885,9 @@ function terminalEvidenceSummary(prior) {
   if (prior.oracle) parts.push('oracle "' + prior.oracle + '"');
   if (prior.agentId && prior.artifact_path) {
     parts.push('a completed run (agentId "' + prior.agentId + '" + artifact_path "' + prior.artifact_path + '")');
+  }
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) {
+    parts.push('a completed subprocess-openrouter run (artifact_path "' + prior.artifact_path + '")');
   }
   return parts.join(', ');
 }
@@ -1115,10 +1122,175 @@ function classifySkip(e) {
   return { skip: true, ok: true };
 }
 
+// #1947 D2/M1/M2 — the subprocess-openrouter provenance arm. A third provenance shape alongside today's
+// agentId (harness-signed Agent-subagent transcript) and inline-skip (a self-declared assertion): a role
+// dispatched by tools/openrouter-role-dispatch.sh as a hermetic `claude -p` subprocess, which has no
+// Agent-subagent transcript and no agentId an Agent-tool spawn would produce.
+//
+// M1 — admissibility is decided SOLELY by the SSOT, read FRESH at check time
+// (routes.seats[role].dispatch === 'subprocess-openrouter'), NEVER by the mere presence of the
+// `dispatch` marker on the ledger row itself (the row is orchestrator-writable; the SSOT field is not — a
+// forged row pointing at any transcript could otherwise satisfy even execution-review's
+// never-inline-skippable invariant). A role whose SSOT seat lacks that dispatch field falls through to
+// today's ordinary agentId arm UNCHANGED, even when the row carries the marker.
+//
+// M2 — the transcript is bound to (task, role, THIS dispatch) via a per-dispatch nonce: the helper mints the
+// nonce and renders it plus `3ROLE_TASK:<id> ROLE:<role>` into the brief's first line, so the transcript's
+// FIRST record (firstRecordText() — the SAME tag-binding predicate the rest of this file already uses,
+// never a whole-file scan) must carry BOTH. The same nonce must also appear in the named artifact — this is
+// what makes a REPLAYED transcript (any older gateway transcript already on disk, e.g. a prior smoke run)
+// inadmissible even when its served model happens to equal the SSOT slug.
+function escapeRegExp(s) { return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Fresh SSOT read: is this role's SEAT declared subprocess-openrouter dispatch right now? Returns
+// {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
+// of those cases must fall through to the ordinary agentId arm, never silently admit the weak arm.
+function seatDispatchIsSubprocess(role) {
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok) return { ok: false, seat: null };
+  const seat = (routesLoaded.routes.seats || {})[role];
+  if (!seat || seat.dispatch !== 'subprocess-openrouter') return { ok: false, seat: null };
+  return { ok: true, seat };
+}
+
+// Read a NAMED subprocess transcript path (NOT a PROJECTS_ROOT/<slug>/<session>/subagents/agent-<id>.jsonl
+// harness-written file — a `claude -p` one-shot's own transcript, named explicitly on the ledger row).
+// Fails closed to the empty/false defaults on any missing/unreadable/unparseable file — mirrors every other
+// can't-tell residual in this module (never a false pass on a read error).
+// A `claude -p` subprocess's OWN top-level session transcript has a DIFFERENT first-record shape than an
+// Agent-subagent transcript: its first line is a `{"type":"queue-operation","operation":"enqueue",...,
+// "content":"<brief text>"}` record — the brief text (carrying the 3ROLE_TASK/ROLE tag + DISPATCH-NONCE line)
+// sits at the TOP LEVEL `content` field, never under `message.content` the way firstRecordText() (built for
+// the Agent-subagent transcript shape) expects. Reusing firstRecordText() here silently returned '' for
+// every real subprocess dispatch — measured live on session 27a10ef1-... (#1947 AC-5 live smoke) — so this
+// is a dedicated extractor, not a wrapper.
+// A leading `{"type":"ai-title",...}` bookkeeping record (an auto-generated conversation title) can sit
+// BEFORE the real `queue-operation`/`enqueue` spawn record on disk — measured live on session
+// bd8c0aec-... (#1947 AC-6 live smoke): the GLM transcript's line 0 was `ai-title`, line 1 the real enqueue.
+// An `ai-title` record structurally can NEVER carry the rendered brief (it has only an `aiTitle` string, no
+// `content`/`message` field), so it is the ONE narrowly-named type this scan skips past. Every other record
+// type ends the scan immediately (return whatever text it has, or '' if none) — this still never scans past
+// the first REAL turn, which is what defeats mention-vs-spawn confusion (M2); it only tolerates ONE specific,
+// content-free metadata record shape in front of it.
+function subprocessFirstRecordText(content) {
+  const lines = String(content == null ? '' : content).split('\n');
+  for (const raw of lines) {
+    if (!raw.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(raw); } catch (e) { return ''; }
+    if (rec && rec.type === 'ai-title') continue;
+    if (rec && typeof rec.content === 'string') return rec.content;
+    const msg = (rec && rec.message) || {};
+    if (typeof msg.content === 'string') return msg.content;
+    if (Array.isArray(msg.content)) {
+      let text = '';
+      for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+      return text;
+    }
+    return '';
+  }
+  return '';
+}
+
+function subprocessTranscriptInfo(transcriptPath) {
+  const out = { exists: false, firstText: '', servedModel: '' };
+  let p = String(transcriptPath == null ? '' : transcriptPath);
+  // transcript_path is stored in portable home-tilde form by normalizeArtifact() (R6) — expand it back to
+  // an absolute path before touching the filesystem; fs.* never expands `~` the way a shell does, so a
+  // tilde-form path here previously read as "does not exist" even when the file was genuinely on disk.
+  if (p === '~') p = HOME;
+  else if (p.startsWith('~/')) p = path.join(HOME, p.slice(2));
+  if (!p || !fileExists(p)) return out;
+  out.exists = true;
+  try {
+    const content = fs.readFileSync(p, 'utf8');
+    out.firstText = subprocessFirstRecordText(content);
+    for (const ln of content.split('\n')) {
+      if (!ln.trim()) continue;
+      try {
+        const rec = JSON.parse(ln);
+        const m = rec && rec.message && rec.message.model;
+        if (m) { out.servedModel = String(m); break; }   // first served model line wins (the dispatch's own turn).
+      } catch (e) { /* skip an unparsable line, keep scanning */ }
+    }
+  } catch (e) { /* fail closed to the empty defaults above */ }
+  return out;
+}
+
+// M2 — the transcript's FIRST record must carry BOTH the exact spawn tag and this dispatch's nonce. A bare
+// tag with no nonce (or a nonce belonging to a DIFFERENT dispatch) never binds — this is what defeats a
+// replayed/reused transcript sitting on disk from an earlier run.
+function subprocessFirstRecordBound(firstText, task, role, nonce) {
+  const n = String(nonce == null ? '' : nonce).trim();
+  if (!firstText || !n) return false;
+  const tagRe = new RegExp('3ROLE_TASK:' + escapeRegExp(task) + ' ROLE:' + escapeRegExp(role));
+  return tagRe.test(firstText) && firstText.indexOf(n) !== -1;
+}
+
+// The full subprocess-openrouter provenance arm for one role's ledger row. Returns:
+//   null  -> NOT admissible (SSOT doesn't declare this seat subprocess-dispatched, or the row carries no
+//            dispatch marker) -> checkRole must fall through to the ordinary agentId arm UNCHANGED.
+//   ''    -> admissible AND fully verified -> treat as a pass.
+//   <str> -> admissible but verification FAILED -> this string is the block reason.
+function checkSubprocessProvenance(role, e, session, task) {
+  if (!e || e.dispatch !== 'subprocess-openrouter') return null;
+  const decl = seatDispatchIsSubprocess(role);
+  if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
+
+  // #1947 M-A (execution-review round-2 FAIL) — a harness-signed, RESOLVING agentId on the SAME row must
+  // ALWAYS outrank a stale/self-declared subprocess marker; the stronger provenance must win a tie. This is
+  // the #1590-class monotonicity fix: D3's bounded fallback (a subprocess dispatch that stamped
+  // dispatch/transcript_path/nonce, then got rejected, then a bounded Anthropic Agent-tool retry self-appends
+  // a REAL agentId + its own artifact + verdict) previously left the STALE dispatch marker in place, so this
+  // function kept re-evaluating the SUPERSEDED subprocess evidence and false-BLOCKed the genuinely-completed
+  // fallback. Belt-and-braces alongside the overlayAppend clear-list fix below (which is the PRIMARY fix — a
+  // genuine agentId/oracle append now also clears dispatch/transcript_path/nonce, so this branch is normally
+  // unreachable for a correctly-composed row) — this tie-break covers any row that somehow still carries BOTH
+  // fields (e.g. an out-of-band ledger edit, or a compose path this round didn't anticipate).
+  if (e.agentId && agentResolves(session, e.agentId)) return null;
+
+  const info = subprocessTranscriptInfo(e.transcript_path);
+  if (!info.exists) {
+    return role + ' dispatch=subprocess-openrouter but transcript_path "' + (e.transcript_path || '') +
+      '" does not exist on disk';
+  }
+  if (!subprocessFirstRecordBound(info.firstText, task, role, e.nonce)) {
+    return role + ' dispatch=subprocess-openrouter transcript "' + e.transcript_path + '" first record does ' +
+      'not carry BOTH the spawn tag (3ROLE_TASK:' + task + ' ROLE:' + role + ') and this dispatch\'s nonce "' +
+      (e.nonce || '<missing>') + '" — a replayed/reused transcript is not admissible (M2)';
+  }
+  if (!info.servedModel || info.servedModel !== decl.seat.model) {
+    return role + ' dispatch=subprocess-openrouter transcript "' + e.transcript_path + '" served model "' +
+      (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
+  }
+  const ap = resolveArtifact(e.artifact_path || '');
+  if (ap) {
+    if (!e.nonce || !fileHas(ap, new RegExp(escapeRegExp(e.nonce)))) {
+      return role + ' dispatch=subprocess-openrouter artifact "' + ap + '" does not contain this dispatch\'s ' +
+        'nonce "' + (e.nonce || '<missing>') + '" (M2 — binds artifact to this exact run)';
+    }
+  } else if (role !== 'executor') {
+    // executor's artifact is legitimately a PR URL/commit/branch string, never required to resolve on disk
+    // (mirrors the ordinary arm's own role-shaped exemption below); every other role needs a real disk path.
+    return role + ' dispatch=subprocess-openrouter artifact_path "' + (e.artifact_path || '') + '" not found';
+  }
+  if (role === 'plan-review' && (!ap || !fileHas(ap, VERDICT_RE))) {
+    return 'plan-review artifact "' + (ap || e.artifact_path) + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
+  }
+  if (role === 'executor' && (!e.artifact_path || String(e.artifact_path).trim() === '')) {
+    return 'executor artifact_path missing (PR URL / commit / branch string)';
+  }
+  return '';   // admissible + fully verified -> pass.
+}
+
 // Returns null when the role is satisfied, else a problem string. `opts.rejectVacuousOracle` (#1276) — set
 // ONLY by the instrumentation-gate's `check --reject-vacuous-oracle` — additionally REJECTS an
 // execution-review oracle that exists + carries a PASS token but is vacuous (0 real assertions).
-function checkRole(role, e, session, opts) {
+function checkRole(role, e, session, opts, task) {
+  // #1947 M1/M2 — try the subprocess-openrouter arm FIRST. It returns null (not admissible for this row/SSOT
+  // state) for every ordinary Agent-tool-dispatched role, so this is a pure addition for everyone else.
+  const sub = checkSubprocessProvenance(role, e, session, task);
+  if (sub !== null) return sub || null;
   const sk = classifySkip(e);
   if (role === 'execution-review') {
     if (sk.skip) {
@@ -1494,17 +1666,38 @@ function overlayAppend(session, task, role, fields) {
   // `reroute`; the completion gate (cmdCheck) only ever READS it, never senses env/base-url itself (S10
   // anti-spoof — the stamp must be a run-time RECORD, not a check-time re-derivation).
   if ('reroute' in fields) entry.reroute = fields.reroute;
+  // #1947 S3 — the subprocess-openrouter provenance fields (D2/M1/M2). Same own-key "provided" overlay
+  // discipline as every field above: unprovided keys persist the prior line's value, so a spawn-time
+  // dispatch/transcript/nonce stamp composes with a later close-only `--artifact` repoint exactly like
+  // agentId/artifact_path already compose.
+  if ('dispatch' in fields) entry.dispatch = fields.dispatch;
+  if ('transcript_path' in fields) entry.transcript_path = fields.transcript_path;
+  if ('nonce' in fields) entry.nonce = fields.nonce;
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
   // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
   // otherwise resurrect) — modelVersion/modelTier/effort/reroute join that clear-list too (#1465/#1640): they
   // are provenance OF a real spawn's transcript/session, so a skip line must not carry a stale claimed model
-  // or a stale declared-reroute stamp.
-  if (('agentId' in fields) || ('oracle' in fields)) delete entry.skip_reason;
+  // or a stale declared-reroute stamp. dispatch/transcript_path/nonce (#1947) join it for the same reason.
+  // #1947 M-A (execution-review round-2 FAIL) — a genuine, harness-signed agentId/oracle is STRICTLY
+  // STRONGER evidence than a self-declared subprocess-openrouter marker (no harness signs that marker at
+  // all), so it must supersede it the SAME way it supersedes a stale skip_reason: an agentId/oracle append
+  // now ALSO clears any inherited dispatch/transcript_path/nonce. Without this, D3's bounded fallback (a
+  // rejected subprocess dispatch stamped dispatch/transcript_path/nonce, then a bounded Anthropic retry
+  // self-appends a real agentId+artifact+verdict onto the SAME row) left the stale marker in place, and
+  // checkSubprocessProvenance kept re-evaluating the SUPERSEDED subprocess evidence against the FALLBACK's
+  // own artifact — which of course never contains the superseded dispatch's nonce — false-BLOCKing a
+  // genuinely-completed role. This is the primary fix; checkSubprocessProvenance's own agentId tie-break
+  // above is the belt-and-braces backstop for a row that reaches it with both fields still present.
+  if (('agentId' in fields) || ('oracle' in fields)) {
+    delete entry.skip_reason;
+    delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+  }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
+    delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -1522,6 +1715,14 @@ function cmdAppend(o) {
   if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
   if ('oracle' in o) fields.oracle = o.oracle;
   if ('verdict' in o) fields.verdict = o.verdict;
+  // #1947 S3 — the subprocess-openrouter provenance fields (D2/M1/M2). Written ONLY by
+  // tools/openrouter-role-dispatch.sh's own self-append (or the role's own self-append, mirroring today's
+  // agentId self-append convention) — `check`'s admissibility gate (checkSubprocessProvenance) reads these
+  // three fields ONLY when the SSOT independently declares this role's seat dispatch=subprocess-openrouter;
+  // writing them on any other role's row is inert (the SSOT gate ignores an unrecognised marker).
+  if ('dispatch' in o) fields.dispatch = o.dispatch;
+  if ('transcript' in o) fields.transcript_path = normalizeArtifact(o.transcript);
+  if ('nonce' in o) fields.nonce = o.nonce;
   // #1100 item 3: provenance — a line authored BY the role's own agent (its SubagentStop scan saw the agent
   // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
   // `--self-authored` (no value) is true, `--self-authored false` is false.
@@ -1657,7 +1858,7 @@ function cmdInherit(o) {
   }
   // Verify-or-fail-closed: run the SAME checkRole `check` uses on both parent entries.
   for (const [r, ent] of [['planner', planner], ['plan-review', planReview]]) {
-    const prob = checkRole(r, ent, session);
+    const prob = checkRole(r, ent, session, undefined, parent);
     if (prob) block(prob);
   }
   // #1575 1a-2 — three additional fail-closed PRECONDITIONS (verify-THEN-write, exit 3, writes NOTHING),
@@ -1832,11 +2033,24 @@ function cmdCheck(o) {
   // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
   const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o) };
   const problems = [];
+  // #1947 M-B (execution-review round-2 FAIL) — D2 promised "check output labels these rows distinctly", but
+  // the string `dispatch=subprocess-openrouter` previously appeared ONLY in comments and in BLOCK-reason
+  // text — never on the success path, so a subprocess-verified row was indistinguishable in `check`'s output
+  // from an ordinary harness-signed pass. Collected here and printed unconditionally (success or not, so it
+  // is visible even when other roles still have problems) — see the DISPATCH: print near the end.
+  const dispatchLabels = [];
   for (const role of REQUIRED_ROLES) {
     const e = byRole[role];
     if (!e) { problems.push('missing ' + role + ' ledger line'); continue; }
-    const r = checkRole(role, e, session, checkOpts);
-    if (r) problems.push(r);
+    const r = checkRole(role, e, session, checkOpts, task);
+    if (r) { problems.push(r); continue; }
+    // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
+    // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
+    // subprocess-openrouter arm, not the ordinary agentId arm.
+    if (checkSubprocessProvenance(role, e, session, task) === '') {
+      const decl = seatDispatchIsSubprocess(role);
+      dispatchLabels.push('role=' + role + ' dispatch=subprocess-openrouter model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
+    }
   }
   // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
   // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.
@@ -2124,6 +2338,12 @@ function cmdCheck(o) {
     }
   }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  // #1947 M-B — print AFTER the problems-guard (so it only reaches stdout on genuine roles-satisfied paths,
+  // matching AC-5(d)/AC-6(d)'s "check exits 0 AND its output labels the row" contract) but BEFORE the final
+  // OK: line, honestly distinct from a harness-signed pass exactly as D2 promised.
+  if (dispatchLabels.length) {
+    console.log('DISPATCH: ' + dispatchLabels.join(' | '));
+  }
   if (resumeNotes.length) {
     console.log('NOTE: ' + resumeNotes.join(' | '));
   }
@@ -2467,6 +2687,21 @@ function cmdResolveRoleModel(o) {
       process.stderr.write('ROUTE-ROLE-MISSING: routes.seats.' + role + ' not declared in ' + routesLoaded.configPath +
         ' -- falling back to opus fail-safe (this role only).\n');
       printRoleModel('opus', '', 'opus', withEffort, withVersion);
+      return;
+    }
+    // #1947 AC-2/M3 -- a seat carrying an explicit `agent_tool_fallback` tier (the two subprocess-dispatched
+    // seats, plan-review/executor) resolves to THAT tier here, NEVER to model_vocabulary's tier_equivalent.
+    // Both OpenRouter dispatch slugs (moonshotai/kimi-k3, z-ai/glm-5.2) carry tier_equivalent:"fable" -- using
+    // it here would silently burn the Fable weekly cap the moment any accidental Agent-tool spawn (or a D3
+    // bounded fallback-to-Anthropic retry) resolved this role. `resolve-role-model` must keep answering with
+    // the SAFE fallback tier so that path lands on today's proven behavior (opus/sonnet), never fable.
+    if (seat.agent_tool_fallback && ROLE_MODELS.includes(seat.agent_tool_fallback)) {
+      const fbTier = seat.agent_tool_fallback;
+      const { found: fbFound, cfg: fbCfg } = loadRoleConfig();
+      if (fbFound) lintRoleConfig(fbCfg);
+      const fbEffort = fbFound ? roleEffortFromCfg(fbCfg, role) : '';
+      const fbVersion = (fbFound && roleVersionFromCfg(fbCfg, role, fbTier)) || fbTier;
+      printRoleModel(fbTier, fbEffort, fbVersion, withEffort, withVersion);
       return;
     }
     const ident = identifyModel(routesLoaded.routes, seat.model);

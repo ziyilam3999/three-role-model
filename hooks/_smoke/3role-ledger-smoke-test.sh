@@ -1531,4 +1531,135 @@ upg_post_skip=$(grep -c '"skip_reason"' "$UPG_POST_FILE" 2>/dev/null); upg_post_
   && ok "#1590 run-supersedes-skip: the legitimate UPGRADE arm (a real run clearing a stale skip) stays GREEN on BOTH the pre-#1580 fixture and current code -- the guard does not false-fire on SUPERSESSION" \
   || bad "#1590 run-supersedes-skip should pass on both the pre-#1580 fixture and current code (pre-ok=$mono_upgrade_pre_ok post-agent=$upg_post_agent post-skip=$upg_post_skip)"
 
+
+# ── #1947 AC-11 — the subprocess-openrouter third provenance arm is SSOT-gated and dispatch-bound, not
+#    row-asserted. Fixture ledger + fixture transcript, isolated CC_ROUTES_JSON + THREE_ROLE_LEDGER_DIR. ────
+OR_FIX="$TMP/or-fixtures"
+mkdir -p "$OR_FIX/ledger" "$OR_FIX/transcripts" "$OR_FIX/artifacts"
+cat > "$OR_FIX/routes.json" <<'ORJSON'
+{
+  "seats": {
+    "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus" },
+    "execution-review": { "provider": "anthropic", "model": "claude-opus-5" }
+  }
+}
+ORJSON
+mk_or_transcript() {   # $1=path $2=nonce $3=served-model $4=lead-with-ai-title(0|1)
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, nonce, model, leadTitle ] = process.argv;
+    const lines = [];
+    if (leadTitle === "1") lines.push(JSON.stringify({ type: "ai-title", aiTitle: "smoke fixture title", sessionId: "or-fixture" }));
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "or-fixture", content: "3ROLE_TASK:t ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+
+# (a) forged-marker control: role=execution-review carries dispatch=subprocess-openrouter, but the SSOT seat
+#     for execution-review has NO dispatch field -> the marker must be IGNORED (fall through to the ordinary
+#     arm), not accepted -> BLOCK naming execution-review.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixA --task t --role planner --skip-reason "fixture: not under test in AC-11(a)" >/dev/null
+  node "$LED" append --session orFixA --task t --role executor --skip-reason "fixture: not under test in AC-11(a)" >/dev/null
+  node "$LED" append --session orFixA --task t --role plan-review --skip-reason "fixture: not under test in AC-11(a)" >/dev/null
+  echo "anything" > "$OR_FIX/transcripts/anything.jsonl"
+  node "$LED" append --session orFixA --task t --role execution-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/anything.jsonl" --nonce "OR-NONCE-forged" >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixA --task t 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | grep -qi "execution-review"; } \
+  && ok "#1947 AC-11(a) forged-marker control: dispatch=subprocess-openrouter on execution-review (SSOT seat has no dispatch field) -> BLOCK naming execution-review, marker ignored" \
+  || bad "#1947 AC-11(a) forged-marker control should BLOCK naming execution-review (rc=$RC out=$OUT)"
+
+# (b) replayed-transcript control: role=plan-review, SSOT-declared subprocess seat, but the named transcript's
+#     FIRST record carries a DIFFERENT nonce than this dispatch's own -> BLOCK (M2).
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixB --task t --role planner --skip-reason "fixture: not under test in AC-11(b)" >/dev/null
+  node "$LED" append --session orFixB --task t --role executor --skip-reason "fixture: not under test in AC-11(b)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-b.md"
+  node "$LED" append --session orFixB --task t --role execution-review --oracle "$OR_FIX/artifacts/er-b.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixB.jsonl" "OR-NONCE-different-run" "moonshotai/kimi-k3" 0
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-THIS-RUN\n' > "$OR_FIX/artifacts/plan-b.md"
+  node "$LED" append --session orFixB --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixB.jsonl" --nonce "OR-NONCE-THIS-RUN" \
+    --artifact "$OR_FIX/artifacts/plan-b.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixB --task t 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | grep -qi "plan-review" && echo "$OUT" | grep -qi "M2"; } \
+  && ok "#1947 AC-11(b) replayed-transcript control: named transcript's first record nonce != this dispatch's nonce -> BLOCK (M2)" \
+  || bad "#1947 AC-11(b) replayed-transcript control should BLOCK on M2 (rc=$RC out=$OUT)"
+
+# (c) well-formed happy path: SSOT-declared seat, first-record tag+nonce present, message.model == SSOT slug,
+#     nonce present in the artifact, verdict token present -> the WHOLE task's check exits 0.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixC --task t --role planner --skip-reason "fixture: not under test in AC-11(c)" >/dev/null
+  node "$LED" append --session orFixC --task t --role executor --skip-reason "fixture: not under test in AC-11(c)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-c.md"
+  node "$LED" append --session orFixC --task t --role execution-review --oracle "$OR_FIX/artifacts/er-c.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixC.jsonl" "OR-NONCE-THIS-RUN-C" "moonshotai/kimi-k3" 0
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-C\n' > "$OR_FIX/artifacts/plan-c.md"
+  node "$LED" append --session orFixC --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixC.jsonl" --nonce "OR-NONCE-THIS-RUN-C" \
+    --artifact "$OR_FIX/artifacts/plan-c.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixC --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#1947 AC-11(c) well-formed plan-review row (SSOT-declared, first-record tag+nonce, served model matches, nonce in artifact) -> check exits 0" \
+  || bad "#1947 AC-11(c) well-formed row should exit 0 (rc=$RC out=$OUT)"
+# M-B (execution-review round-2 FAIL): the SAME well-formed pass must LABEL the row distinctly in check's own
+# output, on the success path -- D2 promised "check output labels these rows distinctly"; previously the
+# string appeared only in comments/BLOCK-reason text, never announced on a genuine pass.
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "role=plan-review dispatch=subprocess-openrouter"; } \
+  && ok "#1947 M-B AC-11(c): check's OWN stdout labels the passing subprocess row 'role=plan-review dispatch=subprocess-openrouter' (D2's disclosure promise, not just an exit code)" \
+  || bad "#1947 M-B AC-11(c) should print the dispatch=subprocess-openrouter label on the success path (rc=$RC out=$OUT)"
+
+# (d) regression control: a leading {"type":"ai-title",...} bookkeeping record before the real enqueue record
+#     must NOT defeat the tag+nonce binding (measured live on #1947 AC-6, session bd8c0aec-...) -> still 0.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixD --task t --role planner --skip-reason "fixture: not under test in AC-11 regression(d)" >/dev/null
+  node "$LED" append --session orFixD --task t --role executor --skip-reason "fixture: not under test in AC-11 regression(d)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-d.md"
+  node "$LED" append --session orFixD --task t --role execution-review --oracle "$OR_FIX/artifacts/er-d.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixD.jsonl" "OR-NONCE-THIS-RUN-D" "moonshotai/kimi-k3" 1
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-D\n' > "$OR_FIX/artifacts/plan-d.md"
+  node "$LED" append --session orFixD --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixD.jsonl" --nonce "OR-NONCE-THIS-RUN-D" \
+    --artifact "$OR_FIX/artifacts/plan-d.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixD --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#1947 AC-11 regression(d): a leading ai-title bookkeeping record before the real enqueue record does not defeat the M2 tag+nonce binding -> still exits 0" \
+  || bad "#1947 AC-11 regression(d) should still exit 0 with a leading ai-title record (rc=$RC out=$OUT)"
+
+# (e) M-A monotonicity control (execution-review round-2 FAIL): a STALE, self-declared
+#     dispatch=subprocess-openrouter marker must NEVER outrank a harness-signed, RESOLVING agentId on the SAME
+#     row -- reproduces D3's bounded-fallback shape end-to-end: a subprocess plan-review dispatch stamps
+#     dispatch/transcript_path/nonce; that Kimi review gets REJECTED (D3's third fallback trigger, "a failed
+#     gate check of the plan's AC"); the bounded Anthropic Opus fallback then self-appends a REAL agentId + its
+#     OWN artifact + verdict=PASS onto the SAME row. Before the fix, checkSubprocessProvenance kept
+#     re-evaluating the SUPERSEDED subprocess evidence (the fallback's artifact never contains the earlier
+#     dispatch's nonce) and false-BLOCKed a genuinely-completed plan-review.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixE --task t --role planner --skip-reason "fixture: not under test in AC-11(e)" >/dev/null
+  node "$LED" append --session orFixE --task t --role executor --skip-reason "fixture: not under test in AC-11(e)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-e.md"
+  node "$LED" append --session orFixE --task t --role execution-review --oracle "$OR_FIX/artifacts/er-e.md" >/dev/null
+  # Step 1: the subprocess dispatch's OWN spawn-time stamp (a real, validly-bound transcript; nonce N-PR-ORIG).
+  mk_or_transcript "$OR_FIX/transcripts/fixE.jsonl" "N-PR-ORIG" "moonshotai/kimi-k3" 0
+  node "$LED" append --session orFixE --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixE.jsonl" --nonce "N-PR-ORIG" >/dev/null
+  # Step 2: that dispatch was REJECTED -- the bounded Anthropic Opus FALLBACK self-appends a REAL, resolving
+  #    agentId + its own artifact + verdict=PASS onto the SAME row (mirrors mk_sub's real-transcript pattern).
+  mk_sub orFixE fallback-agent-e
+  printf '## Review\nDecision: PASS\n' > "$OR_FIX/artifacts/plan-e-fallback.md"
+  node "$LED" append --session orFixE --task t --role plan-review --agent fallback-agent-e \
+    --artifact "$OR_FIX/artifacts/plan-e-fallback.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixE --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#1947 M-A AC-11(e): a harness-signed, RESOLVING agentId + real artifact + verdict on the SAME row always OUTRANKS a stale subprocess dispatch/transcript/nonce stamp (D3's bounded-fallback shape) -> check exits 0, never a false BLOCK from superseded residue" \
+  || bad "#1947 M-A AC-11(e) should exit 0 -- a stale subprocess marker must never outrank a resolving agentId (rc=$RC out=$OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
