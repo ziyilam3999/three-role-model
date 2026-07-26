@@ -2469,6 +2469,21 @@ function cmdResolveRoleModel(o) {
       printRoleModel('opus', '', 'opus', withEffort, withVersion);
       return;
     }
+    // #1947 AC-2/M3 -- a seat carrying an explicit `agent_tool_fallback` tier (the two subprocess-dispatched
+    // seats, plan-review/executor) resolves to THAT tier here, NEVER to model_vocabulary's tier_equivalent.
+    // Both OpenRouter dispatch slugs (moonshotai/kimi-k3, z-ai/glm-5.2) carry tier_equivalent:"fable" -- using
+    // it here would silently burn the Fable weekly cap the moment any accidental Agent-tool spawn (or a D3
+    // bounded fallback-to-Anthropic retry) resolved this role. `resolve-role-model` must keep answering with
+    // the SAFE fallback tier so that path lands on today's proven behavior (opus/sonnet), never fable.
+    if (seat.agent_tool_fallback && ROLE_MODELS.includes(seat.agent_tool_fallback)) {
+      const fbTier = seat.agent_tool_fallback;
+      const { found: fbFound, cfg: fbCfg } = loadRoleConfig();
+      if (fbFound) lintRoleConfig(fbCfg);
+      const fbEffort = fbFound ? roleEffortFromCfg(fbCfg, role) : '';
+      const fbVersion = (fbFound && roleVersionFromCfg(fbCfg, role, fbTier)) || fbTier;
+      printRoleModel(fbTier, fbEffort, fbVersion, withEffort, withVersion);
+      return;
+    }
     const ident = identifyModel(routesLoaded.routes, seat.model);
     if (!ident.ok || !ident.tierEquivalent) {
       process.stderr.write('ROUTE-MODEL-UNDECLARED: routes.seats.' + role + '.model "' + seat.model +
