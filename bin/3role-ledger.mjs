@@ -1692,7 +1692,23 @@ function overlayAppend(session, task, role, fields) {
   // above is the belt-and-braces backstop for a row that reaches it with both fields still present.
   if (('agentId' in fields) || ('oracle' in fields)) {
     delete entry.skip_reason;
-    delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+    // #1947 M-A-2 (execution-review round-2 FAIL — fix-round 2) — the line above unconditionally cleared
+    // dispatch/transcript_path/nonce on the mere PRESENCE of an agentId/oracle KEY, never checking that
+    // either one actually RESOLVES. checkSubprocessProvenance's own tie-break (:1249) already gates the
+    // identical supersession decision on `agentResolves(session, e.agentId)` — a non-resolving agentId (a
+    // bogus/forged value, or an inert `--oracle` that this role's checkRole never even reads — it's read
+    // ONLY for execution-review, :1294/:1299) carries ZERO evidentiary weight and must not erase
+    // nonce-bound, transcript-verified subprocess provenance (the #1590 monotonicity rule: supersession must
+    // be evidence-gated, erasure-on-mere-presence never is). Preserving the fields when neither resolves is
+    // safe: :1249's tie-break still lets a LATER-resolving agentId win the comparison outright.
+    const agentSupersedes = ('agentId' in fields) && agentResolves(session, fields.agentId);
+    const oracleSupersedes = ('oracle' in fields) && role === 'execution-review' && (() => {
+      const op = resolveArtifact(stripOraclePrefix(fields.oracle));
+      return !!op && fileHas(op, VERDICT_RE);
+    })();
+    if (agentSupersedes || oracleSupersedes) {
+      delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+    }
   }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
