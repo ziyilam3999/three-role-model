@@ -1662,4 +1662,67 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_
   && ok "#1947 M-A AC-11(e): a harness-signed, RESOLVING agentId + real artifact + verdict on the SAME row always OUTRANKS a stale subprocess dispatch/transcript/nonce stamp (D3's bounded-fallback shape) -> check exits 0, never a false BLOCK from superseded residue" \
   || bad "#1947 M-A AC-11(e) should exit 0 -- a stale subprocess marker must never outrank a resolving agentId (rc=$RC out=$OUT)"
 
+# (f) M-A-2 Reproduction A (execution-review round-2 FAIL, fix-round 2): the round-2 M-A fix (aa924ff51)
+#     introduced a NEW anti-monotonic arm in overlayAppend's own agentId/oracle clear-list -- it cleared
+#     dispatch/transcript_path/nonce on mere KEY PRESENCE, never checking the incoming agentId/oracle
+#     actually RESOLVES. A NON-resolving (bogus) --agent append therefore erased a completed, nonce-verified
+#     subprocess dispatch's evidence just the same as a genuinely-resolving one -- turning a genuinely-
+#     completed role into a false BLOCK. Both-ends proof, same #1833/#1590 pattern as the monotonicity
+#     tripwire above: RED = the committed pre-fix-round-2 fixture (no git dependency) writes the SAME buggy
+#     unconditional-clear row; GREEN = current code (this file) gates the clear on agentResolves. Both rows
+#     are then read by the SAME real `check` (current, unmodified checkRole/checkSubprocessProvenance) --
+#     the only experimental variable is which engine produced the plan-review row's second append.
+MA2_FIXTURE="$DIR/_fixtures/3role-ledger-pre1947-ma2-overlay.mjs"
+ma2_setup_common_roles() {   # $1=session
+  node "$LED" append --session "$1" --task t --role planner --skip-reason "fixture: not under test in M-A-2 repro" >/dev/null
+  node "$LED" append --session "$1" --task t --role executor --skip-reason "fixture: not under test in M-A-2 repro" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-ma2-$1.md"
+  node "$LED" append --session "$1" --task t --role execution-review --oracle "$OR_FIX/artifacts/er-ma2-$1.md" >/dev/null
+}
+
+if [ -s "$MA2_FIXTURE" ]; then
+  # RED: aa924ff51's buggy engine writes the plan-review row's bogus-agent append -> dispatch fields ERASED
+  # on mere presence, even though "bogusagent999" resolves to nothing.
+  MA2_RED_SID="orMA2Red"
+  ( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+    ma2_setup_common_roles "$MA2_RED_SID"
+    mk_or_transcript "$OR_FIX/transcripts/ma2-red.jsonl" "N-E2-red" "moonshotai/kimi-k3" 0
+    printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-E2-red\n' > "$OR_FIX/artifacts/plan-ma2-red.md"
+    node "$LED" append --session "$MA2_RED_SID" --task t --role plan-review --dispatch subprocess-openrouter \
+      --transcript "$OR_FIX/transcripts/ma2-red.jsonl" --nonce "N-E2-red" \
+      --artifact "$OR_FIX/artifacts/plan-ma2-red.md" --verdict PASS >/dev/null
+    node "$MA2_FIXTURE" append --session "$MA2_RED_SID" --task t --role plan-review --agent bogusagent999 >/dev/null
+  )
+  RED_OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session "$MA2_RED_SID" --task t 2>&1); RED_RC=$?
+  { [ "$RED_RC" = "2" ] && echo "$RED_OUT" | grep -qi 'plan-review agentId "bogusagent999" does not resolve'; } \
+    && ok "#1947 M-A-2 Reproduction A RED (committed pre-fix-round-2 fixture, no git dependency): a NON-resolving agentId append unconditionally erases a completed subprocess dispatch's evidence -- reproduces the round-2 review's exact false BLOCK (rc=2)" \
+    || bad "#1947 M-A-2 Reproduction A RED should reproduce the false BLOCK rc=2 (rc=$RED_RC out=$RED_OUT) -- re-verify hooks/_fixtures/3role-ledger-pre1947-ma2-overlay.mjs against pinned SHA aa924ff51"
+
+  # GREEN: current code (this file) -- the SAME non-resolving agentId must NOT erase the completed
+  # subprocess dispatch's evidence, so check re-validates the ORIGINAL nonce-bound provenance and passes.
+  MA2_GREEN_SID="orMA2Green"
+  ( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+    ma2_setup_common_roles "$MA2_GREEN_SID"
+    mk_or_transcript "$OR_FIX/transcripts/ma2-green.jsonl" "N-E2-green" "moonshotai/kimi-k3" 0
+    printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-E2-green\n' > "$OR_FIX/artifacts/plan-ma2-green.md"
+    node "$LED" append --session "$MA2_GREEN_SID" --task t --role plan-review --dispatch subprocess-openrouter \
+      --transcript "$OR_FIX/transcripts/ma2-green.jsonl" --nonce "N-E2-green" \
+      --artifact "$OR_FIX/artifacts/plan-ma2-green.md" --verdict PASS >/dev/null
+    node "$LED" append --session "$MA2_GREEN_SID" --task t --role plan-review --agent bogusagent999 >/dev/null
+  )
+  GREEN_OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session "$MA2_GREEN_SID" --task t 2>&1); GREEN_RC=$?
+  { [ "$GREEN_RC" = "0" ] && echo "$GREEN_OUT" | grep -qi "OK"; } \
+    && ok "#1947 M-A-2 Reproduction A GREEN (current code, fix-round 2): a NON-resolving agentId append does NOT erase a completed subprocess dispatch's evidence -- check re-validates the ORIGINAL nonce-bound provenance and exits 0, no false BLOCK" \
+    || bad "#1947 M-A-2 Reproduction A GREEN should exit 0 -- a non-resolving agentId must never erase verified subprocess provenance (rc=$GREEN_RC out=$GREEN_OUT)"
+
+  # Non-decay guard (mirrors #1833 AC3): RED and GREEN must produce DIFFERENT rc's on the identical
+  # sequence, else this pair has collapsed into a fixed-vs-fixed tautology that would pass regardless of
+  # whether the fix is actually present.
+  { [ "$RED_RC" != "$GREEN_RC" ]; } \
+    && ok "#1947 M-A-2 non-decay guard: RED (rc=$RED_RC) differs from GREEN (rc=$GREEN_RC) -- the split still has power, has not decayed into a tautology" \
+    || bad "#1947 M-A-2 non-decay guard: RED and GREEN produced the SAME rc ($RED_RC) -- the pair has decayed into a tautology; do NOT regenerate hooks/_fixtures/3role-ledger-pre1947-ma2-overlay.mjs from live code"
+else
+  bad "#1947 M-A-2 Reproduction A: FIXTURE MISSING at $MA2_FIXTURE -- this fixture is committed and must always be present (it carries aa924ff51's pre-fix-round-2 unconditional clear-list behavior; its absence means the RED leg cannot prove the false BLOCK at all)"
+fi
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
