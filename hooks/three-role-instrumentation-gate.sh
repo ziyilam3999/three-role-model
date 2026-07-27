@@ -382,7 +382,7 @@ block_outcome(){
     echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
     echo "  outcome_eval leg FAILED: $1"
     echo "  A tagged 3-role completion must record an HONEST post-ship OUTCOME verdict + specific live-evidence"
-    echo "  (parent-claude.md Invariant #6, VEI #1430): metadata.outcome_eval in {achieved|partial|missed} AND"
+    echo "  (parent-claude.md Invariant #7, VEI #1430): metadata.outcome_eval in {achieved|partial|missed} AND"
     echo "  metadata.outcome_evidence = a SPECIFIC live-run/production observation (>=20 non-ws chars, not"
     echo "  'done'/'n/a'/generic). A missing or unknown verdict is can't-tell => fail-closed (blocked here)."
     echo "  An honest 'missed'/'partial' WITH evidence is ACCEPTED (it ALLOWS — Phase 3 files the iteration"
@@ -593,7 +593,7 @@ fi
 # SOLE tagged ALLOW exit below — a tagged completion with no discoverable plan (APLAN empty) still reaches it,
 # so every tagged completion is gated (nesting it would create an APLAN-empty bypass). A tagged 3-role
 # completion must record an HONEST post-ship OUTCOME verdict + specific live-evidence in its metadata
-# (parent-claude.md Invariant #6, VEI): metadata-only (no card read) => genuinely fail-CLOSED. Both checks must
+# (parent-claude.md Invariant #7, VEI): metadata-only (no card read) => genuinely fail-CLOSED. Both checks must
 # hold, else block_outcome (exit 2). An honest `missed`/`partial` verdict WITH evidence ALLOWS — Phase 3 turns
 # it into the next iteration ticket; blocking an honest miss would only reward a false `achieved`. Feature
 # kill-switch OUTCOME_EVAL_GATE_OFF=1 skips ONLY this leg (mirrors VACUOUS_ORACLE_OFF); the master
