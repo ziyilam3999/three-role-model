@@ -907,6 +907,21 @@ function resolveArtifact(p) {
   return '';
 }
 
+// #2023 diagnosis-speed prevention: a stored artifact_path pointing inside a git worktree subtree
+// resolves fine while that worktree exists, but DANGLES the moment it is quarantined/removed (Rule 14)
+// — the exact defect hit live on task #1981 (planner's self-append ran from inside the worktree,
+// storing a `.claude/worktrees/<slug>/...` path instead of the stable primary-clone path the other
+// two review roles used). Surface the likely cause immediately in the failure message instead of
+// forcing a manual trace through enforce-review-or-lfah.sh -> resolveArtifact -> normalizeArtifact,
+// as happened this session.
+function worktreeDangleHint(rawPath) {
+  const p = String(rawPath == null ? '' : rawPath);
+  if (!/\/\.claude\/worktrees\//.test(p)) return '';
+  return ' (HINT: this path points inside a git worktree subtree — if that worktree was quarantined/removed, ' +
+    're-point the ledger via `3role-ledger.mjs append --artifact <primary-clone-relative-path>` run FROM THE ' +
+    'PRIMARY CLONE, not from inside a worktree, after copying/committing the artifact to that stable path.)';
+}
+
 // #1481 — the SHARED model-resolution helper both cmdAppend AND cmdRefreshModels call (reuse, never a
 // second copy of the transcriptModel()->overlay-merge path). Given a role's explicitAgent (pass '' / falsy
 // to fall back to resolveAgent's tag search) returns {} when no model is resolvable yet (fail-open,
@@ -1272,7 +1287,8 @@ function checkSubprocessProvenance(role, e, session, task) {
   } else if (role !== 'executor') {
     // executor's artifact is legitimately a PR URL/commit/branch string, never required to resolve on disk
     // (mirrors the ordinary arm's own role-shaped exemption below); every other role needs a real disk path.
-    return role + ' dispatch=subprocess-openrouter artifact_path "' + (e.artifact_path || '') + '" not found';
+    return role + ' dispatch=subprocess-openrouter artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
   }
   if (role === 'plan-review' && (!ap || !fileHas(ap, VERDICT_RE))) {
     return 'plan-review artifact "' + (ap || e.artifact_path) + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
@@ -1318,7 +1334,8 @@ function checkRole(role, e, session, opts, task) {
       return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
     }
     const ap = resolveArtifact(e.artifact_path);
-    if (!ap) return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found';
+    if (!ap) return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
     if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
     return null;
   }
@@ -1335,14 +1352,16 @@ function checkRole(role, e, session, opts, task) {
   }
   if (role === 'planner') {
     const ap = resolveArtifact(e.artifact_path);
-    if (!ap) return 'planner artifact_path "' + (e.artifact_path || '') + '" not found (the plan file)';
+    if (!ap) return 'planner artifact_path "' + (e.artifact_path || '') + '" not found (the plan file)' +
+      worktreeDangleHint(e.artifact_path);
     if (!fileHas(ap, PLAN_RE)) return 'planner artifact "' + ap + '" lacks a plan marker — needs a heading like ' +
       '## ELI5, ### Binary AC, ## Binary acceptance criteria, ### Acceptance criteria, ## Acceptance, or ## AC';
     return null;
   }
   if (role === 'plan-review') {
     const ap = resolveArtifact(e.artifact_path);
-    if (!ap) return 'plan-review artifact_path "' + (e.artifact_path || '') + '" not found';
+    if (!ap) return 'plan-review artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
     if (!fileHas(ap, VERDICT_RE)) return 'plan-review artifact "' + ap + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
     return null;
   }
