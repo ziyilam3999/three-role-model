@@ -251,6 +251,21 @@ ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-revi
 echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable primary path (got: $ERR)" || ok "#897 stable primary artifact path -> no warn"
 
 # ---------------------------------------------------------------------------
+# #2028 — worktreeDangleHint's regex must fire on a WORKTREE PATH REGARDLESS OF A LEADING SLASH: both an
+# absolute-embedded `/.claude/worktrees/...` and a bare project-relative `.claude/worktrees/...` (no
+# leading slash) must trigger the HINT when `check` can't resolve the artifact on disk. Pre-fix, the
+# regex required the literal `/.claude/worktrees/` segment and silently missed the bare-relative case.
+# ---------------------------------------------------------------------------
+DHSID="sess-dangle-hint"; DHTASK="2028dh"
+mk_sub "$DHSID" dhp
+node "$LED" append --session "$DHSID" --task "$DHTASK" --role planner --agent dhp \
+  --artifact ".claude/worktrees/2028-fake-slug/.ai-workspace/plans/does-not-exist.md" >/dev/null
+OUT=$(node "$LED" check --session "$DHSID" --task "$DHTASK" 2>&1)
+echo "$OUT" | grep -q 'HINT: this path points inside a git worktree subtree' \
+  && ok "#2028 worktreeDangleHint fires on a BARE project-relative .claude/worktrees/ path (no leading slash)" \
+  || bad "#2028 dangle hint should fire on a bare-relative worktree path (got: $OUT)"
+
+# ---------------------------------------------------------------------------
 # #1036 — append --verdict persists a review verdict; skip_reason clears it; absent -> no field (back-compat).
 # ---------------------------------------------------------------------------
 VSID="sess-verdict"; VTASK="1036v"; VFILE="$THREE_ROLE_LEDGER_DIR/$VSID/$VTASK.jsonl"

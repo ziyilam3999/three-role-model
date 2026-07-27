@@ -916,7 +916,7 @@ function resolveArtifact(p) {
 // as happened this session.
 function worktreeDangleHint(rawPath) {
   const p = String(rawPath == null ? '' : rawPath);
-  if (!/\/\.claude\/worktrees\//.test(p)) return '';
+  if (!/(^|\/)\.claude\/worktrees\//.test(p)) return '';
   return ' (HINT: this path points inside a git worktree subtree — if that worktree was quarantined/removed, ' +
     're-point the ledger via `3role-ledger.mjs append --artifact <primary-clone-relative-path>` run FROM THE ' +
     'PRIMARY CLONE, not from inside a worktree, after copying/committing the artifact to that stable path.)';
