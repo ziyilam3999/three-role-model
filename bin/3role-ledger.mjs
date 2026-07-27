@@ -2389,6 +2389,51 @@ function cmdCheck(o) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
       ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
   }
+  // #1989 — ROUTE-BYPASS trailing-edge detector: an always-on, pure-output advisory (exit code UNCHANGED — the
+  // model-policy legs own blocking; this is visibility, not a gate) printed on the roles-satisfied path, sibling
+  // of DISPATCH:/NOTE:/NOTE-EXECUTOR:/PROVENANCE:. Fires PER required role when ALL hold: (1) the routes SSOT,
+  // read FRESH through seatDispatchIsSubprocess() (M1: the SSOT decides admissibility, never the row — a future
+  // seat flip is covered automatically), declares that seat dispatch==subprocess-openrouter; (2) the role's
+  // ledger line exists and is not an inline-skip; (3) NO subprocess dispatch stamp SURVIVES on ANY of the role's
+  // ledger lines (scans ALL lines[], not just the merged byRole last row — a stamp on ANY surviving line
+  // suppresses the advisory for that role).
+  //
+  // HONEST DETECTION SEMANTICS (round-2 B1 fix, option (i)): absence of a surviving stamp does NOT mean "never
+  // attempted" — both sanctioned D3-fallback shapes leave zero surviving ledger evidence: a dispatch that fails
+  // pre-success never reaches the helper's success-path stamp write (tools/openrouter-role-dispatch.sh stamps
+  // only on success), and a stamped dispatch SUPERSEDED by the bounded Agent-tool retry is ERASED by
+  // overlayAppend's clear-list (delete entry.dispatch/transcript_path/nonce, gated on agentResolves — the
+  // #1590 monotonicity arm, NOT weakened here). So the advisory's claim is exactly "no surviving subprocess
+  // dispatch stamp" — wording that is honest in BOTH a habitual-bypass case AND a genuine D3 fallback (each an
+  // exceptional, visible event). It NEVER says "never attempted", and it names the receipt file's
+  // OR-DISPATCH-FALLBACK / OR-SEAT-SMOKE lines (task-keyed via task=) as the human disambiguator between the two
+  // causes. No absolute $HOME/`/Users/` paths (N5 — the helper is named repo-relatively; advisory stdout gets
+  // quoted into committed artifacts). INDEPENDENT of the Direction-2 block-once marker (N3 — different
+  // surfaces, different keys, NO shared state; a future "optimization" that suppressed this behind the
+  // spawn-time marker would recreate the silent-bypass hole, so the two stay independent in fact, not intent).
+  // First-wave volume (N4): both plan-review AND executor are subprocess-declared today, so this fires on
+  // essentially every existing task in current session ledgers — the ticket's requested retroactive visibility,
+  // not a regression.
+  for (const role of REQUIRED_ROLES) {
+    const decl = seatDispatchIsSubprocess(role);
+    if (!decl.ok) continue;                          // (1) SSOT declares this seat subprocess-dispatched right now
+    const e = byRole[role];
+    if (!e || ('skip_reason' in e)) continue;         // (2) role line exists and is not an inline-skip
+    // (3) no surviving subprocess dispatch stamp on ANY of the role's ledger lines.
+    let stampSurvives = false;
+    for (const ln of lines) {
+      let j; try { j = JSON.parse(ln); } catch (er) { continue; }
+      if (j && j.role === role && j.dispatch === 'subprocess-openrouter') { stampSurvives = true; break; }
+    }
+    if (stampSurvives) continue;
+    const seatModel = (decl.seat && decl.seat.model) || '<unknown>';
+    console.log('ROUTE-BYPASS: role=' + role + ' (seat model ' + seatModel + ', declared dispatch=subprocess-openrouter)' +
+      " — no surviving subprocess dispatch stamp on this routed seat's ledger lines, so its work did not CLOSE" +
+      ' via the subprocess route (tools/openrouter-role-dispatch.sh). agent_tool_fallback made the run gate-clean:' +
+      ' this is a VISIBILITY note, not a verdict invalidation. The two causes are a habitual Agent-tool bypass OR' +
+      " a sanctioned D3 fallback — disambiguate by reading .ai-workspace/status/1947-seat-mix-live-smoke.md's" +
+      ' OR-DISPATCH-FALLBACK / OR-SEAT-SMOKE receipt lines (task-keyed via their task= field).');
+  }
   console.log('OK: role-ledger complete for task ' + sanitize(task) +
     ' (planner, plan-review, executor, execution-review all resolved)');
   process.exit(0);

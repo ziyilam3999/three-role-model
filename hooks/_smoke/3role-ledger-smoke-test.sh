@@ -1725,4 +1725,123 @@ else
   bad "#1947 M-A-2 Reproduction A: FIXTURE MISSING at $MA2_FIXTURE -- this fixture is committed and must always be present (it carries aa924ff51's pre-fix-round-2 unconditional clear-list behavior; its absence means the RED leg cannot prove the false BLOCK at all)"
 fi
 
+# ── #1989 AC-7/AC-8 — ROUTE-BYPASS trailing-edge detector (Direction 3). Self-contained CC_ROUTES_JSON +
+#    THREE_ROLE_LEDGER_DIR fixtures, sibling of the #1947 AC-11 block above. Reuses mk_sub (resolvable agent
+#    transcript) + mk_or_transcript's shape (a dedicated helper below writes the tag for THIS task). The
+#    detector reads seatDispatchIsSubprocess() (loadRoutesConfig, NOT resolveRoute), so a minimal routes
+#    fixture with only the `seats` block suffices (no providers/task_classes needed for THIS leg). ────────
+RB_FIX="$TMP/rb-fixtures"
+mkdir -p "$RB_FIX/ledger" "$RB_FIX/transcripts" "$RB_FIX/artifacts"
+# Fixture declaring plan-review subprocess-openrouter (executor left UNdeclared here so AC-7 fires for
+# plan-review only; AC-8(a)'s no-subprocess-seat control uses a SEPARATE fixture below).
+cat > "$RB_FIX/routes-pr.json" <<'RBJSON'
+{ "seats": { "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus" } } }
+RBJSON
+# Fixture with NO subprocess-declared seat (AC-8(a) control — plan-review here has no dispatch field).
+cat > "$RB_FIX/routes-none.json" <<'RBJSON'
+{ "seats": { "plan-review": { "provider": "anthropic", "model": "claude-opus-5" } } }
+RBJSON
+# mk_rb_or_transcript $path $nonce — a validly-bound subprocess transcript whose FIRST record carries the
+# spawn tag (3ROLE_TASK:rb ROLE:plan-review) + this dispatch's nonce, and an assistant line serving the
+# SSOT-declared model (the two signals checkSubprocessProvenance binds on).
+mk_rb_or_transcript() {
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, nonce ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "rb-fixture", content: "3ROLE_TASK:rb ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model: "moonshotai/kimi-k3", content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2"
+}
+# rb_common $session — satisfy planner/executor/execution-review via the ordinary agentId/oracle arm so the
+# WHOLE task's `check` reaches the roles-satisfied path where ROUTE-BYPASS prints (plan-review is added per-case).
+rb_common() {  # $1=session
+  mk_sub "$1" rb-P; mk_sub "$1" rb-E; mk_sub "$1" rb-V
+  node "$LED" append --session "$1" --task rb --role planner --agent rb-P --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$1" --task rb --role executor --agent rb-E --artifact "PR #rb" >/dev/null
+  printf 'Decision: PASS\n' > "$RB_FIX/artifacts/er-$1.md"
+  node "$LED" append --session "$1" --task rb --role execution-review --oracle "$RB_FIX/artifacts/er-$1.md" >/dev/null
+}
+RB_LED() { echo "$RB_FIX/ledger/$1/rb.jsonl"; }
+
+# ---- AC-7: a fixture ledger whose four roles all satisfy `check` via ordinary arms, under a CC_ROUTES_JSON
+#      declaring plan-review subprocess-dispatched -> `check` exits 0 AND stdout carries a `^ROUTE-BYPASS:` line
+#      naming plan-review, whose text contains 'no surviving subprocess dispatch stamp', does NOT contain
+#      'never attempted', and contains NO '/Users/' substring (N5). ----
+( export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"
+  rb_common rb7; mk_sub rb7 rb-PR
+  printf '## Review\nverdict: PASS\n' > "$RB_FIX/artifacts/plan-rb7.md"
+  node "$LED" append --session rb7 --task rb --role plan-review --agent rb-PR --artifact "$RB_FIX/artifacts/plan-rb7.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"; node "$LED" check --session rb7 --task rb 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "^ROUTE-BYPASS:" && echo "$OUT" | grep -q "plan-review" \
+  && echo "$OUT" | grep -q "no surviving subprocess dispatch stamp" && ! echo "$OUT" | grep -q "never attempted" \
+  && ! echo "$OUT" | grep -q "/Users/"; } \
+  && ok "#1989 AC-7: routed plan-review closed via the agentId arm -> exit 0 + ROUTE-BYPASS with honest wording, no 'never attempted', no /Users/ leak" \
+  || bad "#1989 AC-7 failed (rc=$RC out=$OUT)"
+
+# ---- AC-8(a): the SAME rows under a fixture with NO subprocess-declared seat -> exit 0 and stdout carries NO
+#      ROUTE-BYPASS token (seatDispatchIsSubprocess returns !ok -> the advisory is dormant). ----
+( export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-none.json"
+  rb_common rb8a; mk_sub rb8a rb-PRa
+  printf '## Review\nverdict: PASS\n' > "$RB_FIX/artifacts/plan-rb8a.md"
+  node "$LED" append --session rb8a --task rb --role plan-review --agent rb-PRa --artifact "$RB_FIX/artifacts/plan-rb8a.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-none.json"; node "$LED" check --session rb8a --task rb 2>&1); RC=$?
+{ [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "ROUTE-BYPASS"; } \
+  && ok "#1989 AC-8(a): no subprocess-declared seat -> exit 0, NO ROUTE-BYPASS token (dormant)" \
+  || bad "#1989 AC-8(a) should exit 0 with no ROUTE-BYPASS (rc=$RC out=$OUT)"
+
+# ---- AC-8(b): a plan-review row with VERIFIED subprocess provenance (fixture-only by construction per N2 --
+#      live subprocess rows are keyed by the SUBPROCESS's own session id, so no production single-session
+#      `check` can observe this shape) -> exit 0, DISPATCH: labels it as today, NO ROUTE-BYPASS for plan-review
+#      (a surviving dispatch stamp suppresses the advisory). ----
+( export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"
+  rb_common rb8b
+  mk_rb_or_transcript "$RB_FIX/transcripts/fix8b.jsonl" "OR-NONCE-RB8B"
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-RB8B\n' > "$RB_FIX/artifacts/plan-rb8b.md"
+  node "$LED" append --session rb8b --task rb --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$RB_FIX/transcripts/fix8b.jsonl" --nonce "OR-NONCE-RB8B" \
+    --artifact "$RB_FIX/artifacts/plan-rb8b.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"; node "$LED" check --session rb8b --task rb 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "role=plan-review dispatch=subprocess-openrouter" && ! echo "$OUT" | grep -q "ROUTE-BYPASS"; } \
+  && ok "#1989 AC-8(b): verified subprocess plan-review row -> exit 0, DISPATCH: labels it, NO ROUTE-BYPASS (surviving stamp suppresses)" \
+  || bad "#1989 AC-8(b) should exit 0 + DISPATCH label + no ROUTE-BYPASS (rc=$RC out=$OUT)"
+
+# ---- AC-8(c): the genuine-D3-fallback shape (round-2 B2 requirement). Append a plan-review row carrying
+#      dispatch/transcript/nonce (NO agentId), then SUPERSEDE it with a resolving --agent + --artifact + --verdict
+#      append. overlayAppend's clear-list (gated on agentResolves) ERASES dispatch/transcript_path/nonce on the
+#      resolving append; the prior no-agentId row is NOT retained as history (isNewRound requires prior.agentId).
+#      So the file holds 1 surviving line, `grep -Ec '"dispatch"'` = 0 (positive control `grep -Ec
+#      '"role":"plan-review"'` = 1) -> `check` exits 0 AND the ROUTE-BYPASS: line for plan-review FIRES with the
+#      AC-7 honest wording (it names the receipt file as disambiguator; no 'never attempted' claim). This pins the
+#      designed round-2 semantics: a fallback-closed routed seat is VISIBLE, and the advisory never lies about
+#      the cause. ----
+( export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"
+  rb_common rb8c
+  # Step 1: the subprocess dispatch's OWN spawn-time stamp (a real, validly-bound transcript; no agentId).
+  mk_rb_or_transcript "$RB_FIX/transcripts/fix8c.jsonl" "N-PR-ORIG-8C"
+  node "$LED" append --session rb8c --task rb --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$RB_FIX/transcripts/fix8c.jsonl" --nonce "N-PR-ORIG-8C" >/dev/null
+  # Step 2: that dispatch was REJECTED -- the bounded Anthropic fallback self-appends a REAL, resolving agentId +
+  #    its own artifact + verdict=PASS onto the SAME row (the clear-list erases the stamp on this resolving append).
+  mk_sub rb8c fallback-agent-8c
+  printf '## Review\nDecision: PASS\n' > "$RB_FIX/artifacts/plan-rb8c-fallback.md"
+  node "$LED" append --session rb8c --task rb --role plan-review --agent fallback-agent-8c \
+    --artifact "$RB_FIX/artifacts/plan-rb8c-fallback.md" --verdict PASS >/dev/null
+)
+RB8C_FILE="$(RB_LED rb8c)"
+disp_count=$(grep -Ec '"dispatch"' "$RB8C_FILE" 2>/dev/null); disp_count="${disp_count:-0}"
+pr_count=$(grep -Ec '"role":"plan-review"' "$RB8C_FILE" 2>/dev/null); pr_count="${pr_count:-0}"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_FIX/routes-pr.json"; node "$LED" check --session rb8c --task rb 2>&1); RC=$?
+{ [ "$disp_count" = "0" ] && [ "$pr_count" = "1" ] && [ "$RC" = "0" ] \
+  && echo "$OUT" | grep -q "^ROUTE-BYPASS:" && echo "$OUT" | grep -q "plan-review" \
+  && echo "$OUT" | grep -q "no surviving subprocess dispatch stamp" && ! echo "$OUT" | grep -q "never attempted" \
+  && echo "$OUT" | grep -q "1947-seat-mix-live-smoke"; } \
+  && ok "#1989 AC-8(c): superseded-fallback shape (stamp then resolving --agent/--artifact/--verdict) -> 1 surviving line, grep '\"dispatch\"'=0 (positive control role=plan-review=1), exit 0 + ROUTE-BYPASS FIRES with honest wording naming the receipt file" \
+  || bad "#1989 AC-8(c) failed (dispatch-count=$disp_count pr-count=$pr_count rc=$RC out=$OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
