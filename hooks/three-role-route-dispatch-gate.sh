@@ -71,8 +71,11 @@ INPUT=$(cat 2>/dev/null)
 command -v node >/dev/null 2>&1 || exit 0
 
 # Kill-switches (full exemption, no state mutation). EVERY escape audit-logged (N1) — including the inline
-# token below. `${INPUT}` is already captured above so the audit row carries real session/agent attribution
-# (not just the orchestrator sentinel).
+# token below. `${INPUT}` is already captured above so the audit row at minimum carries the real session id
+# — NOT a claim every field is populated: this hook normally fires from the orchestrator's own
+# PreToolUse(Agent|Task) dispatch, whose payload carries no agent_id, so cmdLogBypass's own attribution
+# logic (3role-ledger.mjs) leaves agent/task empty and role falling to the orchestrator sentinel. Passing
+# INPUT is still strictly better than losing the session id too, never a claim of full attribution.
 if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
   type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-route-dispatch-gate" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
   exit 0
