@@ -1965,9 +1965,9 @@ function cmdInherit(o) {
 // bash gate (three-role-transition-gate.sh) shells out to the `gate-plan-review` CLI below instead of
 // re-implementing this contract in a second language — ONE evaluator, exercised directly by node-level
 // smokes AND by the real gate. Returns { allow, class, detail }; `class` is '' when allow=true, else one of
-// the SEVEN named fail-closed classes the plan requires the block message to distinguish:
+// the EIGHT named fail-closed classes the plan requires the block message to distinguish:
 //   not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent /
-//   deliberate-skip-closed / junk-line
+//   deliberate-skip-closed / junk-line / subprocess-unverified
 function evaluatePlanReviewGate(session, task) {
   const file = ledgerFile(session, task);
   let raw;
@@ -2010,6 +2010,24 @@ function evaluatePlanReviewGate(session, task) {
   }
   if (!AFFIRMATIVE_VERDICTS.has(verdict)) {
     return { allow: false, class: 'negative-verdict', detail: file + ' (line ' + (lastIdx + 1) + ', verdict=' + verdict + ') — the review did not pass; re-plan, re-review' };
+  }
+  // Arm 3 (#2051) — subprocess-openrouter provenance, consulted FIRST after the universal verdict screen,
+  // mirroring checkRole's own consult-order (:1305-1308). Calls the SAME checkSubprocessProvenance the
+  // completion gate already trusts (the #1947 verifier) — never re-implements it (C1/C2: one evaluator, no
+  // mirror; Scope discipline forbids touching that function). Tri-state contract mapped onto the gate:
+  //   null  -> NOT admissible for this row/SSOT state (no dispatch marker, or SSOT silent, or a RESOLVING
+  //            agentId outranks the dispatch marker at checkSubprocessProvenance's own :1264 tie-break) ->
+  //            fall through to arms 1/2 COMPLETELY UNCHANGED — a pure addition for every ordinary row.
+  //   ''    -> admissible AND fully verified -> ALLOW.
+  //   <str> -> admissible but verification FAILED -> BLOCK, fail-closed, class subprocess-unverified (the
+  //            8th named class, #2051 C5), carrying that string as the detail.
+  // Placement is pinned (C2/#1590 monotonicity), not stylistic: a NON-resolving agentId is NOISE and must
+  // never erase otherwise-valid nonce evidence — arm-3-last would let arm 1's no-bound-reviewer-spawn false-
+  // block a valid dual-signal row before the subprocess arm ever ran (AC-10 discriminates the two placements).
+  const sub = checkSubprocessProvenance('plan-review', e, session, task);
+  if (sub !== null) {
+    if (sub === '') return { allow: true, class: '', detail: '' };
+    return { allow: false, class: 'subprocess-unverified', detail: file + ' (line ' + (lastIdx + 1) + ') — ' + sub };
   }
   // Arm 1 — completed-review (primary): affirmative verdict (screened above) AND closedAt (the SubagentStop
   // punch-out) AND agentId, AND that agentId is SPAWN-RECORD-bound to 3ROLE_TASK:<task> ROLE:plan-review.

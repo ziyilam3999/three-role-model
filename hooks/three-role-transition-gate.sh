@@ -9,7 +9,15 @@
 # shells out to `node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" gate-plan-review --session <session> --task <id>` — the SAME
 # evaluator a node-level smoke exercises directly, so there is ONE implementation of the admission contract,
 # not two. That evaluator reads the LAST PARSEABLE plan-review line, fail-closes on trailing junk, runs a
-# universal verdict ALLOWLIST screen, then dispatches to exactly two sanctioned arms:
+# universal verdict ALLOWLIST screen, then dispatches to exactly three sanctioned arms (the #2051 subprocess
+# arm consulted FIRST after the verdict screen, mirroring checkRole's own consult-order):
+#   (3) subprocess-openrouter (#2051) — affirmative verdict + a `dispatch=subprocess-openrouter` marker whose
+#       SSOT seat is declared subprocess-dispatched, verified by the SAME checkSubprocessProvenance the
+#       completion gate already trusts (a per-dispatch nonce stamped into the transcript's FIRST record AND
+#       the artifact, the served model == the SSOT seat model, the transcript exists). A forged/replayed
+#       nonce, a missing transcript, or an SSOT mismatch blocks `subprocess-unverified`. A bare marker with
+#       the SSOT silent admits NOTHING (falls through to arms 1/2). Never a hand-typed ledger append — the
+#       sanctioned route is re-running the dispatch via tools/openrouter-role-dispatch.sh.
 #   (1) completed-review — affirmative verdict + closedAt (the SubagentStop punch-out) + an agentId whose
 #       transcript is SPAWN-RECORD-bound (its FIRST record, not merely a later mention) to
 #       `3ROLE_TASK:<id> ROLE:plan-review`;
@@ -89,10 +97,11 @@ read -r TASKID ROLE SESSION < <(
 
 # #1575 — the ENTIRE plan-review-admission decision lives in `gate-plan-review` (hooks/3role-ledger.mjs):
 # last-parseable-line semantics, trailing-junk fail-closed, the universal verdict allowlist screen, and the
-# two sanctioned arms (completed-review / inherited-review), each spawn-record-bound to the CITED agentId
-# (never a whole-file mention scan, never a newest-mtime "winner"). This hook is a thin caller so there is
-# exactly ONE implementation of the contract — node-level smokes exercise `gate-plan-review` directly, and
-# this bash smoke exercises it through the real hook.
+# three sanctioned arms (subprocess-openrouter / completed-review / inherited-review), each verified by the
+# SAME checkSubprocessProvenance + spawn-record-bound to the CITED agentId (never a whole-file mention scan,
+# never a newest-mtime "winner"). This hook is a thin caller so there is exactly ONE implementation of the
+# contract — node-level smokes exercise `gate-plan-review` directly, and this bash smoke exercises it through
+# the real hook.
 # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
 # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
@@ -109,15 +118,23 @@ fi
 
 # BLOCK: the ledger has no COMPLETED, AFFIRMATIVE plan-review for this task yet. $GATE_STDERR names the
 # specific evidence class that failed (not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn /
-# inherited-row-unbound-to-parent / deliberate-skip-closed / junk-line) plus the ledger file + line evaluated
-# (a misconfigured THREE_ROLE_LEDGER_DIR is otherwise silently permissive-looking and undiagnosable).
+# inherited-row-unbound-to-parent / deliberate-skip-closed / junk-line / subprocess-unverified) plus the
+# ledger file + line evaluated (a misconfigured THREE_ROLE_LEDGER_DIR is otherwise silently permissive-looking
+# and undiagnosable).
 {
   echo "THREE-ROLE TRANSITION GATE (three-role-transition-gate): cannot spawn the EXECUTOR for task #${TASKID} yet."
   echo "  No COMPLETED, AFFIRMATIVE plan-review verdict is recorded for #${TASKID} in this session (${SESSION})."
   echo "  ${GATE_STDERR}"
   echo "  The 3-role model requires the PLAN to be reviewed by a STATELESS reviewer BEFORE execution, and that"
   echo "  review must FINISH with an affirmative verdict (parent-claude.md Invariant #2). The reviewer — not the"
-  echo "  orchestrator — records its verdict. Run the plan-review role and let it complete honestly:"
+  echo "  orchestrator — records its verdict. Run the plan-review role and let it complete honestly."
+  echo "  If the plan-review seat is dispatched via the subprocess-openrouter route (the #1947 norm — e.g. Kimi K3"
+  echo "    via OpenRouter), the SANCTIONED route is to RE-RUN that dispatch, never a hand-typed ledger append for a"
+  echo "    subprocess row (a hand-append is the very forgery this gate exists to block):"
+  echo "    bash tools/openrouter-role-dispatch.sh --role plan-review --brief <brief-path> --task ${TASKID} --session ${SESSION}"
+  echo "    (the dispatch self-stamps dispatch/transcript_path/nonce; the gate verifies them via the SAME"
+  echo "    checkSubprocessProvenance the completion gate already trusts.)"
+  echo "  Otherwise, run an Agent-tool-dispatched plan-review and let it complete honestly:"
   echo "    node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" append --session ${SESSION} --task ${TASKID} --role plan-review \\"
   echo "      --agent <agentId> --artifact <plan-or-review-path> --verdict PASS --closed-at <ISO-8601-timestamp>"
   echo "  If #${TASKID} is a LEG of a parent plan whose plan-review already PASSED, inherit it instead (fails"
