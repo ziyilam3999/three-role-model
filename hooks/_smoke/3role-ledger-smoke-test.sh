@@ -1859,4 +1859,188 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$RB_FIX/ledger"; export CC_ROUTES_JSON="$RB_
   && ok "#1989 AC-8(c): superseded-fallback shape (stamp then resolving --agent/--artifact/--verdict) -> 1 surviving line, grep '\"dispatch\"'=0 (positive control role=plan-review=1), exit 0 + ROUTE-BYPASS FIRES with honest wording naming the receipt file" \
   || bad "#1989 AC-8(c) failed (dispatch-count=$disp_count pr-count=$pr_count rc=$RC out=$OUT)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2051 — the transition gate's evaluatePlanReviewGate now recognizes a genuine subprocess-openrouter
+# (Kimi K3) plan-review PASS via a THIRD sanctioned arm that CALLS checkSubprocessProvenance (never
+# re-implements it), placed FIRST after the universal verdict screen (mirroring checkRole's consult-order).
+# These node-level arms exercise `gate-plan-review` DIRECTLY. Sibling end-to-end arms live in
+# hooks/three-role-transition-gate-smoke-test.sh (AC-7). Isolated CC_ROUTES_JSON + THREE_ROLE_LEDGER_DIR +
+# THREE_ROLE_PROJECTS_ROOT fixtures, reusing the #1947 AC-11 fixture vocabulary.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+G_FIX="$TMP/gate-fixtures"
+mkdir -p "$G_FIX/ledger" "$G_FIX/transcripts" "$G_FIX/artifacts" "$G_FIX/projects"
+# Fixture routes: plan-review = subprocess-openrouter kimi-k3 (the #1947 SSOT shape the gate was blind to).
+cat > "$G_FIX/routes.json" <<'GJSON'
+{ "seats": { "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus" } } }
+GJSON
+# A SECOND routes fixture for AC-4 (SSOT silent — plan-review is an ordinary anthropic seat, no dispatch).
+cat > "$G_FIX/routes-none.json" <<'GJSON'
+{ "seats": { "plan-review": { "provider": "anthropic", "model": "claude-opus-5" } } }
+GJSON
+# mk_g_or_transcript $path $task $nonce $servedModel — a validly-bound subprocess transcript whose FIRST
+# record (queue-operation/enqueue) carries `3ROLE_TASK:<task> ROLE:plan-review` AND this dispatch's nonce,
+# and an assistant line serving the SSOT-declared model. The two signals checkSubprocessProvenance binds on.
+mk_g_or_transcript() {
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce, model ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "g-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# mk_g_bound $session $agentId $task $role — a resolvable AND spawn-record-bound Agent-tool subagent
+# transcript (first record message.content carries the tag), under the fixture PROJECTS_ROOT. Used by
+# AC-10(c) (a genuinely RESOLVING, spawn-bound agentId that must win via arm 1, not be shadowed by arm 3).
+mk_g_bound() {
+  mkdir -p "$G_FIX/projects/proj/$1/subagents"
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4" \
+    > "$G_FIX/projects/proj/$1/subagents/agent-$2.jsonl"
+}
+# Run gate-plan-review under the G fixture env. $1=session $2=task; sets GR_OUT / GR_RC.
+g_gate() { GR_OUT=$(THREE_ROLE_LEDGER_DIR="$G_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$G_FIX/projects" CC_ROUTES_JSON="$G_FIX/routes.json" node "$LED" gate-plan-review --session "$1" --task "$2" 2>&1 >/dev/null); GR_RC=$?; }
+# g_append $session $task <append-args...> — write a plan-review row under the G fixture env.
+g_append() { local S="$1" T="$2"; shift 2; THREE_ROLE_LEDGER_DIR="$G_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$G_FIX/projects" CC_ROUTES_JSON="$G_FIX/routes.json" node "$LED" append --session "$S" --task "$T" --role plan-review "$@" >/dev/null 2>&1; }
+GT="gt1"   # the task id used across these arms
+
+# ---- AC-1 (green — recognition). Hermetic AC-1 fixture: verdict PASS + dispatch + transcript + nonce +
+#      artifact, NO agentId, NO closedAt. The arm-3 call to checkSubprocessProvenance returns '' -> ALLOW. ----
+GS1="s-ac1-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac1.jsonl" "$GT" "N-AC1-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC1-2051\n' > "$G_FIX/artifacts/p-ac1.md"
+g_append "$GS1" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac1.jsonl" \
+  --nonce "N-AC1-2051" --artifact "$G_FIX/artifacts/p-ac1.md" --verdict PASS
+g_gate "$GS1" "$GT"
+{ [ "$GR_RC" = "0" ]; } && ok "#2051 AC-1: a real subprocess-openrouter plan-review PASS (nonce-verified, SSOT-declared) -> gate-plan-review exits 0 (the fix)" \
+  || bad "#2051 AC-1 should ALLOW a genuine subprocess PASS (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-2 (red — nonce/binding forgeries). Each single mutation of the AC-1 fixture exits 2 with
+#      BLOCK:subprocess-unverified. ----
+# (a) transcript first record carries a DIFFERENT nonce than the row's own.
+GS2A="s-ac2a-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac2a.jsonl" "$GT" "WRONG-NONCE-2A" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC2A-2051\n' > "$G_FIX/artifacts/p-ac2a.md"
+g_append "$GS2A" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac2a.jsonl" \
+  --nonce "N-AC2A-2051" --artifact "$G_FIX/artifacts/p-ac2a.md" --verdict PASS
+g_gate "$GS2A" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:subprocess-unverified"; } \
+  && ok "#2051 AC-2(a): transcript first-record nonce != row nonce -> BLOCK:subprocess-unverified (M2)" \
+  || bad "#2051 AC-2(a) should block subprocess-unverified (rc=$GR_RC out=$GR_OUT)"
+
+# (b) served model != SSOT seat model.
+GS2B="s-ac2b-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac2b.jsonl" "$GT" "N-AC2B-2051" "wrong/model-b"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC2B-2051\n' > "$G_FIX/artifacts/p-ac2b.md"
+g_append "$GS2B" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac2b.jsonl" \
+  --nonce "N-AC2B-2051" --artifact "$G_FIX/artifacts/p-ac2b.md" --verdict PASS
+g_gate "$GS2B" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:subprocess-unverified"; } \
+  && ok "#2051 AC-2(b): served model != SSOT seat model -> BLOCK:subprocess-unverified" \
+  || bad "#2051 AC-2(b) should block subprocess-unverified (rc=$GR_RC out=$GR_OUT)"
+
+# (c) artifact does not contain the nonce.
+GS2C="s-ac2c-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac2c.jsonl" "$GT" "N-AC2C-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\n' > "$G_FIX/artifacts/p-ac2c.md"   # NO nonce in the artifact
+g_append "$GS2C" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac2c.jsonl" \
+  --nonce "N-AC2C-2051" --artifact "$G_FIX/artifacts/p-ac2c.md" --verdict PASS
+g_gate "$GS2C" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:subprocess-unverified"; } \
+  && ok "#2051 AC-2(c): artifact lacks this dispatch's nonce -> BLOCK:subprocess-unverified (M2 binds artifact)" \
+  || bad "#2051 AC-2(c) should block subprocess-unverified (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-3 (red — missing transcript). transcript_path points at a non-existent file. ----
+GS3="s-ac3-2051"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC3-2051\n' > "$G_FIX/artifacts/p-ac3.md"
+g_append "$GS3" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/does-not-exist.jsonl" \
+  --nonce "N-AC3-2051" --artifact "$G_FIX/artifacts/p-ac3.md" --verdict PASS
+g_gate "$GS3" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:subprocess-unverified"; } \
+  && ok "#2051 AC-3: missing transcript -> BLOCK:subprocess-unverified" \
+  || bad "#2051 AC-3 should block subprocess-unverified (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-4 (red — forged marker, SSOT silent). AC-1 fixture unchanged EXCEPT CC_ROUTES_JSON declares
+#      plan-review an ordinary anthropic seat (no dispatch). checkSubprocessProvenance returns null (M1:
+#      SSOT silent -> marker ignored) -> fall through -> arms 1/2 (no closedAt/agentId) -> BLOCK:not-finished. ----
+GS4="s-ac4-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac4.jsonl" "$GT" "N-AC4-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC4-2051\n' > "$G_FIX/artifacts/p-ac4.md"
+THREE_ROLE_LEDGER_DIR="$G_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$G_FIX/projects" CC_ROUTES_JSON="$G_FIX/routes.json" \
+  node "$LED" append --session "$GS4" --task "$GT" --role plan-review \
+  --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac4.jsonl" \
+  --nonce "N-AC4-2051" --artifact "$G_FIX/artifacts/p-ac4.md" --verdict PASS >/dev/null 2>&1
+# Run the gate under the SSOT-SILENT routes (routes-none.json) — the row still carries the marker, the SSOT
+# does not declare the seat subprocess-dispatched, so the marker is ignored.
+GR_OUT=$(THREE_ROLE_LEDGER_DIR="$G_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$G_FIX/projects" CC_ROUTES_JSON="$G_FIX/routes-none.json" node "$LED" gate-plan-review --session "$GS4" --task "$GT" 2>&1 >/dev/null); GR_RC=$?
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:not-finished"; } \
+  && ok "#2051 AC-4: bare dispatch marker with SSOT silent -> BLOCK:not-finished (marker admitted nothing; fall-through preserved — the poisoned hand-append lesson is mechanically rejected)" \
+  || bad "#2051 AC-4 should block not-finished (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-5 (red — verdict screen still first). AC-1 fixture with verdict FAIL -> the universal verdict
+#      screen fires before arm 3 -> BLOCK:negative-verdict (never reaches the subprocess arm). ----
+GS5="s-ac5-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac5.jsonl" "$GT" "N-AC5-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-AC5-2051\n' > "$G_FIX/artifacts/p-ac5.md"
+g_append "$GS5" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac5.jsonl" \
+  --nonce "N-AC5-2051" --artifact "$G_FIX/artifacts/p-ac5.md" --verdict FAIL
+g_gate "$GS5" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:negative-verdict"; } \
+  && ok "#2051 AC-5: verdict FAIL on a subprocess row -> BLOCK:negative-verdict (verdict screen ahead of arm 3)" \
+  || bad "#2051 AC-5 should block negative-verdict (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-10(a) (placement discriminator — ALLOW side). The dual-signal row overlayAppend can really
+#      produce: AC-1's fixture row ADDITIONALLY carrying closedAt + a NON-resolving agentId (no transcript
+#      for it exists), alongside valid dispatch/transcript/nonce. arm-3-first: tie-break at :1264 does NOT
+#      fire (agentId non-resolving) -> subprocess evidence verified -> '' -> ALLOW. A wrong arm-3-last
+#      implementation exits 2 BLOCK:no-bound-reviewer-spawn here, so this arm mechanically pins the placement. ----
+GS10A="s-ac10a-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac10a.jsonl" "$GT" "N-AC10A-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC10A-2051\n' > "$G_FIX/artifacts/p-ac10a.md"
+# Two ordinary appends compose the dual-signal row: first the closedAt+agentId, then the dispatch fields.
+# (A NON-resolving agentId: no transcript for "ghost-ac10a" exists under the fixture projects root.)
+g_append "$GS10A" "$GT" --agent "ghost-ac10a" --artifact "$G_FIX/artifacts/p-ac10a.md" --verdict PASS --closed-at "2026-07-28T00:00:00.000Z"
+g_append "$GS10A" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac10a.jsonl" \
+  --nonce "N-AC10A-2051" --artifact "$G_FIX/artifacts/p-ac10a.md" --verdict PASS
+g_gate "$GS10A" "$GT"
+{ [ "$GR_RC" = "0" ]; } \
+  && ok "#2051 AC-10(a): dual-signal row (closedAt + NON-resolving agentId + valid subprocess evidence) -> ALLOW (noise agentId does not erase valid nonce evidence; arm-3-first)" \
+  || bad "#2051 AC-10(a) should ALLOW (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-10(b) (placement discriminator — BLOCK side). Same dual-signal shape with the AC-2(a) forged-nonce
+#      mutation: the subprocess arm blocks BLOCK:subprocess-unverified, specifically NOT no-bound-reviewer-
+#      spawn — proving the dual-signal shape never fail-opens AND the block is issued by arm 3 (a wrong
+#      arm-3-last implementation emits no-bound-reviewer-spawn here). ----
+GS10B="s-ac10b-2051"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac10b.jsonl" "$GT" "WRONG-NONCE-10B" "moonshotai/kimi-k3"   # forged nonce in transcript
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC10B-2051\n' > "$G_FIX/artifacts/p-ac10b.md"
+g_append "$GS10B" "$GT" --agent "ghost-ac10b" --artifact "$G_FIX/artifacts/p-ac10b.md" --verdict PASS --closed-at "2026-07-28T00:00:00.000Z"
+g_append "$GS10B" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac10b.jsonl" \
+  --nonce "N-AC10B-2051" --artifact "$G_FIX/artifacts/p-ac10b.md" --verdict PASS
+g_gate "$GS10B" "$GT"
+{ [ "$GR_RC" = "2" ] && echo "$GR_OUT" | grep -q "BLOCK:subprocess-unverified" && ! echo "$GR_OUT" | grep -q "no-bound-reviewer-spawn"; } \
+  && ok "#2051 AC-10(b): dual-signal + forged nonce -> BLOCK:subprocess-unverified (NOT no-bound-reviewer-spawn; block issued by arm 3, dual-signal never fail-opens)" \
+  || bad "#2051 AC-10(b) should block subprocess-unverified and NOT no-bound-reviewer-spawn (rc=$GR_RC out=$GR_OUT)"
+
+# ---- AC-10(c) (round-2 N6 — the stronger-claim-wins positive control). AC-1's fixture PLUS closedAt PLUS
+#      an agentId that RESOLVES AND is spawn-record-bound to 3ROLE_TASK:<T> ROLE:plan-review (a genuine,
+#      spawn-bound agentId) PLUS a DELIBERATELY forged transcript nonce on the dispatch fields -> exit 0.
+#      checkSubprocessProvenance's tie-break at :1264 returns null for the resolving agentId (the stronger
+#      claim) BEFORE any subprocess verification runs, so arm 3 falls through and arm 1 wins. A MIRRORED
+#      arm-3-first (C2 violation) would block subprocess-unverified here — this arm catches that regression. ----
+GS10C="s-ac10c-2051"
+# A genuinely resolving + spawn-bound agentId transcript under the fixture projects root.
+mk_g_bound "$GS10C" "real-ac10c" "$GT" "plan-review"
+mk_g_or_transcript "$G_FIX/transcripts/f-ac10c.jsonl" "$GT" "WRONG-NONCE-10C" "moonshotai/kimi-k3"   # forged nonce in transcript
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC10C-2051\n' > "$G_FIX/artifacts/p-ac10c.md"
+# Compose: first the resolving+bound agentId + closedAt + verdict, then the (forged) dispatch fields.
+g_append "$GS10C" "$GT" --agent "real-ac10c" --artifact "$G_FIX/artifacts/p-ac10c.md" --verdict PASS --closed-at "2026-07-28T00:00:00.000Z"
+g_append "$GS10C" "$GT" --dispatch subprocess-openrouter --transcript "$G_FIX/transcripts/f-ac10c.jsonl" \
+  --nonce "N-AC10C-2051" --artifact "$G_FIX/artifacts/p-ac10c.md" --verdict PASS
+g_gate "$GS10C" "$GT"
+{ [ "$GR_RC" = "0" ]; } \
+  && ok "#2051 AC-10(c): resolving + spawn-bound agentId PLUS a forged dispatch nonce -> exit 0 (arm 1 wins via the :1264 tie-break; arm 3 must NOT shadow a resolving agentId — catches a mirrored checkSubprocessProvenance regression)" \
+  || bad "#2051 AC-10(c) should ALLOW — a resolving+bound agentId must win, not be shadowed by a forged-nonce subprocess arm (rc=$GR_RC out=$GR_OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

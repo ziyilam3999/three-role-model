@@ -35,8 +35,38 @@ printf '## Review\nverdict: PASS\n' > "$TMP/rev.md"
 
 # run the gate with a raw payload string
 run() { CAP=$(printf '%s' "$1" | THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
+# #2051 AC-7: variant that ALSO forwards CC_ROUTES_JSON to the hook subprocess — the existing run() helper
+# forwards only THREE_ROLE_LEDGER_DIR + THREE_ROLE_PROJECTS_ROOT, so an arm that omitted this would silently
+# evaluate against the shipped config/cc-routes.json (non-hermetic) and NOT satisfy AC-7.
+run_routes() { CAP=$(printf '%s' "$1" | CC_ROUTES_JSON="$OR_ROUTES" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
+# #2051 AC-7 hermeticity discriminator: the SAME row under a fixture SSOT-SILENT routes (plan-review has no
+# dispatch field). If CC_ROUTES_JSON is genuinely delivered + consulted, this BLOCKs not-finished (arm 3
+# returns null -> fall through -> no closedAt/agentId); run_routes() ALLOWs the same row under the fixture
+# subprocess routes. The ONLY variable between the two is CC_ROUTES_JSON — collapsing to the same answer
+# would mean the fixture SSOT was never consulted (the green arm was riding the shipped config, not the fixture).
+run_routes_none() { CAP=$(printf '%s' "$1" | CC_ROUTES_JSON="$OR_ROUTES_NONE" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
 # convenience: an Agent spawn payload with prompt $1, session $2
 agent() { printf '{"tool_name":"Agent","session_id":"%s","tool_input":{"prompt":"%s"}}' "$2" "$1"; }
+# #2051: a validly-bound subprocess-openrouter transcript (a `claude -p` one-shot's own transcript shape)
+# whose FIRST record (queue-operation/enqueue) carries `3ROLE_TASK:<task> ROLE:plan-review` + this dispatch's
+# nonce, and an assistant line serving the SSOT-declared model. Mirrors the node smoke's mk_g_or_transcript.
+mk_or_transcript() { # $1=path $2=task $3=nonce $4=served-model
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce, model ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "or-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# #2051: append a plan-review row carrying the subprocess provenance fields under the fixture routes env.
+or_append() { # $1=session $2=task <append-args...>
+  local S="$1" T="$2"; shift 2
+  CC_ROUTES_JSON="$OR_ROUTES" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" \
+    node "$LED" append --session "$S" --task "$T" --role plan-review "$@" >/dev/null 2>&1
+}
 
 # ---- BOUND transcript fixture builder (round-4 fixture vocabulary): the FIRST record IS the spawn record —
 #      the realistic shape a real subagent transcript has (first record = spawn prompt). ----
@@ -401,5 +431,63 @@ LEDFILE9C2="$LEDGERDIR/$S/$T.jsonl"; mkdir -p "$(dirname "$LEDFILE9C2")"
 } > "$LEDFILE9C2"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC-9(c) converse: stale BLOCK-shaped first, authoritative ALLOW-shaped+bound last -> ALLOW (kills last-line-only-if-it-blocks)" || bad "AC-9(c) converse case should allow (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2051 AC-7 — end-to-end through the REAL bash hook. The gate's third arm (subprocess-openrouter provenance
+# via checkSubprocessProvenance) must fire for a real executor spawn, and the existing run() helper does NOT
+# forward CC_ROUTES_JSON (only THREE_ROLE_LEDGER_DIR + THREE_ROLE_PROJECTS_ROOT), so these arms use run_routes()
+# to demonstrably deliver CC_ROUTES_JSON to the hook's node subprocess — an arm that silently evaluated
+# against the shipped config/cc-routes.json would be non-hermetic and would NOT satisfy this AC.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+OR_FIX="$TMP/or-fixtures"; mkdir -p "$OR_FIX/transcripts" "$OR_FIX/artifacts"
+OR_ROUTES="$OR_FIX/routes.json"
+cat > "$OR_ROUTES" <<'ORJSON'
+{ "seats": { "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus" } } }
+ORJSON
+# A SECOND fixture routes with plan-review as an ordinary anthropic seat (NO dispatch field) — the SSOT-silent
+# control for the hermeticity discriminator below.
+OR_ROUTES_NONE="$OR_FIX/routes-none.json"
+cat > "$OR_ROUTES_NONE" <<'ORJSON'
+{ "seats": { "plan-review": { "provider": "anthropic", "model": "claude-opus-5" } } }
+ORJSON
+
+# ---- AC-7 green: a real subprocess-openrouter plan-review PASS, piped through the real hook with
+#      CC_ROUTES_JSON forwarded -> exit 0 (ALLOW silent). ----
+S="s-ac7-2051"; T="t7-2051"
+mk_or_transcript "$OR_FIX/transcripts/f-ac7.jsonl" "$T" "N-AC7-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC7-2051\n' > "$OR_FIX/artifacts/p-ac7.md"
+or_append "$S" "$T" --dispatch subprocess-openrouter --transcript "$OR_FIX/transcripts/f-ac7.jsonl" \
+  --nonce "N-AC7-2051" --artifact "$OR_FIX/artifacts/p-ac7.md" --verdict PASS
+run_routes "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "#2051 AC-7 green: real subprocess plan-review PASS through the real bash hook (CC_ROUTES_JSON forwarded) -> ALLOW silent" \
+  || bad "#2051 AC-7 green should ALLOW silent (rc=$RC out=$CAP)"
+
+# ---- AC-7 red: the AC-2(a) forged-nonce mutation through the real hook -> exit 2, block message names
+#      subprocess-unverified (the third arm's class token flows through the bash hook with no code change). ----
+S="s-ac7r-2051"; T="t7r-2051"
+mk_or_transcript "$OR_FIX/transcripts/f-ac7r.jsonl" "$T" "WRONG-NONCE-AC7R" "moonshotai/kimi-k3"   # forged nonce
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC7R-2051\n' > "$OR_FIX/artifacts/p-ac7r.md"
+or_append "$S" "$T" --dispatch subprocess-openrouter --transcript "$OR_FIX/transcripts/f-ac7r.jsonl" \
+  --nonce "N-AC7R-2051" --artifact "$OR_FIX/artifacts/p-ac7r.md" --verdict PASS
+run_routes "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "subprocess-unverified"; } \
+  && ok "#2051 AC-7 red: forged-nonce subprocess row through the real bash hook -> BLOCK, names subprocess-unverified (third-arm class flows through unchanged)" \
+  || bad "#2051 AC-7 red should BLOCK naming subprocess-unverified (rc=$RC out=$CAP)"
+
+# ---- AC-7 hermeticity discriminator: the SAME green-arm row, run through the real hook under a fixture
+#      SSOT-SILENT routes (plan-review has no dispatch field) -> BLOCK not-finished. The green arm above
+#      ALLOWs the identical row under the fixture subprocess routes. The ONLY variable between the two is
+#      CC_ROUTES_JSON, so a collapse (same answer both ways) would mean the fixture SSOT was never consulted
+#      and the green arm was riding the shipped config/cc-routes.json — non-hermetic, a FAIL for this AC. ----
+S="s-ac7h-2051"; T="t7h-2051"
+mk_or_transcript "$OR_FIX/transcripts/f-ac7h.jsonl" "$T" "N-AC7H-2051" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC7H-2051\n' > "$OR_FIX/artifacts/p-ac7h.md"
+or_append "$S" "$T" --dispatch subprocess-openrouter --transcript "$OR_FIX/transcripts/f-ac7h.jsonl" \
+  --nonce "N-AC7H-2051" --artifact "$OR_FIX/artifacts/p-ac7h.md" --verdict PASS
+run_routes_none "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not-finished"; } \
+  && ok "#2051 AC-7 hermeticity: the green-arm row under fixture SSOT-SILENT routes -> BLOCK not-finished (the same row ALLOWs under the fixture subprocess routes via run_routes); CC_ROUTES_JSON is genuinely delivered + consulted, the green arm is hermetic" \
+  || bad "#2051 AC-7 hermeticity discriminator FAILED: the green-arm row did NOT block not-finished under the SSOT-silent fixture routes (rc=$RC out=$CAP) — the green arm may be riding the shipped config, not the fixture"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
