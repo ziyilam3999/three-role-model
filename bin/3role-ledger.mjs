@@ -137,40 +137,65 @@
 //     (backgrounded, fail-open) exactly ONCE per invocation, and ONLY when >=1 role actually flipped
 //     absent->present (no-change scans never resync — bounds the extra board-upload cost). ALWAYS exits 0
 //     (fail-open) — a refresh error must never wedge its caller (a backgrounded hook trigger).
-//   reconcile-spawns --session S                                    (#1229)
+//   reconcile-spawns --session S                                    (#1229, incremental rewrite #1851)
 //     MISSING-ROW backfill for the dropped-harness-event gap: for a meaningful fraction of background Agent
 //     dispatches, NEITHER the spawn-ledger hook (PostToolUse) NOR the SubagentStop ledger hook fires, even
 //     though the subagent's own transcript genuinely exists at <PROJECTS_ROOT>/*/<S>/subagents/agent-<id>.jsonl
 //     and its spawn record carries a `3ROLE_TASK:<task> ROLE:<role>` tag — so the ledger row is ABSENT
-//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above). Walks
-//     every subagent transcript under <PROJECTS_ROOT>/*/<S>/subagents/agent-*.jsonl, extracts each transcript's
-//     spawn-record tag via the SAME firstRecordText()+`/3ROLE_TASK:(\S+) ROLE:(\S+)/` shape
-//     tagFromSubagentTranscript() uses (reuse, not a new parser), validates the extracted role against the
-//     SAME RECORDABLE_ROLES enum cmdAppend's own role guard uses (a malformed `ROLE:foobar` tag is REJECTED,
-//     never filed as a garbage-role row), groups by (task, role), and resolves the AUTHORITATIVE agentId per
-//     group via the existing resolveAgent() newest-mtime resolver (the #860 stale-probe defense — reused, not
-//     re-implemented). For each group: reads the current ledger row; a row already carrying a DIFFERENT real
-//     agentId is left byte-untouched (never disturb a genuine row — the #1580 round-boundary trap); an
-//     inline-skipped row (skip_reason present) is never touched (mirrors cmdRefreshModels's own
-//     `if ('skip_reason' in e) continue`); otherwise backfills ONLY agentId (absent->present), modelVersion/
-//     modelTier (via the SAME resolveModelFields() helper cmdAppend/cmdRefreshModels use), and
-//     self_authored:true (ONLY when an honest provenance scan of the resolved agent's OWN transcript shows its
-//     own `3role-ledger.mjs ... append ... --role <role>` Bash tool_use call — reproducing
-//     three-role-subagent-ledger.sh's exact predicate, never a blind stamp) through the SAME overlayAppend()
-//     path append/refresh-models use — inheriting idempotency, per-key "provided" discipline, and
-//     terminal-evidence monotonicity for free. NEVER stamps `closedAt` (a transcript existing on disk does not
-//     prove the subagent STOPPED — that stays close-exclusive to the real SubagentStop hook) and NEVER passes
-//     `artifact_path` (so a swept row can never launder a completion). Idempotent: a group with nothing left to
-//     add (agentId already matches, model already resolved, self_authored already stamped) makes NO
-//     overlayAppend call at all — not even a no-op re-append — so the ledger file stays byte-identical on a
-//     second run (a bare re-append would still refresh `ts` and break byte-identity). A per-session,
-//     mtime-based watermark short-circuits to a cheap readdir/stat-only scan (no per-transcript read, no
-//     writes) when no subagent transcript has advanced past the last sweep. Fires kanban-resync.sh
-//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed (mirrors
-//     refresh-models). Every per-row overlayAppend call is individually wrapped — one row's failure is
-//     logged-and-skipped, never fatal. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook
-//     call it rides (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models
-//     already uses).
+//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above).
+//     #1851 — the ORIGINAL implementation called resolveAgent() (a full corpus re-scan) ONCE PER (task, role)
+//     GROUP, making the sweep O(G x corpus) (~1,006 groups x 979 MB ~= 1 TB decoded, ~24.5 min CPU on a
+//     marathon session — measured). The coarse watermark below never engaged on a live session (some
+//     transcript is always advancing), so a runaway sweep pinned a CPU core essentially continuously. This
+//     rewrite collapses that to O(corpus), by construction, via three changes (D1/D2/D3 of
+//     .ai-workspace/plans/2026-07-27-1851-reconcile-spawns-incremental.md):
+//       D1 (hoist) — the discovery pass below extracts EVERY transcript's spawn-tag facts ONCE (not once per
+//         group): a DISCOVERY tag (the loose first-match rule the old code used to populate `groups`) and every
+//         WINNER-candidate tag (re-verified as a literal substring of the sanitize()-reconstructed tag string,
+//         reproducing resolveAgent()'s `.includes()` semantics exactly — including its two documented seams: a
+//         task id containing a sanitize()-stripped character correctly fails to bind, and a first record naming
+//         TWO tags correctly binds to BOTH groups). The group loop then does a Map lookup, never a corpus scan.
+//       D2 (bounded read) — `readFirstNonEmptyLine()` reads only up to the transcript's first NON-EMPTY line
+//         (matching firstRecordText()'s own `.find(l => l.trim())` predicate exactly, never a looser "read line
+//         1"), growing its read window until it finds that line or hits EOF — never a fixed cap that silently
+//         truncates a transcript out of the mapping (D2's "single worst regression" this fix could cause).
+//       D3 (per-file checkpoint) — a per-session sidecar (`.reconcile-checkpoint.json`, dotted so invisible to
+//         the `.jsonl` glob cmdRefreshModels/cmdCheck use) caches each transcript's derived tag facts keyed on
+//         file IDENTITY (dev+ino) + size-at-derive-time; unchanged-or-grown files reuse the cache (D2's read
+//         never happens again), a REPLACED (new identity) or SHRUNK (possible truncation/rewrite) file is
+//         re-derived. Rests on the load-bearing, Rule-18-gated assumption that a subagent transcript's first
+//         record never changes once written (append-only) — degraded safely by a MANDATORY periodic full
+//         re-derivation (every RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N runs, or when the last full derive is
+//         older than RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS) that ignores the cache outright.
+//     D4/D6 correctness: the group -> row loop still evaluates EVERY known group EVERY run (no transcript is
+//     ever "too old" to enter the mapping; a cold start or a corrupt/unreadable/schema-mismatched sidecar —
+//     schema-versioned — is treated as a full re-derivation, never "nothing to do"). `modelVersion` resolution
+//     is now GATED on `!prior.modelVersion` (previously unconditional — a fixed bug: an already-stamped row paid
+//     a full transcript re-parse on every sweep forever); `self_authored` keeps its existing `!prior.self_authored`
+//     gate. Both gates are the POSITIVE-side skip only — a row that legitimately never earns a field is
+//     re-attempted every run it's still missing (a known, bounded, OBSERVABLE residual cost — see
+//     `laterRecordRederives` in the log line below — never a WRONG ledger value, since the row is either still
+//     unstamped or is correctly stamped once the fact becomes available). D4(c): the coarse watermark now
+//     advances ONLY after a sweep that completed with nothing truncated or row-failed (previously unconditional
+//     — a real bug: a failed row was never retried unless some transcript's mtime happened to advance).
+//     D5 bounded worst case: a wall-clock budget (RECONCILE_SPAWNS_BUDGET_MS) bounds the WHOLE sweep (both the
+//     tag-derivation pass, run OLDEST-transcript-first for strict forward progress, and the group loop);
+//     exceeding it STOPS the sweep, PERSISTS every per-file checkpoint already earned, does NOT advance the
+//     coarse watermark, and still exits 0 — the union of a truncated run plus its successors equals one
+//     unbounded run (transcripts/groups a truncated run didn't reach are simply left for the next invocation,
+//     which resumes cheaply from the persisted cache).
+//     Every per-row overlayAppend call is individually wrapped — one row's failure is logged-and-skipped, never
+//     fatal (and marks the sweep as row-failed for the D4(c) watermark rule above). Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed. Idempotent: a
+//     group with nothing left to add makes NO overlayAppend call at all (byte-identical ledger on a no-op run).
+//     Never stamps `closedAt` or `artifact_path` (unchanged from the original design — a transcript existing on
+//     disk does not prove the subagent stopped, and a swept row must never be able to launder a completion).
+//     Prints one structured completion line prefixed `OK reconcile-spawns: session=... scanned=... changed=...`
+//     (the original prefix, kept — verified zero consumers outside this file via `git grep`, so extending it is
+//     safe) followed by: transcripts=<N> firstRecordsRead=<R> firstRecordsCached=<C> groupsKnown=<G>
+//     groupsEvaluated=<E> laterRecordRederives=<count> elapsedMs=<ms> truncated=<bool> coldStart=<bool>
+//     fullRederive=<bool>. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides
+//     (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models already uses).
 //   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
 //     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
@@ -253,6 +278,23 @@
 //                            (default 4MB — big enough to fit a single ~0.8MB transcript record with margin).
 //   CC_TIER_SENSOR_CAP_BYTES (#1494) — the grow-with-cap ceiling (default 64MB); exceeding it without a
 //                            parseable last-assistant record resolves tier='unknown' (fail-closed).
+//   RECONCILE_SPAWNS_BUDGET_MS (#1851) — wall-clock budget bounding a WHOLE reconcile-spawns sweep (default
+//                            20000 = 20s — a large safety margin over the ~seconds cold-start the D1/D2 hoist
+//                            achieves BY CONSTRUCTION on today's ~2,000-transcript/979MB corpus; this is a
+//                            safety net for a corpus far larger than today's, not the primary mechanism). `0`
+//                            is a valid value (truncate before processing anything — used by the AC6 smoke to
+//                            force truncation deterministically); only an unset/non-numeric/negative value
+//                            falls back to the 20s default.
+//                            Exceeding it stops the sweep, persists every per-file checkpoint already earned,
+//                            and does NOT advance the coarse watermark (D5).
+//   RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N (#1851) — every Nth reconcile-spawns run for a session ignores the
+//                            per-file checkpoint cache outright and re-derives every transcript's tag facts
+//                            fresh (default 20). Belt-and-braces against the D3 append-only assumption ever
+//                            being silently violated (AC5). 0 or unset/invalid disables the count-based trigger
+//                            (the age-based trigger below still applies).
+//   RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS (#1851) — force a full re-derivation when the last one is older
+//                            than this many ms (default 21600000 = 6h), independent of the run-count trigger
+//                            above. A cold start (no sidecar yet) always counts as "due".
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -770,6 +812,14 @@ function agentResolves(session, agentId) {
 // call this). Returns '' on any missing/unreadable/unparseable first line (fails closed to "no match").
 function firstRecordText(content) {
   const firstLine = String(content == null ? '' : content).split('\n').find((l) => l.trim());
+  return firstRecordTextFromLine(firstLine);
+}
+
+// #1851 D2 — the JSON-envelope-extraction body factored OUT of firstRecordText() so a caller that already
+// has the isolated first-non-empty-LINE (e.g. readFirstNonEmptyLine()'s bounded read below) can reuse the
+// EXACT SAME extraction, never a second, potentially-diverging parser. Fed a falsy/unparseable line, returns
+// '' (fails closed to "no match"), identical to firstRecordText()'s own contract.
+function firstRecordTextFromLine(firstLine) {
   if (!firstLine) return '';
   let rec;
   try { rec = JSON.parse(firstLine); } catch (e) { return ''; }
@@ -780,6 +830,118 @@ function firstRecordText(content) {
     for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
   }
   return text;
+}
+
+// #1851 D2 — bounded read of a transcript's FIRST NON-EMPTY line, cost proportional to THAT line's size, not
+// the whole file. Grows its read window (in RECONCILE_READ_CHUNK_BYTES steps) until it finds the
+// line-terminating newline or reaches EOF — never a fixed cap that gives up, which would silently truncate a
+// transcript out of the reconciliation mapping (D2: "the single worst regression this plan can cause").
+// Matches firstRecordText()'s own predicate exactly — the first NON-empty line (`.find(l => l.trim())`), not
+// literally byte-offset-0 line 1 — so a leading blank line degrades identically whether read via this bounded
+// path or the whole-file path (the F2 plan-review finding: a naive "read to the first \n" would diverge from
+// firstRecordText's actual "first non-empty line" semantics on such a file). Fails OPEN (returns '') on any
+// open/read error, mirroring firstRecordText()'s own unreadable-file contract.
+const RECONCILE_READ_CHUNK_BYTES = 8192;
+function readFirstNonEmptyLine(filePath) {
+  let fd;
+  try { fd = fs.openSync(filePath, 'r'); } catch (e) { return ''; }
+  try {
+    let buf = Buffer.alloc(0);
+    let pos = 0;
+    for (;;) {
+      // Drain every complete line already buffered before issuing another read — avoids a redundant syscall
+      // when the first non-empty line is already fully inside `buf` from a prior chunk.
+      for (;;) {
+        const nl = buf.indexOf(0x0a);
+        if (nl === -1) break;
+        const line = buf.subarray(0, nl).toString('utf8');
+        if (line.trim()) return line;
+        buf = buf.subarray(nl + 1);
+      }
+      const chunk = Buffer.alloc(RECONCILE_READ_CHUNK_BYTES);
+      let n;
+      try { n = fs.readSync(fd, chunk, 0, RECONCILE_READ_CHUNK_BYTES, pos); } catch (e) { break; }
+      if (n <= 0) break; // EOF
+      buf = buf.length ? Buffer.concat([buf, chunk.subarray(0, n)]) : chunk.subarray(0, n);
+      pos += n;
+    }
+    // EOF reached with no newline-terminated non-empty line found; the last (possibly unterminated) line in
+    // `buf` is still a valid candidate (mirrors String.split('\n') including a trailing unterminated segment).
+    const leftover = buf.toString('utf8');
+    return leftover.trim() ? leftover : '';
+  } finally {
+    try { fs.closeSync(fd); } catch (e) { /* ignore */ }
+  }
+}
+
+// #1851 D1 — extract BOTH tag facts a transcript's first-record TEXT carries, in ONE pass over that (small,
+// bounded-read) string:
+//   .discovery — the LOOSE, first-match rule the original cmdReconcileSpawns used to populate its `groups`
+//     Set: sanitize(task), the RAW captured role (RECORDABLE_ROLES-checked), no reconstructed-substring
+//     re-check. Only the FIRST occurrence in the text counts (mirrors the original non-global `.match()`).
+//   .winners — every occurrence, each individually re-verified as a literal substring of the
+//     SANITIZE()-RECONSTRUCTED tag string (`3ROLE_TASK:<sanitize(task)> ROLE:<role>`). This is the exact
+//     predicate resolveAgent()'s `.includes(tag)` test enforces, reproduced without re-scanning every OTHER
+//     transcript per group. Preserves both documented seams: (1) a task id containing a sanitize()-stripped
+//     character fails the reconstructed-substring check (the tag as WRITTEN in the raw text differs from the
+//     sanitized reconstruction) — that transcript never becomes a winner-candidate for that group, matching
+//     resolveAgent()'s own '' return for it; (2) a first record naming TWO tags contributes TWO winner
+//     candidates (one per occurrence), so it can bind to BOTH groups exactly as `.includes()` would find it
+//     from either tag's own reconstructed string, even though only the FIRST occurrence feeds `.discovery`.
+function extractTagsFromText(text) {
+  const result = { discovery: null, winners: [] };
+  if (!text) return result;
+  const re = /3ROLE_TASK:(\S+) ROLE:(\S+)/g;
+  let m;
+  let first = true;
+  const seen = new Set();
+  while ((m = re.exec(text))) {
+    const rawTask = m[1];
+    const rawRole = m[2];
+    if (first) {
+      first = false;
+      const dTask = sanitize(rawTask);
+      if (dTask && RECORDABLE_ROLES.includes(rawRole)) result.discovery = { task: dTask, role: rawRole };
+    }
+    const sTask = sanitize(rawTask);
+    if (sTask && RECORDABLE_ROLES.includes(rawRole)) {
+      const reconstructed = '3ROLE_TASK:' + sTask + ' ROLE:' + rawRole;
+      if (text.includes(reconstructed)) {
+        const key = sTask + ' ' + rawRole;
+        if (!seen.has(key)) { seen.add(key); result.winners.push({ task: sTask, role: rawRole }); }
+      }
+    }
+  }
+  return result;
+}
+
+// #1851 D3/D6 — per-session INCREMENTAL CHECKPOINT sidecar for cmdReconcileSpawns. Dotted filename (hidden
+// from the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use, same precedent as the existing
+// `.reconcile-watermark`). Schema-versioned: an unreadable, corrupt, or schema-mismatched file is treated as
+// a COLD START (returns the SAME empty shape a genuinely-first-ever run would see) — never as "nothing to
+// do" (D6).
+const RECONCILE_CHECKPOINT_SCHEMA = 1;
+function reconcileCheckpointFile(sess) { return path.join(LEDGER_DIR, sess, '.reconcile-checkpoint.json'); }
+function readReconcileCheckpoint(sess) {
+  const empty = { schemaVersion: RECONCILE_CHECKPOINT_SCHEMA, runCount: 0, lastFullDeriveTs: 0, files: {} };
+  let raw;
+  try { raw = fs.readFileSync(reconcileCheckpointFile(sess), 'utf8'); } catch (e) { return empty; }
+  let j;
+  try { j = JSON.parse(raw); } catch (e) { return empty; }
+  if (!j || j.schemaVersion !== RECONCILE_CHECKPOINT_SCHEMA || typeof j.files !== 'object' || !j.files) return empty;
+  return {
+    schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
+    runCount: Number.isFinite(j.runCount) ? j.runCount : 0,
+    lastFullDeriveTs: Number.isFinite(j.lastFullDeriveTs) ? j.lastFullDeriveTs : 0,
+    files: j.files,
+  };
+}
+function writeReconcileCheckpoint(sess, data) {
+  try {
+    const file = reconcileCheckpointFile(sess);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(data));
+  } catch (e) { /* best-effort — a checkpoint write failure never blocks the sweep (D5/D6 fail-open) */ }
 }
 
 // #860 / #1575 D1: resolve the agentId of the NEWEST-mtime subagent transcript whose SPAWN RECORD (first
@@ -2584,9 +2746,11 @@ function transcriptSelfAuthored(file, role) {
   return false;
 }
 
-// #1229: reconcile-spawns --session S — MISSING-ROW backfill (see the file-header doc block above for the
-// full design rationale). Walks every subagent transcript for the session, discovers tagged (task, role)
-// pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
+// #1229 / #1851: reconcile-spawns --session S — see the file-header doc block near the top of this file
+// (the "reconcile-spawns" subcommand entry) for the full design rationale, including the #1851 incremental
+// rewrite (D1 hoist / D2 bounded read / D3 per-file checkpoint / D4 correctness / D5 wall-clock budget / D6
+// no-silent-loss). Short version: walks every subagent transcript for the session, discovers tagged (task,
+// role) pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
 // agentId, modelVersion/modelTier, self_authored. Never touches artifact_path/closedAt/verdict/skip_reason.
 // ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides.
 function cmdReconcileSpawns(o) {
@@ -2594,15 +2758,22 @@ function cmdReconcileSpawns(o) {
     const session = o.session;
     if (!session) { console.log('OK reconcile-spawns: no --session given (fail-open, nothing to do)'); process.exit(0); }
     const sess = sanitize(session);
+    const startTs = Date.now();
+    const budgetMsRaw = Number(process.env.RECONCILE_SPAWNS_BUDGET_MS);
+    const budgetMs = Number.isFinite(budgetMsRaw) && budgetMsRaw >= 0 ? budgetMsRaw : 20000; // 0 is a valid ("truncate immediately") value -- must not fall through `||`'s falsy-zero coercion
+    const fullRederiveEveryN = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N);
+    const FULL_REDERIVE_EVERY_N = Number.isFinite(fullRederiveEveryN) && fullRederiveEveryN > 0 ? fullRederiveEveryN : 20;
+    const fullRederiveMaxAgeMs = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS);
+    const FULL_REDERIVE_MAX_AGE_MS = Number.isFinite(fullRederiveMaxAgeMs) && fullRederiveMaxAgeMs > 0 ? fullRederiveMaxAgeMs : (6 * 60 * 60 * 1000);
 
     let slugs = [];
     try { slugs = fs.readdirSync(PROJECTS_ROOT); }
     catch (e) { console.log('OK reconcile-spawns: no projects root'); process.exit(0); }
 
-    // Discover every subagent transcript for this session across all project slugs (cheap: readdir + stat
-    // only in this pass — the per-transcript READ happens below, gated by the watermark short-circuit).
+    // Discovery pass (unchanged cost model -- cheap, readdir + stat only). Now ALSO captures each transcript's
+    // (dev, ino) file identity (the D3 checkpoint cache key).
     let newestMtime = 0;
-    const transcripts = []; // {agentId, file, mtimeMs}
+    const transcripts = []; // {agentId, file, mtimeMs, dev, ino, size}
     for (const slug of slugs) {
       const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
       let files = [];
@@ -2614,50 +2785,96 @@ function cmdReconcileSpawns(o) {
         let st;
         try { st = fs.statSync(f); } catch (e) { continue; }
         if (!st.isFile()) continue;
-        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs });
+        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, size: st.size });
         if (st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
       }
     }
     if (transcripts.length === 0) { console.log('OK reconcile-spawns: no subagent transcripts for session ' + sess); process.exit(0); }
 
+    // #1851 D6 -- an unreadable/corrupt/schema-mismatched sidecar fails open to the SAME empty shape a
+    // genuinely-first-ever run sees (readReconcileCheckpoint's own contract) -- coldStart below is true in
+    // both cases, forcing a full re-derivation rather than "nothing to do".
+    const checkpoint = readReconcileCheckpoint(sess);
+    const coldStart = Object.keys(checkpoint.files).length === 0;
+    const nextRunCount = checkpoint.runCount + 1;
+    const dueByCount = (nextRunCount % FULL_REDERIVE_EVERY_N) === 0;
+    const dueByAge = checkpoint.lastFullDeriveTs === 0 || (Date.now() - checkpoint.lastFullDeriveTs) > FULL_REDERIVE_MAX_AGE_MS;
+    const dueForFullRederive = coldStart || dueByCount || dueByAge; // #1851 D6 periodic belt-and-braces (AC5)
+
     // Cheap per-session watermark: short-circuits to the readdir/stat scan above (no per-transcript read, no
-    // writes) when no transcript has advanced past the last sweep. Stored as a hidden file inside the
-    // session's ledger dir (kept out of the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use).
+    // writes) when no transcript has advanced past the last sweep AND a periodic full re-derive isn't due
+    // (a full re-derive must be able to run even on an otherwise-quiescent session, per D6).
     const watermarkFile = path.join(LEDGER_DIR, sess, '.reconcile-watermark');
     let lastWatermark = 0;
     try { lastWatermark = Number(fs.readFileSync(watermarkFile, 'utf8').trim()) || 0; } catch (e) { lastWatermark = 0; }
-    if (newestMtime > 0 && newestMtime <= lastWatermark) {
+    if (!dueForFullRederive && newestMtime > 0 && newestMtime <= lastWatermark) {
       console.log('OK reconcile-spawns: session=' + sess + ' no new transcript activity since last sweep (watermark)');
       process.exit(0);
     }
 
-    // Extract + validate the spawn-record tag per transcript (reuse firstRecordText() — the SAME predicate
-    // tagFromSubagentTranscript()/resolveAgent() use — never a new/looser parser). Role is validated against
-    // RECORDABLE_ROLES (the SAME enum cmdAppend's own role guard uses) so a malformed `ROLE:foobar` tag is
-    // REJECTED rather than filed as a garbage-role row.
-    const groups = new Set(); // "task role"
-    for (const t of transcripts) {
-      let content;
-      try { content = fs.readFileSync(t.file, 'utf8'); } catch (e) { continue; }
-      const text = firstRecordText(content);
-      if (!text) continue;
-      const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
-      if (!m) continue;
-      const task = sanitize(m[1]);
-      const role = m[2];
-      if (!task || !RECORDABLE_ROLES.includes(role)) continue;
-      groups.add(task + ' ' + role);
+    // #1851 D1/D2/D3/D5 -- the ONE pass that replaces the old per-group resolveAgent() re-scan. Oldest-first
+    // (D5: strict forward progress under a wall-clock budget -- if truncated, the OLDEST unprocessed
+    // transcripts are exactly what the NEXT invocation picks up first). For each transcript: reuse its
+    // per-file checkpoint (D3) when NOT due a full re-derive AND the file's identity is unchanged AND its
+    // size has not SHRUNK (D3: a shrink means possible truncation/rewrite -> re-derive); otherwise a bounded
+    // D2 read + D1 tag extraction. Builds `groups` (every known (task, role) pair -- D6: never skipped just
+    // because its transcript didn't change) and `tagWinners` (the newest-mtime candidate per group, replacing
+    // resolveAgent()'s per-group corpus re-scan with a Map lookup).
+    const sortedTranscripts = transcripts.slice().sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const newFilesCache = Object.assign({}, checkpoint.files); // seed with prior knowledge (D5 partial-progress safety)
+    const groups = new Set(); // "task role"
+    const tagWinners = new Map(); // "task role" -> {agentId, mtimeMs}
+    const transcriptByAgentId = new Map();
+    for (const t of transcripts) transcriptByAgentId.set(t.agentId, t);
+
+    let firstRecordsRead = 0;
+    let firstRecordsCached = 0;
+    let truncated = false;
+    for (const t of sortedTranscripts) {
+      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
+      const identity = t.dev + ':' + t.ino;
+      const cachedEntry = !dueForFullRederive ? checkpoint.files[identity] : undefined;
+      let discovery, winners;
+      if (cachedEntry && t.size >= cachedEntry.size) {
+        discovery = cachedEntry.discovery || null;
+        winners = Array.isArray(cachedEntry.winners) ? cachedEntry.winners : [];
+        firstRecordsCached++;
+      } else {
+        const line = readFirstNonEmptyLine(t.file);
+        const text = firstRecordTextFromLine(line);
+        const extracted = extractTagsFromText(text);
+        discovery = extracted.discovery;
+        winners = extracted.winners;
+        firstRecordsRead++;
+      }
+      newFilesCache[identity] = { size: t.size, discovery, winners };
+      if (discovery) groups.add(discovery.task + ' ' + discovery.role);
+      for (const w of winners) {
+        const key = w.task + ' ' + w.role;
+        const cur = tagWinners.get(key);
+        if (!cur || t.mtimeMs > cur.mtimeMs) tagWinners.set(key, { agentId: t.agentId, mtimeMs: t.mtimeMs });
+      }
     }
 
+    // #1851 D1/D4/D6 -- group -> row loop. Same per-row semantics as before (never disturb an inline-skip row
+    // or a row already bound to a DIFFERENT agentId -- the #1580 round-boundary trap), but the winner is now a
+    // Map lookup (tagWinners), never a resolveAgent() corpus re-scan. modelVersion resolution is now GATED on
+    // `!prior.modelVersion` (D1 item 5 fix -- previously unconditional); self_authored keeps its existing gate.
     let scanned = 0;
+    let groupsEvaluated = 0;
     let changed = 0;
-    for (const key of groups) {
-      const [task, role] = key.split(' ');
+    let laterRecordRederives = 0;
+    let anyRowFailed = false;
+    const groupsArr = Array.from(groups);
+    for (const key of groupsArr) {
+      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
+      const [task, role] = key.split(' ');
+      groupsEvaluated++;
       scanned++;
-      // Authoritative agentId: reuse resolveAgent()'s own newest-mtime resolver (the #860 stale-probe
-      // defense) rather than re-deriving a winner from the walk above.
-      const agentId = resolveAgent(sess, task, role);
-      if (!agentId) continue; // fail-open: shouldn't happen given groups was built from a real tagged hit.
+
+      const winner = tagWinners.get(key);
+      const agentId = winner ? winner.agentId : '';
+      if (!agentId) continue; // fail-open: matches resolveAgent()'s own '' return for an unbound group (D1 seam).
 
       const file = ledgerFile(sess, task);
       let lines = [];
@@ -2667,40 +2884,70 @@ function cmdReconcileSpawns(o) {
 
       // Never disturb an inline-skip row (mirrors cmdRefreshModels's own `if ('skip_reason' in e) continue`).
       if (prior && ('skip_reason' in prior)) continue;
-      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) —
+      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) --
       // write ONLY when the row is absent, its agentId is absent, or its agentId equals the resolved one.
       if (prior && prior.agentId && prior.agentId !== agentId) continue;
 
       // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
-      // call at all (idempotency — AC-2: a bare re-append would still refresh `ts` and break byte-identity).
+      // call at all (idempotency -- a bare re-append would still refresh `ts` and break byte-identity).
       const fields = {};
       let hasChange = false;
       if (!prior || !prior.agentId) { fields.agentId = agentId; hasChange = true; }
 
-      const modelFields = resolveModelFields(sess, task, role, agentId);
-      if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
-      if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
+      // #1851 D1 item 5 fix: GATE modelVersion resolution on absence (previously unconditional -- a fixed
+      // bug: an already-stamped row paid a full transcript re-parse on every sweep forever).
+      if (!prior || !prior.modelVersion) {
+        laterRecordRederives++;
+        const modelFields = resolveModelFields(sess, task, role, agentId);
+        if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
+        if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
+      }
 
       if (!prior || !prior.self_authored) {
-        const tr = transcripts.find((t) => t.agentId === agentId);
+        laterRecordRederives++;
+        const tr = transcriptByAgentId.get(agentId);
         if (tr && transcriptSelfAuthored(tr.file, role)) { fields.self_authored = true; hasChange = true; }
       }
 
       if (!hasChange) continue;
       try { overlayAppend(sess, task, role, fields); changed++; }
-      catch (e) { /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
+      catch (e) { anyRowFailed = true; /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
     }
 
-    try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
+    // #1851 D3 -- persist every per-file checkpoint earned this run (even a truncated one -- D5 partial-progress
+    // safety) and the run bookkeeping (runCount always advances; lastFullDeriveTs advances only when a full
+    // re-derive actually happened this run).
+    writeReconcileCheckpoint(sess, {
+      schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
+      runCount: nextRunCount,
+      lastFullDeriveTs: dueForFullRederive ? Date.now() : checkpoint.lastFullDeriveTs,
+      files: newFilesCache,
+    });
+
+    // #1851 D4(c) -- the coarse watermark advances ONLY after a sweep that completed with nothing truncated or
+    // row-failed (previously unconditional -- a real bug: a failed row was never retried unless some
+    // transcript's mtime happened to advance past it).
+    if (!truncated && !anyRowFailed) {
+      try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
+    }
     if (changed > 0) fireResyncBackground();
-    console.log('OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed);
+    const elapsedMs = Date.now() - startTs;
+    console.log(
+      'OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed +
+      ' transcripts=' + transcripts.length +
+      ' firstRecordsRead=' + firstRecordsRead + ' firstRecordsCached=' + firstRecordsCached +
+      ' groupsKnown=' + groups.size + ' groupsEvaluated=' + groupsEvaluated +
+      ' laterRecordRederives=' + laterRecordRederives +
+      ' elapsedMs=' + elapsedMs +
+      ' truncated=' + truncated +
+      ' coldStart=' + coldStart + ' fullRederive=' + dueForFullRederive
+    );
     process.exit(0);
   } catch (e) {
     console.log('OK reconcile-spawns: error (fail-open): ' + (e && e.message ? e.message : e));
     process.exit(0);
   }
 }
-
 // #1448: resolve-role-model --role <role> [--with-effort] [--with-version]
 // Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
 // fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints

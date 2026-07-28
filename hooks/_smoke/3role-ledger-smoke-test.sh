@@ -2043,4 +2043,323 @@ g_gate "$GS10C" "$GT"
   && ok "#2051 AC-10(c): resolving + spawn-bound agentId PLUS a forged dispatch nonce -> exit 0 (arm 1 wins via the :1264 tie-break; arm 3 must NOT shadow a resolving agentId — catches a mirrored checkSubprocessProvenance regression)" \
   || bad "#2051 AC-10(c) should ALLOW — a resolving+bound agentId must win, not be shadowed by a forged-nonce subprocess arm (rc=$GR_RC out=$GR_OUT)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1851 — reconcile-spawns INCREMENTAL rewrite (O(G x corpus) -> O(corpus)). AC1-AC8 per
+# .ai-workspace/plans/2026-07-27-1851-reconcile-spawns-incremental.md. Red arms run the IDENTICAL harness
+# against the COMMITTED pre-#1851 fixture (hooks/_fixtures/3role-ledger-pre1851-reconcile.mjs -- no git
+# dependency, mirrors the existing pre-#1580 fixture pattern) to prove each check has real falsification
+# power, never a vacuous pass. Every fixture uses its OWN isolated THREE_ROLE_LEDGER_DIR/session so timing
+# runs never contaminate each other's watermark/checkpoint state.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+LED_PRE1851="$DIR/_fixtures/3role-ledger-pre1851-reconcile.mjs"
+
+# mk_tag_line <session> <agentId> <task> <role> [extraText] -- a single first-record-only tagged transcript
+# (no assistant record). extraText (optional) is appended INSIDE the message content, after the tag, so it
+# never disturbs tag matching -- used to pad a transcript's first-record size for the AC2 timing fixtures.
+mk_tag_line() {
+  local sess="$1" aid="$2" task="$3" role="$4" extra="${5:-}"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents"
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work %s"}}\n' \
+    "$task" "$role" "$extra" > "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents/agent-$aid.jsonl"
+}
+# mk_tag_line_2tags <session> <agentId> <task1> <role1> <task2> <role2> -- a single first record naming TWO
+# spawn tags (the D1 multi-tag seam: AC3 requires this transcript to bind to BOTH groups under `.includes()`
+# even though only the FIRST tag is what a non-global first-match would "discover").
+mk_tag_line_2tags() {
+  local sess="$1" aid="$2" t1="$3" r1="$4" t2="$5" r2="$6"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents"
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s and also 3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' \
+    "$t1" "$r1" "$t2" "$r2" > "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents/agent-$aid.jsonl"
+}
+# mk_tag_line_full_model <session> <agentId> <task> <role> <modelId> -- first record + a later assistant
+# record (the AC4 "later-record facts now available" shape).
+mk_tag_line_full_model() {
+  local sess="$1" aid="$2" task="$3" role="$4" model="$5"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents"
+  { printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$task" "$role";
+    printf '{"type":"assistant","agentId":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$aid" "$model"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$sess/subagents/agent-$aid.jsonl"
+}
+
+# ---- AC1 -- Incremental WITH POWER. Cold run over 25 tagged transcripts, then EXACTLY ONE new transcript,
+#      then re-run: the second run's firstRecordsRead must be ~1, not ~26. A zero-new-transcript arm is NOT
+#      accepted as evidence (that already passes today via the inert coarse watermark -- a documented
+#      false-green this AC is designed to reject). ----
+AC1_SID="sess-1851-ac1"
+for i in $(seq 1 25); do mk_tag_line "$AC1_SID" "ac1-t$i" "1851ac1t$i" executor; done
+node "$LED" reconcile-spawns --session "$AC1_SID" >/dev/null 2>&1   # cold run -- establishes the checkpoint
+mk_tag_line "$AC1_SID" "ac1-new" "1851ac1new" executor               # +1 new transcript, nothing else changes
+AC1_OUT=$(node "$LED" reconcile-spawns --session "$AC1_SID" 2>&1); AC1_RC=$?
+AC1_READ=$(echo "$AC1_OUT" | grep -oE 'firstRecordsRead=[0-9]+' | cut -d= -f2)
+{ [ "$AC1_RC" = "0" ] && [ "$AC1_READ" = "1" ]; } \
+  && ok "#1851 AC1: +1 new transcript -> second run reports firstRecordsRead=1, not ~26 (out: $AC1_OUT)" \
+  || bad "#1851 AC1 failed (rc=$AC1_RC read=$AC1_READ out=$AC1_OUT)"
+
+# Red arm: the IDENTICAL harness (same fixture, same assertion) against the committed pre-#1851 fixture.
+# That implementation has NO per-file checkpoint concept whatsoever -- it cannot ever emit a
+# `firstRecordsRead=` token, so the same assertion necessarily fails against it, proving the capability is a
+# genuinely NEW one, not vacuously present in both implementations. Uses a FRESH, isolated ledger dir (never
+# touched by the baseline before) so baseline's own coarse watermark can't mask this into "nothing to do".
+AC1_BASE_OUT=$(THREE_ROLE_LEDGER_DIR="$TMP/ac1-baseline-ledger" node "$LED_PRE1851" reconcile-spawns --session "$AC1_SID" 2>&1)
+if echo "$AC1_BASE_OUT" | grep -qE 'firstRecordsRead=[0-9]+'; then
+  bad "#1851 AC1 red-arm: the pre-#1851 fixture should NOT be able to report firstRecordsRead at all (out: $AC1_BASE_OUT)"
+else
+  ok "#1851 AC1 red-arm: pre-#1851 fixture has no firstRecordsRead concept -- the identical assertion FAILS against it, proving the metric is a real new capability, not shared by both"
+fi
+
+# ---- AC2 -- Cost is flat in group count. Fixtures use large PADDED first records (150KB each) so the
+#      OLD per-group full-corpus-read cost is measurable; PADSTR built ONCE and reused (fast fixture setup).
+AC2_PAD=$(node -e "process.stdout.write('x'.repeat(150000))")
+mk_ac2_corpus() { # <session> <numGroups> <perGroup> <prefix>
+  local sess="$1" ng="$2" pg="$3" prefix="$4" g k i=0
+  for g in $(seq 1 "$ng"); do
+    for k in $(seq 1 "$pg"); do
+      i=$((i + 1))
+      mk_tag_line "$sess" "${prefix}$i" "1851ac2-${prefix}g$g" executor "$AC2_PAD"
+    done
+  done
+}
+
+# Arm (i): same group count (G=20), corpus DOUBLED (100 -> 200 transcripts). Weaker bound: new-code wall
+# time must grow AT MOST ~linearly (not superlinearly) as corpus size doubles.
+AC2I_SMALL="sess-1851-ac2i-small"; AC2I_BIG="sess-1851-ac2i-big"
+mk_ac2_corpus "$AC2I_SMALL" 20 5 "is"
+mk_ac2_corpus "$AC2I_BIG" 20 10 "ib"
+T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2I_SMALL" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2I_SMALL_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2I_SMALL_MS" -lt 1 ] && AC2I_SMALL_MS=1
+T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2I_BIG" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2I_BIG_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2I_BIG_MS" -lt 1 ] && AC2I_BIG_MS=1
+AC2I_RATIO=$(node -e "console.log(($AC2I_BIG_MS / $AC2I_SMALL_MS).toFixed(2))")
+# "at most ~linearly": corpus doubled -> allow generous headroom (<= 3.0x) before calling it superlinear.
+node -e "process.exit(($AC2I_BIG_MS / $AC2I_SMALL_MS) <= 3.0 ? 0 : 1)" \
+  && ok "#1851 AC2(i): same G=20, corpus doubled -> wall time grows at most ~linearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)" \
+  || bad "#1851 AC2(i): corpus-doubled wall time grew superlinearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)"
+
+# Arm (ii) [LOAD-BEARING] -- same corpus (160 transcripts total either way), group count DOUBLED (20 -> 40).
+# New code: wall time must NOT roughly double (the hoist's whole point -- O(corpus), not O(G x corpus)).
+AC2II_LOW="sess-1851-ac2ii-low"; AC2II_HIGH="sess-1851-ac2ii-high"
+mk_ac2_corpus "$AC2II_LOW" 20 8 "gl"
+mk_ac2_corpus "$AC2II_HIGH" 40 4 "gh"
+
+T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2II_LOW" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2II_NEW_LOW_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_NEW_LOW_MS" -lt 1 ] && AC2II_NEW_LOW_MS=1
+T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2II_HIGH" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2II_NEW_HIGH_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_NEW_HIGH_MS" -lt 1 ] && AC2II_NEW_HIGH_MS=1
+AC2II_NEW_RATIO=$(node -e "console.log(($AC2II_NEW_HIGH_MS / $AC2II_NEW_LOW_MS).toFixed(2))")
+node -e "process.exit(($AC2II_NEW_HIGH_MS / $AC2II_NEW_LOW_MS) < 1.5 ? 0 : 1)" \
+  && ok "#1851 AC2(ii) [load-bearing]: same corpus, G doubled (20->40) -> new-code wall time does NOT roughly double (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x)" \
+  || bad "#1851 AC2(ii) FAILED: new-code wall time scaled with group count (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x) -- the hoist did not collapse O(G x corpus)"
+
+# Red arm: the SAME two arms against the pre-#1851 fixture, fresh isolated ledger dirs. Arm (ii) MUST show
+# the ~doubling on baseline -- if it doesn't, this harness has no power to detect the O(G x corpus) defect
+# and AC2's green above proves nothing.
+T0=$(date +%s%N); THREE_ROLE_LEDGER_DIR="$TMP/ac2-baseline-low" node "$LED_PRE1851" reconcile-spawns --session "$AC2II_LOW" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2II_BASE_LOW_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_BASE_LOW_MS" -lt 1 ] && AC2II_BASE_LOW_MS=1
+T0=$(date +%s%N); THREE_ROLE_LEDGER_DIR="$TMP/ac2-baseline-high" node "$LED_PRE1851" reconcile-spawns --session "$AC2II_HIGH" >/dev/null 2>&1; T1=$(date +%s%N)
+AC2II_BASE_HIGH_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_BASE_HIGH_MS" -lt 1 ] && AC2II_BASE_HIGH_MS=1
+AC2II_BASE_RATIO=$(node -e "console.log(($AC2II_BASE_HIGH_MS / $AC2II_BASE_LOW_MS).toFixed(2))")
+node -e "process.exit(($AC2II_BASE_HIGH_MS / $AC2II_BASE_LOW_MS) >= 1.4 ? 0 : 1)" \
+  && ok "#1851 AC2 red-arm: pre-#1851 fixture DOES show the ~doubling on arm(ii) (low=${AC2II_BASE_LOW_MS}ms high=${AC2II_BASE_HIGH_MS}ms ratio=${AC2II_BASE_RATIO}x) -- the harness has real power to detect the O(G x corpus) defect" \
+  || bad "#1851 AC2 red-arm FAILED: baseline did not show scaling with G (low=${AC2II_BASE_LOW_MS}ms high=${AC2II_BASE_HIGH_MS}ms ratio=${AC2II_BASE_RATIO}x) -- this harness cannot see the defect, so AC2's green proves nothing"
+
+# ---- AC3 -- Reconciliation output is unchanged (no behavior regression), INCLUDING the two D1 semantic
+#      seams: a task id containing a sanitize()-stripped character, and a first record carrying two tags.
+#      Also the mandated mtime-flip power check. ----
+AC3_SID="sess-1851-ac3"
+
+# (a) mtime-decided winner + FLIP. Two same-tag transcripts; older first, then (sleep) a newer one.
+mk_tag_line "$AC3_SID" "ac3-old" "1851ac3mt" executor
+sleep 1
+mk_tag_line "$AC3_SID" "ac3-new" "1851ac3mt" executor
+AC3_FILE="$THREE_ROLE_LEDGER_DIR/$AC3_SID/1851ac3mt.jsonl"
+node "$LED" reconcile-spawns --session "$AC3_SID" >/dev/null 2>&1
+AC3_WINNER_1=$(command grep -o '"agentId":"[^"]*"' "$AC3_FILE" 2>/dev/null | head -1)
+[ "$AC3_WINNER_1" = '"agentId":"ac3-new"' ] \
+  && ok "#1851 AC3(a): newest-mtime transcript wins the group (before flip: ac3-new)" \
+  || bad "#1851 AC3(a) failed: expected ac3-new to win before the flip (got $AC3_WINNER_1)"
+# FLIP: bump ac3-old's mtime to be the newest now. Re-run against a FRESH ledger dir (a stale row with a
+# DIFFERENT real agentId is deliberately NEVER disturbed -- the #1580 round-boundary trap -- so re-testing
+# the winner pick needs a clean row, not the #1580 guard's own protection).
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$AC3_SID/subagents/agent-ac3-old.jsonl"
+AC3_FLIP_LEDGER="$TMP/ac3-flip-ledger"
+THREE_ROLE_LEDGER_DIR="$AC3_FLIP_LEDGER" node "$LED" reconcile-spawns --session "$AC3_SID" >/dev/null 2>&1
+AC3_FLIP_FILE="$AC3_FLIP_LEDGER/$AC3_SID/1851ac3mt.jsonl"
+AC3_WINNER_2=$(command grep -o '"agentId":"[^"]*"' "$AC3_FLIP_FILE" 2>/dev/null | head -1)
+[ "$AC3_WINNER_2" = '"agentId":"ac3-old"' ] \
+  && ok "#1851 AC3(a) FLIP: after bumping ac3-old's mtime to be newest, the winner flips to ac3-old (power proof: the pick genuinely tracks mtime)" \
+  || bad "#1851 AC3(a) FLIP failed: winner should have flipped to ac3-old after the mtime bump (got $AC3_WINNER_2) -- if unchanged, the comparison is blind"
+# Same flip on the PRE-#1851 fixture -- must show the SAME behavior (output equivalence).
+AC3_BASE_LEDGER_1="$TMP/ac3-base-ledger-1"; AC3_BASE_LEDGER_2="$TMP/ac3-base-ledger-2"
+THREE_ROLE_LEDGER_DIR="$AC3_BASE_LEDGER_1" node "$LED_PRE1851" reconcile-spawns --session "$AC3_SID" >/dev/null 2>&1
+AC3_BASE_WINNER=$(command grep -o '"agentId":"[^"]*"' "$AC3_BASE_LEDGER_1/$AC3_SID/1851ac3mt.jsonl" 2>/dev/null | head -1)
+[ "$AC3_BASE_WINNER" = '"agentId":"ac3-old"' ] \
+  && ok "#1851 AC3(a) equivalence: pre-#1851 fixture ALSO picks ac3-old post-flip (matches new code -- no behavior regression)" \
+  || bad "#1851 AC3(a) equivalence FAILED: pre-#1851 fixture picked $AC3_BASE_WINNER, new code picked ac3-old -- output diverged"
+
+# (b) D1 seam 1: task id with a sanitize()-stripped character ('#') never resolves to a row on EITHER
+#     implementation (resolveAgent's reconstructed tag is absent from the raw text -> fail-open skip).
+AC3B_SID="sess-1851-ac3b"
+mk_tag_line "$AC3B_SID" "ac3b-e1" "1851#seam" executor
+node "$LED" reconcile-spawns --session "$AC3B_SID" >/dev/null 2>&1
+AC3B_ROWS_NEW=$(find "$THREE_ROLE_LEDGER_DIR/$AC3B_SID" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+THREE_ROLE_LEDGER_DIR="$TMP/ac3b-base-ledger" node "$LED_PRE1851" reconcile-spawns --session "$AC3B_SID" >/dev/null 2>&1
+AC3B_ROWS_BASE=$(find "$TMP/ac3b-base-ledger/$AC3B_SID" -maxdepth 1 -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+{ [ "$AC3B_ROWS_NEW" = "0" ] && [ "$AC3B_ROWS_BASE" = "0" ]; } \
+  && ok "#1851 AC3(b) D1 seam 1: a sanitize()-stripped task id ('1851#seam') produces NO row on EITHER implementation (equivalence held)" \
+  || bad "#1851 AC3(b) failed: new=$AC3B_ROWS_NEW rows, baseline=$AC3B_ROWS_BASE rows (expected 0/0)"
+
+# (c) D1 seam 2: a first record carrying TWO tags binds to BOTH groups on EITHER implementation. The
+#     dual-tag transcript is the NEWEST for the second tag's group (a genuine, OLDER, single-tag transcript
+#     also exists for that group) -- proving it "steals" the winner slot via `.includes()`, not merely
+#     being the sole candidate.
+AC3C_SID="sess-1851-ac3c"
+mk_tag_line "$AC3C_SID" "ac3c-genuine-pr" "1851ac3c" plan-review
+sleep 1
+mk_tag_line_2tags "$AC3C_SID" "ac3c-dual" "1851ac3c" planner "1851ac3c" plan-review
+node "$LED" reconcile-spawns --session "$AC3C_SID" >/dev/null 2>&1
+AC3C_FILE="$THREE_ROLE_LEDGER_DIR/$AC3C_SID/1851ac3c.jsonl"
+AC3C_PLANNER_NEW=$(command grep '"role":"planner"' "$AC3C_FILE" 2>/dev/null | command grep -c '"agentId":"ac3c-dual"')
+AC3C_PLANREVIEW_NEW=$(command grep '"role":"plan-review"' "$AC3C_FILE" 2>/dev/null | command grep -c '"agentId":"ac3c-dual"')
+{ [ "$AC3C_PLANNER_NEW" = "1" ] && [ "$AC3C_PLANREVIEW_NEW" = "1" ]; } \
+  && ok "#1851 AC3(c) D1 seam 2: a two-tag first record binds to BOTH groups (planner AND plan-review both won by the dual-tag transcript)" \
+  || bad "#1851 AC3(c) failed: planner-bound-to-dual=$AC3C_PLANNER_NEW plan-review-bound-to-dual=$AC3C_PLANREVIEW_NEW (expected 1/1)"
+THREE_ROLE_LEDGER_DIR="$TMP/ac3c-base-ledger" node "$LED_PRE1851" reconcile-spawns --session "$AC3C_SID" >/dev/null 2>&1
+AC3C_BASE_FILE="$TMP/ac3c-base-ledger/$AC3C_SID/1851ac3c.jsonl"
+AC3C_PLANNER_BASE=$(command grep '"role":"planner"' "$AC3C_BASE_FILE" 2>/dev/null | command grep -c '"agentId":"ac3c-dual"')
+AC3C_PLANREVIEW_BASE=$(command grep '"role":"plan-review"' "$AC3C_BASE_FILE" 2>/dev/null | command grep -c '"agentId":"ac3c-dual"')
+{ [ "$AC3C_PLANNER_BASE" = "1" ] && [ "$AC3C_PLANREVIEW_BASE" = "1" ]; } \
+  && ok "#1851 AC3(c) equivalence: pre-#1851 fixture ALSO binds the dual-tag transcript to BOTH groups (matches new code)" \
+  || bad "#1851 AC3(c) equivalence FAILED: baseline planner=$AC3C_PLANNER_BASE plan-review=$AC3C_PLANREVIEW_BASE (expected 1/1, matching new code)"
+
+# ---- AC4 -- A mid-write transcript is not permanently skipped. Sweep 1 over a first-record-ONLY transcript
+#      -> agentId stamped, modelVersion/self_authored still absent. Append the later assistant record.
+#      Sweep 2 -> both fields now stamped. ----
+AC4_SID="sess-1851-ac4"; AC4_TASK="1851ac4"
+AC4_TFILE="$THREE_ROLE_PROJECTS_ROOT/proj/$AC4_SID/subagents/agent-ac4-e1.jsonl"
+mk_tag_line "$AC4_SID" "ac4-e1" "$AC4_TASK" executor
+node "$LED" reconcile-spawns --session "$AC4_SID" >/dev/null 2>&1
+AC4_FILE="$THREE_ROLE_LEDGER_DIR/$AC4_SID/$AC4_TASK.jsonl"
+AC4_S1_HAS_AGENT=$(command grep -c '"agentId":"ac4-e1"' "$AC4_FILE" 2>/dev/null)
+AC4_S1_HAS_MODEL=$(command grep -c '"modelVersion"' "$AC4_FILE" 2>/dev/null)
+{ [ "${AC4_S1_HAS_AGENT:-0}" = "1" ] && [ "${AC4_S1_HAS_MODEL:-0}" = "0" ]; } \
+  && ok "#1851 AC4 sweep-1: agentId stamped, modelVersion still absent (first record only, no later facts yet)" \
+  || bad "#1851 AC4 sweep-1 unexpected state (agent=$AC4_S1_HAS_AGENT model=$AC4_S1_HAS_MODEL)"
+printf '{"type":"assistant","agentId":"ac4-e1","message":{"model":"claude-sonnet-5","role":"assistant","content":[]}}\n' >> "$AC4_TFILE"
+node "$LED" reconcile-spawns --session "$AC4_SID" >/dev/null 2>&1
+AC4_S2_HAS_MODEL=$(command grep -c '"modelVersion":"claude-sonnet-5"' "$AC4_FILE" 2>/dev/null)
+[ "${AC4_S2_HAS_MODEL:-0}" = "1" ] \
+  && ok "#1851 AC4 sweep-2: modelVersion now stamped after the append (mid-write transcript is NOT permanently skipped)" \
+  || bad "#1851 AC4 sweep-2 failed: modelVersion still missing after the append (out: $(cat "$AC4_FILE"))"
+
+# Red arm: the SAME sequence WITHOUT the append -- sweep 2 must STILL leave modelVersion missing (proves the
+# AC observes the append, not merely "sweep 2 writes something").
+AC4B_SID="sess-1851-ac4b"; AC4B_TASK="1851ac4b"
+mk_tag_line "$AC4B_SID" "ac4b-e1" "$AC4B_TASK" executor
+node "$LED" reconcile-spawns --session "$AC4B_SID" >/dev/null 2>&1
+node "$LED" reconcile-spawns --session "$AC4B_SID" >/dev/null 2>&1   # sweep 2, NO append happened
+AC4B_FILE="$THREE_ROLE_LEDGER_DIR/$AC4B_SID/$AC4B_TASK.jsonl"
+AC4B_HAS_MODEL=$(command grep -c '"modelVersion"' "$AC4B_FILE" 2>/dev/null)
+[ "${AC4B_HAS_MODEL:-0}" = "0" ] \
+  && ok "#1851 AC4 red-arm: WITHOUT the append, sweep 2 still leaves modelVersion missing (the AC has real power -- it isn't vacuously satisfied by any second sweep)" \
+  || bad "#1851 AC4 red-arm FAILED: modelVersion appeared with no append ever happening (out: $(cat "$AC4B_FILE"))"
+
+# ---- AC5 -- The append-only assumption is safely degraded via MANDATORY periodic full re-derivation
+#      (Rule 18: no executable byte-stability probe is attempted here -- D6's periodic override is the
+#      documented, TESTABLE fallback). Force a tiny interval (every 2nd run) and assert it actually fires on
+#      a run where NOTHING on disk changed (fullRederive=true + firstRecordsRead==total, not 0). ----
+AC5_SID="sess-1851-ac5"
+for i in $(seq 1 8); do mk_tag_line "$AC5_SID" "ac5-t$i" "1851ac5t$i" executor; done
+AC5_ENV_N=2
+RUN1_OUT=$(RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N="$AC5_ENV_N" node "$LED" reconcile-spawns --session "$AC5_SID" 2>&1)
+RUN2_OUT=$(RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N="$AC5_ENV_N" node "$LED" reconcile-spawns --session "$AC5_SID" 2>&1)
+RUN2_FULL=$(echo "$RUN2_OUT" | grep -oE 'fullRederive=[a-z]+' | cut -d= -f2)
+RUN2_READ=$(echo "$RUN2_OUT" | grep -oE 'firstRecordsRead=[0-9]+' | cut -d= -f2)
+{ [ "$RUN2_FULL" = "true" ] && [ "$RUN2_READ" = "8" ]; } \
+  && ok "#1851 AC5: RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N=2 forces run #2 to fully re-derive (fullRederive=true, firstRecordsRead=8) even though NOTHING on disk changed since run #1" \
+  || bad "#1851 AC5 failed: expected run #2 fullRederive=true firstRecordsRead=8 (got fullRederive=$RUN2_FULL firstRecordsRead=$RUN2_READ, out: $RUN2_OUT)"
+# Red arm: run #3 (not a multiple of 2 relative to a FRESH checkpoint) must NOT be a full re-derive -- proves
+# the interval genuinely gates, rather than every run just always reporting fullRederive=true.
+AC5B_SID="sess-1851-ac5b"
+for i in $(seq 1 6); do mk_tag_line "$AC5B_SID" "ac5b-t$i" "1851ac5bt$i" executor; done
+RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N=100 node "$LED" reconcile-spawns --session "$AC5B_SID" >/dev/null 2>&1
+# Bump one transcript's mtime (content/size unchanged) so run #2 does NOT take the coarse-watermark
+# short-circuit -- this run needs to actually execute the tag-derivation pass (cache-hit path) to prove
+# firstRecordsCached, not just print "no new transcript activity".
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$AC5B_SID/subagents/agent-ac5b-t1.jsonl"
+RUN2B_OUT=$(RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N=100 node "$LED" reconcile-spawns --session "$AC5B_SID" 2>&1)
+RUN2B_FULL=$(echo "$RUN2B_OUT" | grep -oE 'fullRederive=[a-z]+' | cut -d= -f2)
+RUN2B_CACHED=$(echo "$RUN2B_OUT" | grep -oE 'firstRecordsCached=[0-9]+' | cut -d= -f2)
+{ [ "$RUN2B_FULL" = "false" ] && [ "$RUN2B_CACHED" = "6" ]; } \
+  && ok "#1851 AC5 red-arm: with a large interval (100), run #2 is NOT a full re-derive and serves all 6 files from cache -- the interval genuinely gates rather than always firing" \
+  || bad "#1851 AC5 red-arm failed: expected fullRederive=false firstRecordsCached=6 (got fullRederive=$RUN2B_FULL firstRecordsCached=$RUN2B_CACHED, out: $RUN2B_OUT)"
+
+# ---- AC6 -- Cold start and truncation are bounded and lossless. Force a tiny wall-clock budget so the
+#      sweep MUST truncate; assert exit 0, truncated=true, the coarse watermark did NOT advance, and that
+#      repeated invocations converge to the SAME rows a single unbounded run would produce. ----
+AC6_SID="sess-1851-ac6"
+for i in $(seq 1 12); do mk_tag_line "$AC6_SID" "ac6-t$i" "1851ac6t$i" executor; done
+AC6_TRUNC_OUT=$(RECONCILE_SPAWNS_BUDGET_MS=0 node "$LED" reconcile-spawns --session "$AC6_SID" 2>&1); AC6_TRUNC_RC=$?
+AC6_TRUNC_FLAG=$(echo "$AC6_TRUNC_OUT" | grep -oE 'truncated=[a-z]+' | cut -d= -f2)
+{ [ "$AC6_TRUNC_RC" = "0" ] && [ "$AC6_TRUNC_FLAG" = "true" ]; } \
+  && ok "#1851 AC6: RECONCILE_SPAWNS_BUDGET_MS=0 forces truncation (exit 0, truncated=true) -- out: $AC6_TRUNC_OUT" \
+  || bad "#1851 AC6 failed to truncate as expected (rc=$AC6_TRUNC_RC out=$AC6_TRUNC_OUT)"
+# watermark must NOT have advanced -- a follow-up run with a NORMAL budget must still find (and finish) real
+# work, not short-circuit via a wrongly-advanced watermark.
+AC6_FOLLOWUP_OUT=$(node "$LED" reconcile-spawns --session "$AC6_SID" 2>&1); AC6_FOLLOWUP_RC=$?
+echo "$AC6_FOLLOWUP_OUT" | grep -qi "no new transcript activity" \
+  && bad "#1851 AC6: watermark advanced despite a truncated run -- the follow-up run wrongly short-circuited (out: $AC6_FOLLOWUP_OUT)" \
+  || ok "#1851 AC6: watermark did NOT advance on the truncated run -- the follow-up run did real work, not a short-circuit (out: $AC6_FOLLOWUP_OUT)"
+# Convergence: the union of the truncated run + its follow-up(s) must equal one unbounded run's rows. Run
+# the SAME fixture fresh, unbounded, in an isolated ledger dir, and diff the FINAL row sets (agentId per task).
+AC6_UNBOUNDED_LEDGER="$TMP/ac6-unbounded-ledger"
+THREE_ROLE_LEDGER_DIR="$AC6_UNBOUNDED_LEDGER" node "$LED" reconcile-spawns --session "$AC6_SID" >/dev/null 2>&1
+node "$LED" reconcile-spawns --session "$AC6_SID" >/dev/null 2>&1   # let the (already-budget-recovered) truncated lineage fully converge
+AC6_CONVERGED_AGENTS=$(command grep -ho '"agentId":"[^"]*"' "$THREE_ROLE_LEDGER_DIR/$AC6_SID"/*.jsonl 2>/dev/null | sort -u)
+AC6_UNBOUNDED_AGENTS=$(command grep -ho '"agentId":"[^"]*"' "$AC6_UNBOUNDED_LEDGER/$AC6_SID"/*.jsonl 2>/dev/null | sort -u)
+[ "$AC6_CONVERGED_AGENTS" = "$AC6_UNBOUNDED_AGENTS" ] \
+  && ok "#1851 AC6: the truncated-run lineage converges to the SAME agentId set as one unbounded run (lossless)" \
+  || bad "#1851 AC6 convergence failed: truncated-lineage agents=[$AC6_CONVERGED_AGENTS] vs unbounded agents=[$AC6_UNBOUNDED_AGENTS]"
+
+# ---- AC7 -- A missing or corrupt checkpoint degrades to cold start, never a silent no-op. ----
+AC7_SID="sess-1851-ac7"
+for i in $(seq 1 5); do mk_tag_line "$AC7_SID" "ac7-t$i" "1851ac7t$i" executor; done
+node "$LED" reconcile-spawns --session "$AC7_SID" >/dev/null 2>&1   # establish a real checkpoint
+AC7_CKPT="$THREE_ROLE_LEDGER_DIR/$AC7_SID/.reconcile-checkpoint.json"
+[ -f "$AC7_CKPT" ] || bad "#1851 AC7 setup: expected a checkpoint file to exist at $AC7_CKPT"
+printf 'not valid json {{{ garbage\n' > "$AC7_CKPT"
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$AC7_SID/subagents/agent-ac7-t1.jsonl"   # force past the coarse watermark too
+AC7_OUT=$(node "$LED" reconcile-spawns --session "$AC7_SID" 2>&1); AC7_RC=$?
+AC7_COLD=$(echo "$AC7_OUT" | grep -oE 'coldStart=[a-z]+' | cut -d= -f2)
+AC7_READ=$(echo "$AC7_OUT" | grep -oE 'firstRecordsRead=[0-9]+' | cut -d= -f2)
+{ [ "$AC7_RC" = "0" ] && [ "$AC7_COLD" = "true" ] && [ "$AC7_READ" = "5" ]; } \
+  && ok "#1851 AC7: a corrupt sidecar degrades to a full cold-start re-derivation (exit 0, coldStart=true, firstRecordsRead=5) -- never a silent no-op" \
+  || bad "#1851 AC7 failed: expected rc=0 coldStart=true firstRecordsRead=5 (got rc=$AC7_RC coldStart=$AC7_COLD firstRecordsRead=$AC7_READ, out: $AC7_OUT)"
+
+# Missing-sidecar variant: delete it outright -> same full-derivation behavior, no group skipped.
+AC7B_SID="sess-1851-ac7b"
+for i in $(seq 1 4); do mk_tag_line "$AC7B_SID" "ac7b-t$i" "1851ac7bt$i" executor; done
+node "$LED" reconcile-spawns --session "$AC7B_SID" >/dev/null 2>&1
+AC7B_ROWS_BEFORE=$(find "$THREE_ROLE_LEDGER_DIR/$AC7B_SID" -maxdepth 1 -name '1851ac7bt*.jsonl' | wc -l | tr -d ' ')
+mv "$THREE_ROLE_LEDGER_DIR/$AC7B_SID/.reconcile-checkpoint.json" "$TMP/_quarantine-ac7b-checkpoint.json" 2>/dev/null
+touch "$THREE_ROLE_PROJECTS_ROOT/proj/$AC7B_SID/subagents/agent-ac7b-t1.jsonl"
+AC7B_OUT=$(node "$LED" reconcile-spawns --session "$AC7B_SID" 2>&1); AC7B_RC=$?
+AC7B_ROWS_AFTER=$(find "$THREE_ROLE_LEDGER_DIR/$AC7B_SID" -maxdepth 1 -name '1851ac7bt*.jsonl' | wc -l | tr -d ' ')
+{ [ "$AC7B_RC" = "0" ] && [ "$AC7B_ROWS_AFTER" = "$AC7B_ROWS_BEFORE" ]; } \
+  && ok "#1851 AC7(b): a MISSING sidecar also degrades to full re-derivation, exit 0, no row lost (rows before=$AC7B_ROWS_BEFORE after=$AC7B_ROWS_AFTER)" \
+  || bad "#1851 AC7(b) failed (rc=$AC7B_RC before=$AC7B_ROWS_BEFORE after=$AC7B_ROWS_AFTER out=$AC7B_OUT)"
+
+# ---- AC8 -- Fail-open contract preserved. Largely already covered above (AC1/AC4/AC5/AC6/AC7 healthy
+#      controls all show nonzero `changed=`/rows -- exit-0 is never achieved by doing nothing); this adds
+#      the two arms not otherwise exercised: a zero-transcript session, and an unreadable ledger dir. ----
+AC8_OUT=$(node "$LED" reconcile-spawns --session "sess-1851-ac8-no-transcripts" 2>&1); AC8_RC=$?
+[ "$AC8_RC" = "0" ] \
+  && ok "#1851 AC8: a zero-transcript session -> exit 0 (fail-open)" \
+  || bad "#1851 AC8 zero-transcript session should exit 0 (rc=$AC8_RC out=$AC8_OUT)"
+AC8B_SID="sess-1851-ac8b"
+mk_tag_line "$AC8B_SID" "ac8b-e1" "1851ac8b" executor
+AC8B_OUT=$(THREE_ROLE_LEDGER_DIR="$TMP/does-not-exist-ledger-1851/deep/nested" node "$LED" reconcile-spawns --session "$AC8B_SID" 2>&1); AC8B_RC=$?
+[ "$AC8B_RC" = "0" ] \
+  && ok "#1851 AC8: an unreadable/absent ledger dir path -> exit 0 (fail-open; ledger dir is created on demand or the write is best-effort)" \
+  || bad "#1851 AC8 unreadable-ledger-dir case should exit 0 (rc=$AC8B_RC out=$AC8B_OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
