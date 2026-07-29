@@ -1,6 +1,45 @@
 #!/usr/bin/env node
-// bin/3role-ledger.mjs — role-LEDGER helper. Bundled in the plugin under bin/; hooks resolve it via
-// "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" (with a repo-relative ../bin fallback).
+// hooks/_fixtures/3role-ledger-pre2075-snapshot.mjs — COMMITTED STATIC FIXTURE (#2075 AC-23(b) / #2094).
+//
+// Durable, hermetic, no-git-dependency stand-in for a git-object-dependent acquisition this fixture
+// REPLACES. AC-23(b) in hooks/3role-ledger-smoke-test.sh used to `git show origin/master:...` pipe
+// the pre-#2075 hooks/3role-ledger.mjs into a temp file (the #1833-class shape-i defect). MEASURED
+// (not assumed, #2094) to fail two ways: (1) CI runs a shallow (depth=1, single-commit) checkout, so
+// `origin/master` -- and, it turns out, an on-demand fetch of ANY specific ancestor SHA -- is not
+// resolvable there without a live network call to the real ai-brain remote; (2) this exact smoke test
+// file is ALSO byte-ported verbatim into the separate `three-role-model` plugin repo
+// (scripts/sync-three-role-plugin.mjs), whose own git history does not contain ai-brain commit SHAs
+// at all, so a SHA-pin-plus-fetch "fix" that works in ai-brain's own CI still permanently fails once
+// ported. This file carries the pre-#2075 ledger IN-POCKET instead: no git dependency, no network,
+// no reachability requirement, always runs for real, in either repo.
+//
+// UNLIKE the sibling fixtures this follows (hooks/_fixtures/3role-ledger-pre1580-overlay.mjs,
+// -pre1947-ma2-overlay.mjs), which are deliberately MINIMAL subsets reproducing one narrow vulnerable
+// function (Rule 17: mechanical, in-pocket, over faithfulness-by-bulk), this fixture is a FULL,
+// untouched, byte-exact port of the entire pre-#2075 hooks/3role-ledger.mjs. AC-23(b)'s claim is
+// GLOBAL byte-identical equivalence across check()'s entire legacy-ledger output surface (not one
+// targeted code path), so a hand-trimmed subset would silently reintroduce exactly what the original
+// test author's own comment explicitly wanted to avoid: "a re-derived assumption" standing in for a
+// real historical snapshot. Full-file byte-fidelity is the only way to catch an UNKNOWN accidental
+// change anywhere else in check()'s formatting, not just the one change this ticket already knows
+// about (the new PROVENANCE-LEGACY note).
+//
+// MEASURED (not assumed) provenance: byte-exact `git show
+// 9757d10e1995af123b6a99bb535604a320bb77c0:hooks/3role-ledger.mjs`, verified 2026-07-29 as the
+// merge-base of the #2075 PR branch with origin/master (i.e. master's tip immediately before the
+// #2075 feature commit landed) -- confirmed identical to that PR branch's own HEAD^.
+//
+// Do NOT hand-edit this file to match the live hooks/3role-ledger.mjs, and do NOT regenerate it from
+// current code — the AC-23(b) non-decay guard in 3role-ledger-smoke-test.sh asserts this fixture's
+// content differs from the live ledger (cmp -s). If a future edit ever collapses the two to identical
+// bytes, that guard goes RED on purpose.
+//
+// ============================================================================================
+// Everything below this line is the UNMODIFIED byte content of the pinned commit's
+// hooks/3role-ledger.mjs (its own header/comments follow, starting with its own shebang+banner).
+// ============================================================================================
+
+// hooks/3role-ledger.mjs — #851 role-LEDGER helper (PR1, Phase 1+2).
 //
 // A tiny CLI that records WHICH 3-role roles actually ran for a task and verifies them against the
 // forgery-resistant signal the harness already produces: one transcript file per real subagent spawn
@@ -239,20 +278,6 @@
 //     "BLOCK:<class>|<ledger-file-and-line>" naming one of seven classes: not-finished / no-verdict /
 //     negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent / deliberate-skip-closed /
 //     junk-line).
-//   provenance-kind --session S --task T --role R                    (#2075 Phase 1, AC-1)
-//     Prints exactly one of E1|E2|E3|none (optionally " legacy"-suffixed) on stdout, exit 0, for the LAST
-//     line recorded for this role — including a missing row, which prints 'none'. This is D1's REPORTING
-//     construction ONLY (min(stored run_kind, verified kind)) — no gate in this file consults it; every
-//     write-side guard reads VERIFIED kind directly (recomputed fresh from the row's own evidence every
-//     time), so a stored `run_kind` label can only ever make this command's OWN output read lower than the
-//     evidence supports, never higher (AC-24's anti-forgery power test).
-//   append ... --run-kind witnessed|bound|inferred [--run-id ID] [--run-source S]     (#2075 Phase 1, D1)
-//     OPTIONAL provenance-kind fields — written ONLY by the writer that obtained the identity (never
-//     re-derived by a reader): `run_id` is the run's own identity (agentId for E1, nonce for E2, absent for
-//     E3); `run_kind` is WRITE-ONCE / monotone-non-decreasing under overlayAppend (witnessed(3) > bound(2) >
-//     inferred(1) — an incoming write whose rank is <= the row's current stored rank is a no-op on this
-//     field alone; the append itself still exits 0 and every OTHER field still merges normally); `run_source`
-//     names which writer stamped it, diagnostic only, never consulted by a gate.
 //
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
 //   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
@@ -881,11 +906,10 @@ function priorHasTerminalEvidence(prior) {
   if (prior.self_authored) return true;
   if (prior.oracle) return true;
   if (prior.agentId && prior.artifact_path) return true;
-  // #1947 (generalized #2075 AC-2) — a completed subprocess dispatch has no agentId (no Agent-subagent
-  // transcript exists), so the disjunct above is blind to it; a completed run (dispatch marker +
-  // artifact_path) is the same terminal-evidence SHAPE one provenance kind over (mirrors the
-  // agentId+artifact_path disjunct exactly) — provider-agnostic via isSubprocessDispatch().
-  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) return true;
+  // #1947 — a completed subprocess-openrouter dispatch has no agentId (no Agent-subagent transcript exists),
+  // so the disjunct above is blind to it; a completed run (dispatch marker + artifact_path) is the same
+  // terminal-evidence SHAPE one provenance kind over (mirrors the agentId+artifact_path disjunct exactly).
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) return true;
   return false;
 }
 
@@ -901,8 +925,8 @@ function terminalEvidenceSummary(prior) {
   if (prior.agentId && prior.artifact_path) {
     parts.push('a completed run (agentId "' + prior.agentId + '" + artifact_path "' + prior.artifact_path + '")');
   }
-  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) {
-    parts.push('a completed ' + prior.dispatch + ' run (artifact_path "' + prior.artifact_path + '")');
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) {
+    parts.push('a completed subprocess-openrouter run (artifact_path "' + prior.artifact_path + '")');
   }
   return parts.join(', ');
 }
@@ -1172,23 +1196,14 @@ function classifySkip(e) {
 // inadmissible even when its served model happens to equal the SSOT slug.
 function escapeRegExp(s) { return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// #2075 D1/AC-2 — the ONE shared predicate for "is this a non-Agent-tool (subprocess) dispatch class?".
-// Replaces the ~5 per-site literal `dispatch === 'subprocess-openrouter'` comparisons the pre-#2075 file
-// re-derived at every call site (C2's diagnosis: the concept was re-implemented, never named once). A
-// prefix test rather than an enum: `subprocess-openrouter` is the only class that exists in production
-// today, but a future `subprocess-ollama` class (§D4) is recognized by every site that calls this with ZERO
-// further edits (AC-3's provider-agnosticism proof) — the class boundary is "not an Agent-tool spawn",
-// never a specific vendor name.
-function isSubprocessDispatch(v) { return typeof v === 'string' && v.indexOf('subprocess-') === 0; }
-
-// Fresh SSOT read: is this role's SEAT declared a subprocess (non-Agent-tool) dispatch right now? Returns
+// Fresh SSOT read: is this role's SEAT declared subprocess-openrouter dispatch right now? Returns
 // {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
 // of those cases must fall through to the ordinary agentId arm, never silently admit the weak arm.
 function seatDispatchIsSubprocess(role) {
   const routesLoaded = loadRoutesConfig();
   if (!routesLoaded.ok) return { ok: false, seat: null };
   const seat = (routesLoaded.routes.seats || {})[role];
-  if (!seat || !isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
+  if (!seat || seat.dispatch !== 'subprocess-openrouter') return { ok: false, seat: null };
   return { ok: true, seat };
 }
 
@@ -1272,7 +1287,7 @@ function subprocessFirstRecordBound(firstText, task, role, nonce) {
 //   ''    -> admissible AND fully verified -> treat as a pass.
 //   <str> -> admissible but verification FAILED -> this string is the block reason.
 function checkSubprocessProvenance(role, e, session, task) {
-  if (!e || !isSubprocessDispatch(e.dispatch)) return null;
+  if (!e || e.dispatch !== 'subprocess-openrouter') return null;
   const decl = seatDispatchIsSubprocess(role);
   if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
 
@@ -1321,97 +1336,6 @@ function checkSubprocessProvenance(role, e, session, task) {
     return 'executor artifact_path missing (PR URL / commit / branch string)';
   }
   return '';   // admissible + fully verified -> pass.
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
-// #2075 Phase 1 — D1's shared Provenance Record primitive: ONE strength lattice (E1 > E2 > E3), consulted by
-// every reader AND writer instead of ~14 sites each re-deriving "which vendor produced this row?" ad hoc.
-//
-// Two DISTINCT "verified kind" predicates on purpose (R5-N3 — the design's own round-5 review named this
-// split; AC-11's own protection-vs-admissibility test is the binary oracle that forces it):
-//   - computeVerifiedKind()            — the ADMISSIBILITY triple (does this row's evidence fully verify,
-//                                         including served-model equality?). Used by provenance-kind's
-//                                         REPORTING formula (AC-1/AC-24) — never by a write-side guard.
-//   - computeVerifiedKindForProtection() — the narrower PROTECTION predicate (execution record exists AND
-//                                         its first record is tag+nonce bound — served-model equality is an
-//                                         admissibility concern, not a protection one). Used ONLY to decide
-//                                         whether an E3-derived background sweep (reconcile-spawns /
-//                                         refresh-models) may write over a row at all (§D5(c), AC-9/AC-11a).
-// Neither predicate reads the STORED run_kind label — both recompute fresh from the row's own evidence every
-// time (agentResolves/agentBoundToTag for E1, the transcript-existence+binding check for E2), so a forged or
-// stale stored label can never inflate what a row is actually proven to be.
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
-
-// ADMISSIBILITY-scoped verified kind: 'E1' | 'E2' | 'none'. E1 requires a resolving AND spawn-record-bound
-// agentId (never resolveAgent()'s newest-mtime search — that is E3, a guess, never "verified"). E2 reuses
-// checkSubprocessProvenance UNCHANGED (the #2051 discipline: one evaluator, no mirror) — the full triple,
-// including served-model equality.
-function computeVerifiedKind(role, row, session, task) {
-  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
-    return 'E1';
-  }
-  if (row && isSubprocessDispatch(row.dispatch) && checkSubprocessProvenance(role, row, session, task) === '') {
-    return 'E2';
-  }
-  return 'none';
-}
-
-// PROTECTION-scoped verified kind: 'E1' | 'E2' | 'none'. Same E1 test as above (a resolving+bound agentId is
-// unconditionally strong evidence for both questions). The E2 arm is DELIBERATELY narrower than
-// checkSubprocessProvenance's full admissibility triple — it does NOT require served-model equality, only
-// that the row's own execution record exists and its first record is tag+nonce bound — because an E2 row
-// whose model happens to be unreadable is still real, verified evidence that must not be erased by a guess
-// (AC-11's honest-blank-beats-confidently-wrong split; R5-N3).
-function computeVerifiedKindForProtection(role, row, session, task) {
-  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
-    return 'E1';
-  }
-  if (row && isSubprocessDispatch(row.dispatch)) {
-    const decl = seatDispatchIsSubprocess(role);
-    if (decl.ok) {
-      const info = subprocessTranscriptInfo(row.transcript_path);
-      if (info.exists && subprocessFirstRecordBound(info.firstText, task, role, row.nonce)) return 'E2';
-    }
-  }
-  return 'none';
-}
-
-// §D1 storage-layer rank order — witnessed(3) > bound(2) > inferred(1) > unset/absent(0). Governs the
-// write-once clamp in overlayAppend AND provenance-kind's REPORTING formula below (min(stored, verified)) —
-// the ONLY two consumers of the stored run_kind label; every write-side GUARD in this file reads verified
-// kind directly (see computeVerifiedKind[ForProtection] above), never this label.
-const RUN_KIND_RANK = { witnessed: 3, bound: 2, inferred: 1 };
-const KIND_LABEL_BY_RANK = { 3: 'E1', 2: 'E2', 1: 'E3', 0: 'none' };
-function verifiedKindRank(label) { return label === 'E1' ? 3 : (label === 'E2' ? 2 : 0); }
-
-// AC-1's REPORTING construction: min(stored run_kind, verified kind). A row with NO stored run_kind at all
-// (a pre-#2075 "legacy" row — AC-23) reports its verified kind directly, suffixed " legacy" so a consumer
-// can tell a classified-by-inference row from a genuinely stored one — never suffixed for a 'none' verdict
-// (there is nothing to distinguish a legacy 'none' from a stored one; AC-1's own "bare spawn placeholder"
-// arm asserts a bare 'none', no suffix).
-function provenanceKindOf(role, row, session, task) {
-  const verified = computeVerifiedKind(role, row, session, task);
-  if (!row || !('run_kind' in row) || row.run_kind == null) {
-    return verified === 'none' ? 'none' : (verified + ' legacy');
-  }
-  const storedRank = RUN_KIND_RANK[row.run_kind] || 0;
-  const rank = Math.min(storedRank, verifiedKindRank(verified));
-  return KIND_LABEL_BY_RANK[rank];
-}
-
-// provenance-kind --session S --task T --role R (#2075 AC-1). Prints exactly one of E1|E2|E3|none (optionally
-// " legacy"-suffixed) on stdout, exit 0, for every row shape — including a missing row (no line at all for
-// this role), which reports 'none'.
-function cmdProvenanceKind(o) {
-  const session = o.session, task = o.task, role = o.role;
-  if (!session || !task || !role) { console.error('provenance-kind: --session, --task, --role are required'); process.exit(2); }
-  const file = ledgerFile(session, task);
-  let lines = [];
-  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); } catch (e) { /* no ledger yet */ }
-  let row = null;
-  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) row = j; } catch (e) { /* skip */ } }
-  console.log(provenanceKindOf(role, row, session, task));
-  process.exit(0);
 }
 
 // Returns null when the role is satisfied, else a problem string. `opts.rejectVacuousOracle` (#1276) — set
@@ -1807,26 +1731,6 @@ function overlayAppend(session, task, role, fields) {
   if ('dispatch' in fields) entry.dispatch = fields.dispatch;
   if ('transcript_path' in fields) entry.transcript_path = fields.transcript_path;
   if ('nonce' in fields) entry.nonce = fields.nonce;
-  // #2075 D1 — run_id is an ordinary own-key overlay (same discipline as every field above): E1 -> agentId,
-  // E2 -> nonce, E3 -> absent. run_source is diagnostic-only, same discipline, never consulted by a gate.
-  if ('run_id' in fields) entry.run_id = fields.run_id;
-  if ('run_source' in fields) entry.run_source = fields.run_source;
-  // #2075 D1/§D5(a) round-4 storage-layer fix (R3-B1/R3-B2) — run_kind is WRITE-ONCE / monotone-non-
-  // decreasing, NOT an ordinary last-writer-wins overlay: `entry.run_kind` at this point already carries the
-  // PRIOR line's stored value (composed onto `entry` from `prior` above, for a same-round merge) or nothing
-  // (a genuinely new round, isNewRound above — that row's first run_kind write is legitimately unconstrained,
-  // matching the "round split runs first" ordering §D5(a) requires). An incoming write whose rank is <= the
-  // row's CURRENT stored rank is a field-level no-op — every OTHER field this call carries still merges
-  // exactly as before, and the append itself still exits 0 (submitting a stale/weaker claim is not an error).
-  // This is what closes R3-B1/R3-B2 at the storage layer: no later bare `--run-kind inferred` append can ever
-  // push an already-classified row's stored label back down, so §D5(a)/(c)'s VERIFIED-kind-only guards never
-  // need to defend against a demotion trick that reaches them through the stored field.
-  if ('run_kind' in fields) {
-    const incomingRank = RUN_KIND_RANK[fields.run_kind] || 0;
-    const existingRank = ('run_kind' in entry) ? (RUN_KIND_RANK[entry.run_kind] || 0) : 0;
-    if (!('run_kind' in entry) || incomingRank > existingRank) entry.run_kind = fields.run_kind;
-    // else: no-op — `entry.run_kind` is left at its current (higher-or-equal) value.
-  }
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
@@ -1868,10 +1772,6 @@ function overlayAppend(session, task, role, fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
     delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
-    // #2075 D1 — run_id/run_kind/run_source join the clear-list too: a skip line must not carry a stale
-    // claimed provenance kind (join the SAME reasoning as modelVersion/dispatch above — these are provenance
-    // OF a real run, and a skip is a declaration that no run happened).
-    delete entry.run_id; delete entry.run_kind; delete entry.run_source;
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -1897,14 +1797,6 @@ function cmdAppend(o) {
   if ('dispatch' in o) fields.dispatch = o.dispatch;
   if ('transcript' in o) fields.transcript_path = normalizeArtifact(o.transcript);
   if ('nonce' in o) fields.nonce = o.nonce;
-  // #2075 Phase 1, D1 — the provenance-kind fields. Written ONLY by the writer that obtained the identity
-  // (three-role-subagent-ledger.sh -> witnessed; the dispatch helper -> bound; cmdReconcileSpawns /
-  // cmdRefreshModels -> inferred, stamped internally below, never via this flag). --run-kind is WRITE-ONCE /
-  // monotone-non-decreasing under overlayAppend (see its own comment there); --run-id/--run-source are
-  // ordinary own-key overlays.
-  if ('run-kind' in o) fields.run_kind = o['run-kind'];
-  if ('run-id' in o) fields.run_id = o['run-id'];
-  if ('run-source' in o) fields.run_source = o['run-source'];
   // #1100 item 3: provenance — a line authored BY the role's own agent (its SubagentStop scan saw the agent
   // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
   // `--self-authored` (no value) is true, `--self-authored false` is false.
@@ -2224,7 +2116,7 @@ function cmdCheck(o) {
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
   catch (e) {
     console.log('BLOCK: no role-ledger found for task ' + sanitize(task) + ' in this session (' + file +
-      '). Append a ledger line per role: node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> ...');
+      '). Append a ledger line per role: node hooks/3role-ledger.mjs append --session <sid> --task <id> --role <role> ...');
     process.exit(2);
   }
   const byRole = {};
@@ -2246,11 +2138,10 @@ function cmdCheck(o) {
     if (r) { problems.push(r); continue; }
     // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
     // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
-    // subprocess arm, not the ordinary agentId arm. #2075 AC-3: label the ROW's actual dispatch value, never
-    // a hardcoded vendor literal — a subprocess-ollama row must not be mislabeled subprocess-openrouter.
+    // subprocess-openrouter arm, not the ordinary agentId arm.
     if (checkSubprocessProvenance(role, e, session, task) === '') {
       const decl = seatDispatchIsSubprocess(role);
-      dispatchLabels.push('role=' + role + ' dispatch=' + e.dispatch + ' model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
+      dispatchLabels.push('role=' + role + ' dispatch=subprocess-openrouter model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
     }
   }
   // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
@@ -2480,16 +2371,6 @@ function cmdCheck(o) {
   if (requireProv) {
     for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
   }
-  // #2075 AC-23 — legacy-row surfacing: ALWAYS-ON (never opt-in, never blocking), the drift detector for an
-  // unpatched writer. A required-role row with NO stored `run_kind` key at all predates this design (or was
-  // written by a writer that has not been taught to stamp it yet) — its kind is still computed correctly
-  // (from live, verified evidence — see provenanceKindOf's legacy branch), this is visibility only.
-  const legacyRoles = [];
-  for (const role of REQUIRED_ROLES) {
-    const e = byRole[role];
-    if (!e || ('skip_reason' in e)) continue;   // missing handled above; a skip has no run to classify
-    if (!('run_kind' in e)) legacyRoles.push(role);
-  }
   // #1509 Leg A — TRACKED, not merely present. Opt-in via --enforce-tracked-artifacts (only the completion
   // gate passes it; base `check` stays existence-only — AC-3). Role-keyed HARD block for the three disk-path
   // roles; executor is exempt by role but its disk-path row (if any) is surfaced as a NOTE, never blocked.
@@ -2565,11 +2446,6 @@ function cmdCheck(o) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
       ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
   }
-  if (legacyRoles.length) {
-    console.log('PROVENANCE-LEGACY: ' + legacyRoles.join(', ') +
-      ' — no stored run_kind (pre-#2075 row, or a writer not yet taught to stamp it); kind is computed fresh ' +
-      "from this row's live, verified evidence — see `provenance-kind` — never from a stored label.");
-  }
   // #1989 — ROUTE-BYPASS trailing-edge detector: an always-on, pure-output advisory (exit code UNCHANGED — the
   // model-policy legs own blocking; this is visibility, not a gate) printed on the roles-satisfied path, sibling
   // of DISPATCH:/NOTE:/NOTE-EXECUTOR:/PROVENANCE:. Fires PER required role when ALL hold: (1) the routes SSOT,
@@ -2604,7 +2480,7 @@ function cmdCheck(o) {
     let stampSurvives = false;
     for (const ln of lines) {
       let j; try { j = JSON.parse(ln); } catch (er) { continue; }
-      if (j && j.role === role && isSubprocessDispatch(j.dispatch)) { stampSurvives = true; break; }
+      if (j && j.role === role && j.dispatch === 'subprocess-openrouter') { stampSurvives = true; break; }
     }
     if (stampSurvives) continue;
     const seatModel = (decl.seat && decl.seat.model) || '<unknown>';
@@ -2705,19 +2581,9 @@ function cmdRefreshModels(o) {
         if (!e) continue;                       // no line for this role yet -> nothing to refresh
         if ('skip_reason' in e) continue;        // inline-skip -> no transcript to read
         if (e.modelVersion) continue;            // ABSENT->PRESENT ONLY: already has a model, never rewrite
-        // #2075 D5(c) — E3 CONTAINMENT (AC-9/AC-11a): a row already carrying protection-verified E2 evidence
-        // (a subprocess dispatch, no agentId of its own) must not have its blank modelVersion filled from an
-        // unrelated sibling — resolveModelFields('' explicitAgent) would fall back to a blind cross-session
-        // search precisely for this row shape. A verified-E1 row is unaffected (its own e.agentId is passed
-        // explicitly below, so no search ever runs for it) — AC-10's ordinary-row backfill keeps working.
-        if (computeVerifiedKindForProtection(role, e, sess, task) === 'E2') continue;
         scanned++;
         const modelFields = resolveModelFields(sess, task, role, e.agentId || '');
         if (!modelFields.modelVersion) continue; // transcript still carries no message.model line yet -> too early
-        // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (same
-        // reasoning as cmdReconcileSpawns above; D1 names resolveModelFields's own callers explicitly).
-        modelFields.run_kind = 'inferred';
-        modelFields.run_source = 'refresh-models';
         overlayAppend(sess, task, role, modelFields);
         changed++;
       }
@@ -2843,15 +2709,6 @@ function cmdReconcileSpawns(o) {
       // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) —
       // write ONLY when the row is absent, its agentId is absent, or its agentId equals the resolved one.
       if (prior && prior.agentId && prior.agentId !== agentId) continue;
-      // #2075 D5(c) — E3 CONTAINMENT (fixes B16, the ~30s corruption timer). `agentId` above is ALWAYS
-      // E3-derived (a blind, cross-session, newest-mtime SEARCH — resolveAgent()'s own contract), so the one
-      // genuine corruption vector is a row that ALREADY carries protection-verified E2 evidence (a subprocess
-      // dispatch with no agentId of its own): this sweep's search could otherwise find an unrelated Anthropic
-      // sibling's transcript and misattribute its model onto this row (measured live, cairn 2026-07-28:270).
-      // A row already carrying a resolving+bound agentId (verified E1) is UNAFFECTED by this guard — its own
-      // agentId is passed explicitly to resolveModelFields below, so no blind search ever runs for it (AC-10's
-      // ordinary-Anthropic-row backfill keeps working unchanged).
-      if (computeVerifiedKindForProtection(role, prior, sess, task) === 'E2') continue;
 
       // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
       // call at all (idempotency — AC-2: a bare re-append would still refresh `ts` and break byte-identity).
@@ -2869,12 +2726,6 @@ function cmdReconcileSpawns(o) {
       }
 
       if (!hasChange) continue;
-      // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (round-1
-      // blocker B3's fix: a search-backfilled row must never be byte-identical on disk to a genuine E1 row).
-      // The write-once clamp in overlayAppend means this can only ever RAISE an absent/lower stored value,
-      // never lower an already-classified row's — no extra guard needed here.
-      fields.run_kind = 'inferred';
-      fields.run_source = 'reconcile-spawns';
       try { overlayAppend(sess, task, role, fields); changed++; }
       catch (e) { /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
     }
@@ -3529,9 +3380,8 @@ try {
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
-  else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
@@ -3540,8 +3390,7 @@ try {
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
-      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
-      '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]]');
+      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)]');
     process.exit(2);
   }
 } catch (e) {
