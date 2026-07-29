@@ -16,6 +16,29 @@ export THREE_ROLE_PROJECTS_ROOT="$TMP/projects"
 SID="sess-ledger"; TASK="700"
 LEDFILE="$THREE_ROLE_LEDGER_DIR/$SID/$TASK.jsonl"
 
+# ---- #2075 AC-23(b) baseline fixture (committed, no git dependency, no network) -----------------
+# AC-23(b) below diffs the NEW binary's check() output against the OLD (pre-#2075) binary's output
+# on an identical fixture -- proving #2075 is byte-identical on a legacy ledger except for its one
+# new PROVENANCE-LEGACY note. Same class of problem, same fix pattern, as the established
+# hooks/_fixtures/3role-ledger-pre1580-overlay.mjs / -pre1947-ma2-overlay.mjs (#1833 Bundle 1A / #1947
+# M-A-2): the original cut acquired the pre-fix binary via `git show origin/master:...` piped into an
+# artifact (the #1833-class shape-i defect) -- MEASURED to fail two ways (#2094): (1) CI runs a
+# shallow (depth=1) checkout, so neither `origin/master` nor an on-demand SHA fetch resolves there
+# without a live network call; (2) this file is also byte-ported into the separate `three-role-model`
+# plugin repo (scripts/sync-three-role-plugin.mjs), whose git history does not contain ai-brain SHAs
+# at all, so even a network fetch permanently fails there. Unlike the two sibling fixtures above
+# (deliberately a MINIMAL subset -- Rule 17, mechanical-over-bulk, since each targets one narrow
+# vulnerable function), AC-23(b)'s claim is GLOBAL byte-identical equivalence across check()'s entire
+# legacy-ledger output surface, which can only be honestly tested against the real, complete pre-fix
+# implementation (a hand-trimmed subset would silently re-introduce "a re-derived assumption" -- the
+# exact risk the original test author's own comment called out). So this fixture is a full, untouched,
+# byte-exact `git show 9757d10e1995af123b6a99bb535604a320bb77c0:hooks/3role-ledger.mjs` port (master's
+# tip immediately before the #2075 feature commit landed) -- see the fixture file's own header for
+# provenance + the do-not-hand-edit / non-decay-guard notes the sibling fixtures also carry.
+AC23B_FIXTURE="$DIR/_fixtures/3role-ledger-pre2075-snapshot.mjs"
+OLD_LED="$AC23B_FIXTURE"
+
+
 # Create a real (resolvable) subagent transcript fixture under the fixture projects root.
 mk_sub() { mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"; printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1" > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"; }
 nlines() { [ -f "$LEDFILE" ] && grep -c . "$LEDFILE" || echo 0; }
@@ -2042,5 +2065,390 @@ g_gate "$GS10C" "$GT"
 { [ "$GR_RC" = "0" ]; } \
   && ok "#2051 AC-10(c): resolving + spawn-bound agentId PLUS a forged dispatch nonce -> exit 0 (arm 1 wins via the :1264 tie-break; arm 3 must NOT shadow a resolving agentId — catches a mirrored checkSubprocessProvenance regression)" \
   || bad "#2051 AC-10(c) should ALLOW — a resolving+bound agentId must win, not be shadowed by a forged-nonce subprocess arm (rc=$GR_RC out=$GR_OUT)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2075 Phase 1 — provider-agnostic ledger provenance primitive (provenance-kind, strength lattice,
+# stored run_kind/run_id/run_source, E3 containment). Isolated CC_ROUTES_JSON + THREE_ROLE_LEDGER_DIR +
+# THREE_ROLE_PROJECTS_ROOT fixture root, reusing the #1947/#2051 fixture vocabulary (mk_*_tagged /
+# mk_*_or_transcript). Covers AC-1, AC-2, AC-3, AC-9, AC-10, AC-11, AC-23(a/b/c), AC-24 — the plan's own
+# Phase 1 scope (`.ai-workspace/plans/2026-07-29-2075-ledger-provenance-redesign.md`). AC-23(d)/(e) and
+# every AC-4..AC-8c/AC-12..AC-27 sit in Phase 2/3 (the `run_id` round-identity extension + the clause-2
+# write-protocol / route-change-clause rewrite) and are NOT built here — see this task's PR body.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+P1_FIX="$TMP/p1-fixtures"
+mkdir -p "$P1_FIX/ledger" "$P1_FIX/projects" "$P1_FIX/transcripts" "$P1_FIX/artifacts"
+cat > "$P1_FIX/routes.json" <<'P1JSON'
+{ "seats": { "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus" } } }
+P1JSON
+cat > "$P1_FIX/routes-ollama.json" <<'P1JSON'
+{ "seats": { "plan-review": { "provider": "ollama", "model": "gemma4:26b-nvfp4-cfgA", "dispatch": "subprocess-ollama", "agent_tool_fallback": "opus" } } }
+P1JSON
+
+# mk_p1_tagged $session $agentId $task $role — a resolving AND spawn-record-bound Agent-tool subagent
+# transcript (first record message.content carries the tag), first record only (no model line yet).
+mk_p1_tagged() {
+  mkdir -p "$P1_FIX/projects/proj/$1/subagents"
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4" \
+    > "$P1_FIX/projects/proj/$1/subagents/agent-$2.jsonl"
+}
+# mk_p1_tagged_model $session $agentId $task $role $model — same, PLUS a trailing assistant message.model line.
+mk_p1_tagged_model() {
+  mkdir -p "$P1_FIX/projects/proj/$1/subagents"
+  { printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4";
+    printf '{"type":"assistant","message":{"model":"%s","role":"assistant","content":[]}}\n' "$5"; } \
+    > "$P1_FIX/projects/proj/$1/subagents/agent-$2.jsonl"
+}
+# p1_append_model_line $session $agentId $model — append a trailing assistant message.model line to an
+# EXISTING tagged transcript (simulates the transcript "completing" after an initial spawn-time stamp).
+p1_append_model_line() {
+  printf '{"type":"assistant","message":{"model":"%s","role":"assistant","content":[]}}\n' "$3" \
+    >> "$P1_FIX/projects/proj/$1/subagents/agent-$2.jsonl"
+}
+# mk_p1_or_transcript $path $task $nonce $model — a validly-bound subprocess transcript (queue-operation/
+# enqueue first record carrying the tag + nonce, plus a served-model assistant line).
+mk_p1_or_transcript() {
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce, model ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "p1-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# mk_p1_or_transcript_nomodel $path $task $nonce — the SAME bound first record, but NO assistant line at
+# all (AC-11: an execution record with no readable message.model).
+mk_p1_or_transcript_nomodel() {
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce ] = process.argv;
+    const lines = [ JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "p1-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }) ];
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3"
+}
+# p1_append $routesFile $session $task $role <extra append args...> — fire-and-forget write.
+p1_append() {
+  local RF="$1" S="$2" T="$3" R="$4"; shift 4
+  THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$RF" \
+    node "$LED" append --session "$S" --task "$T" --role "$R" "$@" >/dev/null 2>&1
+}
+# p1_append_capture $routesFile $session $task $role <extra append args...> — sets PAOUT/PARC.
+p1_append_capture() {
+  local RF="$1" S="$2" T="$3" R="$4"; shift 4
+  PAOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$RF" \
+    node "$LED" append --session "$S" --task "$T" --role "$R" "$@" 2>&1); PARC=$?
+}
+# p1_kind $routesFile $session $task $role — sets PKOUT/PKRC.
+p1_kind() {
+  PKOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$1" \
+    node "$LED" provenance-kind --session "$2" --task "$3" --role "$4" 2>&1); PKRC=$?
+}
+# p1_check $routesFile $session $task — sets PCOUT/PCRC.
+p1_check() {
+  PCOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$1" \
+    node "$LED" check --session "$2" --task "$3" 2>&1); PCRC=$?
+}
+# p1_reconcile $routesFile $session — sets RCOUT/RCRC.
+p1_reconcile() {
+  RCOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$1" \
+    node "$LED" reconcile-spawns --session "$2" 2>&1); RCRC=$?
+}
+# p1_refresh $routesFile $session — sets RFOUT/RFRC.
+p1_refresh() {
+  RFOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$1" \
+    node "$LED" refresh-models --session "$2" 2>&1); RFRC=$?
+}
+# p1_row_get $session $task $role $field — prints the RAW stored value of $field on the last matching row
+# (empty string if absent/no row). Byte-level assertions, never through provenance-kind's own formula.
+p1_row_get() {
+  local FILE="$P1_FIX/ledger/$1/$2.jsonl"
+  node -e '
+    const fs = require("fs");
+    const [ , file, role, field ] = process.argv;
+    let lines = []; try { lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim()); } catch (e) {}
+    let row = null;
+    for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) row = j; } catch (e) {} }
+    process.stdout.write(row && row[field] != null ? String(row[field]) : "");
+  ' "$FILE" "$3" "$4"
+}
+
+# ---- AC-1 (provenance-kind reporting formula: min(stored run_kind, verified kind)) -------------------------
+# Arm 1: Agent-tool row, resolving + tag-bound agentId, stamped run_kind:witnessed -> E1.
+mk_p1_tagged "p1-ac1a" "ag-ac1a" "t1" "plan-review"
+p1_append "$P1_FIX/routes.json" "p1-ac1a" "t1" "plan-review" --agent "ag-ac1a" --run-kind witnessed
+p1_kind "$P1_FIX/routes.json" "p1-ac1a" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E1" ]; } \
+  && ok "#2075 AC-1 arm1: resolving+tag-bound agentId, stamped witnessed -> provenance-kind prints E1" \
+  || bad "#2075 AC-1 arm1 expected E1 (rc=$PKRC out=$PKOUT)"
+
+# Arm 2: nonce-bound subprocess row, fully verified (transcript+artifact+model), stamped run_kind:bound -> E2.
+mk_p1_or_transcript "$P1_FIX/transcripts/ac1b.jsonl" "t1" "N-AC1B" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC1B\n' > "$P1_FIX/artifacts/ac1b.md"
+p1_append "$P1_FIX/routes.json" "p1-ac1b" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/ac1b.jsonl" --nonce "N-AC1B" --artifact "$P1_FIX/artifacts/ac1b.md" \
+  --verdict PASS --run-kind bound
+p1_kind "$P1_FIX/routes.json" "p1-ac1b" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E2" ]; } \
+  && ok "#2075 AC-1 arm2: fully-verified nonce-bound subprocess row, stamped bound -> provenance-kind prints E2" \
+  || bad "#2075 AC-1 arm2 expected E2 (rc=$PKRC out=$PKOUT)"
+
+# Arm 3: reconcile-spawns backfills a bare row from a real tagged sibling -> stamps run_kind:inferred, so
+# provenance-kind reports E3 even though the agentId genuinely resolves and is tag-bound.
+mk_p1_tagged "p1-ac1c" "ag-ac1c" "t1" "executor"
+p1_reconcile "$P1_FIX/routes.json" "p1-ac1c"
+p1_kind "$P1_FIX/routes.json" "p1-ac1c" "t1" "executor"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E3" ]; } \
+  && ok "#2075 AC-1 arm3: reconcile-spawns-backfilled row (run_kind:inferred) -> provenance-kind prints E3 despite a genuinely resolving agentId" \
+  || bad "#2075 AC-1 arm3 expected E3 (rc=$PKRC out=$PKOUT)"
+AC1C_RK=$(p1_row_get "p1-ac1c" "t1" "executor" "run_kind")
+[ "$AC1C_RK" = "inferred" ] \
+  && ok "#2075 AC-1 arm3: reconcile-spawns stamped run_kind=inferred on the raw row" \
+  || bad "#2075 AC-1 arm3 expected raw run_kind=inferred (got '$AC1C_RK')"
+
+# Arm 4: a bare spawn placeholder (no evidence, no run_kind at all) -> none, no legacy suffix.
+p1_append "$P1_FIX/routes.json" "p1-ac1d" "t1" "plan-review"
+p1_kind "$P1_FIX/routes.json" "p1-ac1d" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "none" ]; } \
+  && ok "#2075 AC-1 arm4: bare spawn placeholder -> provenance-kind prints none (no legacy suffix)" \
+  || bad "#2075 AC-1 arm4 expected none (rc=$PKRC out=$PKOUT)"
+
+# ---- AC-2 (comparison-site count guard — necessary, not sufficient; AC-3 carries the real weight) ----------
+AC2_COUNT=$(awk '{ if ($0 ~ /^[[:space:]]*\/\//) { print "" } else { print } }' "$LED" \
+  | grep -oiE "\.dispatch[[:space:]]*[!=]==[[:space:]]*['\"]subprocess[-_]?openrouter['\"]" | wc -l | tr -d ' ')
+[ "$AC2_COUNT" -le 2 ] \
+  && ok "#2075 AC-2: comparison-operator-scoped, comment-stripped subprocess-openrouter count = $AC2_COUNT (target <= 2)" \
+  || bad "#2075 AC-2 expected <= 2 direct comparisons, got $AC2_COUNT"
+
+# ---- AC-3 (provider-agnosticism proof) — the SAME AC-1 arm-2 and AC-9 arm-1 shapes, ZERO further code
+#      edits, with a fixture subprocess-ollama seat substituted throughout (fixture SSOT seat AND row
+#      dispatch value both flip). Only AC-9 is a Phase-1-built AC, so that is the arm this proof re-runs. ----
+mk_p1_or_transcript "$P1_FIX/transcripts/ac3a.jsonl" "t1" "N-AC3A" "gemma4:26b-nvfp4-cfgA"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC3A\n' > "$P1_FIX/artifacts/ac3a.md"
+p1_append "$P1_FIX/routes-ollama.json" "p1-ac3a" "t1" "plan-review" --dispatch subprocess-ollama \
+  --transcript "$P1_FIX/transcripts/ac3a.jsonl" --nonce "N-AC3A" --artifact "$P1_FIX/artifacts/ac3a.md" \
+  --verdict PASS --run-kind bound
+p1_kind "$P1_FIX/routes-ollama.json" "p1-ac3a" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E2" ]; } \
+  && ok "#2075 AC-3(i): AC-1 arm2's shape re-run with a subprocess-ollama SSOT seat + row dispatch, ZERO code edits -> still prints E2" \
+  || bad "#2075 AC-3(i) expected E2 under subprocess-ollama (rc=$PKRC out=$PKOUT)"
+
+mk_p1_or_transcript "$P1_FIX/transcripts/ac3b.jsonl" "t1" "N-AC3B" "gemma4:26b-nvfp4-cfgA"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC3B\n' > "$P1_FIX/artifacts/ac3b.md"
+p1_append "$P1_FIX/routes-ollama.json" "p1-ac3b" "t1" "plan-review" --dispatch subprocess-ollama \
+  --transcript "$P1_FIX/transcripts/ac3b.jsonl" --nonce "N-AC3B" --artifact "$P1_FIX/artifacts/ac3b.md" \
+  --verdict PASS --run-kind bound
+D3B_BEFORE=$(p1_row_get "p1-ac3b" "t1" "plan-review" "dispatch")
+mk_p1_tagged_model "p1-ac3b" "sib-ac3b" "t1" "plan-review" "claude-opus-5"
+p1_reconcile "$P1_FIX/routes-ollama.json" "p1-ac3b"
+D3B_AFTER=$(p1_row_get "p1-ac3b" "t1" "plan-review" "dispatch")
+MV3B_AFTER=$(p1_row_get "p1-ac3b" "t1" "plan-review" "modelVersion")
+{ [ "$D3B_AFTER" = "$D3B_BEFORE" ] && [ "$MV3B_AFTER" != "claude-opus-5" ]; } \
+  && ok "#2075 AC-3(ii): AC-9 arm1's E3-corruption regression re-run under subprocess-ollama, ZERO code edits -> dispatch survives, model never the Anthropic sibling's" \
+  || bad "#2075 AC-3(ii) regression under subprocess-ollama (dispatch before=$D3B_BEFORE after=$D3B_AFTER model=$MV3B_AFTER)"
+
+# ---- AC-9 (the ~30s timer / E3-containment guard, arm1 + the demotion-interposed arm2) ---------------------
+# Arm 1: a verified E2 plan-review row PLUS a same-session/same-task Agent-tool SIBLING transcript. After
+#        reconcile-spawns, the E2 row's dispatch/transcript_path/nonce/run_kind survive; modelVersion is
+#        never backfilled from the sibling.
+mk_p1_or_transcript "$P1_FIX/transcripts/ac9a.jsonl" "t1" "N-AC9A" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC9A\n' > "$P1_FIX/artifacts/ac9a.md"
+p1_append "$P1_FIX/routes.json" "p1-ac9a" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/ac9a.jsonl" --nonce "N-AC9A" --artifact "$P1_FIX/artifacts/ac9a.md" \
+  --verdict PASS --run-kind bound
+D9A_BEFORE=$(p1_row_get "p1-ac9a" "t1" "plan-review" "dispatch")
+T9A_BEFORE=$(p1_row_get "p1-ac9a" "t1" "plan-review" "transcript_path")
+N9A_BEFORE=$(p1_row_get "p1-ac9a" "t1" "plan-review" "nonce")
+mk_p1_tagged_model "p1-ac9a" "sib-ac9a" "t1" "plan-review" "claude-opus-5"
+p1_reconcile "$P1_FIX/routes.json" "p1-ac9a"
+D9A_AFTER=$(p1_row_get "p1-ac9a" "t1" "plan-review" "dispatch")
+T9A_AFTER=$(p1_row_get "p1-ac9a" "t1" "plan-review" "transcript_path")
+N9A_AFTER=$(p1_row_get "p1-ac9a" "t1" "plan-review" "nonce")
+RK9A_AFTER=$(p1_row_get "p1-ac9a" "t1" "plan-review" "run_kind")
+MV9A_AFTER=$(p1_row_get "p1-ac9a" "t1" "plan-review" "modelVersion")
+{ [ "$D9A_AFTER" = "$D9A_BEFORE" ] && [ "$T9A_AFTER" = "$T9A_BEFORE" ] && [ "$N9A_AFTER" = "$N9A_BEFORE" ] \
+  && [ "$RK9A_AFTER" = "bound" ] && [ "$MV9A_AFTER" != "claude-opus-5" ]; } \
+  && ok "#2075 AC-9 arm1: reconcile-spawns with an Agent-tool sibling present -> E2 row's dispatch/transcript_path/nonce/run_kind survive intact, modelVersion never the sibling's" \
+  || bad "#2075 AC-9 arm1 regression (dispatch=$D9A_AFTER transcript=$T9A_AFTER nonce=$N9A_AFTER run_kind=$RK9A_AFTER modelVersion=$MV9A_AFTER)"
+
+# Arm 2 (demotion-interposed): a bare --run-kind inferred append lands BEFORE reconcile-spawns runs.
+#   (i) immediately after the demotion, run_kind is still 'bound' (write-once clamp).
+#   (ii) reconcile-spawns then STILL cannot erase the row's E2 evidence (guard reads verified kind).
+mk_p1_or_transcript "$P1_FIX/transcripts/ac9b.jsonl" "t1" "N-AC9B" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC9B\n' > "$P1_FIX/artifacts/ac9b.md"
+p1_append "$P1_FIX/routes.json" "p1-ac9b" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/ac9b.jsonl" --nonce "N-AC9B" --artifact "$P1_FIX/artifacts/ac9b.md" \
+  --verdict PASS --run-kind bound
+D9B_BEFORE=$(p1_row_get "p1-ac9b" "t1" "plan-review" "dispatch")
+T9B_BEFORE=$(p1_row_get "p1-ac9b" "t1" "plan-review" "transcript_path")
+N9B_BEFORE=$(p1_row_get "p1-ac9b" "t1" "plan-review" "nonce")
+p1_append "$P1_FIX/routes.json" "p1-ac9b" "t1" "plan-review" --run-kind inferred
+RK9B_MID=$(p1_row_get "p1-ac9b" "t1" "plan-review" "run_kind")
+[ "$RK9B_MID" = "bound" ] \
+  && ok "#2075 AC-9 arm2(i): a bare --run-kind inferred append against an already-bound row is a no-op on the stored field (write-once clamp)" \
+  || bad "#2075 AC-9 arm2(i) expected run_kind to stay 'bound' after the demotion append, got '$RK9B_MID'"
+mk_p1_tagged_model "p1-ac9b" "sib-ac9b" "t1" "plan-review" "claude-opus-5"
+p1_reconcile "$P1_FIX/routes.json" "p1-ac9b"
+D9B_AFTER=$(p1_row_get "p1-ac9b" "t1" "plan-review" "dispatch")
+T9B_AFTER=$(p1_row_get "p1-ac9b" "t1" "plan-review" "transcript_path")
+N9B_AFTER=$(p1_row_get "p1-ac9b" "t1" "plan-review" "nonce")
+RK9B_AFTER=$(p1_row_get "p1-ac9b" "t1" "plan-review" "run_kind")
+{ [ "$D9B_AFTER" = "$D9B_BEFORE" ] && [ "$T9B_AFTER" = "$T9B_BEFORE" ] && [ "$N9B_AFTER" = "$N9B_BEFORE" ] && [ "$RK9B_AFTER" = "bound" ]; } \
+  && ok "#2075 AC-9 arm2(ii): after an interposed demotion append, reconcile-spawns STILL cannot erase the row's E2 evidence (guard reads verified kind, not the stored label)" \
+  || bad "#2075 AC-9 arm2(ii) regression (dispatch=$D9B_AFTER transcript=$T9B_AFTER nonce=$N9B_AFTER run_kind=$RK9B_AFTER)"
+
+# ---- AC-10 (E3 may still fill a blank row — regression guard) ----------------------------------------------
+# (a) via reconcile-spawns: a genuinely tagged+modeled Anthropic transcript with NO ledger row yet.
+mk_p1_tagged_model "p1-ac10a" "ag-ac10a" "t1" "executor" "claude-sonnet-5"
+p1_reconcile "$P1_FIX/routes.json" "p1-ac10a"
+AID10A=$(p1_row_get "p1-ac10a" "t1" "executor" "agentId")
+MV10A=$(p1_row_get "p1-ac10a" "t1" "executor" "modelVersion")
+RK10A=$(p1_row_get "p1-ac10a" "t1" "executor" "run_kind")
+{ [ "$AID10A" = "ag-ac10a" ] && [ "$MV10A" = "claude-sonnet-5" ] && [ "$RK10A" = "inferred" ]; } \
+  && ok "#2075 AC-10(a): an ordinary Anthropic row is still filled by reconcile-spawns, stamped run_kind:inferred (regression guard)" \
+  || bad "#2075 AC-10(a) regression (agentId=$AID10A modelVersion=$MV10A run_kind=$RK10A)"
+
+# (b) via refresh-models: agentId present, modelVersion genuinely unresolvable at append time (the transcript
+#     "completes" only AFTER the row already exists).
+mk_p1_tagged "p1-ac10b" "ag-ac10b" "t1" "executor"
+p1_append "$P1_FIX/routes.json" "p1-ac10b" "t1" "executor" --agent "ag-ac10b" --artifact "PR #1"
+MV10B_BEFORE=$(p1_row_get "p1-ac10b" "t1" "executor" "modelVersion")
+p1_append_model_line "p1-ac10b" "ag-ac10b" "claude-opus-5"
+p1_refresh "$P1_FIX/routes.json" "p1-ac10b"
+MV10B_AFTER=$(p1_row_get "p1-ac10b" "t1" "executor" "modelVersion")
+RK10B_AFTER=$(p1_row_get "p1-ac10b" "t1" "executor" "run_kind")
+{ [ -z "$MV10B_BEFORE" ] && [ "$MV10B_AFTER" = "claude-opus-5" ] && [ "$RK10B_AFTER" = "inferred" ]; } \
+  && ok "#2075 AC-10(b): an ordinary Anthropic row is still filled by refresh-models, stamped run_kind:inferred (regression guard)" \
+  || bad "#2075 AC-10(b) regression (before=$MV10B_BEFORE after=$MV10B_AFTER run_kind=$RK10B_AFTER)"
+
+# ---- AC-11 (protection-vs-admissibility split for an unreadable served model) -------------------------------
+mk_p1_or_transcript_nomodel "$P1_FIX/transcripts/ac11.jsonl" "t1" "N-AC11"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC11\n' > "$P1_FIX/artifacts/ac11.md"
+p1_append "$P1_FIX/routes.json" "p1-ac11" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/ac11.jsonl" --nonce "N-AC11" --artifact "$P1_FIX/artifacts/ac11.md" \
+  --verdict PASS --run-kind bound
+D11_BEFORE=$(p1_row_get "p1-ac11" "t1" "plan-review" "dispatch")
+T11_BEFORE=$(p1_row_get "p1-ac11" "t1" "plan-review" "transcript_path")
+N11_BEFORE=$(p1_row_get "p1-ac11" "t1" "plan-review" "nonce")
+MV11_BEFORE=$(p1_row_get "p1-ac11" "t1" "plan-review" "modelVersion")
+[ -z "$MV11_BEFORE" ] \
+  && ok "#2075 AC-11 setup: the E2 row genuinely starts with no modelVersion (unreadable served model)" \
+  || bad "#2075 AC-11 setup should start with no modelVersion, got '$MV11_BEFORE'"
+
+# (a) protection (write side): reconcile-spawns (with a real Agent-tool sibling present) and refresh-models
+#     must NOT fill modelVersion from a guess, and must NOT clear dispatch/transcript_path/nonce.
+mk_p1_tagged_model "p1-ac11" "sib-ac11" "t1" "plan-review" "claude-opus-5"
+p1_reconcile "$P1_FIX/routes.json" "p1-ac11"
+p1_refresh "$P1_FIX/routes.json" "p1-ac11"
+D11_AFTER=$(p1_row_get "p1-ac11" "t1" "plan-review" "dispatch")
+T11_AFTER=$(p1_row_get "p1-ac11" "t1" "plan-review" "transcript_path")
+N11_AFTER=$(p1_row_get "p1-ac11" "t1" "plan-review" "nonce")
+MV11_AFTER=$(p1_row_get "p1-ac11" "t1" "plan-review" "modelVersion")
+{ [ "$D11_AFTER" = "$D11_BEFORE" ] && [ "$T11_AFTER" = "$T11_BEFORE" ] && [ "$N11_AFTER" = "$N11_BEFORE" ] && [ -z "$MV11_AFTER" ]; } \
+  && ok "#2075 AC-11(a) protection: modelVersion stays absent, dispatch/transcript_path/nonce survive intact (honest-blank beats confidently-wrong)" \
+  || bad "#2075 AC-11(a) regression (dispatch=$D11_AFTER transcript=$T11_AFTER nonce=$N11_AFTER modelVersion=$MV11_AFTER)"
+
+# (b) admissibility (read side) still FAILS CLOSED: check exits 2, naming plan-review + the unreadable model.
+p1_append "$P1_FIX/routes.json" "p1-ac11" "t1" "planner" --skip-reason "fixture: not under test in AC-11"
+p1_append "$P1_FIX/routes.json" "p1-ac11" "t1" "executor" --skip-reason "fixture: not under test in AC-11"
+printf 'Decision: PASS\n' > "$P1_FIX/artifacts/ac11-er.md"
+p1_append "$P1_FIX/routes.json" "p1-ac11" "t1" "execution-review" --oracle "$P1_FIX/artifacts/ac11-er.md"
+p1_check "$P1_FIX/routes.json" "p1-ac11" "t1"
+{ [ "$PCRC" = "2" ] && echo "$PCOUT" | grep -qi "plan-review" && echo "$PCOUT" | grep -qi "served model"; } \
+  && ok "#2075 AC-11(b) admissibility: check still FAILS CLOSED (exit 2) naming plan-review's unreadable served model" \
+  || bad "#2075 AC-11(b) should BLOCK naming plan-review's served model (rc=$PCRC out=$PCOUT)"
+
+# ---- AC-23 (legacy-row migration, arms a/b/c — buildable this phase). A "legacy" row is simply one
+#      appended WITHOUT --run-kind (no key at all) — functionally identical to a row the pre-#2075 binary
+#      would have written; there is no separate parsing path to reproduce. Arms (d)/(e) require clause 2's
+#      Phase-3 route-change-clause (R-C) rewrite, which does not exist in this binary — NOT built here,
+#      see the PR body. ----------------------------------------------------------------------------------
+# (a) resolving+tag-bound legacy row -> "E1 legacy"; bare placeholder -> "none" (no suffix).
+mk_p1_tagged "p1-ac23a" "ag-ac23a" "t1" "plan-review"
+p1_append "$P1_FIX/routes.json" "p1-ac23a" "t1" "plan-review" --agent "ag-ac23a"
+p1_kind "$P1_FIX/routes.json" "p1-ac23a" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E1 legacy" ]; } \
+  && ok "#2075 AC-23(a): a legacy (no run_kind) resolving+tag-bound row -> provenance-kind prints 'E1 legacy'" \
+  || bad "#2075 AC-23(a) expected 'E1 legacy' (rc=$PKRC out=$PKOUT)"
+p1_append "$P1_FIX/routes.json" "p1-ac23a2" "t1" "plan-review"
+p1_kind "$P1_FIX/routes.json" "p1-ac23a2" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "none" ]; } \
+  && ok "#2075 AC-23(a): a legacy bare placeholder -> provenance-kind prints plain 'none' (no legacy suffix)" \
+  || bad "#2075 AC-23(a) bare-placeholder expected 'none' (rc=$PKRC out=$PKOUT)"
+
+# (b) check() on an all-legacy 4-role ledger prints output BYTE-IDENTICAL to the pre-#2075 binary's output
+#     on the SAME fixture, except for the new PROVENANCE-LEGACY: note. Diff against a real origin/master
+#     snapshot (git show), not a re-derived assumption.
+mk_p1_tagged "p1-ac23b" "ac23b-p" "t1" "planner"
+mk_p1_tagged "p1-ac23b" "ac23b-r" "t1" "plan-review"
+mk_p1_tagged "p1-ac23b" "ac23b-e" "t1" "executor"
+mk_p1_tagged "p1-ac23b" "ac23b-v" "t1" "execution-review"
+printf '## ELI5\na plan\n### Binary AC\n- AC1\n' > "$P1_FIX/artifacts/ac23b-plan.md"
+printf '## Review\nverdict: PASS\n' > "$P1_FIX/artifacts/ac23b-rev.md"
+p1_append "$P1_FIX/routes.json" "p1-ac23b" "t1" "planner" --agent "ac23b-p" --artifact "$P1_FIX/artifacts/ac23b-plan.md"
+p1_append "$P1_FIX/routes.json" "p1-ac23b" "t1" "plan-review" --agent "ac23b-r" --artifact "$P1_FIX/artifacts/ac23b-rev.md" --verdict PASS
+p1_append "$P1_FIX/routes.json" "p1-ac23b" "t1" "executor" --agent "ac23b-e" --artifact "PR #99"
+p1_append "$P1_FIX/routes.json" "p1-ac23b" "t1" "execution-review" --agent "ac23b-v" --artifact "$P1_FIX/artifacts/ac23b-rev.md"
+p1_check "$P1_FIX/routes.json" "p1-ac23b" "t1"
+NEW_OUT="$PCOUT"; NEW_RC="$PCRC"
+# OLD_LED == AC23B_FIXTURE, the committed pinned pre-#2075 snapshot (test-setup block above; no git
+# ref, no network -- same FIXTURE-MISSING-fails-closed convention as this file's sibling pinned-
+# baseline ACs, hooks/_fixtures/3role-ledger-pre1580-overlay.mjs / -pre1947-ma2-overlay.mjs).
+if [ -s "$AC23B_FIXTURE" ]; then
+  OLD_OUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$P1_FIX/routes.json" \
+    node "$OLD_LED" check --session "p1-ac23b" --task "t1" 2>&1); OLD_RC=$?
+  NEW_OUT_STRIPPED=$(echo "$NEW_OUT" | grep -v '^PROVENANCE-LEGACY:')
+  # Non-decay guard (same convention as this file's other pinned-baseline ACs, e.g. #1833 AC3 / #1947
+  # M-A-2): the pinned snapshot must NOT be byte-identical to the live ledger, else a future careless
+  # "regenerate the snapshot from HEAD" collapses this into a fixed-vs-fixed tautology with zero power.
+  cmp -s "$OLD_LED" "$LED" && bad "#2075 AC-23(b) non-decay guard: pinned pre-#2075 snapshot is byte-identical to the LIVE ledger -- the comparison has decayed into a tautology (re-pin hooks/_fixtures/3role-ledger-pre2075-snapshot.mjs from the real pre-#2075 commit)"
+  { [ "$NEW_RC" = "0" ] && [ "$NEW_RC" = "$OLD_RC" ] && [ "$NEW_OUT_STRIPPED" = "$OLD_OUT" ] \
+    && echo "$NEW_OUT" | grep -q '^PROVENANCE-LEGACY: planner, plan-review, executor, execution-review'; } \
+    && ok "#2075 AC-23(b): check() on an all-legacy ledger is byte-identical to the pre-#2075 (pinned snapshot) binary's output, except the new PROVENANCE-LEGACY: note naming all four roles" \
+    || bad "#2075 AC-23(b) regression (new_rc=$NEW_RC old_rc=$OLD_RC new=[$NEW_OUT] old=[$OLD_OUT])"
+else
+  bad "#2075 AC-23(b): FIXTURE MISSING at $AC23B_FIXTURE -- this fixture is committed and must always be present (it replaced a git-object acquisition; its absence means this AC cannot prove the byte-identical-except-PROVENANCE-LEGACY claim at all)"
+fi
+
+# (c) legacy row protection is UNCHANGED: a verdict-less skip/inherit write against a legacy TERMINAL row
+#     (verdict present) still exits 2 (clause 1, untouched by #2075).
+mk_p1_tagged "p1-ac23c" "ag-ac23c" "t1" "plan-review"
+printf '## Review\nverdict: PASS\n' > "$P1_FIX/artifacts/ac23c.md"
+p1_append "$P1_FIX/routes.json" "p1-ac23c" "t1" "plan-review" --agent "ag-ac23c" --artifact "$P1_FIX/artifacts/ac23c.md" --verdict PASS
+p1_append_capture "$P1_FIX/routes.json" "p1-ac23c" "t1" "plan-review" --skip-reason "trying to erase"
+VD23C_AFTER=$(p1_row_get "p1-ac23c" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD23C_AFTER" = "PASS" ]; } \
+  && ok "#2075 AC-23(c): a legacy TERMINAL row is still erasure-protected (clause 1 unchanged) -- verdict-less skip append exits 2, verdict survives" \
+  || bad "#2075 AC-23(c) regression (rc=$PARC verdict_after=$VD23C_AFTER)"
+
+# ---- AC-24 (demotion-only, PROMOTION direction — the anti-forgery power test for AC-1) ---------------------
+# Arm A: stored run_kind:witnessed but a NON-resolving agentId -> provenance-kind prints none (not E1), and
+#        a supersession attempt CITING that same non-resolving agentId still exits 2 -- proven against
+#        EXISTING (unmodified by #2075) clause-2 anti-forgery code (agentBoundToTag on the incoming write),
+#        never the Phase-3 R-C rewrite.
+printf '## Review\nverdict: FAIL\n' > "$P1_FIX/artifacts/ac24a.md"
+p1_append "$P1_FIX/routes.json" "p1-ac24a" "t1" "plan-review" --agent "ghost-ac24a" --run-kind witnessed \
+  --artifact "$P1_FIX/artifacts/ac24a.md" --verdict FAIL --closed-at "2026-01-01T00:00:00.000Z"
+p1_kind "$P1_FIX/routes.json" "p1-ac24a" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "none" ]; } \
+  && ok "#2075 AC-24 arm A(i): stored run_kind:witnessed but a NON-resolving agentId -> provenance-kind prints none, not E1 (the stored label can only ever LOWER a row's kind)" \
+  || bad "#2075 AC-24 arm A(i) expected none (rc=$PKRC out=$PKOUT)"
+p1_append_capture "$P1_FIX/routes.json" "p1-ac24a" "t1" "plan-review" --agent "ghost-ac24a" --verdict PASS --closed-at "2026-01-02T00:00:00.000Z"
+[ "$PARC" = "2" ] \
+  && ok "#2075 AC-24 arm A(ii): a verdict-flip attempt citing that same NON-resolving agentId still exits 2 (today's existing anti-forgery, unbroken by #2075)" \
+  || bad "#2075 AC-24 arm A(ii) expected exit 2 (rc=$PARC out=$PAOUT)"
+
+# Arm B: stored run_kind:inferred alongside a FULLY VERIFYING nonce triple -> provenance-kind prints E3, not
+#        E2 -- the stored label can never PROMOTE a row above its true verified strength.
+mk_p1_or_transcript "$P1_FIX/transcripts/ac24b.jsonl" "t1" "N-AC24B" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC24B\n' > "$P1_FIX/artifacts/ac24b.md"
+p1_append "$P1_FIX/routes.json" "p1-ac24b" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/ac24b.jsonl" --nonce "N-AC24B" --artifact "$P1_FIX/artifacts/ac24b.md" \
+  --verdict PASS --run-kind inferred
+p1_kind "$P1_FIX/routes.json" "p1-ac24b" "t1" "plan-review"
+{ [ "$PKRC" = "0" ] && [ "$PKOUT" = "E3" ]; } \
+  && ok "#2075 AC-24 arm B: stored run_kind:inferred alongside a fully-verifying nonce triple -> provenance-kind prints E3, not E2 (the label can never raise a row's kind)" \
+  || bad "#2075 AC-24 arm B expected E3 (rc=$PKRC out=$PKOUT)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
