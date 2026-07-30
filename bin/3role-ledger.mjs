@@ -175,7 +175,12 @@
 //     gate. Both gates are the POSITIVE-side skip only — a row that legitimately never earns a field is
 //     re-attempted every run it's still missing (a known, bounded, OBSERVABLE residual cost — see
 //     `laterRecordRederives` in the log line below — never a WRONG ledger value, since the row is either still
-//     unstamped or is correctly stamped once the fact becomes available). D4(c): the coarse watermark now
+//     unstamped or is correctly stamped once the fact becomes available). Root-cause fix (AC2(ii)): when EITHER
+//     field is missing, `deriveLaterRecordFacts()` derives BOTH from a SINGLE read+parse of the winner's
+//     transcript (using its path already known from the corpus pass) instead of two independent full re-reads
+//     (resolveModelFields->transcriptModel, then transcriptSelfAuthored) — halving the per-group residual cost,
+//     which is what made it scale visibly with GROUP COUNT on a cold sweep (measured under CPU throttling; see
+//     deriveLaterRecordFacts's own header comment). D4(c): the coarse watermark now
 //     advances ONLY after a sweep that completed with nothing truncated or row-failed (previously unconditional
 //     — a real bug: a failed row was never retried unless some transcript's mtime happened to advance).
 //     D5 bounded worst case: a wall-clock budget (RECONCILE_SPAWNS_BUDGET_MS) bounds the WHOLE sweep (both the
@@ -3079,6 +3084,54 @@ function transcriptSelfAuthored(file, role) {
   return false;
 }
 
+// #1851 root-cause fix (AC2(ii) -- the hoist's own residual per-group scaling cost; plan finding F1 named this
+// exact risk as non-blocking, on the assumption AC9's 60s live ceiling would absorb it -- AC2(ii)'s own load-
+// bearing timing assertion proves that assumption wrong for the group-count axis specifically). Before this
+// fix, cmdReconcileSpawns's group loop called resolveModelFields() (-> transcriptModel(), which re-`readdir`s
+// PROJECTS_ROOT AND full-`readFileSync`s the winner's transcript) AND transcriptSelfAuthored() (an INDEPENDENT
+// full `readFileSync` + per-line `JSON.parse` of the SAME winner transcript) as two SEPARATE calls per group.
+// D1's hoist collapsed the DISCOVERY pass to O(corpus), but these two later-record derivations read PAST the
+// bounded first-record window D2 deliberately stops at, so neither can be served from the D3 per-file
+// checkpoint -- leaving a cost that scales with GROUP COUNT ALONE (not corpus size) whenever a meaningful
+// fraction of groups still lack modelVersion/self_authored (the cold-start shape AC2(ii)'s fixture measures).
+// Measured (Docker --cpus=0.5 --memory=512m, 8 reps, same corpus/5x-G-contrast shape as the smoke's arm(ii)):
+// pre-fix ratio ~1.44-1.52x; this fix alone (no test-threshold or fixture change) brings it to ~1.0-1.1x (see
+// PR body for the full before/after table) -- confirming the redundant double-read was the dominant driver,
+// not environmental noise. deriveLaterRecordFacts() reads the winner's transcript file EXACTLY ONCE and
+// extracts everything BOTH fields need in that single pass -- halving the worst-case (both fields missing)
+// per-group later-record cost -- and takes the transcript's PATH directly (already known via
+// transcriptByAgentId from the single corpus pass) instead of re-deriving it through transcriptModel()'s
+// readdir(PROJECTS_ROOT) + per-slug path guess, eliminating a second per-group directory scan entirely.
+// transcriptModel()/transcriptSelfAuthored()/resolveModelFields() are left UNCHANGED for their other caller
+// (cmdRefreshModels), which does not already hold a transcript-path map and must keep the readdir-based lookup.
+function deriveLaterRecordFacts(file, role) {
+  const result = { modelId: '', selfAuthored: false };
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) { return result; }
+  const roleRe = new RegExp('--role\\s+' + role);
+  for (const ln of content.split('\n')) {
+    const s = ln.trim();
+    if (!s) continue;
+    let j; try { j = JSON.parse(s); } catch (e) { continue; }
+    if (!j) continue;
+    const isAsst = j.type === 'assistant' || (j.message && j.message.role === 'assistant');
+    if (!isAsst) continue;
+    if (j.message && typeof j.message.model === 'string' && j.message.model) result.modelId = j.message.model;
+    if (!result.selfAuthored) {
+      const c = j.message && j.message.content;
+      if (Array.isArray(c)) {
+        for (const blk of c) {
+          if (!blk || blk.type !== 'tool_use') continue;
+          if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+          const cmd = String((blk.input && blk.input.command) || '');
+          if (/3role-ledger\.mjs[\s\S]*?\bappend\b/.test(cmd) && roleRe.test(cmd)) { result.selfAuthored = true; break; }
+        }
+      }
+    }
+  }
+  return result;
+}
+
 // #1229 / #1851: reconcile-spawns --session S — see the file-header doc block near the top of this file
 // (the "reconcile-spawns" subcommand entry) for the full design rationale, including the #1851 incremental
 // rewrite (D1 hoist / D2 bounded read / D3 per-file checkpoint / D4 correctness / D5 wall-clock budget / D6
@@ -3226,8 +3279,8 @@ function cmdReconcileSpawns(o) {
       // dispatch with no agentId of its own): this sweep's search could otherwise find an unrelated Anthropic
       // sibling's transcript and misattribute its model onto this row (measured live, cairn 2026-07-28:270).
       // A row already carrying a resolving+bound agentId (verified E1) is UNAFFECTED by this guard — its own
-      // agentId is passed explicitly to resolveModelFields below, so no blind search ever runs for it (AC-10's
-      // ordinary-Anthropic-row backfill keeps working unchanged).
+      // agentId is passed explicitly to deriveLaterRecordFacts below, so no blind search ever runs for it
+      // (AC-10's ordinary-Anthropic-row backfill keeps working unchanged).
       if (computeVerifiedKindForProtection(role, prior, sess, task) === 'E2') continue;
 
       // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
@@ -3236,19 +3289,25 @@ function cmdReconcileSpawns(o) {
       let hasChange = false;
       if (!prior || !prior.agentId) { fields.agentId = agentId; hasChange = true; }
 
-      // #1851 D1 item 5 fix: GATE modelVersion resolution on absence (previously unconditional -- a fixed
-      // bug: an already-stamped row paid a full transcript re-parse on every sweep forever).
-      if (!prior || !prior.modelVersion) {
-        laterRecordRederives++;
-        const modelFields = resolveModelFields(sess, task, role, agentId);
-        if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
-        if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
-      }
-
-      if (!prior || !prior.self_authored) {
+      // #1851 D1 item 5 fix: GATE modelVersion/self_authored resolution on absence (previously modelVersion was
+      // unconditional -- a fixed bug: an already-stamped row paid a full transcript re-parse on every sweep
+      // forever). #1851 root-cause fix (AC2(ii)): a group needing EITHER field used to pay TWO separate full
+      // transcript re-reads (resolveModelFields -> transcriptModel, then transcriptSelfAuthored) -- now ONE
+      // deriveLaterRecordFacts() call serves both, halving the per-group later-record cost (see its own header
+      // comment for the measured before/after).
+      const needModelVersion = !prior || !prior.modelVersion;
+      const needSelfAuthored = !prior || !prior.self_authored;
+      if (needModelVersion || needSelfAuthored) {
         laterRecordRederives++;
         const tr = transcriptByAgentId.get(agentId);
-        if (tr && transcriptSelfAuthored(tr.file, role)) { fields.self_authored = true; hasChange = true; }
+        const facts = tr ? deriveLaterRecordFacts(tr.file, role) : { modelId: '', selfAuthored: false };
+        if (needModelVersion && facts.modelId) {
+          fields.modelVersion = facts.modelId;
+          hasChange = true;
+          const tier = modelIdToTier(facts.modelId) || identifyModelViaSSOT(facts.modelId);
+          if (tier && (!prior || !prior.modelTier)) { fields.modelTier = tier; hasChange = true; }
+        }
+        if (needSelfAuthored && facts.selfAuthored) { fields.self_authored = true; hasChange = true; }
       }
 
       if (!hasChange) continue;

@@ -2143,46 +2143,77 @@ mk_ac2_corpus() { # <session> <numGroups> <perGroup> <prefix>
   done
 }
 
-# Arm (i): same group count (G=20), corpus DOUBLED (100 -> 200 transcripts). Weaker bound: new-code wall
-# time must grow AT MOST ~linearly (not superlinearly) as corpus size doubles.
+# median_run_ms <led-path> <session> <label> -- run reconcile-spawns 3x, each in a FRESH, ISOLATED ledger dir
+# (no watermark/checkpoint carryover between reps -- every rep pays the SAME cold-start cost), print the
+# MEDIAN wall-clock ms. #1851 CI-FLAKE FIX: a single-run timing sample is noisy on a loaded/throttled CI
+# runner (Node startup jitter, GC pauses, scheduler contention) -- ai-brain PR #1316's own CI failed once at
+# ratio=1.80x against a 1.5x threshold on the prior single-run design. Root cause of THAT specific ratio (not
+# just noise): cmdReconcileSpawns's group loop paid TWO independent full transcript re-reads per group needing
+# modelVersion/self_authored (resolveModelFields->transcriptModel, then transcriptSelfAuthored) -- a genuine
+# per-group cost the D1 hoist never eliminated (see hooks/3role-ledger.mjs's deriveLaterRecordFacts() for the
+# fix: ONE combined read replaces the two). Measured under Docker --cpus=0.5 --memory=512m: pre-fix ratio
+# ~1.44-1.52x (8 reps, G 20->100 contrast); post-fix ~0.83-1.14x (same harness, same reps). The residual noise
+# on TOP of that real fix (occasional single-run outliers even post-fix, e.g. 2.09x/3.33x observed across
+# repeated throttled attempts) is what this median-of-3 + the widened G-contrast below jointly absorb -- the
+# median cancels a one-off GC/scheduler outlier without the assertion needing to know why any single rep spiked.
+median_run_ms() {
+  local led="$1" sess="$2" label="$3" i t0 t1 ms ld
+  local times=()
+  for i in 1 2 3; do
+    ld="$TMP/med-${label}-${i}"
+    t0=$(date +%s%N); THREE_ROLE_LEDGER_DIR="$ld" node "$led" reconcile-spawns --session "$sess" >/dev/null 2>&1; t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 )); [ "$ms" -lt 1 ] && ms=1
+    times+=("$ms")
+  done
+  printf '%s\n' "${times[@]}" | sort -n | sed -n '2p'
+}
+
+# Arm (i): same group count (G=20), corpus DOUBLED (100 -> 200 transcripts). Weaker bound: new-code MEDIAN
+# wall time must grow AT MOST ~linearly (not superlinearly) as corpus size doubles. Median-of-3 per #1851
+# CI-flake fix above (this arm was not observed to flake, but shares the same noise-sensitivity mechanism).
 AC2I_SMALL="sess-1851-ac2i-small"; AC2I_BIG="sess-1851-ac2i-big"
 mk_ac2_corpus "$AC2I_SMALL" 20 5 "is"
 mk_ac2_corpus "$AC2I_BIG" 20 10 "ib"
-T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2I_SMALL" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2I_SMALL_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2I_SMALL_MS" -lt 1 ] && AC2I_SMALL_MS=1
-T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2I_BIG" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2I_BIG_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2I_BIG_MS" -lt 1 ] && AC2I_BIG_MS=1
+AC2I_SMALL_MS=$(median_run_ms "$LED" "$AC2I_SMALL" "ac2i-small")
+AC2I_BIG_MS=$(median_run_ms "$LED" "$AC2I_BIG" "ac2i-big")
 AC2I_RATIO=$(node -e "console.log(($AC2I_BIG_MS / $AC2I_SMALL_MS).toFixed(2))")
 # "at most ~linearly": corpus doubled -> allow generous headroom (<= 3.0x) before calling it superlinear.
 node -e "process.exit(($AC2I_BIG_MS / $AC2I_SMALL_MS) <= 3.0 ? 0 : 1)" \
-  && ok "#1851 AC2(i): same G=20, corpus doubled -> wall time grows at most ~linearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)" \
-  || bad "#1851 AC2(i): corpus-doubled wall time grew superlinearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)"
+  && ok "#1851 AC2(i): same G=20, corpus doubled -> median wall time grows at most ~linearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)" \
+  || bad "#1851 AC2(i): corpus-doubled median wall time grew superlinearly (small=${AC2I_SMALL_MS}ms big=${AC2I_BIG_MS}ms ratio=${AC2I_RATIO}x)"
 
-# Arm (ii) [LOAD-BEARING] -- same corpus (160 transcripts total either way), group count DOUBLED (20 -> 40).
-# New code: wall time must NOT roughly double (the hoist's whole point -- O(corpus), not O(G x corpus)).
+# Arm (ii) [LOAD-BEARING] -- same corpus (200 transcripts total either way), group-count contrast WIDENED to
+# 5x (20 -> 100; was 2x/20->40 pre-fix). New code: MEDIAN wall time must NOT scale anywhere close to G (the
+# hoist's whole point -- O(corpus), not O(G x corpus)).
+#
+# #1851 CI-FLAKE FIX (both changes empirically validated together under Docker --cpus=0.5 --memory=512m, 15
+# reps, before landing): at the original scale (G 20->40, single run, threshold 1.5x) the SIGNAL (new code's
+# true near-flat scaling, ~1.0-1.3x) sat too close to the pass threshold relative to CI wall-clock NOISE for a
+# small, sub-second workload -- a genuinely-correct O(corpus) implementation measured anywhere from 1.1x to
+# >2x on a single noisy sample (see CI-observed ratio=1.80x above). Two independent fixes, applied together:
+# (1) MEDIAN of 3 cold, independently-ledgered reps per arm cancels a one-off GC/scheduler outlier (Rule 18);
+# (2) WIDEN the G contrast 20->100 (5x, was 2x) so a genuine O(G x corpus) regression produces a dramatically
+# larger, unambiguous signal (measured ~4.6x on the pre-#1851 fixture at this scale vs new-code's measured
+# 1.09x-1.47x across 15 throttled reps -- comfortable separation, no overlap observed).
 AC2II_LOW="sess-1851-ac2ii-low"; AC2II_HIGH="sess-1851-ac2ii-high"
-mk_ac2_corpus "$AC2II_LOW" 20 8 "gl"
-mk_ac2_corpus "$AC2II_HIGH" 40 4 "gh"
+mk_ac2_corpus "$AC2II_LOW" 20 10 "gl"
+mk_ac2_corpus "$AC2II_HIGH" 100 2 "gh"
 
-T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2II_LOW" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2II_NEW_LOW_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_NEW_LOW_MS" -lt 1 ] && AC2II_NEW_LOW_MS=1
-T0=$(date +%s%N); node "$LED" reconcile-spawns --session "$AC2II_HIGH" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2II_NEW_HIGH_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_NEW_HIGH_MS" -lt 1 ] && AC2II_NEW_HIGH_MS=1
+AC2II_NEW_LOW_MS=$(median_run_ms "$LED" "$AC2II_LOW" "ac2ii-new-low")
+AC2II_NEW_HIGH_MS=$(median_run_ms "$LED" "$AC2II_HIGH" "ac2ii-new-high")
 AC2II_NEW_RATIO=$(node -e "console.log(($AC2II_NEW_HIGH_MS / $AC2II_NEW_LOW_MS).toFixed(2))")
-node -e "process.exit(($AC2II_NEW_HIGH_MS / $AC2II_NEW_LOW_MS) < 1.5 ? 0 : 1)" \
-  && ok "#1851 AC2(ii) [load-bearing]: same corpus, G doubled (20->40) -> new-code wall time does NOT roughly double (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x)" \
-  || bad "#1851 AC2(ii) FAILED: new-code wall time scaled with group count (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x) -- the hoist did not collapse O(G x corpus)"
+node -e "process.exit(($AC2II_NEW_HIGH_MS / $AC2II_NEW_LOW_MS) < 2.0 ? 0 : 1)" \
+  && ok "#1851 AC2(ii) [load-bearing]: same corpus, G widened 5x (20->100) -> new-code median wall time does NOT scale with G (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x)" \
+  || bad "#1851 AC2(ii) FAILED: new-code median wall time scaled with group count (low=${AC2II_NEW_LOW_MS}ms high=${AC2II_NEW_HIGH_MS}ms ratio=${AC2II_NEW_RATIO}x) -- the hoist did not collapse O(G x corpus)"
 
-# Red arm: the SAME two arms against the pre-#1851 fixture, fresh isolated ledger dirs. Arm (ii) MUST show
-# the ~doubling on baseline -- if it doesn't, this harness has no power to detect the O(G x corpus) defect
-# and AC2's green above proves nothing.
-T0=$(date +%s%N); THREE_ROLE_LEDGER_DIR="$TMP/ac2-baseline-low" node "$LED_PRE1851" reconcile-spawns --session "$AC2II_LOW" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2II_BASE_LOW_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_BASE_LOW_MS" -lt 1 ] && AC2II_BASE_LOW_MS=1
-T0=$(date +%s%N); THREE_ROLE_LEDGER_DIR="$TMP/ac2-baseline-high" node "$LED_PRE1851" reconcile-spawns --session "$AC2II_HIGH" >/dev/null 2>&1; T1=$(date +%s%N)
-AC2II_BASE_HIGH_MS=$(( (T1 - T0) / 1000000 )); [ "$AC2II_BASE_HIGH_MS" -lt 1 ] && AC2II_BASE_HIGH_MS=1
+# Red arm: the SAME two arms against the pre-#1851 fixture, fresh isolated ledger dirs each rep. Arm (ii) MUST
+# show DRAMATIC scaling on baseline -- if it doesn't, this harness has no power to detect the O(G x corpus)
+# defect and AC2's green above proves nothing.
+AC2II_BASE_LOW_MS=$(median_run_ms "$LED_PRE1851" "$AC2II_LOW" "ac2ii-base-low")
+AC2II_BASE_HIGH_MS=$(median_run_ms "$LED_PRE1851" "$AC2II_HIGH" "ac2ii-base-high")
 AC2II_BASE_RATIO=$(node -e "console.log(($AC2II_BASE_HIGH_MS / $AC2II_BASE_LOW_MS).toFixed(2))")
-node -e "process.exit(($AC2II_BASE_HIGH_MS / $AC2II_BASE_LOW_MS) >= 1.4 ? 0 : 1)" \
-  && ok "#1851 AC2 red-arm: pre-#1851 fixture DOES show the ~doubling on arm(ii) (low=${AC2II_BASE_LOW_MS}ms high=${AC2II_BASE_HIGH_MS}ms ratio=${AC2II_BASE_RATIO}x) -- the harness has real power to detect the O(G x corpus) defect" \
+node -e "process.exit(($AC2II_BASE_HIGH_MS / $AC2II_BASE_LOW_MS) >= 2.5 ? 0 : 1)" \
+  && ok "#1851 AC2 red-arm: pre-#1851 fixture DOES show dramatic scaling on arm(ii) (low=${AC2II_BASE_LOW_MS}ms high=${AC2II_BASE_HIGH_MS}ms ratio=${AC2II_BASE_RATIO}x) -- the harness has real power to detect the O(G x corpus) defect" \
   || bad "#1851 AC2 red-arm FAILED: baseline did not show scaling with G (low=${AC2II_BASE_LOW_MS}ms high=${AC2II_BASE_HIGH_MS}ms ratio=${AC2II_BASE_RATIO}x) -- this harness cannot see the defect, so AC2's green proves nothing"
 
 # ---- AC3 -- Reconciliation output is unchanged (no behavior regression), INCLUDING the two D1 semantic
