@@ -2216,6 +2216,151 @@ function cmdGatePlanReview(o) {
   process.exit(2);
 }
 
+// ── #1936 — read-side history lanes (STRICTLY ADDITIVE; `byRole` selection, checkRole, and the ENTIRE
+// write path — cmdAppend, both terminal-evidence clauses, round-boundary logic — are UNTOUCHED). `check`
+// today reads only the byRole-selected (last-parse-wins) row per role and references neither `.verdict` nor
+// `.closedAt` (see the plan's Context section). These two lanes read PAST that single row, across each
+// role's FULL history, so a content-free row (bare spawn, artifact-only re-point, unattributed verdict
+// overlay) can never silently bury a recorded review outcome. Default-ON, no opt-in flag, no kill-switch,
+// no bypass token (round-1 decision, confirmed by four plan-review rounds): the observed failure was an
+// orchestrator trusting a bare `check` OK, and the remedy for a legitimate block is always available —
+// spawn a fresh review, whose sanctioned three-write lifecycle (spawn-shaped agent append, mid-turn
+// self-append, stop-shaped closed-at append) both records honestly and satisfies the read precondition
+// with no extra ceremony (see the plan's §"The sanctioned supersession flow").
+
+// Check-lane affirmative set = AFFIRMATIVE_VERDICTS (:844, UNCHANGED — it keeps gating cmdInherit and the
+// executor-spawn gate at their current strictness) PLUS `PASS-WITH-FIXES`, as a SEPARATE check-lane
+// constant (round-1 review N2, corpus-measured: 12 effective PASS-WITH-FIXES closes across 9 tasks, 6 of
+// which pass `check` today and would false-block under `:844` verbatim). Still an ALLOWLIST (D3):
+// NEEDS-WORK, SHIP-WITH-FIXES, BLOCK-resolved, REVISE, typos, empty — all block.
+const CHECK_LANE_AFFIRMATIVE = new Set([...AFFIRMATIVE_VERDICTS, 'PASS-WITH-FIXES']);
+
+// Parse an ISO-ish closedAt string to epoch MILLISECONDS (round-3 review N-d): the corpus provably carries
+// mixed sub-second/second precision that inverts lexicographically inside a shared second
+// (`"...:20.500Z" < "...:20Z"` as strings while 20.500s > 20s as instants) — so every closedAt comparison in
+// both lanes below compares PARSED epoch values, never strings. Absent/unparseable -> null, treated as
+// ABSENT throughout (never a false "equal" or a string-order artifact).
+function parseClosedAtMs(v) {
+  if (!v) return null;
+  const t = Date.parse(String(v));
+  return Number.isNaN(t) ? null : t;
+}
+
+// Every row for ONE role, in ledger PARSE ORDER (file top-to-bottom) — the role's FULL history, never just
+// the byRole-selected (last-parse-wins) row. Unparseable lines are silently skipped (mirrors the byRole
+// build loop's own `catch (e) { /* skip */ }`). File order is chronological within a role by construction
+// (overlayAppend always retains an older round's row, verbatim, ahead of the new/merged row it writes —
+// see the plan's Context section and the round-3/round-4 reviewers' independent fixture proofs).
+function rowsForRole(lines, role) {
+  const out = [];
+  for (const ln of lines) {
+    try { const j = JSON.parse(ln); if (j && j.role === role) out.push(j); } catch (e) { /* skip */ }
+  }
+  return out;
+}
+
+// Verdict-BEARING rows only (a truthy `.verdict` field). A bare spawn row, an artifact-only re-point, or a
+// provenance/oracle-only row carries no verdict and is read PAST — never treated as evidence by Lane B. A
+// row carrying BOTH a verdict and an oracle is verdict-bearing (the recorded decision outranks a token-file
+// — the plan's Lane B bullet); nothing here inspects `.oracle` at all.
+function verdictRows(rows) {
+  return rows.filter((r) => r && r.verdict);
+}
+
+// The monotonicity ruling (Intent §"The monotonicity ruling"): a later verdict-bearing row supersedes a
+// currently-effective NEGATIVE verdict ONLY when it carries an agentId DISTINCT from the negative row's AND
+// a closedAt STRICTLY newer than the negative row's (parsed-epoch comparison; equal is NOT strictly newer
+// -> refuse). Absence semantics: the superseding row MUST itself carry both an agentId and a closedAt that
+// PARSES — an absent/unparseable value on the superseding side can never supersede (an unparseable
+// superseder is treated exactly like an absent one). A negative row lacking either field makes that half
+// trivially satisfied (an attributed, punched-out superseder is distinct/newer than nothing by
+// construction) — this is what lets AC-14's raw hand-written shapes and the real #1821 fixture (whose bare
+// shield row is never itself the negative — the negative is the FAIL row, which always carries both fields
+// in the corpus) resolve correctly without a separate code path.
+function supersedesNegative(candidate, negative) {
+  if (!candidate || !candidate.agentId) return false;
+  const candMs = parseClosedAtMs(candidate.closedAt);
+  if (candMs === null) return false;
+  const distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
+  if (!distinct) return false;
+  const negMs = parseClosedAtMs(negative.closedAt);
+  const newer = (negMs === null) ? true : (candMs > negMs);
+  return newer;
+}
+
+// Walk a role's verdict-bearing rows OLDEST -> NEWEST, folding them into ONE effective verdict row per the
+// ruling above. A later row supersedes a currently-effective AFFIRMATIVE verdict UNCONDITIONALLY (newest
+// wins); it supersedes a currently-effective NEGATIVE verdict only per supersedesNegative() above — otherwise
+// the row is read PAST and the negative stays effective. Returns null when the role carries NO
+// verdict-bearing row at all (Lane B stays SILENT — today's honest fail-open residual, pinned by AC-7(c)).
+function effectiveVerdictRow(vrows) {
+  let eff = null;
+  for (const row of vrows) {
+    if (!eff) { eff = row; continue; }
+    if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) { eff = row; continue; }   // affirmative -> unconditional newest-wins
+    if (supersedesNegative(row, eff)) eff = row;                            // negative -> gated supersession
+    // else: read PAST this row, keep the negative effective.
+  }
+  return eff;
+}
+
+// Lane B — outcome MONOTONICITY, for ONE review-pair role (execution-review OR plan-review — the shield is
+// role-symmetric, round-2 review N1). Returns null (silent) when the role carries no verdict anywhere in its
+// history, or its effective verdict is check-lane affirmative; else a `NEGATIVE-VERDICT:` problem string.
+function laneBProblem(role, lines) {
+  const vrows = verdictRows(rowsForRole(lines, role));
+  if (!vrows.length) return null;                        // no verdict on ANY row of the role -> silent (AC-7(c)).
+  const eff = effectiveVerdictRow(vrows);
+  if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) return null;
+  return 'NEGATIVE-VERDICT: role ' + role + ' — effective recorded verdict is "' + eff.verdict + '" (agentId ' +
+    (eff.agentId || '<none>') + ', ' + (eff.closedAt ? 'closedAt ' + eff.closedAt : 'no closedAt') +
+    ') — a recorded negative verdict is superseded only by a later verdict row carrying an agentId DISTINCT ' +
+    'from the negative row\'s AND a closedAt STRICTLY newer than the negative row\'s. Sanctioned remedy: ' +
+    'spawn a fresh ' + role + ' (the three-write lifecycle records + supersedes with no extra ceremony).';
+}
+
+// Lane A — round-aware FRESHNESS (rebuilt per B3; never a raw timestamp inequality). For a (subject ->
+// review) pair, a `STALE-REVIEW:` problem fires ONLY when the ledger shows a genuinely NEW subject round
+// left unreviewed — ALL THREE conditions below. Any missing/unparseable input -> that condition can't hold
+// -> fail OPEN (silent) — never a false block on an environment can't-tell.
+function laneAProblem(subjectRole, reviewRole, byRole, lines) {
+  // (1) the review role's authoritative row carries closedAt.
+  const review = byRole[reviewRole];
+  if (!review || !review.closedAt) return null;
+  const reviewMs = parseClosedAtMs(review.closedAt);
+  if (reviewMs === null) return null;
+
+  // (2) the subject role's history has >=2 rows, and its authoritative row carries an agentId AND a
+  //     closedAt STRICTLY newer than the review's closedAt (equal allows — same parsed-epoch semantics as
+  //     Lane B).
+  const subjectAuth = byRole[subjectRole];
+  if (!subjectAuth || !subjectAuth.agentId || !subjectAuth.closedAt) return null;
+  const subjMs = parseClosedAtMs(subjectAuth.closedAt);
+  if (subjMs === null) return null;
+  if (!(subjMs > reviewMs)) return null;                 // equal or older -> not a newer unreviewed round.
+
+  const subjectRows = rowsForRole(lines, subjectRole);
+  if (subjectRows.length < 2) return null;                // no second round exists to have been left unreviewed
+                                                            // (kills the #1760/#1719 resume-re-close class — a
+                                                            // same-agent SubagentStop re-append merges onto the
+                                                            // SAME row rather than creating a second one).
+
+  // (3) an OLDER subject row exists with a DISTINCT agentId whose closedAt is at-or-before the review's
+  //     closedAt — the round the review could actually have covered.
+  const olderRows = subjectRows.slice(0, -1);
+  const hasCoveredRound = olderRows.some((r) => {
+    if (!r || !r.agentId || r.agentId === subjectAuth.agentId) return false;
+    const ms = parseClosedAtMs(r.closedAt);
+    if (ms === null) return false;
+    return ms <= reviewMs;
+  });
+  if (!hasCoveredRound) return null;
+
+  return 'STALE-REVIEW: ' + reviewRole + ' (closedAt ' + review.closedAt + ') is stale against a newer ' +
+    subjectRole + ' round (agentId ' + subjectAuth.agentId + ', closedAt ' + subjectAuth.closedAt +
+    ') that the review could not have covered — spawn a fresh ' + reviewRole + ' to cover it.';
+}
+
 function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
@@ -2252,6 +2397,21 @@ function cmdCheck(o) {
       const decl = seatDispatchIsSubprocess(role);
       dispatchLabels.push('role=' + role + ' dispatch=' + e.dispatch + ' model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
     }
+  }
+  // #1936 -- Lane B (outcome monotonicity) + Lane A (round-aware freshness). Read-side only, strictly
+  // additive: both lanes only ADD problems on top of whatever the base existence/checkRole loop above
+  // already found (or didn't) -- they never suppress or loosen an existing test, and they run unconditionally
+  // (no opt-in flag) for both review-pair roles / both subject-review pairs. Each lane is independently
+  // silent on any missing/unparseable/absent input (fail-open by design -- see each function's doc comment).
+  for (const role of ['execution-review', 'plan-review']) {
+    const laneB = laneBProblem(role, lines);
+    if (laneB) problems.push(laneB);
+  }
+  {
+    const laneAExec = laneAProblem('executor', 'execution-review', byRole, lines);
+    if (laneAExec) problems.push(laneAExec);
+    const laneAPlan = laneAProblem('planner', 'plan-review', byRole, lines);
+    if (laneAPlan) problems.push(laneAPlan);
   }
   // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
   // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.

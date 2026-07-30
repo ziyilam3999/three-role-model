@@ -2450,5 +2450,321 @@ p1_kind "$P1_FIX/routes.json" "p1-ac24b" "t1" "plan-review"
 { [ "$PKRC" = "0" ] && [ "$PKOUT" = "E3" ]; } \
   && ok "#2075 AC-24 arm B: stored run_kind:inferred alongside a fully-verifying nonce triple -> provenance-kind prints E3, not E2 (the label can never raise a row's kind)" \
   || bad "#2075 AC-24 arm B expected E3 (rc=$PKRC out=$PKOUT)"
+# ---------------------------------------------------------------------------
+# #1936 -- read-side history lanes: Lane B (outcome monotonicity) + Lane A (round-aware freshness).
+# `check` gains two additional, strictly-additive lanes over the role's FULL row history (never just the
+# byRole-selected last-parse-wins row): Lane B walks a review role's verdict-bearing rows and refuses to let
+# a bare/unattributed later row silently bury a recorded NEGATIVE verdict (NEGATIVE-VERDICT: problem); Lane A
+# fires STALE-REVIEW: only when the ledger shows a genuinely NEW subject round left unreviewed. Fixture rows
+# are built THROUGH the real CLI mirroring the sanctioned three-write lifecycle (spawn-shaped agent append,
+# mid-turn self-append, stop-shaped closed-at append), EXCEPT AC-14 (marked below) which appends raw JSONL
+# rows DIRECTLY to the fixture file to simulate hand-written / pre-existing states -- exactly the
+# already-on-disk population the read lane defends. Dedicated session id (sess-1936) so agent ids never
+# collide with any earlier section's fixtures.
+# ---------------------------------------------------------------------------
+S1936="sess-1936"
+raw_append_1936() { # <ledger-file> <json-line> -- append a RAW JSONL row directly, bypassing the CLI (the
+                     #    sanctioned AC-14 "hand-written state" exception).
+  mkdir -p "$(dirname "$1")"
+  printf '%s\n' "$2" >> "$1"
+}
+# Minimal GREEN baseline for the THREE roles NOT under test in a given AC-14/AC-15 case: planner + executor
+# + the "other" review role (single round each, bound + resolvable + closedAt well before anything the
+# target review role's own history will carry). <target> in {execution-review, plan-review}.
+mk_baseline3_1936() { # <task> <target-review-role>
+  local t="$1" target="$2"
+  local other="execution-review"; [ "$target" = "execution-review" ] && other="plan-review"
+  mk_sub "$S1936" "${t}-p1"; mk_sub "$S1936" "${t}-e1"; mk_sub "$S1936" "${t}-o1"
+  node "$LED" append --session "$S1936" --task "$t" --role planner --agent "${t}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+  node "$LED" append --session "$S1936" --task "$t" --role executor --agent "${t}-e1" --artifact "PR #$t" --closed-at "2026-01-01T00:05:00Z" >/dev/null
+  node "$LED" append --session "$S1936" --task "$t" --role "$other" --agent "${t}-o1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T00:10:00Z" >/dev/null
+}
+# Complete GREEN 4-role fixture, all single-round, controllable per-role closedAt (used by AC-3/4/5/6/7/8/9).
+mk_green4_1936() { # <task> <planner_closedAt> <planreview_closedAt> <executor_closedAt> <execreview_closedAt>
+  local t="$1" pc="$2" prc="$3" ec="$4" erc="$5"
+  mk_sub "$S1936" "${t}-p1"; mk_sub "$S1936" "${t}-pr1"; mk_sub "$S1936" "${t}-e1"; mk_sub "$S1936" "${t}-er1"
+  node "$LED" append --session "$S1936" --task "$t" --role planner --agent "${t}-p1" --artifact "$TMP/plan.md" --closed-at "$pc" >/dev/null
+  node "$LED" append --session "$S1936" --task "$t" --role plan-review --agent "${t}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "$prc" >/dev/null
+  node "$LED" append --session "$S1936" --task "$t" --role executor --agent "${t}-e1" --artifact "PR #$t" --closed-at "$ec" >/dev/null
+  node "$LED" append --session "$S1936" --task "$t" --role execution-review --agent "${t}-er1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "$erc" >/dev/null
+}
+
+# ---- AC-3: fresh execution-review FAIL is a handoff, not completion (single round, no Lane-A signal). ----
+T3="1936ac3"
+mk_sub "$S1936" "${T3}-p1"; mk_sub "$S1936" "${T3}-pr1"; mk_sub "$S1936" "${T3}-e1"; mk_sub "$S1936" "${T3}-er1"
+node "$LED" append --session "$S1936" --task "$T3" --role planner --agent "${T3}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T3" --role plan-review --agent "${T3}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T3" --role executor --agent "${T3}-e1" --artifact "PR #$T3" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T3" --role execution-review --agent "${T3}-er1" --artifact "$TMP/rev.md" --verdict FAIL --closed-at "2026-01-01T03:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T3" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+  && ok "1936 AC-3: fresh execution-review FAIL (no staleness signal at all) -> NEGATIVE-VERDICT, not a completion (kills a freshness-only fix)" \
+  || bad "1936 AC-3 failed (rc=$RC out=$OUT)"
+
+# ---- AC-4: stale review of a superseded executor round (Lane A, executor pair). ----
+T4="1936ac4"
+mk_sub "$S1936" "${T4}-p1"; mk_sub "$S1936" "${T4}-pr1"; mk_sub "$S1936" "${T4}-e1"; mk_sub "$S1936" "${T4}-er1"; mk_sub "$S1936" "${T4}-e2"
+node "$LED" append --session "$S1936" --task "$T4" --role planner --agent "${T4}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T4" --role plan-review --agent "${T4}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T00:30:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T4" --role executor --agent "${T4}-e1" --artifact "PR #${T4}-r1" --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T4" --role execution-review --agent "${T4}-er1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T4" --role executor --agent "${T4}-e2" --artifact "PR #${T4}-r2" --closed-at "2026-01-01T03:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T4" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "STALE-REVIEW" && echo "$OUT" | command grep -q "execution-review"; } \
+  && ok "1936 AC-4: stale review of a SUPERSEDED executor round -> STALE-REVIEW + execution-review (kills a verdict-only fix)" \
+  || bad "1936 AC-4 failed (rc=$RC out=$OUT)"
+
+# ---- AC-5: GREEN disjunct -- a fresh execution-review round (the sanctioned remedy) is NOT false-blocked. ----
+mk_sub "$S1936" "${T4}-er2"
+node "$LED" append --session "$S1936" --task "$T4" --role execution-review --agent "${T4}-er2" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T04:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T4" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-5: fresh execution-review round (distinct agent, PASS, newer closedAt) -> ALLOW (sanctioned remedy not false-blocked, #1179 class)" \
+  || bad "1936 AC-5 failed (rc=$RC out=$OUT)"
+
+# ---- AC-6: planner pair, (a) STALE-REVIEW fires (b) fresh review clears it (c) resume-re-close twin ALLOWS. ----
+T6="1936ac6"
+mk_sub "$S1936" "${T6}-p1"; mk_sub "$S1936" "${T6}-pr1"; mk_sub "$S1936" "${T6}-e1"; mk_sub "$S1936" "${T6}-er1"
+node "$LED" append --session "$S1936" --task "$T6" --role planner --agent "${T6}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6" --role plan-review --agent "${T6}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6" --role executor --agent "${T6}-e1" --artifact "PR #$T6" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6" --role execution-review --agent "${T6}-er1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T03:00:00Z" >/dev/null
+mk_sub "$S1936" "${T6}-p2"
+node "$LED" append --session "$S1936" --task "$T6" --role planner --agent "${T6}-p2" --artifact "$TMP/plan.md" --closed-at "2026-01-01T04:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T6" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "STALE-REVIEW" && echo "$OUT" | command grep -q "plan-review"; } \
+  && ok "1936 AC-6(a): new planner round unreviewed -> STALE-REVIEW + plan-review" \
+  || bad "1936 AC-6(a) failed (rc=$RC out=$OUT)"
+
+mk_sub "$S1936" "${T6}-pr2"
+node "$LED" append --session "$S1936" --task "$T6" --role plan-review --agent "${T6}-pr2" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T05:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T6" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-6(b): fresh plan-review round covering the new planner round -> ALLOW" \
+  || bad "1936 AC-6(b) failed (rc=$RC out=$OUT)"
+
+T6C="1936ac6c"
+mk_sub "$S1936" "${T6C}-p1"; mk_sub "$S1936" "${T6C}-pr1"; mk_sub "$S1936" "${T6C}-e1"; mk_sub "$S1936" "${T6C}-er1"
+node "$LED" append --session "$S1936" --task "$T6C" --role planner --agent "${T6C}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6C" --role plan-review --agent "${T6C}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6C" --role executor --agent "${T6C}-e1" --artifact "PR #$T6C" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6C" --role execution-review --agent "${T6C}-er1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T03:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T6C" --role planner --agent "${T6C}-p1" --closed-at "2026-01-01T06:00:00Z" >/dev/null
+pcount6c=$(command grep -c '"role":"planner"' "$THREE_ROLE_LEDGER_DIR/$S1936/$T6C.jsonl")
+OUT=$(node "$LED" check --session "$S1936" --task "$T6C" 2>&1); RC=$?
+{ [ "$pcount6c" = "1" ] && [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-6(c): resume-re-close twin (SAME planner agent, only a newer closed-at, single row, closedAt > review's) -> ALLOW (kills the #1760/#1719 false-block class)" \
+  || bad "1936 AC-6(c) failed (planner-rows=$pcount6c rc=$RC out=$OUT)"
+
+# ---- AC-7: can't-tell fails OPEN (legacy / oracle / verdict-absent shapes keep working). ----
+T7A="1936ac7a"
+mk_sub "$S1936" "${T7A}-p1"; mk_sub "$S1936" "${T7A}-pr1"; mk_sub "$S1936" "${T7A}-e1"; mk_sub "$S1936" "${T7A}-er1"
+node "$LED" append --session "$S1936" --task "$T7A" --role planner --agent "${T7A}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7A" --role plan-review --agent "${T7A}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7A" --role executor --agent "${T7A}-e1" --artifact "PR #$T7A" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7A" --role execution-review --agent "${T7A}-er1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T02:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T7A" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-7(a): executor row with NO closedAt -> can't-tell fails OPEN, still ALLOW" \
+  || bad "1936 AC-7(a) failed (rc=$RC out=$OUT)"
+
+T7B="1936ac7b"
+mk_sub "$S1936" "${T7B}-p1"; mk_sub "$S1936" "${T7B}-pr1"; mk_sub "$S1936" "${T7B}-e1"
+printf 'tests: 3 passed -- PASS\n' > "$TMP/oracle-1936.txt"
+node "$LED" append --session "$S1936" --task "$T7B" --role planner --agent "${T7B}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7B" --role plan-review --agent "${T7B}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7B" --role execution-review --oracle "$TMP/oracle-1936.txt" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7B" --role executor --agent "${T7B}-e1" --artifact "PR #$T7B" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T7B" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-7(b): oracle-shaped execution-review (no verdict field anywhere, no agentId) with a later-closed executor -> ALLOW" \
+  || bad "1936 AC-7(b) failed (rc=$RC out=$OUT)"
+
+T7C="1936ac7c"
+mk_sub "$S1936" "${T7C}-p1"; mk_sub "$S1936" "${T7C}-pr1"; mk_sub "$S1936" "${T7C}-e1"; mk_sub "$S1936" "${T7C}-er1"
+node "$LED" append --session "$S1936" --task "$T7C" --role planner --agent "${T7C}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7C" --role plan-review --agent "${T7C}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7C" --role executor --agent "${T7C}-e1" --artifact "PR #$T7C" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T7C" --role execution-review --agent "${T7C}-er1" --artifact "$TMP/rev.md" --closed-at "2026-01-01T05:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T7C" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-7(c) Lane-B twin: execution-review bound+artifact+FRESHEST closedAt but NO verdict anywhere in its history -> Lane B stays silent, ALLOW" \
+  || bad "1936 AC-7(c) failed (rc=$RC out=$OUT)"
+
+# ---- AC-8: artifact-only re-points for ALL FOUR roles, executor LAST -- still ALLOW. ----
+T8="1936ac8"
+mk_green4_1936 "$T8" "2026-01-01T00:00:00Z" "2026-01-01T01:00:00Z" "2026-01-01T02:00:00Z" "2026-01-01T03:00:00Z"
+node "$LED" append --session "$S1936" --task "$T8" --role planner --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$S1936" --task "$T8" --role plan-review --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$S1936" --task "$T8" --role execution-review --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$S1936" --task "$T8" --role executor --artifact "PR #${T8}-repointed" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T8" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-8: artifact-only re-points (all 4 roles, executor LAST) -> STILL ALLOW (ts-refresh/block-relocation-fragile implementations would false-block here)" \
+  || bad "1936 AC-8 failed (rc=$RC out=$OUT)"
+
+# ---- AC-9: allowlist pinned at BOTH edges. Single-round fixtures (the target verdict IS the role's only
+# ---- round) -- deliberately avoids a same-role verdict-CHANGE across rounds, which is the pre-existing,
+# ---- untouched write-side clause-2 guard's OWN jurisdiction (it requires a spawn-tag-BOUND --agent, not
+# ---- merely a resolvable one -- irrelevant to what Lane B is being proven here). ----
+T9A="1936ac9a"
+mk_sub "$S1936" "${T9A}-p1"; mk_sub "$S1936" "${T9A}-pr1"; mk_sub "$S1936" "${T9A}-e1"; mk_sub "$S1936" "${T9A}-er1"
+node "$LED" append --session "$S1936" --task "$T9A" --role planner --agent "${T9A}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9A" --role plan-review --agent "${T9A}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9A" --role executor --agent "${T9A}-e1" --artifact "PR #$T9A" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9A" --role execution-review --agent "${T9A}-er1" --artifact "$TMP/rev.md" --verdict PASS-WITH-FIXES --closed-at "2026-01-01T03:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T9A" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+  && ok "1936 AC-9(a): fresh execution-review PASS-WITH-FIXES -> ALLOW (check-lane allowlist, separate from :844)" \
+  || bad "1936 AC-9(a) failed (rc=$RC out=$OUT)"
+
+T9B="1936ac9b"
+mk_sub "$S1936" "${T9B}-p1"; mk_sub "$S1936" "${T9B}-pr1"; mk_sub "$S1936" "${T9B}-e1"; mk_sub "$S1936" "${T9B}-er1"
+node "$LED" append --session "$S1936" --task "$T9B" --role planner --agent "${T9B}-p1" --artifact "$TMP/plan.md" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9B" --role plan-review --agent "${T9B}-pr1" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9B" --role executor --agent "${T9B}-e1" --artifact "PR #$T9B" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+node "$LED" append --session "$S1936" --task "$T9B" --role execution-review --agent "${T9B}-er1" --artifact "$TMP/rev.md" --verdict NEEDS-WORK --closed-at "2026-01-01T03:00:00Z" >/dev/null
+OUT=$(node "$LED" check --session "$S1936" --task "$T9B" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+  && ok "1936 AC-9(b): fresh execution-review NEEDS-WORK -> NEGATIVE-VERDICT (not in the check-lane allowlist)" \
+  || bad "1936 AC-9(b) failed (rc=$RC out=$OUT)"
+
+# ---- AC-14: supersession precondition pinned at BOTH edges (RAW JSONL, hand-written-state population), ----
+# ---- both review roles. ----
+for RROLE_14 in execution-review plan-review; do
+  T14A="1936ac14a-${RROLE_14}"
+  mk_baseline3_1936 "$T14A" "$RROLE_14"
+  F14A="$THREE_ROLE_LEDGER_DIR/$S1936/${T14A}.jsonl"
+  mk_sub "$S1936" "ac14-${RROLE_14}-A1"
+  raw_append_1936 "$F14A" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-A1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T10:00:00Z\"}"
+  raw_append_1936 "$F14A" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-A1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\",\"closedAt\":\"2026-01-01T11:00:00Z\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T14A" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-14(a) $RROLE_14: SAME agentId + newer closedAt -> STILL NEGATIVE-VERDICT (not a genuinely new reviewer)" \
+    || bad "1936 AC-14(a) $RROLE_14 failed (rc=$RC out=$OUT)"
+
+  T14B="1936ac14b-${RROLE_14}"
+  mk_baseline3_1936 "$T14B" "$RROLE_14"
+  F14B="$THREE_ROLE_LEDGER_DIR/$S1936/${T14B}.jsonl"
+  mk_sub "$S1936" "ac14-${RROLE_14}-B1"; mk_sub "$S1936" "ac14-${RROLE_14}-B2"
+  raw_append_1936 "$F14B" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-B1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T10:00:00Z\"}"
+  raw_append_1936 "$F14B" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-B2\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T14B" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-14(b) $RROLE_14: distinct agentId, closedAt ABSENT -> STILL NEGATIVE-VERDICT" \
+    || bad "1936 AC-14(b)-absent $RROLE_14 failed (rc=$RC out=$OUT)"
+
+  T14B2="1936ac14b2-${RROLE_14}"
+  mk_baseline3_1936 "$T14B2" "$RROLE_14"
+  F14B2="$THREE_ROLE_LEDGER_DIR/$S1936/${T14B2}.jsonl"
+  raw_append_1936 "$F14B2" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-B1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T10:00:00Z\"}"
+  raw_append_1936 "$F14B2" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-B2\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\",\"closedAt\":\"2026-01-01T09:00:00Z\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T14B2" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-14(b) $RROLE_14: distinct agentId, closedAt OLDER (<= T1) -> STILL NEGATIVE-VERDICT" \
+    || bad "1936 AC-14(b)-older $RROLE_14 failed (rc=$RC out=$OUT)"
+
+  T14C1="1936ac14c1-${RROLE_14}"
+  mk_baseline3_1936 "$T14C1" "$RROLE_14"
+  F14C1="$THREE_ROLE_LEDGER_DIR/$S1936/${T14C1}.jsonl"
+  mk_sub "$S1936" "ac14-${RROLE_14}-C1"; mk_sub "$S1936" "ac14-${RROLE_14}-C2"
+  raw_append_1936 "$F14C1" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-C1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T10:00:20Z\"}"
+  raw_append_1936 "$F14C1" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-C2\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\",\"closedAt\":\"2026-01-01T10:00:20.500Z\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T14C1" 2>&1); RC=$?
+  { [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+    && ok "1936 AC-14(c) $RROLE_14 accept-leg: sub-second closedAt numerically NEWER (lexicographically SMALLER) -> ALLOW (epoch, never string, comparison)" \
+    || bad "1936 AC-14(c)-accept $RROLE_14 failed (rc=$RC out=$OUT)"
+
+  T14C2="1936ac14c2-${RROLE_14}"
+  mk_baseline3_1936 "$T14C2" "$RROLE_14"
+  F14C2="$THREE_ROLE_LEDGER_DIR/$S1936/${T14C2}.jsonl"
+  raw_append_1936 "$F14C2" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-C1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T10:00:20.500Z\"}"
+  raw_append_1936 "$F14C2" "{\"role\":\"${RROLE_14}\",\"session_id\":\"$S1936\",\"agentId\":\"ac14-${RROLE_14}-C2\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\",\"closedAt\":\"2026-01-01T10:00:20Z\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T14C2" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-14(c) $RROLE_14 refuse-leg: sub-second closedAt numerically OLDER (lexicographically LARGER) -> STILL NEGATIVE-VERDICT" \
+    || bad "1936 AC-14(c)-refuse $RROLE_14 failed (rc=$RC out=$OUT)"
+done
+
+# ---- AC-15: the sanctioned self-append flow passes against a shielded state (B5's regression proof), ----
+# ---- both review roles -- built through the real CLI, mirroring the live three-write lifecycle exactly. ----
+for RROLE_15 in execution-review plan-review; do
+  T15="1936ac15-${RROLE_15}"
+  mk_baseline3_1936 "$T15" "$RROLE_15"
+  mk_sub "$S1936" "ac15-${RROLE_15}-A1"; mk_sub "$S1936" "ac15-${RROLE_15}-A2"
+  # (1) full FAIL review round, three-write lifecycle: spawn -> mid-turn self-append -> stop-shaped closed-at.
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --agent "ac15-${RROLE_15}-A1" >/dev/null
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --artifact "$TMP/rev.md" --verdict FAIL >/dev/null
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --agent "ac15-${RROLE_15}-A1" --closed-at "2026-01-01T10:00:00Z" >/dev/null
+  # (2) round-2 spawn-shaped append (A2, distinct) -- the interposed bare row, the DEFAULT shield state.
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --agent "ac15-${RROLE_15}-A2" >/dev/null
+
+  # (a) the doctrine command, verbatim shape -- NO --agent, NO --closed-at -- must exit 0 (write path
+  #     completely unchanged; this is the exact command round-3's write-side re-key was measured to refuse).
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --artifact "$TMP/rev.md" --verdict PASS >"$TMP/1936-ac15-a-${RROLE_15}.out" 2>&1; DRC=$?
+  { [ "$DRC" = "0" ]; } \
+    && ok "1936 AC-15(a) $RROLE_15: doctrine self-append (no --agent, no --closed-at) over a shielded FAIL -> exits 0 (write path never touched)" \
+    || bad "1936 AC-15(a) $RROLE_15 failed (rc=$DRC out=$(cat "$TMP/1936-ac15-a-${RROLE_15}.out"))"
+
+  # (b) check AT THIS transient point (PASS self-appended, punch-out NOT yet stamped) -- must STILL block
+  #     negative. THIS is the leg the fresh execution-review found still RED pre-fix; it must be GREEN now.
+  OUT=$(node "$LED" check --session "$S1936" --task "$T15" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-15(b) $RROLE_15: transient window (PASS self-appended, no closedAt yet) -> STILL NEGATIVE-VERDICT (fails SAFE toward the negative) -- the fix's discriminating leg" \
+    || bad "1936 AC-15(b) $RROLE_15 FAILED -- this is the documented pre-fix RED that must flip to GREEN (rc=$RC out=$OUT)"
+
+  # (c) stop-shaped append (A2, closed-at T2 > T1) -- the SubagentStop punch-out -- check now ALLOWS.
+  node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --agent "ac15-${RROLE_15}-A2" --closed-at "2026-01-01T11:00:00Z" >/dev/null
+  OUT=$(node "$LED" check --session "$S1936" --task "$T15" 2>&1); RC=$?
+  { [ "$RC" = "0" ] && echo "$OUT" | command grep -qi "OK"; } \
+    && ok "1936 AC-15(c) $RROLE_15: full sanctioned lifecycle complete (distinct agent + affirmative verdict + strictly-newer closedAt) -> ALLOW" \
+    || bad "1936 AC-15(c) $RROLE_15 failed (rc=$RC out=$OUT)"
+done
+
+# ---- AC-2: committed synthetic twin of AC-1 (the REAL #1821 hero case), BOTH review roles. Field-for-field ----
+# ---- replica: full FAIL review round, then a bare distinct-agent round-2 append (the #1821 shield shape). ----
+for RROLE_2 in execution-review plan-review; do
+  T2="1936ac2-${RROLE_2}"
+  mk_baseline3_1936 "$T2" "$RROLE_2"
+  mk_sub "$S1936" "ac2-${RROLE_2}-RA1"; mk_sub "$S1936" "ac2-${RROLE_2}-RA2"
+  node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --agent "ac2-${RROLE_2}-RA1" --artifact "$TMP/rev.md" --verdict FAIL --closed-at "2026-01-01T00:15:00Z" >/dev/null
+  node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --agent "ac2-${RROLE_2}-RA2" >/dev/null   # bare round-2 spawn -- the #1821 shield row
+
+  # (leg 1) bare state -> check blocks with NEGATIVE-VERDICT + the role name.
+  OUT=$(node "$LED" check --session "$S1936" --task "$T2" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT" && echo "$OUT" | command grep -q "$RROLE_2"; } \
+    && ok "1936 AC-2($RROLE_2) leg1: bare #1821-shape shield row -> NEGATIVE-VERDICT + role name" \
+    || bad "1936 AC-2($RROLE_2) leg1 failed (rc=$RC out=$OUT)"
+
+  # (leg 2) artifact-only re-point onto the bare shield row -> STILL blocks.
+  node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --artifact "$TMP/rev.md" >/dev/null
+  OUT=$(node "$LED" check --session "$S1936" --task "$T2" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-2($RROLE_2) leg2: artifact-only re-point laundering -> STILL blocks" \
+    || bad "1936 AC-2($RROLE_2) leg2 failed (rc=$RC out=$OUT)"
+
+  # (leg iv-a) BOTH attribution-free appends LAND (exit 0 each -- write path unchanged, the scope pin) and
+  #            check STILL blocks afterwards (the B4 verdict-overlay laundering, killed at the READ side).
+  node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --artifact "$TMP/rev.md" >"$TMP/1936-ac2-iva1-${RROLE_2}.out" 2>&1; R1=$?
+  node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --verdict PASS >"$TMP/1936-ac2-iva2-${RROLE_2}.out" 2>&1; R2=$?
+  OUT=$(node "$LED" check --session "$S1936" --task "$T2" 2>&1); RC=$?
+  { [ "$R1" = "0" ] && [ "$R2" = "0" ] && [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-2($RROLE_2) leg(iv-a): both attribution-free appends land (exit0/exit0, write path unchanged) yet check STILL blocks" \
+    || bad "1936 AC-2($RROLE_2) leg(iv-a) failed (r1=$R1 r2=$R2 rc=$RC out=$OUT)"
+
+  # (leg iv-b) raw-JSONL hand-written twin, on a FRESH task: FAIL round complete, then a DIRECTLY-appended
+  #            laundered row (verdict PASS, a DISTINCT agentId, NO closedAt -- the exact merged shape the
+  #            CLI produces in leg iv-a) -- still blocks.
+  T2B="1936ac2b-${RROLE_2}"
+  mk_baseline3_1936 "$T2B" "$RROLE_2"
+  F2B="$THREE_ROLE_LEDGER_DIR/$S1936/${T2B}.jsonl"
+  mk_sub "$S1936" "ac2b-${RROLE_2}-RA1"; mk_sub "$S1936" "ac2b-${RROLE_2}-RA2"
+  raw_append_1936 "$F2B" "{\"role\":\"${RROLE_2}\",\"session_id\":\"$S1936\",\"agentId\":\"ac2b-${RROLE_2}-RA1\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"FAIL\",\"closedAt\":\"2026-01-01T00:15:00Z\"}"
+  raw_append_1936 "$F2B" "{\"role\":\"${RROLE_2}\",\"session_id\":\"$S1936\",\"agentId\":\"ac2b-${RROLE_2}-RA2\",\"artifact_path\":\"$TMP/rev.md\",\"verdict\":\"PASS\"}"
+  OUT=$(node "$LED" check --session "$S1936" --task "$T2B" 2>&1); RC=$?
+  { [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-2($RROLE_2) leg(iv-b): directly-written laundered row (distinct agentId, NO closedAt) -> STILL blocks (kills a distinct-agentId-only read rule)" \
+    || bad "1936 AC-2($RROLE_2) leg(iv-b) failed (rc=$RC out=$OUT)"
+done
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
