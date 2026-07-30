@@ -1,6 +1,45 @@
 #!/usr/bin/env node
-// bin/3role-ledger.mjs — role-LEDGER helper. Bundled in the plugin under bin/; hooks resolve it via
-// "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" (with a repo-relative ../bin fallback).
+// hooks/_fixtures/3role-ledger-pre2075-snapshot.mjs — COMMITTED STATIC FIXTURE (#2075 AC-23(b) / #2094).
+//
+// Durable, hermetic, no-git-dependency stand-in for a git-object-dependent acquisition this fixture
+// REPLACES. AC-23(b) in hooks/3role-ledger-smoke-test.sh used to `git show origin/master:...` pipe
+// the pre-#2075 hooks/3role-ledger.mjs into a temp file (the #1833-class shape-i defect). MEASURED
+// (not assumed, #2094) to fail two ways: (1) CI runs a shallow (depth=1, single-commit) checkout, so
+// `origin/master` -- and, it turns out, an on-demand fetch of ANY specific ancestor SHA -- is not
+// resolvable there without a live network call to the real ai-brain remote; (2) this exact smoke test
+// file is ALSO byte-ported verbatim into the separate `three-role-model` plugin repo
+// (scripts/sync-three-role-plugin.mjs), whose own git history does not contain ai-brain commit SHAs
+// at all, so a SHA-pin-plus-fetch "fix" that works in ai-brain's own CI still permanently fails once
+// ported. This file carries the pre-#2075 ledger IN-POCKET instead: no git dependency, no network,
+// no reachability requirement, always runs for real, in either repo.
+//
+// UNLIKE the sibling fixtures this follows (hooks/_fixtures/3role-ledger-pre1580-overlay.mjs,
+// -pre1947-ma2-overlay.mjs), which are deliberately MINIMAL subsets reproducing one narrow vulnerable
+// function (Rule 17: mechanical, in-pocket, over faithfulness-by-bulk), this fixture is a FULL,
+// untouched, byte-exact port of the entire pre-#2075 hooks/3role-ledger.mjs. AC-23(b)'s claim is
+// GLOBAL byte-identical equivalence across check()'s entire legacy-ledger output surface (not one
+// targeted code path), so a hand-trimmed subset would silently reintroduce exactly what the original
+// test author's own comment explicitly wanted to avoid: "a re-derived assumption" standing in for a
+// real historical snapshot. Full-file byte-fidelity is the only way to catch an UNKNOWN accidental
+// change anywhere else in check()'s formatting, not just the one change this ticket already knows
+// about (the new PROVENANCE-LEGACY note).
+//
+// MEASURED (not assumed) provenance: byte-exact `git show
+// 9757d10e1995af123b6a99bb535604a320bb77c0:hooks/3role-ledger.mjs`, verified 2026-07-29 as the
+// merge-base of the #2075 PR branch with origin/master (i.e. master's tip immediately before the
+// #2075 feature commit landed) -- confirmed identical to that PR branch's own HEAD^.
+//
+// Do NOT hand-edit this file to match the live hooks/3role-ledger.mjs, and do NOT regenerate it from
+// current code — the AC-23(b) non-decay guard in 3role-ledger-smoke-test.sh asserts this fixture's
+// content differs from the live ledger (cmp -s). If a future edit ever collapses the two to identical
+// bytes, that guard goes RED on purpose.
+//
+// ============================================================================================
+// Everything below this line is the UNMODIFIED byte content of the pinned commit's
+// hooks/3role-ledger.mjs (its own header/comments follow, starting with its own shebang+banner).
+// ============================================================================================
+
+// hooks/3role-ledger.mjs — #851 role-LEDGER helper (PR1, Phase 1+2).
 //
 // A tiny CLI that records WHICH 3-role roles actually ran for a task and verifies them against the
 // forgery-resistant signal the harness already produces: one transcript file per real subagent spawn
@@ -137,65 +176,40 @@
 //     (backgrounded, fail-open) exactly ONCE per invocation, and ONLY when >=1 role actually flipped
 //     absent->present (no-change scans never resync — bounds the extra board-upload cost). ALWAYS exits 0
 //     (fail-open) — a refresh error must never wedge its caller (a backgrounded hook trigger).
-//   reconcile-spawns --session S                                    (#1229, incremental rewrite #1851)
+//   reconcile-spawns --session S                                    (#1229)
 //     MISSING-ROW backfill for the dropped-harness-event gap: for a meaningful fraction of background Agent
 //     dispatches, NEITHER the spawn-ledger hook (PostToolUse) NOR the SubagentStop ledger hook fires, even
 //     though the subagent's own transcript genuinely exists at <PROJECTS_ROOT>/*/<S>/subagents/agent-<id>.jsonl
 //     and its spawn record carries a `3ROLE_TASK:<task> ROLE:<role>` tag — so the ledger row is ABSENT
-//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above).
-//     #1851 — the ORIGINAL implementation called resolveAgent() (a full corpus re-scan) ONCE PER (task, role)
-//     GROUP, making the sweep O(G x corpus) (~1,006 groups x 979 MB ~= 1 TB decoded, ~24.5 min CPU on a
-//     marathon session — measured). The coarse watermark below never engaged on a live session (some
-//     transcript is always advancing), so a runaway sweep pinned a CPU core essentially continuously. This
-//     rewrite collapses that to O(corpus), by construction, via three changes (D1/D2/D3 of
-//     .ai-workspace/plans/2026-07-27-1851-reconcile-spawns-incremental.md):
-//       D1 (hoist) — the discovery pass below extracts EVERY transcript's spawn-tag facts ONCE (not once per
-//         group): a DISCOVERY tag (the loose first-match rule the old code used to populate `groups`) and every
-//         WINNER-candidate tag (re-verified as a literal substring of the sanitize()-reconstructed tag string,
-//         reproducing resolveAgent()'s `.includes()` semantics exactly — including its two documented seams: a
-//         task id containing a sanitize()-stripped character correctly fails to bind, and a first record naming
-//         TWO tags correctly binds to BOTH groups). The group loop then does a Map lookup, never a corpus scan.
-//       D2 (bounded read) — `readFirstNonEmptyLine()` reads only up to the transcript's first NON-EMPTY line
-//         (matching firstRecordText()'s own `.find(l => l.trim())` predicate exactly, never a looser "read line
-//         1"), growing its read window until it finds that line or hits EOF — never a fixed cap that silently
-//         truncates a transcript out of the mapping (D2's "single worst regression" this fix could cause).
-//       D3 (per-file checkpoint) — a per-session sidecar (`.reconcile-checkpoint.json`, dotted so invisible to
-//         the `.jsonl` glob cmdRefreshModels/cmdCheck use) caches each transcript's derived tag facts keyed on
-//         file IDENTITY (dev+ino) + size-at-derive-time; unchanged-or-grown files reuse the cache (D2's read
-//         never happens again), a REPLACED (new identity) or SHRUNK (possible truncation/rewrite) file is
-//         re-derived. Rests on the load-bearing, Rule-18-gated assumption that a subagent transcript's first
-//         record never changes once written (append-only) — degraded safely by a MANDATORY periodic full
-//         re-derivation (every RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N runs, or when the last full derive is
-//         older than RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS) that ignores the cache outright.
-//     D4/D6 correctness: the group -> row loop still evaluates EVERY known group EVERY run (no transcript is
-//     ever "too old" to enter the mapping; a cold start or a corrupt/unreadable/schema-mismatched sidecar —
-//     schema-versioned — is treated as a full re-derivation, never "nothing to do"). `modelVersion` resolution
-//     is now GATED on `!prior.modelVersion` (previously unconditional — a fixed bug: an already-stamped row paid
-//     a full transcript re-parse on every sweep forever); `self_authored` keeps its existing `!prior.self_authored`
-//     gate. Both gates are the POSITIVE-side skip only — a row that legitimately never earns a field is
-//     re-attempted every run it's still missing (a known, bounded, OBSERVABLE residual cost — see
-//     `laterRecordRederives` in the log line below — never a WRONG ledger value, since the row is either still
-//     unstamped or is correctly stamped once the fact becomes available). D4(c): the coarse watermark now
-//     advances ONLY after a sweep that completed with nothing truncated or row-failed (previously unconditional
-//     — a real bug: a failed row was never retried unless some transcript's mtime happened to advance).
-//     D5 bounded worst case: a wall-clock budget (RECONCILE_SPAWNS_BUDGET_MS) bounds the WHOLE sweep (both the
-//     tag-derivation pass, run OLDEST-transcript-first for strict forward progress, and the group loop);
-//     exceeding it STOPS the sweep, PERSISTS every per-file checkpoint already earned, does NOT advance the
-//     coarse watermark, and still exits 0 — the union of a truncated run plus its successors equals one
-//     unbounded run (transcripts/groups a truncated run didn't reach are simply left for the next invocation,
-//     which resumes cheaply from the persisted cache).
-//     Every per-row overlayAppend call is individually wrapped — one row's failure is logged-and-skipped, never
-//     fatal (and marks the sweep as row-failed for the D4(c) watermark rule above). Fires kanban-resync.sh
-//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed. Idempotent: a
-//     group with nothing left to add makes NO overlayAppend call at all (byte-identical ledger on a no-op run).
-//     Never stamps `closedAt` or `artifact_path` (unchanged from the original design — a transcript existing on
-//     disk does not prove the subagent stopped, and a swept row must never be able to launder a completion).
-//     Prints one structured completion line prefixed `OK reconcile-spawns: session=... scanned=... changed=...`
-//     (the original prefix, kept — verified zero consumers outside this file via `git grep`, so extending it is
-//     safe) followed by: transcripts=<N> firstRecordsRead=<R> firstRecordsCached=<C> groupsKnown=<G>
-//     groupsEvaluated=<E> laterRecordRederives=<count> elapsedMs=<ms> truncated=<bool> coldStart=<bool>
-//     fullRederive=<bool>. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides
-//     (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models already uses).
+//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above). Walks
+//     every subagent transcript under <PROJECTS_ROOT>/*/<S>/subagents/agent-*.jsonl, extracts each transcript's
+//     spawn-record tag via the SAME firstRecordText()+`/3ROLE_TASK:(\S+) ROLE:(\S+)/` shape
+//     tagFromSubagentTranscript() uses (reuse, not a new parser), validates the extracted role against the
+//     SAME RECORDABLE_ROLES enum cmdAppend's own role guard uses (a malformed `ROLE:foobar` tag is REJECTED,
+//     never filed as a garbage-role row), groups by (task, role), and resolves the AUTHORITATIVE agentId per
+//     group via the existing resolveAgent() newest-mtime resolver (the #860 stale-probe defense — reused, not
+//     re-implemented). For each group: reads the current ledger row; a row already carrying a DIFFERENT real
+//     agentId is left byte-untouched (never disturb a genuine row — the #1580 round-boundary trap); an
+//     inline-skipped row (skip_reason present) is never touched (mirrors cmdRefreshModels's own
+//     `if ('skip_reason' in e) continue`); otherwise backfills ONLY agentId (absent->present), modelVersion/
+//     modelTier (via the SAME resolveModelFields() helper cmdAppend/cmdRefreshModels use), and
+//     self_authored:true (ONLY when an honest provenance scan of the resolved agent's OWN transcript shows its
+//     own `3role-ledger.mjs ... append ... --role <role>` Bash tool_use call — reproducing
+//     three-role-subagent-ledger.sh's exact predicate, never a blind stamp) through the SAME overlayAppend()
+//     path append/refresh-models use — inheriting idempotency, per-key "provided" discipline, and
+//     terminal-evidence monotonicity for free. NEVER stamps `closedAt` (a transcript existing on disk does not
+//     prove the subagent STOPPED — that stays close-exclusive to the real SubagentStop hook) and NEVER passes
+//     `artifact_path` (so a swept row can never launder a completion). Idempotent: a group with nothing left to
+//     add (agentId already matches, model already resolved, self_authored already stamped) makes NO
+//     overlayAppend call at all — not even a no-op re-append — so the ledger file stays byte-identical on a
+//     second run (a bare re-append would still refresh `ts` and break byte-identity). A per-session,
+//     mtime-based watermark short-circuits to a cheap readdir/stat-only scan (no per-transcript read, no
+//     writes) when no subagent transcript has advanced past the last sweep. Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed (mirrors
+//     refresh-models). Every per-row overlayAppend call is individually wrapped — one row's failure is
+//     logged-and-skipped, never fatal. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook
+//     call it rides (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models
+//     already uses).
 //   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
 //     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
 //     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
@@ -264,20 +278,6 @@
 //     "BLOCK:<class>|<ledger-file-and-line>" naming one of seven classes: not-finished / no-verdict /
 //     negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent / deliberate-skip-closed /
 //     junk-line).
-//   provenance-kind --session S --task T --role R                    (#2075 Phase 1, AC-1)
-//     Prints exactly one of E1|E2|E3|none (optionally " legacy"-suffixed) on stdout, exit 0, for the LAST
-//     line recorded for this role — including a missing row, which prints 'none'. This is D1's REPORTING
-//     construction ONLY (min(stored run_kind, verified kind)) — no gate in this file consults it; every
-//     write-side guard reads VERIFIED kind directly (recomputed fresh from the row's own evidence every
-//     time), so a stored `run_kind` label can only ever make this command's OWN output read lower than the
-//     evidence supports, never higher (AC-24's anti-forgery power test).
-//   append ... --run-kind witnessed|bound|inferred [--run-id ID] [--run-source S]     (#2075 Phase 1, D1)
-//     OPTIONAL provenance-kind fields — written ONLY by the writer that obtained the identity (never
-//     re-derived by a reader): `run_id` is the run's own identity (agentId for E1, nonce for E2, absent for
-//     E3); `run_kind` is WRITE-ONCE / monotone-non-decreasing under overlayAppend (witnessed(3) > bound(2) >
-//     inferred(1) — an incoming write whose rank is <= the row's current stored rank is a no-op on this
-//     field alone; the append itself still exits 0 and every OTHER field still merges normally); `run_source`
-//     names which writer stamped it, diagnostic only, never consulted by a gate.
 //
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
 //   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
@@ -292,23 +292,6 @@
 //                            (default 4MB — big enough to fit a single ~0.8MB transcript record with margin).
 //   CC_TIER_SENSOR_CAP_BYTES (#1494) — the grow-with-cap ceiling (default 64MB); exceeding it without a
 //                            parseable last-assistant record resolves tier='unknown' (fail-closed).
-//   RECONCILE_SPAWNS_BUDGET_MS (#1851) — wall-clock budget bounding a WHOLE reconcile-spawns sweep (default
-//                            20000 = 20s — a large safety margin over the ~seconds cold-start the D1/D2 hoist
-//                            achieves BY CONSTRUCTION on today's ~2,000-transcript/979MB corpus; this is a
-//                            safety net for a corpus far larger than today's, not the primary mechanism). `0`
-//                            is a valid value (truncate before processing anything — used by the AC6 smoke to
-//                            force truncation deterministically); only an unset/non-numeric/negative value
-//                            falls back to the 20s default.
-//                            Exceeding it stops the sweep, persists every per-file checkpoint already earned,
-//                            and does NOT advance the coarse watermark (D5).
-//   RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N (#1851) — every Nth reconcile-spawns run for a session ignores the
-//                            per-file checkpoint cache outright and re-derives every transcript's tag facts
-//                            fresh (default 20). Belt-and-braces against the D3 append-only assumption ever
-//                            being silently violated (AC5). 0 or unset/invalid disables the count-based trigger
-//                            (the age-based trigger below still applies).
-//   RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS (#1851) — force a full re-derivation when the last one is older
-//                            than this many ms (default 21600000 = 6h), independent of the run-count trigger
-//                            above. A cold start (no sidecar yet) always counts as "due".
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -826,14 +809,6 @@ function agentResolves(session, agentId) {
 // call this). Returns '' on any missing/unreadable/unparseable first line (fails closed to "no match").
 function firstRecordText(content) {
   const firstLine = String(content == null ? '' : content).split('\n').find((l) => l.trim());
-  return firstRecordTextFromLine(firstLine);
-}
-
-// #1851 D2 — the JSON-envelope-extraction body factored OUT of firstRecordText() so a caller that already
-// has the isolated first-non-empty-LINE (e.g. readFirstNonEmptyLine()'s bounded read below) can reuse the
-// EXACT SAME extraction, never a second, potentially-diverging parser. Fed a falsy/unparseable line, returns
-// '' (fails closed to "no match"), identical to firstRecordText()'s own contract.
-function firstRecordTextFromLine(firstLine) {
   if (!firstLine) return '';
   let rec;
   try { rec = JSON.parse(firstLine); } catch (e) { return ''; }
@@ -844,118 +819,6 @@ function firstRecordTextFromLine(firstLine) {
     for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
   }
   return text;
-}
-
-// #1851 D2 — bounded read of a transcript's FIRST NON-EMPTY line, cost proportional to THAT line's size, not
-// the whole file. Grows its read window (in RECONCILE_READ_CHUNK_BYTES steps) until it finds the
-// line-terminating newline or reaches EOF — never a fixed cap that gives up, which would silently truncate a
-// transcript out of the reconciliation mapping (D2: "the single worst regression this plan can cause").
-// Matches firstRecordText()'s own predicate exactly — the first NON-empty line (`.find(l => l.trim())`), not
-// literally byte-offset-0 line 1 — so a leading blank line degrades identically whether read via this bounded
-// path or the whole-file path (the F2 plan-review finding: a naive "read to the first \n" would diverge from
-// firstRecordText's actual "first non-empty line" semantics on such a file). Fails OPEN (returns '') on any
-// open/read error, mirroring firstRecordText()'s own unreadable-file contract.
-const RECONCILE_READ_CHUNK_BYTES = 8192;
-function readFirstNonEmptyLine(filePath) {
-  let fd;
-  try { fd = fs.openSync(filePath, 'r'); } catch (e) { return ''; }
-  try {
-    let buf = Buffer.alloc(0);
-    let pos = 0;
-    for (;;) {
-      // Drain every complete line already buffered before issuing another read — avoids a redundant syscall
-      // when the first non-empty line is already fully inside `buf` from a prior chunk.
-      for (;;) {
-        const nl = buf.indexOf(0x0a);
-        if (nl === -1) break;
-        const line = buf.subarray(0, nl).toString('utf8');
-        if (line.trim()) return line;
-        buf = buf.subarray(nl + 1);
-      }
-      const chunk = Buffer.alloc(RECONCILE_READ_CHUNK_BYTES);
-      let n;
-      try { n = fs.readSync(fd, chunk, 0, RECONCILE_READ_CHUNK_BYTES, pos); } catch (e) { break; }
-      if (n <= 0) break; // EOF
-      buf = buf.length ? Buffer.concat([buf, chunk.subarray(0, n)]) : chunk.subarray(0, n);
-      pos += n;
-    }
-    // EOF reached with no newline-terminated non-empty line found; the last (possibly unterminated) line in
-    // `buf` is still a valid candidate (mirrors String.split('\n') including a trailing unterminated segment).
-    const leftover = buf.toString('utf8');
-    return leftover.trim() ? leftover : '';
-  } finally {
-    try { fs.closeSync(fd); } catch (e) { /* ignore */ }
-  }
-}
-
-// #1851 D1 — extract BOTH tag facts a transcript's first-record TEXT carries, in ONE pass over that (small,
-// bounded-read) string:
-//   .discovery — the LOOSE, first-match rule the original cmdReconcileSpawns used to populate its `groups`
-//     Set: sanitize(task), the RAW captured role (RECORDABLE_ROLES-checked), no reconstructed-substring
-//     re-check. Only the FIRST occurrence in the text counts (mirrors the original non-global `.match()`).
-//   .winners — every occurrence, each individually re-verified as a literal substring of the
-//     SANITIZE()-RECONSTRUCTED tag string (`3ROLE_TASK:<sanitize(task)> ROLE:<role>`). This is the exact
-//     predicate resolveAgent()'s `.includes(tag)` test enforces, reproduced without re-scanning every OTHER
-//     transcript per group. Preserves both documented seams: (1) a task id containing a sanitize()-stripped
-//     character fails the reconstructed-substring check (the tag as WRITTEN in the raw text differs from the
-//     sanitized reconstruction) — that transcript never becomes a winner-candidate for that group, matching
-//     resolveAgent()'s own '' return for it; (2) a first record naming TWO tags contributes TWO winner
-//     candidates (one per occurrence), so it can bind to BOTH groups exactly as `.includes()` would find it
-//     from either tag's own reconstructed string, even though only the FIRST occurrence feeds `.discovery`.
-function extractTagsFromText(text) {
-  const result = { discovery: null, winners: [] };
-  if (!text) return result;
-  const re = /3ROLE_TASK:(\S+) ROLE:(\S+)/g;
-  let m;
-  let first = true;
-  const seen = new Set();
-  while ((m = re.exec(text))) {
-    const rawTask = m[1];
-    const rawRole = m[2];
-    if (first) {
-      first = false;
-      const dTask = sanitize(rawTask);
-      if (dTask && RECORDABLE_ROLES.includes(rawRole)) result.discovery = { task: dTask, role: rawRole };
-    }
-    const sTask = sanitize(rawTask);
-    if (sTask && RECORDABLE_ROLES.includes(rawRole)) {
-      const reconstructed = '3ROLE_TASK:' + sTask + ' ROLE:' + rawRole;
-      if (text.includes(reconstructed)) {
-        const key = sTask + ' ' + rawRole;
-        if (!seen.has(key)) { seen.add(key); result.winners.push({ task: sTask, role: rawRole }); }
-      }
-    }
-  }
-  return result;
-}
-
-// #1851 D3/D6 — per-session INCREMENTAL CHECKPOINT sidecar for cmdReconcileSpawns. Dotted filename (hidden
-// from the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use, same precedent as the existing
-// `.reconcile-watermark`). Schema-versioned: an unreadable, corrupt, or schema-mismatched file is treated as
-// a COLD START (returns the SAME empty shape a genuinely-first-ever run would see) — never as "nothing to
-// do" (D6).
-const RECONCILE_CHECKPOINT_SCHEMA = 1;
-function reconcileCheckpointFile(sess) { return path.join(LEDGER_DIR, sess, '.reconcile-checkpoint.json'); }
-function readReconcileCheckpoint(sess) {
-  const empty = { schemaVersion: RECONCILE_CHECKPOINT_SCHEMA, runCount: 0, lastFullDeriveTs: 0, files: {} };
-  let raw;
-  try { raw = fs.readFileSync(reconcileCheckpointFile(sess), 'utf8'); } catch (e) { return empty; }
-  let j;
-  try { j = JSON.parse(raw); } catch (e) { return empty; }
-  if (!j || j.schemaVersion !== RECONCILE_CHECKPOINT_SCHEMA || typeof j.files !== 'object' || !j.files) return empty;
-  return {
-    schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
-    runCount: Number.isFinite(j.runCount) ? j.runCount : 0,
-    lastFullDeriveTs: Number.isFinite(j.lastFullDeriveTs) ? j.lastFullDeriveTs : 0,
-    files: j.files,
-  };
-}
-function writeReconcileCheckpoint(sess, data) {
-  try {
-    const file = reconcileCheckpointFile(sess);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(data));
-  } catch (e) { /* best-effort — a checkpoint write failure never blocks the sweep (D5/D6 fail-open) */ }
 }
 
 // #860 / #1575 D1: resolve the agentId of the NEWEST-mtime subagent transcript whose SPAWN RECORD (first
@@ -1043,11 +906,10 @@ function priorHasTerminalEvidence(prior) {
   if (prior.self_authored) return true;
   if (prior.oracle) return true;
   if (prior.agentId && prior.artifact_path) return true;
-  // #1947 (generalized #2075 AC-2) — a completed subprocess dispatch has no agentId (no Agent-subagent
-  // transcript exists), so the disjunct above is blind to it; a completed run (dispatch marker +
-  // artifact_path) is the same terminal-evidence SHAPE one provenance kind over (mirrors the
-  // agentId+artifact_path disjunct exactly) — provider-agnostic via isSubprocessDispatch().
-  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) return true;
+  // #1947 — a completed subprocess-openrouter dispatch has no agentId (no Agent-subagent transcript exists),
+  // so the disjunct above is blind to it; a completed run (dispatch marker + artifact_path) is the same
+  // terminal-evidence SHAPE one provenance kind over (mirrors the agentId+artifact_path disjunct exactly).
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) return true;
   return false;
 }
 
@@ -1063,8 +925,8 @@ function terminalEvidenceSummary(prior) {
   if (prior.agentId && prior.artifact_path) {
     parts.push('a completed run (agentId "' + prior.agentId + '" + artifact_path "' + prior.artifact_path + '")');
   }
-  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) {
-    parts.push('a completed ' + prior.dispatch + ' run (artifact_path "' + prior.artifact_path + '")');
+  if (prior.dispatch === 'subprocess-openrouter' && prior.artifact_path) {
+    parts.push('a completed subprocess-openrouter run (artifact_path "' + prior.artifact_path + '")');
   }
   return parts.join(', ');
 }
@@ -1334,23 +1196,14 @@ function classifySkip(e) {
 // inadmissible even when its served model happens to equal the SSOT slug.
 function escapeRegExp(s) { return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// #2075 D1/AC-2 — the ONE shared predicate for "is this a non-Agent-tool (subprocess) dispatch class?".
-// Replaces the ~5 per-site literal `dispatch === 'subprocess-openrouter'` comparisons the pre-#2075 file
-// re-derived at every call site (C2's diagnosis: the concept was re-implemented, never named once). A
-// prefix test rather than an enum: `subprocess-openrouter` is the only class that exists in production
-// today, but a future `subprocess-ollama` class (§D4) is recognized by every site that calls this with ZERO
-// further edits (AC-3's provider-agnosticism proof) — the class boundary is "not an Agent-tool spawn",
-// never a specific vendor name.
-function isSubprocessDispatch(v) { return typeof v === 'string' && v.indexOf('subprocess-') === 0; }
-
-// Fresh SSOT read: is this role's SEAT declared a subprocess (non-Agent-tool) dispatch right now? Returns
+// Fresh SSOT read: is this role's SEAT declared subprocess-openrouter dispatch right now? Returns
 // {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
 // of those cases must fall through to the ordinary agentId arm, never silently admit the weak arm.
 function seatDispatchIsSubprocess(role) {
   const routesLoaded = loadRoutesConfig();
   if (!routesLoaded.ok) return { ok: false, seat: null };
   const seat = (routesLoaded.routes.seats || {})[role];
-  if (!seat || !isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
+  if (!seat || seat.dispatch !== 'subprocess-openrouter') return { ok: false, seat: null };
   return { ok: true, seat };
 }
 
@@ -1434,7 +1287,7 @@ function subprocessFirstRecordBound(firstText, task, role, nonce) {
 //   ''    -> admissible AND fully verified -> treat as a pass.
 //   <str> -> admissible but verification FAILED -> this string is the block reason.
 function checkSubprocessProvenance(role, e, session, task) {
-  if (!e || !isSubprocessDispatch(e.dispatch)) return null;
+  if (!e || e.dispatch !== 'subprocess-openrouter') return null;
   const decl = seatDispatchIsSubprocess(role);
   if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
 
@@ -1483,97 +1336,6 @@ function checkSubprocessProvenance(role, e, session, task) {
     return 'executor artifact_path missing (PR URL / commit / branch string)';
   }
   return '';   // admissible + fully verified -> pass.
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
-// #2075 Phase 1 — D1's shared Provenance Record primitive: ONE strength lattice (E1 > E2 > E3), consulted by
-// every reader AND writer instead of ~14 sites each re-deriving "which vendor produced this row?" ad hoc.
-//
-// Two DISTINCT "verified kind" predicates on purpose (R5-N3 — the design's own round-5 review named this
-// split; AC-11's own protection-vs-admissibility test is the binary oracle that forces it):
-//   - computeVerifiedKind()            — the ADMISSIBILITY triple (does this row's evidence fully verify,
-//                                         including served-model equality?). Used by provenance-kind's
-//                                         REPORTING formula (AC-1/AC-24) — never by a write-side guard.
-//   - computeVerifiedKindForProtection() — the narrower PROTECTION predicate (execution record exists AND
-//                                         its first record is tag+nonce bound — served-model equality is an
-//                                         admissibility concern, not a protection one). Used ONLY to decide
-//                                         whether an E3-derived background sweep (reconcile-spawns /
-//                                         refresh-models) may write over a row at all (§D5(c), AC-9/AC-11a).
-// Neither predicate reads the STORED run_kind label — both recompute fresh from the row's own evidence every
-// time (agentResolves/agentBoundToTag for E1, the transcript-existence+binding check for E2), so a forged or
-// stale stored label can never inflate what a row is actually proven to be.
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
-
-// ADMISSIBILITY-scoped verified kind: 'E1' | 'E2' | 'none'. E1 requires a resolving AND spawn-record-bound
-// agentId (never resolveAgent()'s newest-mtime search — that is E3, a guess, never "verified"). E2 reuses
-// checkSubprocessProvenance UNCHANGED (the #2051 discipline: one evaluator, no mirror) — the full triple,
-// including served-model equality.
-function computeVerifiedKind(role, row, session, task) {
-  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
-    return 'E1';
-  }
-  if (row && isSubprocessDispatch(row.dispatch) && checkSubprocessProvenance(role, row, session, task) === '') {
-    return 'E2';
-  }
-  return 'none';
-}
-
-// PROTECTION-scoped verified kind: 'E1' | 'E2' | 'none'. Same E1 test as above (a resolving+bound agentId is
-// unconditionally strong evidence for both questions). The E2 arm is DELIBERATELY narrower than
-// checkSubprocessProvenance's full admissibility triple — it does NOT require served-model equality, only
-// that the row's own execution record exists and its first record is tag+nonce bound — because an E2 row
-// whose model happens to be unreadable is still real, verified evidence that must not be erased by a guess
-// (AC-11's honest-blank-beats-confidently-wrong split; R5-N3).
-function computeVerifiedKindForProtection(role, row, session, task) {
-  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
-    return 'E1';
-  }
-  if (row && isSubprocessDispatch(row.dispatch)) {
-    const decl = seatDispatchIsSubprocess(role);
-    if (decl.ok) {
-      const info = subprocessTranscriptInfo(row.transcript_path);
-      if (info.exists && subprocessFirstRecordBound(info.firstText, task, role, row.nonce)) return 'E2';
-    }
-  }
-  return 'none';
-}
-
-// §D1 storage-layer rank order — witnessed(3) > bound(2) > inferred(1) > unset/absent(0). Governs the
-// write-once clamp in overlayAppend AND provenance-kind's REPORTING formula below (min(stored, verified)) —
-// the ONLY two consumers of the stored run_kind label; every write-side GUARD in this file reads verified
-// kind directly (see computeVerifiedKind[ForProtection] above), never this label.
-const RUN_KIND_RANK = { witnessed: 3, bound: 2, inferred: 1 };
-const KIND_LABEL_BY_RANK = { 3: 'E1', 2: 'E2', 1: 'E3', 0: 'none' };
-function verifiedKindRank(label) { return label === 'E1' ? 3 : (label === 'E2' ? 2 : 0); }
-
-// AC-1's REPORTING construction: min(stored run_kind, verified kind). A row with NO stored run_kind at all
-// (a pre-#2075 "legacy" row — AC-23) reports its verified kind directly, suffixed " legacy" so a consumer
-// can tell a classified-by-inference row from a genuinely stored one — never suffixed for a 'none' verdict
-// (there is nothing to distinguish a legacy 'none' from a stored one; AC-1's own "bare spawn placeholder"
-// arm asserts a bare 'none', no suffix).
-function provenanceKindOf(role, row, session, task) {
-  const verified = computeVerifiedKind(role, row, session, task);
-  if (!row || !('run_kind' in row) || row.run_kind == null) {
-    return verified === 'none' ? 'none' : (verified + ' legacy');
-  }
-  const storedRank = RUN_KIND_RANK[row.run_kind] || 0;
-  const rank = Math.min(storedRank, verifiedKindRank(verified));
-  return KIND_LABEL_BY_RANK[rank];
-}
-
-// provenance-kind --session S --task T --role R (#2075 AC-1). Prints exactly one of E1|E2|E3|none (optionally
-// " legacy"-suffixed) on stdout, exit 0, for every row shape — including a missing row (no line at all for
-// this role), which reports 'none'.
-function cmdProvenanceKind(o) {
-  const session = o.session, task = o.task, role = o.role;
-  if (!session || !task || !role) { console.error('provenance-kind: --session, --task, --role are required'); process.exit(2); }
-  const file = ledgerFile(session, task);
-  let lines = [];
-  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); } catch (e) { /* no ledger yet */ }
-  let row = null;
-  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) row = j; } catch (e) { /* skip */ } }
-  console.log(provenanceKindOf(role, row, session, task));
-  process.exit(0);
 }
 
 // Returns null when the role is satisfied, else a problem string. `opts.rejectVacuousOracle` (#1276) — set
@@ -1969,26 +1731,6 @@ function overlayAppend(session, task, role, fields) {
   if ('dispatch' in fields) entry.dispatch = fields.dispatch;
   if ('transcript_path' in fields) entry.transcript_path = fields.transcript_path;
   if ('nonce' in fields) entry.nonce = fields.nonce;
-  // #2075 D1 — run_id is an ordinary own-key overlay (same discipline as every field above): E1 -> agentId,
-  // E2 -> nonce, E3 -> absent. run_source is diagnostic-only, same discipline, never consulted by a gate.
-  if ('run_id' in fields) entry.run_id = fields.run_id;
-  if ('run_source' in fields) entry.run_source = fields.run_source;
-  // #2075 D1/§D5(a) round-4 storage-layer fix (R3-B1/R3-B2) — run_kind is WRITE-ONCE / monotone-non-
-  // decreasing, NOT an ordinary last-writer-wins overlay: `entry.run_kind` at this point already carries the
-  // PRIOR line's stored value (composed onto `entry` from `prior` above, for a same-round merge) or nothing
-  // (a genuinely new round, isNewRound above — that row's first run_kind write is legitimately unconstrained,
-  // matching the "round split runs first" ordering §D5(a) requires). An incoming write whose rank is <= the
-  // row's CURRENT stored rank is a field-level no-op — every OTHER field this call carries still merges
-  // exactly as before, and the append itself still exits 0 (submitting a stale/weaker claim is not an error).
-  // This is what closes R3-B1/R3-B2 at the storage layer: no later bare `--run-kind inferred` append can ever
-  // push an already-classified row's stored label back down, so §D5(a)/(c)'s VERIFIED-kind-only guards never
-  // need to defend against a demotion trick that reaches them through the stored field.
-  if ('run_kind' in fields) {
-    const incomingRank = RUN_KIND_RANK[fields.run_kind] || 0;
-    const existingRank = ('run_kind' in entry) ? (RUN_KIND_RANK[entry.run_kind] || 0) : 0;
-    if (!('run_kind' in entry) || incomingRank > existingRank) entry.run_kind = fields.run_kind;
-    // else: no-op — `entry.run_kind` is left at its current (higher-or-equal) value.
-  }
   // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
   // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
   // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
@@ -2030,10 +1772,6 @@ function overlayAppend(session, task, role, fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
     delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
-    // #2075 D1 — run_id/run_kind/run_source join the clear-list too: a skip line must not carry a stale
-    // claimed provenance kind (join the SAME reasoning as modelVersion/dispatch above — these are provenance
-    // OF a real run, and a skip is a declaration that no run happened).
-    delete entry.run_id; delete entry.run_kind; delete entry.run_source;
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -2059,14 +1797,6 @@ function cmdAppend(o) {
   if ('dispatch' in o) fields.dispatch = o.dispatch;
   if ('transcript' in o) fields.transcript_path = normalizeArtifact(o.transcript);
   if ('nonce' in o) fields.nonce = o.nonce;
-  // #2075 Phase 1, D1 — the provenance-kind fields. Written ONLY by the writer that obtained the identity
-  // (three-role-subagent-ledger.sh -> witnessed; the dispatch helper -> bound; cmdReconcileSpawns /
-  // cmdRefreshModels -> inferred, stamped internally below, never via this flag). --run-kind is WRITE-ONCE /
-  // monotone-non-decreasing under overlayAppend (see its own comment there); --run-id/--run-source are
-  // ordinary own-key overlays.
-  if ('run-kind' in o) fields.run_kind = o['run-kind'];
-  if ('run-id' in o) fields.run_id = o['run-id'];
-  if ('run-source' in o) fields.run_source = o['run-source'];
   // #1100 item 3: provenance — a line authored BY the role's own agent (its SubagentStop scan saw the agent
   // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
   // `--self-authored` (no value) is true, `--self-authored false` is false.
@@ -2378,151 +2108,6 @@ function cmdGatePlanReview(o) {
   process.exit(2);
 }
 
-// ── #1936 — read-side history lanes (STRICTLY ADDITIVE; `byRole` selection, checkRole, and the ENTIRE
-// write path — cmdAppend, both terminal-evidence clauses, round-boundary logic — are UNTOUCHED). `check`
-// today reads only the byRole-selected (last-parse-wins) row per role and references neither `.verdict` nor
-// `.closedAt` (see the plan's Context section). These two lanes read PAST that single row, across each
-// role's FULL history, so a content-free row (bare spawn, artifact-only re-point, unattributed verdict
-// overlay) can never silently bury a recorded review outcome. Default-ON, no opt-in flag, no kill-switch,
-// no bypass token (round-1 decision, confirmed by four plan-review rounds): the observed failure was an
-// orchestrator trusting a bare `check` OK, and the remedy for a legitimate block is always available —
-// spawn a fresh review, whose sanctioned three-write lifecycle (spawn-shaped agent append, mid-turn
-// self-append, stop-shaped closed-at append) both records honestly and satisfies the read precondition
-// with no extra ceremony (see the plan's §"The sanctioned supersession flow").
-
-// Check-lane affirmative set = AFFIRMATIVE_VERDICTS (:844, UNCHANGED — it keeps gating cmdInherit and the
-// executor-spawn gate at their current strictness) PLUS `PASS-WITH-FIXES`, as a SEPARATE check-lane
-// constant (round-1 review N2, corpus-measured: 12 effective PASS-WITH-FIXES closes across 9 tasks, 6 of
-// which pass `check` today and would false-block under `:844` verbatim). Still an ALLOWLIST (D3):
-// NEEDS-WORK, SHIP-WITH-FIXES, BLOCK-resolved, REVISE, typos, empty — all block.
-const CHECK_LANE_AFFIRMATIVE = new Set([...AFFIRMATIVE_VERDICTS, 'PASS-WITH-FIXES']);
-
-// Parse an ISO-ish closedAt string to epoch MILLISECONDS (round-3 review N-d): the corpus provably carries
-// mixed sub-second/second precision that inverts lexicographically inside a shared second
-// (`"...:20.500Z" < "...:20Z"` as strings while 20.500s > 20s as instants) — so every closedAt comparison in
-// both lanes below compares PARSED epoch values, never strings. Absent/unparseable -> null, treated as
-// ABSENT throughout (never a false "equal" or a string-order artifact).
-function parseClosedAtMs(v) {
-  if (!v) return null;
-  const t = Date.parse(String(v));
-  return Number.isNaN(t) ? null : t;
-}
-
-// Every row for ONE role, in ledger PARSE ORDER (file top-to-bottom) — the role's FULL history, never just
-// the byRole-selected (last-parse-wins) row. Unparseable lines are silently skipped (mirrors the byRole
-// build loop's own `catch (e) { /* skip */ }`). File order is chronological within a role by construction
-// (overlayAppend always retains an older round's row, verbatim, ahead of the new/merged row it writes —
-// see the plan's Context section and the round-3/round-4 reviewers' independent fixture proofs).
-function rowsForRole(lines, role) {
-  const out = [];
-  for (const ln of lines) {
-    try { const j = JSON.parse(ln); if (j && j.role === role) out.push(j); } catch (e) { /* skip */ }
-  }
-  return out;
-}
-
-// Verdict-BEARING rows only (a truthy `.verdict` field). A bare spawn row, an artifact-only re-point, or a
-// provenance/oracle-only row carries no verdict and is read PAST — never treated as evidence by Lane B. A
-// row carrying BOTH a verdict and an oracle is verdict-bearing (the recorded decision outranks a token-file
-// — the plan's Lane B bullet); nothing here inspects `.oracle` at all.
-function verdictRows(rows) {
-  return rows.filter((r) => r && r.verdict);
-}
-
-// The monotonicity ruling (Intent §"The monotonicity ruling"): a later verdict-bearing row supersedes a
-// currently-effective NEGATIVE verdict ONLY when it carries an agentId DISTINCT from the negative row's AND
-// a closedAt STRICTLY newer than the negative row's (parsed-epoch comparison; equal is NOT strictly newer
-// -> refuse). Absence semantics: the superseding row MUST itself carry both an agentId and a closedAt that
-// PARSES — an absent/unparseable value on the superseding side can never supersede (an unparseable
-// superseder is treated exactly like an absent one). A negative row lacking either field makes that half
-// trivially satisfied (an attributed, punched-out superseder is distinct/newer than nothing by
-// construction) — this is what lets AC-14's raw hand-written shapes and the real #1821 fixture (whose bare
-// shield row is never itself the negative — the negative is the FAIL row, which always carries both fields
-// in the corpus) resolve correctly without a separate code path.
-function supersedesNegative(candidate, negative) {
-  if (!candidate || !candidate.agentId) return false;
-  const candMs = parseClosedAtMs(candidate.closedAt);
-  if (candMs === null) return false;
-  const distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
-  if (!distinct) return false;
-  const negMs = parseClosedAtMs(negative.closedAt);
-  const newer = (negMs === null) ? true : (candMs > negMs);
-  return newer;
-}
-
-// Walk a role's verdict-bearing rows OLDEST -> NEWEST, folding them into ONE effective verdict row per the
-// ruling above. A later row supersedes a currently-effective AFFIRMATIVE verdict UNCONDITIONALLY (newest
-// wins); it supersedes a currently-effective NEGATIVE verdict only per supersedesNegative() above — otherwise
-// the row is read PAST and the negative stays effective. Returns null when the role carries NO
-// verdict-bearing row at all (Lane B stays SILENT — today's honest fail-open residual, pinned by AC-7(c)).
-function effectiveVerdictRow(vrows) {
-  let eff = null;
-  for (const row of vrows) {
-    if (!eff) { eff = row; continue; }
-    if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) { eff = row; continue; }   // affirmative -> unconditional newest-wins
-    if (supersedesNegative(row, eff)) eff = row;                            // negative -> gated supersession
-    // else: read PAST this row, keep the negative effective.
-  }
-  return eff;
-}
-
-// Lane B — outcome MONOTONICITY, for ONE review-pair role (execution-review OR plan-review — the shield is
-// role-symmetric, round-2 review N1). Returns null (silent) when the role carries no verdict anywhere in its
-// history, or its effective verdict is check-lane affirmative; else a `NEGATIVE-VERDICT:` problem string.
-function laneBProblem(role, lines) {
-  const vrows = verdictRows(rowsForRole(lines, role));
-  if (!vrows.length) return null;                        // no verdict on ANY row of the role -> silent (AC-7(c)).
-  const eff = effectiveVerdictRow(vrows);
-  if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) return null;
-  return 'NEGATIVE-VERDICT: role ' + role + ' — effective recorded verdict is "' + eff.verdict + '" (agentId ' +
-    (eff.agentId || '<none>') + ', ' + (eff.closedAt ? 'closedAt ' + eff.closedAt : 'no closedAt') +
-    ') — a recorded negative verdict is superseded only by a later verdict row carrying an agentId DISTINCT ' +
-    'from the negative row\'s AND a closedAt STRICTLY newer than the negative row\'s. Sanctioned remedy: ' +
-    'spawn a fresh ' + role + ' (the three-write lifecycle records + supersedes with no extra ceremony).';
-}
-
-// Lane A — round-aware FRESHNESS (rebuilt per B3; never a raw timestamp inequality). For a (subject ->
-// review) pair, a `STALE-REVIEW:` problem fires ONLY when the ledger shows a genuinely NEW subject round
-// left unreviewed — ALL THREE conditions below. Any missing/unparseable input -> that condition can't hold
-// -> fail OPEN (silent) — never a false block on an environment can't-tell.
-function laneAProblem(subjectRole, reviewRole, byRole, lines) {
-  // (1) the review role's authoritative row carries closedAt.
-  const review = byRole[reviewRole];
-  if (!review || !review.closedAt) return null;
-  const reviewMs = parseClosedAtMs(review.closedAt);
-  if (reviewMs === null) return null;
-
-  // (2) the subject role's history has >=2 rows, and its authoritative row carries an agentId AND a
-  //     closedAt STRICTLY newer than the review's closedAt (equal allows — same parsed-epoch semantics as
-  //     Lane B).
-  const subjectAuth = byRole[subjectRole];
-  if (!subjectAuth || !subjectAuth.agentId || !subjectAuth.closedAt) return null;
-  const subjMs = parseClosedAtMs(subjectAuth.closedAt);
-  if (subjMs === null) return null;
-  if (!(subjMs > reviewMs)) return null;                 // equal or older -> not a newer unreviewed round.
-
-  const subjectRows = rowsForRole(lines, subjectRole);
-  if (subjectRows.length < 2) return null;                // no second round exists to have been left unreviewed
-                                                            // (kills the #1760/#1719 resume-re-close class — a
-                                                            // same-agent SubagentStop re-append merges onto the
-                                                            // SAME row rather than creating a second one).
-
-  // (3) an OLDER subject row exists with a DISTINCT agentId whose closedAt is at-or-before the review's
-  //     closedAt — the round the review could actually have covered.
-  const olderRows = subjectRows.slice(0, -1);
-  const hasCoveredRound = olderRows.some((r) => {
-    if (!r || !r.agentId || r.agentId === subjectAuth.agentId) return false;
-    const ms = parseClosedAtMs(r.closedAt);
-    if (ms === null) return false;
-    return ms <= reviewMs;
-  });
-  if (!hasCoveredRound) return null;
-
-  return 'STALE-REVIEW: ' + reviewRole + ' (closedAt ' + review.closedAt + ') is stale against a newer ' +
-    subjectRole + ' round (agentId ' + subjectAuth.agentId + ', closedAt ' + subjectAuth.closedAt +
-    ') that the review could not have covered — spawn a fresh ' + reviewRole + ' to cover it.';
-}
-
 function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
@@ -2531,7 +2116,7 @@ function cmdCheck(o) {
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
   catch (e) {
     console.log('BLOCK: no role-ledger found for task ' + sanitize(task) + ' in this session (' + file +
-      '). Append a ledger line per role: node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> ...');
+      '). Append a ledger line per role: node hooks/3role-ledger.mjs append --session <sid> --task <id> --role <role> ...');
     process.exit(2);
   }
   const byRole = {};
@@ -2553,27 +2138,11 @@ function cmdCheck(o) {
     if (r) { problems.push(r); continue; }
     // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
     // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
-    // subprocess arm, not the ordinary agentId arm. #2075 AC-3: label the ROW's actual dispatch value, never
-    // a hardcoded vendor literal — a subprocess-ollama row must not be mislabeled subprocess-openrouter.
+    // subprocess-openrouter arm, not the ordinary agentId arm.
     if (checkSubprocessProvenance(role, e, session, task) === '') {
       const decl = seatDispatchIsSubprocess(role);
-      dispatchLabels.push('role=' + role + ' dispatch=' + e.dispatch + ' model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
+      dispatchLabels.push('role=' + role + ' dispatch=subprocess-openrouter model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
     }
-  }
-  // #1936 -- Lane B (outcome monotonicity) + Lane A (round-aware freshness). Read-side only, strictly
-  // additive: both lanes only ADD problems on top of whatever the base existence/checkRole loop above
-  // already found (or didn't) -- they never suppress or loosen an existing test, and they run unconditionally
-  // (no opt-in flag) for both review-pair roles / both subject-review pairs. Each lane is independently
-  // silent on any missing/unparseable/absent input (fail-open by design -- see each function's doc comment).
-  for (const role of ['execution-review', 'plan-review']) {
-    const laneB = laneBProblem(role, lines);
-    if (laneB) problems.push(laneB);
-  }
-  {
-    const laneAExec = laneAProblem('executor', 'execution-review', byRole, lines);
-    if (laneAExec) problems.push(laneAExec);
-    const laneAPlan = laneAProblem('planner', 'plan-review', byRole, lines);
-    if (laneAPlan) problems.push(laneAPlan);
   }
   // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
   // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.
@@ -2802,16 +2371,6 @@ function cmdCheck(o) {
   if (requireProv) {
     for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
   }
-  // #2075 AC-23 — legacy-row surfacing: ALWAYS-ON (never opt-in, never blocking), the drift detector for an
-  // unpatched writer. A required-role row with NO stored `run_kind` key at all predates this design (or was
-  // written by a writer that has not been taught to stamp it yet) — its kind is still computed correctly
-  // (from live, verified evidence — see provenanceKindOf's legacy branch), this is visibility only.
-  const legacyRoles = [];
-  for (const role of REQUIRED_ROLES) {
-    const e = byRole[role];
-    if (!e || ('skip_reason' in e)) continue;   // missing handled above; a skip has no run to classify
-    if (!('run_kind' in e)) legacyRoles.push(role);
-  }
   // #1509 Leg A — TRACKED, not merely present. Opt-in via --enforce-tracked-artifacts (only the completion
   // gate passes it; base `check` stays existence-only — AC-3). Role-keyed HARD block for the three disk-path
   // roles; executor is exempt by role but its disk-path row (if any) is surfaced as a NOTE, never blocked.
@@ -2887,11 +2446,6 @@ function cmdCheck(o) {
     console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
       ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
   }
-  if (legacyRoles.length) {
-    console.log('PROVENANCE-LEGACY: ' + legacyRoles.join(', ') +
-      ' — no stored run_kind (pre-#2075 row, or a writer not yet taught to stamp it); kind is computed fresh ' +
-      "from this row's live, verified evidence — see `provenance-kind` — never from a stored label.");
-  }
   // #1989 — ROUTE-BYPASS trailing-edge detector: an always-on, pure-output advisory (exit code UNCHANGED — the
   // model-policy legs own blocking; this is visibility, not a gate) printed on the roles-satisfied path, sibling
   // of DISPATCH:/NOTE:/NOTE-EXECUTOR:/PROVENANCE:. Fires PER required role when ALL hold: (1) the routes SSOT,
@@ -2926,7 +2480,7 @@ function cmdCheck(o) {
     let stampSurvives = false;
     for (const ln of lines) {
       let j; try { j = JSON.parse(ln); } catch (er) { continue; }
-      if (j && j.role === role && isSubprocessDispatch(j.dispatch)) { stampSurvives = true; break; }
+      if (j && j.role === role && j.dispatch === 'subprocess-openrouter') { stampSurvives = true; break; }
     }
     if (stampSurvives) continue;
     const seatModel = (decl.seat && decl.seat.model) || '<unknown>';
@@ -3027,19 +2581,9 @@ function cmdRefreshModels(o) {
         if (!e) continue;                       // no line for this role yet -> nothing to refresh
         if ('skip_reason' in e) continue;        // inline-skip -> no transcript to read
         if (e.modelVersion) continue;            // ABSENT->PRESENT ONLY: already has a model, never rewrite
-        // #2075 D5(c) — E3 CONTAINMENT (AC-9/AC-11a): a row already carrying protection-verified E2 evidence
-        // (a subprocess dispatch, no agentId of its own) must not have its blank modelVersion filled from an
-        // unrelated sibling — resolveModelFields('' explicitAgent) would fall back to a blind cross-session
-        // search precisely for this row shape. A verified-E1 row is unaffected (its own e.agentId is passed
-        // explicitly below, so no search ever runs for it) — AC-10's ordinary-row backfill keeps working.
-        if (computeVerifiedKindForProtection(role, e, sess, task) === 'E2') continue;
         scanned++;
         const modelFields = resolveModelFields(sess, task, role, e.agentId || '');
         if (!modelFields.modelVersion) continue; // transcript still carries no message.model line yet -> too early
-        // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (same
-        // reasoning as cmdReconcileSpawns above; D1 names resolveModelFields's own callers explicitly).
-        modelFields.run_kind = 'inferred';
-        modelFields.run_source = 'refresh-models';
         overlayAppend(sess, task, role, modelFields);
         changed++;
       }
@@ -3079,11 +2623,9 @@ function transcriptSelfAuthored(file, role) {
   return false;
 }
 
-// #1229 / #1851: reconcile-spawns --session S — see the file-header doc block near the top of this file
-// (the "reconcile-spawns" subcommand entry) for the full design rationale, including the #1851 incremental
-// rewrite (D1 hoist / D2 bounded read / D3 per-file checkpoint / D4 correctness / D5 wall-clock budget / D6
-// no-silent-loss). Short version: walks every subagent transcript for the session, discovers tagged (task,
-// role) pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
+// #1229: reconcile-spawns --session S — MISSING-ROW backfill (see the file-header doc block above for the
+// full design rationale). Walks every subagent transcript for the session, discovers tagged (task, role)
+// pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
 // agentId, modelVersion/modelTier, self_authored. Never touches artifact_path/closedAt/verdict/skip_reason.
 // ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides.
 function cmdReconcileSpawns(o) {
@@ -3091,22 +2633,15 @@ function cmdReconcileSpawns(o) {
     const session = o.session;
     if (!session) { console.log('OK reconcile-spawns: no --session given (fail-open, nothing to do)'); process.exit(0); }
     const sess = sanitize(session);
-    const startTs = Date.now();
-    const budgetMsRaw = Number(process.env.RECONCILE_SPAWNS_BUDGET_MS);
-    const budgetMs = Number.isFinite(budgetMsRaw) && budgetMsRaw >= 0 ? budgetMsRaw : 20000; // 0 is a valid ("truncate immediately") value -- must not fall through `||`'s falsy-zero coercion
-    const fullRederiveEveryN = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N);
-    const FULL_REDERIVE_EVERY_N = Number.isFinite(fullRederiveEveryN) && fullRederiveEveryN > 0 ? fullRederiveEveryN : 20;
-    const fullRederiveMaxAgeMs = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS);
-    const FULL_REDERIVE_MAX_AGE_MS = Number.isFinite(fullRederiveMaxAgeMs) && fullRederiveMaxAgeMs > 0 ? fullRederiveMaxAgeMs : (6 * 60 * 60 * 1000);
 
     let slugs = [];
     try { slugs = fs.readdirSync(PROJECTS_ROOT); }
     catch (e) { console.log('OK reconcile-spawns: no projects root'); process.exit(0); }
 
-    // Discovery pass (unchanged cost model -- cheap, readdir + stat only). Now ALSO captures each transcript's
-    // (dev, ino) file identity (the D3 checkpoint cache key).
+    // Discover every subagent transcript for this session across all project slugs (cheap: readdir + stat
+    // only in this pass — the per-transcript READ happens below, gated by the watermark short-circuit).
     let newestMtime = 0;
-    const transcripts = []; // {agentId, file, mtimeMs, dev, ino, size}
+    const transcripts = []; // {agentId, file, mtimeMs}
     for (const slug of slugs) {
       const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
       let files = [];
@@ -3118,96 +2653,50 @@ function cmdReconcileSpawns(o) {
         let st;
         try { st = fs.statSync(f); } catch (e) { continue; }
         if (!st.isFile()) continue;
-        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, size: st.size });
+        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs });
         if (st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
       }
     }
     if (transcripts.length === 0) { console.log('OK reconcile-spawns: no subagent transcripts for session ' + sess); process.exit(0); }
 
-    // #1851 D6 -- an unreadable/corrupt/schema-mismatched sidecar fails open to the SAME empty shape a
-    // genuinely-first-ever run sees (readReconcileCheckpoint's own contract) -- coldStart below is true in
-    // both cases, forcing a full re-derivation rather than "nothing to do".
-    const checkpoint = readReconcileCheckpoint(sess);
-    const coldStart = Object.keys(checkpoint.files).length === 0;
-    const nextRunCount = checkpoint.runCount + 1;
-    const dueByCount = (nextRunCount % FULL_REDERIVE_EVERY_N) === 0;
-    const dueByAge = checkpoint.lastFullDeriveTs === 0 || (Date.now() - checkpoint.lastFullDeriveTs) > FULL_REDERIVE_MAX_AGE_MS;
-    const dueForFullRederive = coldStart || dueByCount || dueByAge; // #1851 D6 periodic belt-and-braces (AC5)
-
     // Cheap per-session watermark: short-circuits to the readdir/stat scan above (no per-transcript read, no
-    // writes) when no transcript has advanced past the last sweep AND a periodic full re-derive isn't due
-    // (a full re-derive must be able to run even on an otherwise-quiescent session, per D6).
+    // writes) when no transcript has advanced past the last sweep. Stored as a hidden file inside the
+    // session's ledger dir (kept out of the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use).
     const watermarkFile = path.join(LEDGER_DIR, sess, '.reconcile-watermark');
     let lastWatermark = 0;
     try { lastWatermark = Number(fs.readFileSync(watermarkFile, 'utf8').trim()) || 0; } catch (e) { lastWatermark = 0; }
-    if (!dueForFullRederive && newestMtime > 0 && newestMtime <= lastWatermark) {
+    if (newestMtime > 0 && newestMtime <= lastWatermark) {
       console.log('OK reconcile-spawns: session=' + sess + ' no new transcript activity since last sweep (watermark)');
       process.exit(0);
     }
 
-    // #1851 D1/D2/D3/D5 -- the ONE pass that replaces the old per-group resolveAgent() re-scan. Oldest-first
-    // (D5: strict forward progress under a wall-clock budget -- if truncated, the OLDEST unprocessed
-    // transcripts are exactly what the NEXT invocation picks up first). For each transcript: reuse its
-    // per-file checkpoint (D3) when NOT due a full re-derive AND the file's identity is unchanged AND its
-    // size has not SHRUNK (D3: a shrink means possible truncation/rewrite -> re-derive); otherwise a bounded
-    // D2 read + D1 tag extraction. Builds `groups` (every known (task, role) pair -- D6: never skipped just
-    // because its transcript didn't change) and `tagWinners` (the newest-mtime candidate per group, replacing
-    // resolveAgent()'s per-group corpus re-scan with a Map lookup).
-    const sortedTranscripts = transcripts.slice().sort((a, b) => a.mtimeMs - b.mtimeMs);
-    const newFilesCache = Object.assign({}, checkpoint.files); // seed with prior knowledge (D5 partial-progress safety)
-    const groups = new Set(); // "task role"
-    const tagWinners = new Map(); // "task role" -> {agentId, mtimeMs}
-    const transcriptByAgentId = new Map();
-    for (const t of transcripts) transcriptByAgentId.set(t.agentId, t);
-
-    let firstRecordsRead = 0;
-    let firstRecordsCached = 0;
-    let truncated = false;
-    for (const t of sortedTranscripts) {
-      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
-      const identity = t.dev + ':' + t.ino;
-      const cachedEntry = !dueForFullRederive ? checkpoint.files[identity] : undefined;
-      let discovery, winners;
-      if (cachedEntry && t.size >= cachedEntry.size) {
-        discovery = cachedEntry.discovery || null;
-        winners = Array.isArray(cachedEntry.winners) ? cachedEntry.winners : [];
-        firstRecordsCached++;
-      } else {
-        const line = readFirstNonEmptyLine(t.file);
-        const text = firstRecordTextFromLine(line);
-        const extracted = extractTagsFromText(text);
-        discovery = extracted.discovery;
-        winners = extracted.winners;
-        firstRecordsRead++;
-      }
-      newFilesCache[identity] = { size: t.size, discovery, winners };
-      if (discovery) groups.add(discovery.task + ' ' + discovery.role);
-      for (const w of winners) {
-        const key = w.task + ' ' + w.role;
-        const cur = tagWinners.get(key);
-        if (!cur || t.mtimeMs > cur.mtimeMs) tagWinners.set(key, { agentId: t.agentId, mtimeMs: t.mtimeMs });
-      }
+    // Extract + validate the spawn-record tag per transcript (reuse firstRecordText() — the SAME predicate
+    // tagFromSubagentTranscript()/resolveAgent() use — never a new/looser parser). Role is validated against
+    // RECORDABLE_ROLES (the SAME enum cmdAppend's own role guard uses) so a malformed `ROLE:foobar` tag is
+    // REJECTED rather than filed as a garbage-role row.
+    const groups = new Set(); // "task role"
+    for (const t of transcripts) {
+      let content;
+      try { content = fs.readFileSync(t.file, 'utf8'); } catch (e) { continue; }
+      const text = firstRecordText(content);
+      if (!text) continue;
+      const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
+      if (!m) continue;
+      const task = sanitize(m[1]);
+      const role = m[2];
+      if (!task || !RECORDABLE_ROLES.includes(role)) continue;
+      groups.add(task + ' ' + role);
     }
 
-    // #1851 D1/D4/D6 -- group -> row loop. Same per-row semantics as before (never disturb an inline-skip row
-    // or a row already bound to a DIFFERENT agentId -- the #1580 round-boundary trap), but the winner is now a
-    // Map lookup (tagWinners), never a resolveAgent() corpus re-scan. modelVersion resolution is now GATED on
-    // `!prior.modelVersion` (D1 item 5 fix -- previously unconditional); self_authored keeps its existing gate.
     let scanned = 0;
-    let groupsEvaluated = 0;
     let changed = 0;
-    let laterRecordRederives = 0;
-    let anyRowFailed = false;
-    const groupsArr = Array.from(groups);
-    for (const key of groupsArr) {
-      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
-      const [task, role] = key.split(' ');
-      groupsEvaluated++;
+    for (const key of groups) {
+      const [task, role] = key.split(' ');
       scanned++;
-
-      const winner = tagWinners.get(key);
-      const agentId = winner ? winner.agentId : '';
-      if (!agentId) continue; // fail-open: matches resolveAgent()'s own '' return for an unbound group (D1 seam).
+      // Authoritative agentId: reuse resolveAgent()'s own newest-mtime resolver (the #860 stale-probe
+      // defense) rather than re-deriving a winner from the walk above.
+      const agentId = resolveAgent(sess, task, role);
+      if (!agentId) continue; // fail-open: shouldn't happen given groups was built from a real tagged hit.
 
       const file = ledgerFile(sess, task);
       let lines = [];
@@ -3217,85 +2706,40 @@ function cmdReconcileSpawns(o) {
 
       // Never disturb an inline-skip row (mirrors cmdRefreshModels's own `if ('skip_reason' in e) continue`).
       if (prior && ('skip_reason' in prior)) continue;
-      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) --
+      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) —
       // write ONLY when the row is absent, its agentId is absent, or its agentId equals the resolved one.
       if (prior && prior.agentId && prior.agentId !== agentId) continue;
-      // #2075 D5(c) — E3 CONTAINMENT (fixes B16, the ~30s corruption timer). `agentId` above is ALWAYS
-      // E3-derived (a blind, cross-session, newest-mtime SEARCH — resolveAgent()'s own contract), so the one
-      // genuine corruption vector is a row that ALREADY carries protection-verified E2 evidence (a subprocess
-      // dispatch with no agentId of its own): this sweep's search could otherwise find an unrelated Anthropic
-      // sibling's transcript and misattribute its model onto this row (measured live, cairn 2026-07-28:270).
-      // A row already carrying a resolving+bound agentId (verified E1) is UNAFFECTED by this guard — its own
-      // agentId is passed explicitly to resolveModelFields below, so no blind search ever runs for it (AC-10's
-      // ordinary-Anthropic-row backfill keeps working unchanged).
-      if (computeVerifiedKindForProtection(role, prior, sess, task) === 'E2') continue;
 
       // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
-      // call at all (idempotency -- a bare re-append would still refresh `ts` and break byte-identity).
+      // call at all (idempotency — AC-2: a bare re-append would still refresh `ts` and break byte-identity).
       const fields = {};
       let hasChange = false;
       if (!prior || !prior.agentId) { fields.agentId = agentId; hasChange = true; }
 
-      // #1851 D1 item 5 fix: GATE modelVersion resolution on absence (previously unconditional -- a fixed
-      // bug: an already-stamped row paid a full transcript re-parse on every sweep forever).
-      if (!prior || !prior.modelVersion) {
-        laterRecordRederives++;
-        const modelFields = resolveModelFields(sess, task, role, agentId);
-        if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
-        if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
-      }
+      const modelFields = resolveModelFields(sess, task, role, agentId);
+      if (modelFields.modelVersion && (!prior || !prior.modelVersion)) { fields.modelVersion = modelFields.modelVersion; hasChange = true; }
+      if (modelFields.modelTier && (!prior || !prior.modelTier)) { fields.modelTier = modelFields.modelTier; hasChange = true; }
 
       if (!prior || !prior.self_authored) {
-        laterRecordRederives++;
-        const tr = transcriptByAgentId.get(agentId);
+        const tr = transcripts.find((t) => t.agentId === agentId);
         if (tr && transcriptSelfAuthored(tr.file, role)) { fields.self_authored = true; hasChange = true; }
       }
 
       if (!hasChange) continue;
-      // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (round-1
-      // blocker B3's fix: a search-backfilled row must never be byte-identical on disk to a genuine E1 row).
-      // The write-once clamp in overlayAppend means this can only ever RAISE an absent/lower stored value,
-      // never lower an already-classified row's — no extra guard needed here.
-      fields.run_kind = 'inferred';
-      fields.run_source = 'reconcile-spawns';
       try { overlayAppend(sess, task, role, fields); changed++; }
-      catch (e) { anyRowFailed = true; /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
+      catch (e) { /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
     }
 
-    // #1851 D3 -- persist every per-file checkpoint earned this run (even a truncated one -- D5 partial-progress
-    // safety) and the run bookkeeping (runCount always advances; lastFullDeriveTs advances only when a full
-    // re-derive actually happened this run).
-    writeReconcileCheckpoint(sess, {
-      schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
-      runCount: nextRunCount,
-      lastFullDeriveTs: dueForFullRederive ? Date.now() : checkpoint.lastFullDeriveTs,
-      files: newFilesCache,
-    });
-
-    // #1851 D4(c) -- the coarse watermark advances ONLY after a sweep that completed with nothing truncated or
-    // row-failed (previously unconditional -- a real bug: a failed row was never retried unless some
-    // transcript's mtime happened to advance past it).
-    if (!truncated && !anyRowFailed) {
-      try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
-    }
+    try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
     if (changed > 0) fireResyncBackground();
-    const elapsedMs = Date.now() - startTs;
-    console.log(
-      'OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed +
-      ' transcripts=' + transcripts.length +
-      ' firstRecordsRead=' + firstRecordsRead + ' firstRecordsCached=' + firstRecordsCached +
-      ' groupsKnown=' + groups.size + ' groupsEvaluated=' + groupsEvaluated +
-      ' laterRecordRederives=' + laterRecordRederives +
-      ' elapsedMs=' + elapsedMs +
-      ' truncated=' + truncated +
-      ' coldStart=' + coldStart + ' fullRederive=' + dueForFullRederive
-    );
+    console.log('OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed);
     process.exit(0);
   } catch (e) {
     console.log('OK reconcile-spawns: error (fail-open): ' + (e && e.message ? e.message : e));
     process.exit(0);
   }
 }
+
 // #1448: resolve-role-model --role <role> [--with-effort] [--with-version]
 // Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
 // fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
@@ -3936,9 +3380,8 @@ try {
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
-  else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
@@ -3947,8 +3390,7 @@ try {
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
-      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
-      '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]]');
+      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)]');
     process.exit(2);
   }
 } catch (e) {
