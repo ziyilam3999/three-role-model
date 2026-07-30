@@ -3669,6 +3669,226 @@ function cmdLintRoutes(opts) {
   console.log('OK: routes lint clean (' + loaded.configPath + ')');
   process.exit(0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2105 — Mode switch SSOT: resolve-mode / set-mode. A tiny operator posture pin (~/.config/cc-mode.json,
+// machine-local, never tracked/synced) governs TWO axes read from the tracked table below:
+//   - lane_ceiling:        the hard cap a NEW lane-start may not exceed (hooks/mode-pin-lane-gate.sh).
+//   - openrouter_dispatch: whether tools/openrouter-*-dispatch.sh may reach OpenRouter at all.
+// Fail-safe direction (D1): EVERY failure shape (absent/unreadable/unparseable pin, unknown mode value,
+// broken/absent tracked table) resolves to `normal` — the harm asymmetry is that an accidental non-Anthropic
+// dispatch violates the operator's directive AND a data-posture boundary, while 4 lanes is the operator's own
+// declared normal-mode default. Garbage state can never resolve to speed-boost and can never resolve to
+// openrouter_dispatch=permitted.
+// Fixture seams (mirrors CC_ROUTES_JSON): CC_MODE_FILE (the pin) and CC_MODE_POLICY_JSON (the tracked table).
+// No smoke may ever omit both — the real ~/.config/cc-mode.json is NEVER read or written by any test arm.
+
+const MODE_FALLBACK = Object.freeze({
+  mode: 'normal',
+  lane_ceiling: 4,
+  openrouter_dispatch: 'forbidden',
+});
+
+function resolveModePolicyPath() {
+  if ('CC_MODE_POLICY_JSON' in process.env) {
+    const p = process.env.CC_MODE_POLICY_JSON;
+    return (p && fileExists(p)) ? p : '';
+  }
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const cand = path.join(selfDir, '..', 'config', 'cc-mode-policy.json');
+  return fileExists(cand) ? cand : '';
+}
+
+// The pin lives OUTSIDE every repo (#1918's measured location argument — no git verb, no PR, Rule 12 can
+// never fire, and every consumer below is a fresh process per event so an edit is live on the next spawn).
+function resolveModePinPath() {
+  if ('CC_MODE_FILE' in process.env) return process.env.CC_MODE_FILE;
+  return path.join(HOME, '.config', 'cc-mode.json');
+}
+
+// Load + validate the tracked mode-policy table. Never throws: { ok, policy, error, path }. A missing file,
+// an unreadable file, unparseable JSON, or a shape that lacks a resolvable default_mode/modes entry are all
+// treated as "broken table" -> the caller falls back to MODE_FALLBACK in-code constants (AC 3(g)).
+function loadModePolicy() {
+  const p = resolveModePolicyPath();
+  if (!p) return { ok: false, policy: null, error: 'MODE-POLICY-NOT-FOUND', path: '' };
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) { return { ok: false, policy: null, error: 'MODE-POLICY-READ-ERROR: ' + (e && e.message ? e.message : e), path: p }; }
+  let policy;
+  try { policy = JSON.parse(raw); }
+  catch (e) { return { ok: false, policy: null, error: 'MODE-POLICY-PARSE-ERROR: ' + (e && e.message ? e.message : e), path: p }; }
+  if (!policy || typeof policy !== 'object' || !policy.modes || typeof policy.modes !== 'object' ||
+      !policy.default_mode || !policy.modes[policy.default_mode]) {
+    return { ok: false, policy: null, error: 'MODE-POLICY-SHAPE-ERROR: missing modes/default_mode', path: p };
+  }
+  return { ok: true, policy, error: '', path: p };
+}
+
+// Resolve a mode-id string (possibly an alias, e.g. #2035's "token-conservative") against the loaded policy
+// table. Returns '' if unresolvable (unknown mode, unknown alias).
+function resolveModeAlias(policy, rawMode) {
+  const m = String(rawMode == null ? '' : rawMode).trim();
+  if (!m) return '';
+  if (policy.modes[m]) return m;
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const aliased = aliases[m];
+  if (aliased && policy.modes[aliased]) return aliased;
+  return '';
+}
+
+// The single choke point (D1). Never throws — every failure shape resolves to a SAFE mode, loudly labeled
+// via `source`. Returns { mode, ceiling, openrouter_dispatch, source, reason, set_at, task }.
+function resolveMode() {
+  const loaded = loadModePolicy();
+  if (!loaded.ok) {
+    // AC 3(g) — a broken/absent TRACKED TABLE can neither brick the resolver nor widen anything: the
+    // fallback constants (the directive's own numbers) live in code, never in a file a bad edit can corrupt.
+    return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
+             openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
+             reason: 'broken-mode-policy-table', set_at: '', task: '' };
+  }
+  const policy = loaded.policy;
+  const pinPath = resolveModePinPath();
+  let pinRaw;
+  try { pinRaw = fs.readFileSync(pinPath, 'utf8'); }
+  catch (e) {
+    // Absent pin (ENOENT) is the NORMAL, expected steady state -> source=default. Any OTHER read error
+    // (permission, a directory in its place, ...) is treated the same as unparseable -> invalid-pin-fallback,
+    // never silently promoted to "default".
+    const isAbsent = e && e.code === 'ENOENT';
+    if (isAbsent) {
+      const dm = policy.default_mode;
+      const row = policy.modes[dm];
+      return { mode: dm, ceiling: row.lane_ceiling, openrouter_dispatch: row.openrouter_dispatch,
+               source: 'default', reason: '', set_at: '', task: '' };
+    }
+    return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
+             openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
+             reason: 'unreadable-pin', set_at: '', task: '' };
+  }
+  let pin;
+  try { pin = JSON.parse(pinRaw); }
+  catch (e) {
+    // AC 3(a)/(f) — unparseable JSON, INCLUDING a torn/truncated prefix an aborted flip can leave, resolves
+    // to normal. No partial write can ever land in a permitting state.
+    return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
+             openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
+             reason: 'unparseable-pin', set_at: '', task: '' };
+  }
+  if (!pin || typeof pin !== 'object') {
+    return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
+             openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
+             reason: 'unparseable-pin', set_at: '', task: '' };
+  }
+  const resolved = resolveModeAlias(policy, pin.mode);
+  if (!resolved) {
+    // AC 3(b) — an unknown mode value in the pin resolves the same as unparseable.
+    return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
+             openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
+             reason: 'unknown-mode-value', set_at: '', task: '' };
+  }
+  const row = policy.modes[resolved];
+  return { mode: resolved, ceiling: row.lane_ceiling, openrouter_dispatch: row.openrouter_dispatch,
+           source: 'pin', reason: String(pin.reason == null ? '' : pin.reason),
+           set_at: String(pin.set_at == null ? '' : pin.set_at), task: String(pin.task == null ? '' : pin.task) };
+}
+
+function cmdResolveMode(opts) {
+  void opts;
+  const r = resolveMode();
+  console.log('mode=' + r.mode);
+  console.log('ceiling=' + r.ceiling);
+  console.log('openrouter_dispatch=' + r.openrouter_dispatch);
+  console.log('source=' + r.source);
+  console.log('reason=' + r.reason);
+  process.exit(0);
+}
+
+// Best-effort ambient invoking-identity resolution (D1, round 3 — attribution-BY-RECORD, never
+// authentication): an explicit --session/--agent-id/--agent flag wins; else the harness's own ambient
+// CLAUDE_CODE_SESSION_ID env var (set inside a live Claude Code Bash tool call — see
+// hooks/openrouter-role-dispatch-smoke-test.sh:194-198 for the same convention); else the literal
+// 'unknown' — NEVER an absent/omitted field.
+function ambientIdentity(o) {
+  const explicit = o.session || o['agent-id'] || o.agent;
+  if (explicit) { const s = sanitize(explicit); if (s) return s; }
+  const envSid = process.env.CLAUDE_CODE_SESSION_ID;
+  if (envSid && String(envSid).trim()) { const s = sanitize(envSid); if (s) return s; }
+  return 'unknown';
+}
+
+// set-mode --mode <m> [--reason <text>] [--task <id>] [--session <id>] — validates against the tracked
+// table, refuses an unknown mode with the pin file BYTE-UNCHANGED (AC 3(c)), and writes ATOMICALLY
+// (temp-file-plus-rename in the pin's OWN directory, AC 19) so the pin is, at every instant, either the
+// prior valid state or the new valid state — never a torn intermediate. Every SUCCESSFUL flip appends one
+// audit line to the unified override/audit log (never on a refusal, AC 20(a)).
+function cmdSetMode(o) {
+  const loaded = loadModePolicy();
+  if (!loaded.ok) {
+    console.log('BLOCK: set-mode: ' + loaded.error);
+    process.exit(2);
+  }
+  const policy = loaded.policy;
+  const requested = o.mode;
+  const resolved = resolveModeAlias(policy, requested);
+  if (!resolved) {
+    console.log('BLOCK: set-mode: unknown mode "' + (requested || '') + '" — valid: ' +
+      Object.keys(policy.modes).concat(Object.keys(policy.aliases || {})).join(', '));
+    process.exit(2);
+  }
+  const pinPath = resolveModePinPath();
+  // Read the PRIOR mode for the audit line's transition= field (best-effort; unresolvable -> 'unknown').
+  let priorMode = 'unknown';
+  try { priorMode = resolveMode().mode; } catch (e) { /* best-effort */ }
+
+  const nowIso = new Date().toISOString();
+  const pinObj = { mode: resolved, set_at: nowIso };
+  if (o.reason) pinObj.reason = String(o.reason);
+  if (o.task) pinObj.task = String(o.task);
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort; write below surfaces a real error */ }
+  const tmpPath = path.join(dir, '.cc-mode.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(pinObj, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    // AC 19 — a write-protected directory (temp-file create/rename needs dir-write perms) must fail
+    // WITHOUT mutating the real pin. Clean up any partial temp file, never touch pinPath.
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: set-mode: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+
+  // AC 20(a) — audit ONLY on success, into the SAME unified log as every other bypass/override record
+  // (rule12LogPath(), the ledger's existing env override RULE12_LOG). Additive `kind: 'mode-flip'` record —
+  // never replaces the base 8-key shape any other writer emits (mirrors #1640 S10's own additive keys).
+  try {
+    const record = {
+      ts: nowIso,
+      session: '',
+      agent: '',
+      task: sanitize(o.task || ''),
+      role: 'orchestrator',
+      hook: 'mode-flip',
+      var: 'CC_MODE',
+      decision: 'PERMIT',
+      kind: 'mode-flip',
+      transition: priorMode + '->' + resolved,
+      reason: o.reason ? String(o.reason) : '',
+      actor: ambientIdentity(o),
+    };
+    const logPath = rule12LogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) { /* best-effort — audit failure must never un-do an already-committed pin write */ }
+
+  console.log('OK: mode set to ' + resolved + ' (' + priorMode + ' -> ' + resolved + ')');
+  process.exit(0);
+}
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 const [, , cmd, ...rest] = process.argv;
@@ -3690,8 +3910,10 @@ try {
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
   else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
+  else if (cmd === 'resolve-mode') cmdResolveMode(opts);
+  else if (cmd === 'set-mode') cmdSetMode(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
@@ -3701,7 +3923,9 @@ try {
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
       '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
-      '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]]');
+      '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
+      '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
+      '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)]');
     process.exit(2);
   }
 } catch (e) {

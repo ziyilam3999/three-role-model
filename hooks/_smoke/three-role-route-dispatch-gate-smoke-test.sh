@@ -31,6 +31,20 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 STATE="$TMP/state"
 LOG="$TMP/bypass.log"
 
+# #2105 D3 backstop mode fixtures. This hook's positive block-once path (AC-3/AC-4 below) now ALSO requires
+# mode=conservative (the new mode gate at three-role-route-dispatch-gate.sh:147-161) -- so those assertions
+# must explicitly pin CC_MODE_FILE=$CONS_PIN or they'll silently stop firing under whatever mode this dev
+# machine's real environment happens to resolve to (normally normal/default, since this smoke never sets
+# HOME). CC_MODE_FILE is an isolated scratch path per pin -- this smoke NEVER reads or writes the real
+# ~/.config/cc-mode.json. NO_PIN is deliberately never created -> resolves to mode=normal via source=default
+# (the AC-11a arm). SB_PIN pins speed-boost (the AC-11c arm).
+LED="$ROOT/bin/3role-ledger.mjs"
+CONS_PIN="$TMP/cons-pin.json"
+CC_MODE_FILE="$CONS_PIN" node "$LED" set-mode --mode conservative --reason smoke >/dev/null 2>&1
+NO_PIN="$TMP/no-pin-never-created.json"
+SB_PIN="$TMP/sb-pin.json"
+CC_MODE_FILE="$SB_PIN" node "$LED" set-mode --mode speed-boost --reason smoke >/dev/null 2>&1
+
 # Fixture A — BOTH plan-review and executor declared subprocess-openrouter (real #1947 shape). Drives AC-3/4
 # (the two declared seats each have their OWN session:task:role signature -> distinct markers, no
 # cannibalization). task_classes + provider data_posture are present so resolve-route's capability (C-2) and
@@ -95,11 +109,11 @@ echo "== SECTION 1: positive block-once + no home-path leak — AC 3-4 =="
 #      repo-relatively (tools/openrouter-role-dispatch.sh) and contains NO /Users/ substring (N5); the IDENTICAL
 #      second issue -> exit 0 (block-once, never wedged). ----
 P3='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review\nreview the plan"}}'
-run "$P3"
+run "$P3" CC_MODE_FILE="$CONS_PIN"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
   && ok "AC-3 first issue: plan-review subprocess seat -> exit 2, stderr names tools/openrouter-role-dispatch.sh, no /Users/ leak" \
   || bad "AC-3 first issue should block + name helper + leak no home path (rc=$RC out=$CAP)"
-run "$P3"
+run "$P3" CC_MODE_FILE="$CONS_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-3 second issue: identical re-issue -> exit 0 silent (block-once, not wedged)" \
   || bad "AC-3 second issue should exit 0 silent (rc=$RC out=$CAP)"
@@ -108,12 +122,12 @@ run "$P3"
 #      signature -> it blocks on FIRST issue EVEN AFTER AC-3's plan-review marker exists in the same STATE_DIR
 #      (distinct signature, no cannibalization). ----
 P4='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:executor\nimplement the plan"}}'
-run "$P4"
+run "$P4" CC_MODE_FILE="$CONS_PIN"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "executor" && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh"; } \
   && ok "AC-4: executor subprocess seat -> exit 2 even after AC-3's plan-review marker exists (distinct session:task:role signature)" \
   || bad "AC-4 executor should block on first issue independent of the plan-review marker (rc=$RC out=$CAP)"
 # and its own re-issue exits 0 (block-once per signature).
-run "$P4"
+run "$P4" CC_MODE_FILE="$CONS_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-4 second issue: executor re-issue -> exit 0 silent (block-once)" \
   || bad "AC-4 second issue should exit 0 silent (rc=$RC out=$CAP)"
@@ -201,5 +215,50 @@ else
     && ok "AC-5g plugin-safe: family switches -> exit 0, logging dormant (rows=0, no override lib) — exits still proven" \
     || bad "AC-5g plugin: family switches should exit 0 with no rows (rcTri=$rcTri rcShip=$rcShip rows=$ROWS2)"
 fi
+
+echo "== SECTION 3: #2105 D3 mode-awareness backstop — AC 11(a)/(b)/(c) =="
+
+# ---- AC-11(a): mode=normal (default, NO_PIN never created -> source=default) -- the SAME subprocess-declared
+#      plan-review payload that blocks under conservative (AC-3) now stays COMPLETELY SILENT on its FIRST
+#      issue: outside conservative mode the Agent-tool spawn of this seat IS the sanctioned primary (D3's own
+#      dispatch helpers refuse the subprocess route themselves in normal/speed-boost), so nudging it here
+#      would just train every routine normal-mode spawn to carry the bypass token. Distinct session id so no
+#      STATE_DIR marker collision with AC-3's own signature. ----
+P11A='{"session_id":"ac11a","tool_input":{"prompt":"3ROLE_TASK:9601 ROLE:plan-review\nreview the plan"}}'
+run "$P11A" CC_MODE_FILE="$NO_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-11a: mode=normal (default) -> exit 0 silent on FIRST issue (non-conservative = Agent-tool IS sanctioned primary)" \
+  || bad "AC-11a normal mode should stay silent even on first issue (rc=$RC out=$CAP)"
+
+# ---- AC-11(b): mode=conservative -> byte-identical to today's (pre-#2105) behavior. Re-derive independently
+#      of AC-3 (fresh session id, fresh signature) so this arm doesn't just inherit AC-3's already-proven
+#      marker state. ----
+P11B='{"session_id":"ac11b","tool_input":{"prompt":"3ROLE_TASK:9602 ROLE:plan-review\nreview the plan"}}'
+run "$P11B" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
+  && ok "AC-11b: mode=conservative -> exit 2 first issue, byte-identical shape to pre-#2105 (helper named, no home-path leak)" \
+  || bad "AC-11b conservative mode should block first issue exactly as before #2105 (rc=$RC out=$CAP)"
+run "$P11B" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-11b: mode=conservative re-issue -> exit 0 silent (block-once still holds under the mode gate)" \
+  || bad "AC-11b conservative re-issue should exit 0 silent (rc=$RC out=$CAP)"
+
+# ---- AC-11(c): mode=speed-boost (a SECOND non-conservative mode, not just "not pinned") -> also silent,
+#      proving the gate keys on "== conservative", not merely "!= normal" / "no pin present". ----
+P11C='{"session_id":"ac11c","tool_input":{"prompt":"3ROLE_TASK:9603 ROLE:executor\nimplement the plan"}}'
+run "$P11C" CC_MODE_FILE="$SB_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-11c: mode=speed-boost -> exit 0 silent (gate keys on ==conservative, not merely !=normal)" \
+  || bad "AC-11c speed-boost mode should stay silent (rc=$RC out=$CAP)"
+
+# ---- AC-11(d): a crashed/unreadable mode resolver still fails OPEN (silent), matching the hook's own
+#      documented convention -- point CC_MODE_FILE at a directory (not a file) so resolve-mode's fs.readFileSync
+#      throws a NON-ENOENT error (EISDIR), which loadModePolicy/resolveMode surface as invalid-pin-fallback,
+#      never "conservative". ----
+P11D='{"session_id":"ac11d","tool_input":{"prompt":"3ROLE_TASK:9604 ROLE:plan-review\nreview the plan"}}'
+run "$P11D" CC_MODE_FILE="$TMP"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-11d: unreadable/crashed mode pin -> fails OPEN (silent), never mistaken for conservative" \
+  || bad "AC-11d a broken mode resolution should fail open silent, not block (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
