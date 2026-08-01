@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+    # `edited` is LOAD-BEARING, not tidiness (#2205 review, blocker B2). The default type set is
+    # [opened, synchronize, reopened] — none of which fire on a PR TITLE change. Since the gate
+    # below validates the title, the default set lets a PR go green while titled correctly and then
+    # be retitled to garbage with the stale green still showing. `edited` re-runs on title/body edits.
+    types: [opened, synchronize, reopened, edited]
 
 # The plugin is bash hooks + zero-dependency node (.mjs) + markdown. There is no
 # build step and no npm dependency tree, so CI runs on Linux only (the hooks are
@@ -13,7 +18,13 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 is LOAD-BEARING for the commit-subject gate below, not boilerplate: that gate
+      # walks `base.sha..head.sha` to read every commit subject in the PR. The default depth-1
+      # checkout of the synthetic merge ref has neither endpoint, so the walk would silently yield an
+      # EMPTY list — a gate that validates nothing while exiting 0.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use Node.js 20
         uses: actions/setup-node@v4
@@ -66,47 +77,90 @@ jobs:
       # pull_request event the checked-out HEAD is GitHub's SYNTHETIC merge ref, whose subject is
       # "Merge <sha> into <sha>". That matches the `^Merge ` exemption below, so a bare removal of
       # the `if:` would make every PR run exit 0 having validated a string no human wrote — green,
-      # and blind. The only surface with real pre-merge power is the PR TITLE, because this repo
-      # squash-merges and the PR title BECOMES the master subject (verified: PR #78's title is
-      # byte-for-byte the subject of e28e060, modulo the trailing " (#78)"). So the event selects
-      # WHICH string to validate; the grammar is shared by both arms.
+      # and blind. So the event selects WHICH strings to validate; the grammar is shared.
+      #
+      # WHY THE PR ARM VALIDATES *BOTH* THE TITLE AND EVERY COMMIT SUBJECT (#2205 review, blocker
+      # B1 — this corrects a FALSE premise the first version of this comment asserted). The first
+      # draft claimed "the PR title BECOMES the master subject", citing PR #78 as verification.
+      # That verification had ZERO discriminating power: #78's title and its single commit's subject
+      # were byte-identical, which is equally consistent with either rule. MEASURED against the repo
+      # settings instead (`gh api repos/<owner>/three-role-model`):
+      #   squash_merge_commit_title = COMMIT_OR_PR_TITLE  <- NOT PR_TITLE
+      #   allow_merge_commit = true, allow_rebase_merge = true
+      # COMMIT_OR_PR_TITLE prefills the squash subject from THE COMMIT when the PR has exactly one
+      # commit, and from the PR title only at >=2 commits. Single-commit is the dominant shape here
+      # (#77 and #78 both had one), so title-only validation is bypassable by construction: commit
+      # `wip garbage` + title `fix: proper title` passes the gate and lands `wip garbage (#N)` on
+      # master. Rebase-merge makes it worse — every commit subject lands verbatim.
+      # Validating BOTH is the only rule that is correct under all three enabled merge modes AND
+      # stays correct if the repo setting is changed later. It is stricter than the old intent by
+      # design: with rebase enabled, an unconventional commit subject really can reach master.
       - name: Validate commit message (Conventional Commits)
         shell: bash
         # Passed via `env:`, never interpolated into the script body — a PR title is
         # attacker-controlled text and `${{ }}` inside `run:` is a shell-injection sink.
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            SUBJECT="$PR_TITLE"
-            SRC="PR title (becomes the squash-merge subject on master)"
-          else
-            SUBJECT="$(git log -1 --pretty=%s)"
-            SRC="HEAD commit subject"
-          fi
-
-          # A true (non-squash) merge commit carries a subject no author chose, so it is exempt.
-          # Deliberately scoped to push: on pull_request the title is never auto-generated, so this
-          # arm can never mask a badly-titled PR — which is exactly how the old un-scoped form
-          # would have failed open.
-          if [ "$GITHUB_EVENT_NAME" = "push" ] && printf '%s' "$SUBJECT" | grep -qE "^Merge "; then
-            echo "skipped: true merge commit — subject is not author-chosen"
-            exit 0
-          fi
 
           # `sync` is first-class here, not a concession. This repo is the PUBLIC mirror of a private
           # canonical source, and `sync:` is the established prefix for every lockstep port (17 of the
           # last 20 master commits used it). The type list was simply never taught about the one
           # commit class this repo produces most.
-          if ! printf '%s' "$SUBJECT" | grep -qE "^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert|sync)(\(.+\))?(!)?: .+"; then
-            echo "ERROR: $SRC is not Conventional Commits format."
-            echo "  Got: $SUBJECT"
+          GRAMMAR='^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert|sync)(\(.+\))?(!)?: .+'
+
+          FAILED=0
+          check() {   # check <subject> <source-label>
+            if printf '%s' "$1" | grep -qE "$GRAMMAR"; then
+              echo "OK   ($2): $1"
+            else
+              echo "FAIL ($2): $1"
+              FAILED=1
+            fi
+          }
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            check "$PR_TITLE" "PR title — the squash subject when this PR has 2+ commits"
+
+            # Every commit subject in the PR. `--no-merges`: a true merge commit's subject is
+            # generated, not author-chosen. Fail LOUD on an empty walk rather than passing
+            # vacuously — an empty list here means the checkout lacks the endpoints (see the
+            # fetch-depth: 0 note above), which is a broken gate, not a clean PR.
+            SUBJECTS="$(git log --no-merges --pretty=%s "$PR_BASE_SHA..$PR_HEAD_SHA")"
+            if [ -z "$SUBJECTS" ]; then
+              echo "ERROR: walked $PR_BASE_SHA..$PR_HEAD_SHA and found zero non-merge commits."
+              echo "  A PR always has at least one. This means the gate could not see the commits,"
+              echo "  so it is refusing to report a vacuous pass."
+              exit 1
+            fi
+            while IFS= read -r s; do
+              check "$s" "commit subject — the squash subject when this PR has exactly 1 commit, and the master subject verbatim under rebase-merge"
+            done <<< "$SUBJECTS"
+          else
+            SUBJECT="$(git log -1 --pretty=%s)"
+            # A true (non-squash) merge commit carries a subject no author chose, so it is exempt.
+            # Deliberately scoped to push: on pull_request the strings above are never
+            # auto-generated, so this exemption can never mask a badly-named PR — which is exactly
+            # how the old un-scoped form would have failed open.
+            if printf '%s' "$SUBJECT" | grep -qE "^Merge "; then
+              echo "skipped: true merge commit — subject is not author-chosen"
+              exit 0
+            fi
+            check "$SUBJECT" "HEAD commit subject"
+          fi
+
+          if [ "$FAILED" != "0" ]; then
+            echo ""
+            echo "ERROR: one or more subjects are not Conventional Commits format."
             echo "  Expected: <type>[(scope)][!]: <description>"
             echo "  Types: feat fix docs chore refactor test style perf ci build revert sync"
             if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-              echo "  Fix: edit the PR title. It becomes the commit subject when this is squash-merged."
+              echo "  Fix: retitle the PR and/or reword the offending commit(s). This repo has squash,"
+              echo "  merge-commit and rebase all enabled, so BOTH surfaces can reach master."
             fi
             exit 1
           fi
-          echo "commit message OK ($SRC): $SUBJECT"
+          echo "all subjects OK"

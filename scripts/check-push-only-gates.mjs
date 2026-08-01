@@ -57,22 +57,37 @@ function triggersOnPullRequest(lines) {
   const head = jobsAt === -1 ? lines : lines.slice(0, jobsAt);
   return head.some((l) => {
     const bare = l.replace(/#.*$/, '');
-    return /^\s*pull_request(_target)?\s*:/.test(bare)   // block form
-        || /^on:\s*\[.*\bpull_request\b/.test(bare);      // inline list form
+    return /^\s*pull_request(_target)?\s*:/.test(bare)              // block form
+        || /^\s*-\s*pull_request(_target)?\s*$/.test(bare)          // block-SEQUENCE form
+        || /^\s*["']?on["']?:\s*\[.*\bpull_request\b/.test(bare);   // inline list form
   });
 }
+// The two non-obvious spellings above are FALSE-NEGATIVE guards, and this is the highest-cost
+// direction of error in this whole file: a missed trigger makes the checker skip the ENTIRE
+// workflow ("skip -- does not trigger on pull_request"), so every push-only step in it goes
+// unexamined while the job still exits 0.
+//   * block-SEQUENCE `on:\n  - push\n  - pull_request` is valid YAML that GitHub accepts; the
+//     block-form regex needs a trailing colon, so a bare `- pull_request` matched neither pattern.
+//   * `"on":` -- YAML 1.1 folds bare `on` to boolean true, so writing it quoted is a real and
+//     recommended style. It only ever mattered for the inline-list arm: the block-form arm keys off
+//     the nested `pull_request:` line and never reads the parent key, so it was already immune.
 
 // An `if:` that gates on the push event and never mentions pull_request. Both quote styles, and the
 // `github.event_name != 'pull_request'` spelling, which is the same defect wearing a different hat.
 function isPushOnlyCondition(value) {
   const v = value.trim();
-  if (!/github\.event_name/.test(v)) return false;
   const positivePush = /github\.event_name\s*==\s*['"]push['"]/.test(v);
   const negativePr = /github\.event_name\s*!=\s*['"]pull_request['"]/.test(v);
-  if (!positivePush && !negativePr) return false;
+  // A THIRD spelling of the same defect, and the one that reads least like it: on a push event
+  // `github.event.pull_request` is null, so this is exactly "not a PR" wearing context-object
+  // clothing instead of event_name clothing. The old `if (!/github\.event_name/) return false;`
+  // early-exit made it structurally unreachable -- the condition never mentions event_name at all.
+  const nullPrContext = /github\.event\.pull_request\s*==\s*null/.test(v)
+    || /!\s*github\.event\.pull_request\b/.test(v);
+  if (!positivePush && !negativePr && !nullPrContext) return false;
   // An `if:` that ALSO admits pull_request is not push-only — e.g.
   //   if: github.event_name == 'push' || github.event_name == 'pull_request'
-  if (positivePush && /==\s*['"]pull_request['"]/.test(v)) return false;
+  if ((positivePush || nullPrContext) && /==\s*['"]pull_request['"]/.test(v)) return false;
   return true;
 }
 
@@ -85,18 +100,29 @@ function stepsOf(lines) {
     const m = lines[i].match(/^(\s*)-\s+(name|uses|run|id):/);
     if (m) starts.push({ i, indent: m[1].length });
   }
+  // Preamble start per step: the first line of the contiguous run of comments immediately above it.
+  // Computed for ALL steps BEFORE any body, because a step's body must stop at the NEXT step's
+  // preamble. Ending it at the next step's own start line (the original form) put those comment
+  // lines inside BOTH steps -- and since annotationReason() scans [...preamble, ...body], step N's
+  // `# push-only-ok:` comment silently exempted step N-1 as well. That is the #1590 monotonicity
+  // shape: a justification written for one step erasing the gate on another. Reproduced before the
+  // fix -- a step with NO annotation of its own passed because the next step had one.
+  const preStarts = starts.map(({ i }) => {
+    let pre = i;
+    while (pre - 1 >= 0 && /^\s*#/.test(lines[pre - 1])) pre--;
+    return pre;
+  });
   return starts.map(({ i, indent }, k) => {
-    // Body: to the next step start, or to a line that dedents out of the steps list.
-    let end = k + 1 < starts.length ? starts[k + 1].i : lines.length;
+    // Body: to the next step's PREAMBLE, or to a line that dedents out of the steps list.
+    // max(i+1, ...) keeps the body non-empty in the degenerate case.
+    let end = k + 1 < starts.length ? Math.max(i + 1, preStarts[k + 1]) : lines.length;
     for (let j = i + 1; j < end; j++) {
       const l = lines[j];
       if (l.trim() === '') continue;
       const ind = l.length - l.trimStart().length;
       if (ind < indent) { end = j; break; }
     }
-    // Preamble: contiguous comment lines immediately above.
-    let pre = i;
-    while (pre - 1 >= 0 && /^\s*#/.test(lines[pre - 1])) pre--;
+    const pre = preStarts[k];
     const nameLine = lines.slice(i, end).find((l) => /-?\s*name:/.test(l));
     return {
       startLine: i + 1,
