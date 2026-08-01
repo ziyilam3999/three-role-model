@@ -4110,6 +4110,15 @@ function cmdResolveMode(opts) {
   console.log('openrouter_dispatch=' + r.openrouter_dispatch);
   console.log('source=' + r.source);
   console.log('reason=' + r.reason);
+  // AC 20(b) (#2197) — `set_at=` is emitted ONLY on the source=pin arm, and only when the pin actually
+  // carries a timestamp. This is the PAIRED ABSENCE contract both consumers already state in their own
+  // comments (tools/openrouter-role-dispatch.sh:158-160 and tools/openrouter-research-dispatch.sh:565-568):
+  // "a source=default refusal carries NEITHER field, never an empty placeholder". Before this line the
+  // command emitted exactly five keys and NO set_at at all, so the consumers' `grep -m1 '^set_at='`
+  // resolved to the empty string and every conservative-mode MODE line shipped a bare `set_at=` with no
+  // value -- the provenance half of AC 20(b) was permanently unmet. resolveMode() has always COMPUTED
+  // set_at correctly (:4099); only the print path dropped it.
+  if (r.source === 'pin' && r.set_at) console.log('set_at=' + r.set_at);
   process.exit(0);
 }
 
