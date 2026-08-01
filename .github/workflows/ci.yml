@@ -46,15 +46,58 @@ jobs:
           done
           if [ "$found" = "0" ]; then echo "no smoke tests yet (bootstrap) — skipping"; fi
 
+      # #2205 — this step used to carry `if: github.event_name == 'push'`, which made it
+      # STRUCTURALLY incapable of preventing anything. It ran only AFTER a merge landed on master,
+      # at which point the subject is immutable without a history rewrite. MEASURED 2026-08-01:
+      # 17 of the last 20 origin/master first-parent commits FAILED it, and it blocked exactly zero
+      # of them; on PR #78's own run (30681721306) this step's conclusion was literally `skipped`.
+      # A check that can only run after the irreversible step is a reporter, not a gate.
+      #
+      # WHY IT CANNOT SIMPLY BE UN-SCOPED — the trap that makes the naive fix vacuous. On a
+      # pull_request event the checked-out HEAD is GitHub's SYNTHETIC merge ref, whose subject is
+      # "Merge <sha> into <sha>". That matches the `^Merge ` exemption below, so a bare removal of
+      # the `if:` would make every PR run exit 0 having validated a string no human wrote — green,
+      # and blind. The only surface with real pre-merge power is the PR TITLE, because this repo
+      # squash-merges and the PR title BECOMES the master subject (verified: PR #78's title is
+      # byte-for-byte the subject of e28e060, modulo the trailing " (#78)"). So the event selects
+      # WHICH string to validate; the grammar is shared by both arms.
       - name: Validate commit message (Conventional Commits)
-        if: github.event_name == 'push'
         shell: bash
+        # Passed via `env:`, never interpolated into the script body — a PR title is
+        # attacker-controlled text and `${{ }}` inside `run:` is a shell-injection sink.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          COMMIT_MSG=$(git log -1 --pretty=%s)
-          if echo "$COMMIT_MSG" | grep -qE "^Merge "; then exit 0; fi
-          if ! echo "$COMMIT_MSG" | grep -qE "^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert)(\(.+\))?(!)?: .+"; then
-            echo "ERROR: HEAD commit message is not Conventional Commits format."
-            echo "  Got: $COMMIT_MSG"
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            SUBJECT="$PR_TITLE"
+            SRC="PR title (becomes the squash-merge subject on master)"
+          else
+            SUBJECT="$(git log -1 --pretty=%s)"
+            SRC="HEAD commit subject"
+          fi
+
+          # A true (non-squash) merge commit carries a subject no author chose, so it is exempt.
+          # Deliberately scoped to push: on pull_request the title is never auto-generated, so this
+          # arm can never mask a badly-titled PR — which is exactly how the old un-scoped form
+          # would have failed open.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && printf '%s' "$SUBJECT" | grep -qE "^Merge "; then
+            echo "skipped: true merge commit — subject is not author-chosen"
+            exit 0
+          fi
+
+          # `sync` is first-class here, not a concession. This repo is the PUBLIC mirror of a private
+          # canonical source, and `sync:` is the established prefix for every lockstep port (17 of the
+          # last 20 master commits used it). The type list was simply never taught about the one
+          # commit class this repo produces most.
+          if ! printf '%s' "$SUBJECT" | grep -qE "^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert|sync)(\(.+\))?(!)?: .+"; then
+            echo "ERROR: $SRC is not Conventional Commits format."
+            echo "  Got: $SUBJECT"
+            echo "  Expected: <type>[(scope)][!]: <description>"
+            echo "  Types: feat fix docs chore refactor test style perf ci build revert sync"
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "  Fix: edit the PR title. It becomes the commit subject when this is squash-merged."
+            fi
             exit 1
           fi
-          echo "commit message OK: $COMMIT_MSG"
+          echo "commit message OK ($SRC): $SUBJECT"
