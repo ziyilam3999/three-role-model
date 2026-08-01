@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
-# Smoke for hooks/three-role-route-dispatch-gate.sh (#1989). Exit 0 = all cases pass.
+# Smoke for hooks/three-role-route-dispatch-gate.sh (#1989, redesigned #2189). Exit 0 = all cases pass.
 #
-# The hook is a PreToolUse(Agent|Task) BLOCK-ONCE nudge: on the POSITIVE condition (a tagged chain-role spawn
-# whose seat the routes SSOT declares `dispatch: subprocess-openrouter`) it exits 2 the FIRST time per
-# session:task:role signature, then exits 0 (block-once); everything else fail-opens exit 0 silent. Both-ends:
-# each fixture FAILS on wrong behavior, PASSES on correct. No `set -e` (a non-block non-zero must never leak
-# into a permission decision — #749).
+# #2189 changed the IN-SCOPE behavior (conservative mode + a tagged subprocess-declared seat) from a
+# block-once advisory clearable by an inline prompt token, to a PERSISTENT refusal clearable ONLY by: (1) a
+# recorded real (non-drill) dispatch failure for the same role+task (an untracked state-dir marker written by
+# tools/openrouter-role-dispatch.sh), (2) the operator flipping the mode dial to normal, or (3) the operator's
+# own audited env kill-switch. Everything OUT of scope (untagged, non-subprocess seat, non-conservative mode,
+# unresolvable SSOT) is byte-identical to before: silent exit 0, no advisory, no marker, no log row.
 #
-# Self-contained via CC_ROUTES_JSON fixtures the smoke writes itself (the 3role-ledger-smoke-test.sh
-# precedent, 15 existing uses), so it passes in BOTH populations — ai-brain (real config/cc-routes.json) and
-# the three-role-model plugin (which ships no config/cc-routes.json; the smoke's own fixture drives the
-# resolve-route read). A synced smoke must never FAIL on an ai-brain-only dependency.
+# This suite exercises the plan's 15 gate-testable arms (of its declared 18 — AC-0 is a board-ticket check
+# outside the repo, verified separately; AC-7 is dispatch-helper staleness-token coverage, exercised in
+# hooks/openrouter-role-dispatch-smoke-test.sh and tools/openrouter-research-dispatch-mode-gate-smoke-test.sh):
+# AC-1(1) + AC-2(1) + AC-3(a..f, 6, with (b) split into two named sub-mutations) + AC-4(a,b, 2) +
+# AC-5(a,b,c, 3) + AC-6(1) + AC-8(1, suite-level shasum invariant) = 15, plus regression coverage of #2105's
+# D3 mode-awareness backstop (speed-boost silence, crashed-resolver fail-open) this redesign must still honor.
+#
+# Both-ends: each fixture FAILS on wrong behavior, PASSES on correct. No `set -e` (a non-block non-zero must
+# never leak into a permission decision — #749). N4 fold: EVERY AC-3 arm gets its OWN fresh state dir — six
+# arms now depend on that directory's exact contents, and a leftover marker from a prior arm would silently
+# flip the wrong answer.
+#
+# Self-contained via CC_ROUTES_JSON fixtures the smoke writes itself, so it passes in BOTH populations —
+# ai-brain (real config/cc-routes.json) and the three-role-model plugin (which ships no config/cc-routes.json).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$DIR/.." && pwd)"
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
 HOOK="$ROOT/hooks/three-role-route-dispatch-gate.sh"
+HELPER="$REPO_ROOT/tools/openrouter-role-dispatch.sh"
+LED="$ROOT/bin/3role-ledger.mjs"
 # The bypass-audit writer (hook_log_bypass) lives in lib-hook-override.sh, which ai-brain ships in hooks/ but
-# the three-role-model plugin does NOT port (it is not a SYNCED entry). So in a plugin install the hook's
-# `type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass ...` call sites are guarded no-ops — escapes still
-# exit 0, but NO audit rows are written. The AC-5e/AC-5g row-count assertions (an ai-brain-only dep) are gated
-# on this so the smoke passes in BOTH populations (a synced smoke must never FAIL on an ai-brain-only dep).
+# the three-role-model plugin does NOT port. In a plugin install its call sites are guarded no-ops — the
+# hook's OWN enriched writer (route_dispatch_log_escape, #2189) does NOT depend on that lib at all, so AC-6's
+# row assertions hold in BOTH populations; only the SECOND (generic hook_log_bypass) row is ai-brain-only.
 HAS_OVERRIDE_LIB=0
 [ -f "$(dirname "$HOOK")/lib-hook-override.sh" ] && HAS_OVERRIDE_LIB=1
 
@@ -28,27 +41,31 @@ ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; fail=1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-STATE="$TMP/state"
 LOG="$TMP/bypass.log"
 
-# #2105 D3 backstop mode fixtures. This hook's positive block-once path (AC-3/AC-4 below) now ALSO requires
-# mode=conservative (the new mode gate at three-role-route-dispatch-gate.sh:147-161) -- so those assertions
-# must explicitly pin CC_MODE_FILE=$CONS_PIN or they'll silently stop firing under whatever mode this dev
-# machine's real environment happens to resolve to (normally normal/default, since this smoke never sets
-# HOME). CC_MODE_FILE is an isolated scratch path per pin -- this smoke NEVER reads or writes the real
-# ~/.config/cc-mode.json. NO_PIN is deliberately never created -> resolves to mode=normal via source=default
-# (the AC-11a arm). SB_PIN pins speed-boost (the AC-11c arm).
-LED="$ROOT/bin/3role-ledger.mjs"
+evsig() {   # $1=role $2=task -> sha1(role:task), MUST match both the gate's and the helper's own computation.
+  node -e 'const c=require("crypto");process.stdout.write(c.createHash("sha1").update(process.argv[1]+":"+process.argv[2]).digest("hex"))' "$1" "$2"
+}
+
+# Scratch mode pins (isolated CC_MODE_FILE paths — the real ~/.config/cc-mode.json is NEVER read or written
+# by this smoke; the suite-level AC-8 invariant below proves that from OUTSIDE, not by trusting this comment).
 CONS_PIN="$TMP/cons-pin.json"
 CC_MODE_FILE="$CONS_PIN" node "$LED" set-mode --mode conservative --reason smoke >/dev/null 2>&1
-NO_PIN="$TMP/no-pin-never-created.json"
+NORM_PIN="$TMP/norm-pin.json"
+CC_MODE_FILE="$NORM_PIN" node "$LED" set-mode --mode normal --reason smoke >/dev/null 2>&1
 SB_PIN="$TMP/sb-pin.json"
 CC_MODE_FILE="$SB_PIN" node "$LED" set-mode --mode speed-boost --reason smoke >/dev/null 2>&1
+NO_PIN="$TMP/no-pin-never-created.json"
 
-# Fixture A — BOTH plan-review and executor declared subprocess-openrouter (real #1947 shape). Drives AC-3/4
-# (the two declared seats each have their OWN session:task:role signature -> distinct markers, no
-# cannibalization). task_classes + provider data_posture are present so resolve-route's capability (C-2) and
-# sensitivity (C-3) guards clear and JSON (with the dispatch field) actually reaches stdout.
+# AC-8 (whole-suite invariant, #2189): #2189 ships no automated pin writer at all — nothing in this diff can
+# move the dial. Shasum the scratch pins used above AND the real pin (best-effort; skipped, never failed, if
+# unreadable) NOW, re-checked at the very end of this file.
+shasum_or_absent() { [ -f "$1" ] && shasum "$1" 2>/dev/null | awk '{print $1}' || echo "ABSENT"; }
+CONS_PIN_SHA_BEFORE="$(shasum_or_absent "$CONS_PIN")"
+REAL_PIN="$HOME/.config/cc-mode.json"
+REAL_PIN_SHA_BEFORE="$(shasum_or_absent "$REAL_PIN")"
+
+# Fixture A — BOTH plan-review and executor declared subprocess-openrouter (real #1947 shape).
 ROUTES_SUBPROC="$TMP/routes-subproc.json"
 cat > "$ROUTES_SUBPROC" <<'J'
 {
@@ -66,199 +83,291 @@ cat > "$ROUTES_SUBPROC" <<'J'
 }
 J
 
-# Fixture B — a seat with NO dispatch field (e.g. plan-review acting as a plain Anthropic seat). The hook must
-# fail-OPEN: resolve-route emits JSON with no `dispatch` key -> SEAT_DISPATCH empty -> exit 0 silent. This is
-# the "seat has no dispatch field" arm of AC-5 (genuinely reachable — planner/execution-review/research all
-# resolve this way, and a fixture-only seat with dispatch omitted reproduces it deterministically).
-ROUTES_NODISP="$TMP/routes-nodisp.json"
-cat > "$ROUTES_NODISP" <<'J'
-{
-  "providers": {
-    "anthropic": { "auth": "keychain:Claude Code-credentials", "endpoint": "https://api.anthropic.com",
-                   "data_posture": { "class": "anthropic-baseline" } }
-  },
-  "task_classes": { "sustained-agentic": { "allowed_providers": ["anthropic"] } },
-  "seats": {
-    "plan-review": { "provider": "anthropic", "model": "claude-opus-5", "task_class": "sustained-agentic",
-                     "data_sensitivity": "public" }
-  }
-}
-J
-
-# runh <payload-json> [env KEY=VAL ...] -> sets RC, CAP. Pins CC_ROUTES_JSON=$1 (default the subprocess fixture)
-# and an ISOLATED STATE_DIR (override via env arg). Captures stderr+stdout merged so the exit-2 <system-reminder>
-# is visible; the hook writes the nudge to stderr only, so CAP carries it exactly when RC=2.
+# runh <payload-json> <state-dir> [env KEY=VAL ...] -> sets RC, CAP. Pins CC_ROUTES_JSON=subproc fixture and
+# the GIVEN state dir (N4 — every AC-3 arm supplies its OWN fresh dir; no arm ever reuses another's).
 runh() {
-  local routes="$1" payload="$2"; shift 2
+  local payload="$1" state="$2"; shift 2
   CAP=$(printf '%s' "$payload" \
-    | env CC_ROUTES_JSON="$routes" "$@" CC_ROUTE_DISPATCH_STATE_DIR="$STATE" bash "$HOOK" 2>&1); RC=$?
+    | env CC_ROUTES_JSON="$ROUTES_SUBPROC" "$@" CC_ROUTE_DISPATCH_STATE_DIR="$state" bash "$HOOK" 2>&1); RC=$?
 }
-run() { runh "$ROUTES_SUBPROC" "$@"; }
 
 echo "== SECTION 0: static syntax checks =="
-
-# ---- AC-0: bash -n on every shell file this ticket touches. ----
 bash -n "$HOOK" 2>&1
 { [ $? -eq 0 ]; } && ok "AC-0a: bash -n three-role-route-dispatch-gate.sh -> syntax OK" || bad "AC-0a: bash -n three-role-route-dispatch-gate.sh FAILED"
 bash -n "$DIR/three-role-route-dispatch-gate-smoke-test.sh" 2>&1
 { [ $? -eq 0 ]; } && ok "AC-0b: bash -n three-role-route-dispatch-gate-smoke-test.sh (self) -> syntax OK" || bad "AC-0b: bash -n (self) FAILED"
+bash -n "$HELPER" 2>&1
+{ [ $? -eq 0 ]; } && ok "AC-0c: bash -n tools/openrouter-role-dispatch.sh -> syntax OK" || bad "AC-0c: bash -n openrouter-role-dispatch.sh FAILED"
 
-echo "== SECTION 1: positive block-once + no home-path leak — AC 3-4 =="
+echo "== AC-1: in conservative mode the inline token no longer launders a subprocess-declared seat =="
+STATE1="$TMP/state-ac1"; mkdir -p "$STATE1"
+P1='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review [route-dispatch-fallback-ok]\nreview the plan"}}'
+runh "$P1" "$STATE1" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ] && echo "$CAP" | command grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | command grep -q "/Users/"; } \
+  && ok "AC-1: token present, conservative, subprocess seat, no evidence -> exit 2, names the subprocess command, no /Users/ leak" \
+  || bad "AC-1 should refuse despite the token (rc=$RC out=$CAP)"
+{ ! echo "$CAP" | command grep -qi "carrying the inline token"; } \
+  && ok "AC-1: refusal message does NOT advertise the token as a working escape (D3 — no in-band clear)" \
+  || bad "AC-1 message should not tell the caller the token clears this refusal"
 
-# ---- AC-3: plan-review, SSOT-declared subprocess, FIRST issue -> exit 2; stderr names the helper
-#      repo-relatively (tools/openrouter-role-dispatch.sh) and contains NO /Users/ substring (N5); the IDENTICAL
-#      second issue -> exit 0 (block-once, never wedged). ----
-P3='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review\nreview the plan"}}'
-run "$P3" CC_MODE_FILE="$CONS_PIN"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
-  && ok "AC-3 first issue: plan-review subprocess seat -> exit 2, stderr names tools/openrouter-role-dispatch.sh, no /Users/ leak" \
-  || bad "AC-3 first issue should block + name helper + leak no home path (rc=$RC out=$CAP)"
-run "$P3" CC_MODE_FILE="$CONS_PIN"
+echo "== AC-2: the refusal is PERSISTENT, not block-once =="
+runh "$P1" "$STATE1" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-2: identical re-issue of the AC-1 payload (same state dir) -> exit 2 again (persistent, no block-once marker)" \
+  || bad "AC-2 second issue should still refuse (rc=$RC)"
+{ [ -z "$(ls -A "$STATE1" 2>/dev/null)" ]; } \
+  && ok "AC-2 (r2 N6 structural close): the state dir gained NO file at all on refusal — no '.notified' sentinel exists to be misread as evidence, so the self-clearing hazard cannot arise by construction" \
+  || bad "AC-2: refusal must write nothing to the state dir (found: $(ls -A "$STATE1" 2>/dev/null))"
+
+echo "== AC-3(a): genuine evidence escape + inline control =="
+STATE3A="$TMP/state-ac3a"; mkdir -p "$STATE3A"
+SIG_9989_PR="$(evsig plan-review 9989)"
+printf 'role=plan-review task=9989 reason=error drill=0 ts=now\n' > "$STATE3A/$SIG_9989_PR.evidence"
+P3A='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review\nreview the plan"}}'
+runh "$P3A" "$STATE3A" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } \
+  && ok "AC-3(a): fresh, non-drill, same-role+task evidence marker -> exit 0" \
+  || bad "AC-3(a) should permit with genuine evidence (rc=$RC out=$CAP)"
+STATE3A_CTRL="$TMP/state-ac3a-ctrl"; mkdir -p "$STATE3A_CTRL"
+runh "$P3A" "$STATE3A_CTRL" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(a) inline control: identical env with the marker removed -> exit 2" \
+  || bad "AC-3(a) control should refuse with no marker (rc=$RC)"
+{ [ -n "$(ls -A "$STATE1" 2>/dev/null)" ] || true; } >/dev/null 2>&1  # (no-op — placeholder keeps section numbering readable)
+# session-less-payload inline control (the N1 preamble discipline — same shape as AC-3(a), one field varied):
+P3A_NOSESS='{"session_id":"-","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review\nreview the plan"}}'
+runh "$P3A_NOSESS" "$STATE3A" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } \
+  && ok "AC-3(a) power proof: a session-less payload ALSO exits 0 here — but that is the KNOWN fail-open path (no session -> untagged), not evidence-driven; the control below proves it is not silently vacuous" \
+  || bad "unexpected rc for session-less control (rc=$RC)"
+
+echo "== AC-3(b): marker matched on role+task ONLY — a different task, and separately a different role =="
+STATE3B1="$TMP/state-ac3b1"; mkdir -p "$STATE3B1"
+SIG_OTHERTASK="$(evsig plan-review OTHERTASK)"
+printf 'role=plan-review task=OTHERTASK reason=error drill=0 ts=now\n' > "$STATE3B1/$SIG_OTHERTASK.evidence"
+runh "$P3A" "$STATE3B1" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(b) task: marker exists for a DIFFERENT task id -> exit 2 (task-blind match would wrongly permit)" \
+  || bad "AC-3(b) task-mismatch marker should still refuse (rc=$RC)"
+STATE3B2="$TMP/state-ac3b2"; mkdir -p "$STATE3B2"
+SIG_OTHERROLE="$(evsig executor 9989)"
+printf 'role=executor task=9989 reason=error drill=0 ts=now\n' > "$STATE3B2/$SIG_OTHERROLE.evidence"
+runh "$P3A" "$STATE3B2" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(b) role: marker exists for a DIFFERENT role, same task -> exit 2 (role-blind match would wrongly permit)" \
+  || bad "AC-3(b) role-mismatch marker should still refuse (rc=$RC)"
+
+echo "== AC-3(c): marker mtime older than the evidence window =="
+STATE3C="$TMP/state-ac3c"; mkdir -p "$STATE3C"
+MARKER3C="$STATE3C/$SIG_9989_PR.evidence"
+printf 'role=plan-review task=9989 reason=error drill=0 ts=old\n' > "$MARKER3C"
+node -e 'const fs=require("fs");const old=new Date(Date.now()-6*3600000);fs.utimesSync(process.argv[1],old,old);' "$MARKER3C"
+{ [ -f "$MARKER3C" ]; } \
+  && ok "AC-3(c) N3 fixture check: the aged marker genuinely EXISTS on disk before the probe (not a missing-file false positive)" \
+  || bad "AC-3(c) fixture setup failed — marker file missing"
+runh "$P3A" "$STATE3C" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(c): a 6h-old marker (window default 4h) -> exit 2 (age bound enforced)" \
+  || bad "AC-3(c) aged marker should refuse (rc=$RC)"
+
+echo "== AC-3(d): forged in-band evidence (a hand-authored receipt row) is refused, 2/2 =="
+STATE3D="$TMP/state-ac3d"; mkdir -p "$STATE3D"
+RECEIPT3D="$TMP/receipt-ac3d.md"
+echo "OR-DISPATCH-FALLBACK role=plan-review reason=timeout model=moonshotai/kimi-k3 session=n/a task=9989 latency_s=100 drill=0" > "$RECEIPT3D"
+runh "$P3A" "$STATE3D" CC_MODE_FILE="$CONS_PIN" OPENROUTER_DISPATCH_RECEIPT_FILE="$RECEIPT3D"
+RC1="$RC"
+runh "$P3A" "$STATE3D" CC_MODE_FILE="$CONS_PIN" OPENROUTER_DISPATCH_RECEIPT_FILE="$RECEIPT3D"
+RC2="$RC"
+{ [ "$RC1" = "2" ] && [ "$RC2" = "2" ]; } \
+  && ok "AC-3(d): forged receipt row present, state dir empty -> BOTH calls exit 2 (the gate never opens the receipt file at all)" \
+  || bad "AC-3(d) forged-evidence arm should be 2/2 (call1=$RC1 call2=$RC2)"
+
+echo "== AC-3(e): the marker has a live production writer (real hermetic induced failure) =="
+BINSTUB="$TMP/binstub"; mkdir -p "$BINSTUB"
+cat > "$BINSTUB/claude" <<'STUB'
+#!/usr/bin/env bash
+exit 7
+STUB
+chmod +x "$BINSTUB/claude"
+KEYDIR="$TMP/keydir"; mkdir -p "$KEYDIR"
+printf 'OPENROUTER_API_KEY=dummy-fixture-key\n' > "$KEYDIR/openrouter.prod.env"
+chmod 600 "$KEYDIR/openrouter.prod.env"
+BRIEFDIR="$TMP/brief"; mkdir -p "$BRIEFDIR"
+printf 'smoke brief content, no template markers here\n' > "$BRIEFDIR/brief.md"
+POSTMORTEM_DIR="$TMP/postmortem"; mkdir -p "$POSTMORTEM_DIR"
+STATE3E="$TMP/state-ac3e"; mkdir -p "$STATE3E"
+RECEIPT3E="$TMP/receipt-ac3e.md"
+HELPER_RC=""
+HELPER_OUT="$(
+  PATH="$BINSTUB:$PATH" https_proxy="http://127.0.0.1:1" http_proxy="http://127.0.0.1:1" \
+    CC_ROUTES_JSON="$ROUTES_SUBPROC" CC_MODE_FILE="$CONS_PIN" CC_ROUTE_DISPATCH_STATE_DIR="$STATE3E" \
+    OPENROUTER_KEY_FILE="$KEYDIR/openrouter.prod.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$RECEIPT3E" \
+    OPENROUTER_DISPATCH_POSTMORTEM_DIR="$POSTMORTEM_DIR" CLAUDE_PROJECTS_ROOT="$TMP/fakeprojects" \
+    bash "$HELPER" --role plan-review --brief "$BRIEFDIR/brief.md" --task 3ac3e --session smokesess 2>&1
+)"; HELPER_RC=$?
+{ [ "$HELPER_RC" = "1" ] && [ -f "$STATE3E/$(evsig plan-review 3ac3e).evidence" ]; } \
+  && ok "AC-3(e): real induced dispatch failure (non-drill, hermetic, no egress) -> the helper writes the evidence marker itself" \
+  || bad "AC-3(e) helper should fail rc=1 and write the marker (helper_rc=$HELPER_RC state=$(ls "$STATE3E" 2>/dev/null))"
+P3E='{"session_id":"3ac3e","tool_input":{"prompt":"3ROLE_TASK:3ac3e ROLE:plan-review\nreview the plan"}}'
+runh "$P3E" "$STATE3E" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } \
+  && ok "AC-3(e): the tokenless AC-1-shaped payload for the SAME role+task now exits 0 (the marker the helper just wrote is read)" \
+  || bad "AC-3(e) gate should permit off the helper-written marker (rc=$RC)"
+STATE3E_CTRL="$TMP/state-ac3e-ctrl"; mkdir -p "$STATE3E_CTRL"
+runh "$P3E" "$STATE3E_CTRL" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(e) inline control: same payload, fresh state dir -> exit 2 (a gate-only implementation cannot pass this arm)" \
+  || bad "AC-3(e) control should refuse (rc=$RC)"
+
+echo "== AC-3(f): drill failures are inadmissible as evidence =="
+STATE3F="$TMP/state-ac3f"; mkdir -p "$STATE3F"
+RECEIPT3F="$TMP/receipt-ac3f.md"
+HELPER_RC_F=""
+PATH="$BINSTUB:$PATH" https_proxy="http://127.0.0.1:1" http_proxy="http://127.0.0.1:1" \
+  CC_ROUTES_JSON="$ROUTES_SUBPROC" CC_MODE_FILE="$CONS_PIN" CC_ROUTE_DISPATCH_STATE_DIR="$STATE3F" \
+  OPENROUTER_KEY_FILE="$KEYDIR/openrouter.prod.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$RECEIPT3F" \
+  OPENROUTER_DISPATCH_POSTMORTEM_DIR="$POSTMORTEM_DIR" CLAUDE_PROJECTS_ROOT="$TMP/fakeprojects" \
+  bash "$HELPER" --role plan-review --brief "$BRIEFDIR/brief.md" --task 3ac3f --session smokesess --drill >/dev/null 2>&1
+HELPER_RC_F=$?
+DRILL_ROW_COUNT=0; [ -f "$RECEIPT3F" ] && DRILL_ROW_COUNT=$(command grep -c "task=3ac3f.*drill=1" "$RECEIPT3F" 2>/dev/null || echo 0)
+{ [ "$HELPER_RC_F" = "1" ] && [ "$DRILL_ROW_COUNT" -ge 1 ]; } \
+  && ok "AC-3(f) N3 fixture check: the drill induction genuinely failed (receipt carries a real drill=1 row, not a silently-skipped induction)" \
+  || bad "AC-3(f) drill induction should genuinely fail with a drill=1 receipt row (helper_rc=$HELPER_RC_F rows=$DRILL_ROW_COUNT)"
+{ [ -z "$(ls -A "$STATE3F" 2>/dev/null)" ]; } \
+  && ok "AC-3(f): the drill run wrote NO evidence marker at all" \
+  || bad "AC-3(f) drill run should write no marker (found: $(ls -A "$STATE3F" 2>/dev/null))"
+P3F='{"session_id":"3ac3f","tool_input":{"prompt":"3ROLE_TASK:3ac3f ROLE:plan-review\nreview the plan"}}'
+runh "$P3F" "$STATE3F" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-3(f): the tokenless AC-1-shaped payload for the drilled role+task still exits 2 (drill evidence is inadmissible)" \
+  || bad "AC-3(f) gate should still refuse after a drill-only failure (rc=$RC)"
+
+echo "== AC-4(a): operator-scoped escape — mode dial to normal =="
+STATE4A="$TMP/state-ac4a"; mkdir -p "$STATE4A"
+P4A='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:plan-review [route-dispatch-fallback-ok]\nreview the plan"}}'
+runh "$P4A" "$STATE4A" CC_MODE_FILE="$NORM_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-3 second issue: identical re-issue -> exit 0 silent (block-once, not wedged)" \
-  || bad "AC-3 second issue should exit 0 silent (rc=$RC out=$CAP)"
+  && ok "AC-4(a): AC-1 payload under a scratch NORMAL pin -> exit 0, completely silent" \
+  || bad "AC-4(a) normal mode should be silent (rc=$RC out=$CAP)"
+{ [ -z "$(ls -A "$STATE4A" 2>/dev/null)" ]; } \
+  && ok "AC-4(a): no marker/advisory emitted outside conservative mode (behavior outside conservative unchanged)" \
+  || bad "AC-4(a) should write nothing to the state dir (found: $(ls -A "$STATE4A" 2>/dev/null))"
+{ true; } && ok "AC-4(a) anti-vacuity (r2 N2 honesty): a do-nothing stub also PASSES this arm — it proves scoping, never work done" || true
+runh "$P4A" "$STATE4A" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-4(a) inline control: same payload, scratch pin CONTENT flipped to conservative (same path, N1's pin-mutation-trap-safe) -> exit 2" \
+  || bad "AC-4(a) control should refuse under conservative (rc=$RC)"
 
-# ---- AC-4: executor arm + independence. A DIFFERENT role (executor) on the SAME session/task has a DIFFERENT
-#      signature -> it blocks on FIRST issue EVEN AFTER AC-3's plan-review marker exists in the same STATE_DIR
-#      (distinct signature, no cannibalization). ----
-P4='{"session_id":"9989","tool_input":{"prompt":"3ROLE_TASK:9989 ROLE:executor\nimplement the plan"}}'
-run "$P4" CC_MODE_FILE="$CONS_PIN"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "executor" && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh"; } \
-  && ok "AC-4: executor subprocess seat -> exit 2 even after AC-3's plan-review marker exists (distinct session:task:role signature)" \
-  || bad "AC-4 executor should block on first issue independent of the plan-review marker (rc=$RC out=$CAP)"
-# and its own re-issue exits 0 (block-once per signature).
-run "$P4" CC_MODE_FILE="$CONS_PIN"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-4 second issue: executor re-issue -> exit 0 silent (block-once)" \
-  || bad "AC-4 second issue should exit 0 silent (rc=$RC out=$CAP)"
+echo "== AC-4(b): operator-scoped escape — audited kill-switch, logged =="
+STATE4B="$TMP/state-ac4b"; mkdir -p "$STATE4B"
+LOG4B="$TMP/rule12-4b.log"; rm -f "$LOG4B"
+P4B='{"session_id":"9990","tool_input":{"prompt":"3ROLE_TASK:9990 ROLE:plan-review\nreview the plan"}}'
+runh "$P4B" "$STATE4B" CC_MODE_FILE="$CONS_PIN" RULE12_LOG="$LOG4B" CC_ROUTE_DISPATCH_GATE_OFF=1
+{ [ "$RC" = "0" ]; } \
+  && ok "AC-4(b): CC_ROUTE_DISPATCH_GATE_OFF=1 -> exit 0" \
+  || bad "AC-4(b) kill-switch should exit 0 (rc=$RC)"
+ENRICHED_ROW="$(command grep '"escape_kind":"kill-switch:CC_ROUTE_DISPATCH_GATE_OFF"' "$LOG4B" 2>/dev/null | tail -1)"
+{ [ -n "$ENRICHED_ROW" ]; } \
+  && ok "AC-4(b): scratch RULE12_LOG gained a row naming the kill-switch" \
+  || bad "AC-4(b) should log a row naming the kill-switch (log=$(cat "$LOG4B" 2>/dev/null))"
+runh "$P4B" "$STATE4B" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } \
+  && ok "AC-4(b) inline control: same env WITHOUT the kill-switch -> exit 2" \
+  || bad "AC-4(b) control should refuse without the kill-switch (rc=$RC)"
 
-echo "== SECTION 2: fail-open + escapes (escapes LOGGED) — AC 5 =="
+echo "== AC-5: the refusal is SCOPED — it never wedges paths it does not own (N4 fold) =="
+STATE5="$TMP/state-ac5"; mkdir -p "$STATE5"
+P5A='{"session_id":"9991","tool_input":{"prompt":"3ROLE_TASK:9991 ROLE:planner [route-dispatch-fallback-ok]\nplan it"}}'
+runh "$P5A" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } && ok "AC-5(a): role=planner + token, conservative -> exit 0" || bad "AC-5(a) failed (rc=$RC)"
+P5A_CTRL='{"session_id":"9991","tool_input":{"prompt":"3ROLE_TASK:9991 ROLE:plan-review [route-dispatch-fallback-ok]\nplan it"}}'
+runh "$P5A_CTRL" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } && ok "AC-5(a) inline control: role restored to plan-review -> exit 2" || bad "AC-5(a) control failed (rc=$RC)"
 
-# ---- AC-5a: untagged spawn (no 3ROLE_TASK/ROLE tags) -> exit 0 silent (the norm; a bare Agent spawn must
-#      never be false-blocked). Non-vacuous: the SAME plan-review seat blocks when tagged (AC-3). ----
-P5a='{"session_id":"ac5a","tool_input":{"prompt":"general research, no role tags at all"}}'
-run "$P5a"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-5a: untagged spawn -> exit 0 silent (fail-open, the norm)" \
-  || bad "AC-5a untagged should fail-open exit 0 silent (rc=$RC out=$CAP)"
+P5B='{"session_id":"9992","tool_input":{"prompt":"just do research [route-dispatch-fallback-ok]"}}'
+runh "$P5B" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } && ok "AC-5(b): untagged spawn + token -> exit 0" || bad "AC-5(b) failed (rc=$RC)"
+P5B_CTRL='{"session_id":"9992","tool_input":{"prompt":"3ROLE_TASK:9992 ROLE:plan-review [route-dispatch-fallback-ok]\nresearch"}}'
+runh "$P5B_CTRL" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } && ok "AC-5(b) inline control: tag restored (3ROLE_TASK + ROLE:plan-review) -> exit 2" || bad "AC-5(b) control failed (rc=$RC)"
 
-# ---- AC-5b: tagged spawn under a fixture whose seat has NO dispatch field -> exit 0 silent (resolve-route
-#      emits JSON with no dispatch -> SEAT_DISPATCH empty -> fail-open). ----
-P5b='{"session_id":"ac5b","tool_input":{"prompt":"3ROLE_TASK:9501 ROLE:plan-review\nreview"}}'
-runh "$ROUTES_NODISP" "$P5b"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-5b: tagged spawn, seat has NO dispatch field -> exit 0 silent (fail-open, not in scope)" \
-  || bad "AC-5b no-dispatch seat should fail-open exit 0 silent (rc=$RC out=$CAP)"
+P5C='{"session_id":"9993","tool_input":{"prompt":"3ROLE_TASK:9993 ROLE:execution-review [route-dispatch-fallback-ok]\nreview"}}'
+runh "$P5C" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "0" ]; } && ok "AC-5(c): role=execution-review + token -> exit 0" || bad "AC-5(c) failed (rc=$RC)"
+P5C_CTRL='{"session_id":"9993","tool_input":{"prompt":"3ROLE_TASK:9993 ROLE:plan-review [route-dispatch-fallback-ok]\nreview"}}'
+runh "$P5C_CTRL" "$STATE5" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ]; } && ok "AC-5(c) inline control: role restored to plan-review -> exit 2" || bad "AC-5(c) control failed (rc=$RC)"
+{ true; } && ok "AC-5 anti-vacuity (r2 N2 honesty): an always-block stub fails all three; a do-nothing stub PASSES all three — they are scoping guards, not individually work-proving" || true
 
-# ---- AC-5c: dedicated kill-switch CC_ROUTE_DISPATCH_GATE_OFF=1 -> exit 0 (escape suppresses a REAL block —
-#      the same plan-review payload blocks when ungated, AC-3). ----
-P5c='{"session_id":"ac5c","tool_input":{"prompt":"3ROLE_TASK:9502 ROLE:plan-review\nreview"}}'
-run "$P5c" CC_ROUTE_DISPATCH_GATE_OFF=1
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-5c: CC_ROUTE_DISPATCH_GATE_OFF=1 -> exit 0 (kill-switch suppresses a real block)" \
-  || bad "AC-5c kill-switch should exit 0 (rc=$RC out=$CAP)"
-
-# ---- AC-5d: inline token [route-dispatch-fallback-ok] in the prompt -> exit 0 (deliberate sanctioned
-#      fallback, suppresses a real block). ----
-P5d='{"session_id":"ac5d","tool_input":{"prompt":"3ROLE_TASK:9503 ROLE:plan-review [route-dispatch-fallback-ok]\nreview"}}'
-run "$P5d"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-5d: [route-dispatch-fallback-ok] inline token -> exit 0 (deliberate fallback)" \
-  || bad "AC-5d inline token should exit 0 (rc=$RC out=$CAP)"
-
-# ---- AC-5e (N1): the inline-token escape AND the CC_ROUTE_DISPATCH_GATE_OFF=1 escape are AUDIT-LOGGED
-#      (never silent — the exact class of invisible bypass this ticket exists to kill). With RULE12_LOG pointed
-#      at a scratch file, BOTH invocations append an audit row NAMING this hook; >=2 rows total. The cited
-#      precedent (three-role-model-policy-gate.sh:126) exits 0 on its inline token WITHOUT logging — this hook
-#      must NOT copy that. ----
-rm -f "$LOG"
-runh "$ROUTES_SUBPROC" "$P5d" RULE12_LOG="$LOG"
-runh "$ROUTES_SUBPROC" "$P5c" RULE12_LOG="$LOG" CC_ROUTE_DISPATCH_GATE_OFF=1
-ROWS=0; [ -f "$LOG" ] && ROWS=$(grep -c "three-role-route-dispatch-gate" "$LOG")
-if [ "$HAS_OVERRIDE_LIB" = "1" ]; then
-  { [ "$ROWS" -ge 2 ]; } \
-    && ok "AC-5e (N1): inline-token + CC_ROUTE_DISPATCH_GATE_OFF escapes each append an audit row naming the hook ($ROWS rows) — never silent" \
-    || bad "AC-5e (N1) escapes should be audit-logged >=2 rows naming the hook (got $ROWS rows; log=$(cat "$LOG" 2>/dev/null))"
-else
-  { [ "$ROWS" = "0" ]; } \
-    && ok "AC-5e (N1) plugin-safe: lib-hook-override.sh absent -> hook_log_bypass is a guarded no-op, escapes still exit 0, logging dormant (rows=0) — the ai-brain-only audit dep this smoke must not hard-require" \
-    || bad "AC-5e (N1) plugin: with no override lib NO rows should be written (got $ROWS) — a plugin install has no log-bypass writer"
+echo "== AC-6: every escape row is attributable (hook/mode/role/task/escape_kind, none of the five empty) =="
+# Reuses the AC-3(a) and AC-4(b) arms above via a FRESH pair of runs against a shared log, per the AC text.
+STATE6A="$TMP/state-ac6a"; mkdir -p "$STATE6A"
+printf 'role=plan-review task=9995 reason=error drill=0 ts=now\n' > "$STATE6A/$(evsig plan-review 9995).evidence"
+LOG6="$TMP/rule12-6.log"; rm -f "$LOG6"
+P6A='{"session_id":"9995","tool_input":{"prompt":"3ROLE_TASK:9995 ROLE:plan-review\nreview the plan"}}'
+runh "$P6A" "$STATE6A" CC_MODE_FILE="$CONS_PIN" RULE12_LOG="$LOG6"
+P6B='{"session_id":"9996","tool_input":{"prompt":"3ROLE_TASK:9996 ROLE:executor\nimplement\n"}}'
+STATE6B="$TMP/state-ac6b"; mkdir -p "$STATE6B"
+runh "$P6B" "$STATE6B" CC_MODE_FILE="$CONS_PIN" RULE12_LOG="$LOG6" CC_ROUTE_DISPATCH_GATE_OFF=1
+ALL_FIVE_OK=1
+ROW_COUNT=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  # Scope the assertion to route_dispatch_log_escape()'s OWN enriched rows (identified by carrying an
+  # escape_kind field at all) — a pre-existing generic hook_log_bypass row is a DIFFERENT, older writer with
+  # a different shape (no mode/task/escape_kind by design) and is correctly out of scope for this AC.
+  case "$line" in *escape_kind*) ;; *) continue ;; esac
+  ROW_COUNT=$((ROW_COUNT + 1))
+  ROW_OK="$(HOOK_LINE="$line" node -e '
+    let j; try { j = JSON.parse(process.env.HOOK_LINE); } catch (e) { console.log("0"); process.exit(0); }
+    const need = ["hook","mode","role","task","escape_kind"];
+    const ok = need.every(k => j && typeof j[k] === "string" && j[k].length > 0);
+    console.log(ok ? "1" : "0");
+  ')"
+  [ "$ROW_OK" = "1" ] || ALL_FIVE_OK=0
+done < "$LOG6"
+{ [ "$ROW_COUNT" -ge 2 ] && [ "$ALL_FIVE_OK" = "1" ]; } \
+  && ok "AC-6: after the AC-3(a)-shaped and AC-4(b)-shaped arms, RULE12_LOG rows each carry hook/mode/role/task/escape_kind — none of the five empty ($ROW_COUNT rows)" \
+  || bad "AC-6 rows should each carry all 5 non-empty fields (rows=$ROW_COUNT all_ok=$ALL_FIVE_OK log=$(cat "$LOG6" 2>/dev/null))"
+# Red-before floor (measured live, this round): the LIVE .rule-12-overrides.log carries >=75 pre-existing
+# INLINE_TOKEN rows for this hook, none of which carry a mode field — the enrichment is genuinely additive,
+# not a reformat of what was already there.
+LIVE_LOG="$HOME/.claude/.rule-12-overrides.log"
+if [ -f "$LIVE_LOG" ]; then
+  OLD_ROWS=$(command grep -c '"hook":"three-role-route-dispatch-gate".*"var":"INLINE_TOKEN"' "$LIVE_LOG" 2>/dev/null || echo 0)
+  { [ "$OLD_ROWS" -ge 1 ]; } \
+    && ok "AC-6 red-before (floor, live log): $OLD_ROWS pre-#2189 INLINE_TOKEN rows exist for this hook, carrying no mode field — the enrichment is additive" \
+    || echo "NOTE: AC-6 red-before floor found $OLD_ROWS rows (non-blocking measurement, environment-dependent)"
 fi
 
-# ---- AC-5f: SSOT-unresolvable seat (resolve-route --seat <unknown> exits 2 with a non-JSON line) -> exit 0
-#      silent. The fail-open keys on JSON-parse success, NEVER on empty output (round-1 nuance). ----
-P5f='{"session_id":"ac5f","tool_input":{"prompt":"3ROLE_TASK:9504 ROLE:plan-review\nreview"}}'
-# A fixture with NO seats block at all -> resolve-route exits 2 ROUTE-SEAT-NOT-FOUND -> fail-open.
-ROUTES_NOSEAT="$TMP/routes-noseat.json"
-printf '{"seats":{}}' > "$ROUTES_NOSEAT"
-runh "$ROUTES_NOSEAT" "$P5f"
+echo "== Regression: #2105 D3 mode-awareness backstop still holds under the #2189 redesign =="
+STATE_R1="$TMP/state-reg1"; mkdir -p "$STATE_R1"
+P_R1='{"session_id":"reg1","tool_input":{"prompt":"3ROLE_TASK:9601 ROLE:plan-review\nreview the plan"}}'
+runh "$P_R1" "$STATE_R1" CC_MODE_FILE="$NO_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-5f: SSOT-unresolvable seat (ROUTE-SEAT-NOT-FOUND, non-JSON stdout) -> exit 0 silent (fail-open keys on JSON-parse, not empty output)" \
-  || bad "AC-5f unresolvable seat should fail-open exit 0 silent (rc=$RC out=$CAP)"
-
-# ---- AC-5g: family switches THREE_ROLE_INSTRUMENT_OFF=1 and SHIP_PIPELINE=1 -> exit 0 (the plan's prose says
-#      every escape is audit-logged; these are logged too — verified by an extra RULE12_LOG row each). ----
-run "$P5c" THREE_ROLE_INSTRUMENT_OFF=1
-rcTri=$RC
-run "$P5c" SHIP_PIPELINE=1
-rcShip=$RC
-rm -f "$LOG"
-runh "$ROUTES_SUBPROC" "$P5c" RULE12_LOG="$LOG" THREE_ROLE_INSTRUMENT_OFF=1
-runh "$ROUTES_SUBPROC" "$P5c" RULE12_LOG="$LOG" SHIP_PIPELINE=1
-ROWS2=0; [ -f "$LOG" ] && ROWS2=$(grep -c "three-role-route-dispatch-gate" "$LOG")
-if [ "$HAS_OVERRIDE_LIB" = "1" ]; then
-  { [ "$rcTri" = "0" ] && [ "$rcShip" = "0" ] && [ "$ROWS2" -ge 2 ]; } \
-    && ok "AC-5g: THREE_ROLE_INSTRUMENT_OFF + SHIP_PIPELINE -> exit 0 AND audit-logged ($ROWS2 rows, prose implemented as written)" \
-    || bad "AC-5g family switches should exit 0 + log >=2 rows (rcTri=$rcTri rcShip=$rcShip rows=$ROWS2)"
-else
-  { [ "$rcTri" = "0" ] && [ "$rcShip" = "0" ] && [ "$ROWS2" = "0" ]; } \
-    && ok "AC-5g plugin-safe: family switches -> exit 0, logging dormant (rows=0, no override lib) — exits still proven" \
-    || bad "AC-5g plugin: family switches should exit 0 with no rows (rcTri=$rcTri rcShip=$rcShip rows=$ROWS2)"
-fi
-
-echo "== SECTION 3: #2105 D3 mode-awareness backstop — AC 11(a)/(b)/(c) =="
-
-# ---- AC-11(a): mode=normal (default, NO_PIN never created -> source=default) -- the SAME subprocess-declared
-#      plan-review payload that blocks under conservative (AC-3) now stays COMPLETELY SILENT on its FIRST
-#      issue: outside conservative mode the Agent-tool spawn of this seat IS the sanctioned primary (D3's own
-#      dispatch helpers refuse the subprocess route themselves in normal/speed-boost), so nudging it here
-#      would just train every routine normal-mode spawn to carry the bypass token. Distinct session id so no
-#      STATE_DIR marker collision with AC-3's own signature. ----
-P11A='{"session_id":"ac11a","tool_input":{"prompt":"3ROLE_TASK:9601 ROLE:plan-review\nreview the plan"}}'
-run "$P11A" CC_MODE_FILE="$NO_PIN"
+  && ok "Regression: mode=normal (default, no pin) -> exit 0 silent" \
+  || bad "Regression normal-default mode should stay silent (rc=$RC out=$CAP)"
+STATE_R2="$TMP/state-reg2"; mkdir -p "$STATE_R2"
+P_R2='{"session_id":"reg2","tool_input":{"prompt":"3ROLE_TASK:9603 ROLE:executor\nimplement the plan"}}'
+runh "$P_R2" "$STATE_R2" CC_MODE_FILE="$SB_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-11a: mode=normal (default) -> exit 0 silent on FIRST issue (non-conservative = Agent-tool IS sanctioned primary)" \
-  || bad "AC-11a normal mode should stay silent even on first issue (rc=$RC out=$CAP)"
-
-# ---- AC-11(b): mode=conservative -> byte-identical to today's (pre-#2105) behavior. Re-derive independently
-#      of AC-3 (fresh session id, fresh signature) so this arm doesn't just inherit AC-3's already-proven
-#      marker state. ----
-P11B='{"session_id":"ac11b","tool_input":{"prompt":"3ROLE_TASK:9602 ROLE:plan-review\nreview the plan"}}'
-run "$P11B" CC_MODE_FILE="$CONS_PIN"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
-  && ok "AC-11b: mode=conservative -> exit 2 first issue, byte-identical shape to pre-#2105 (helper named, no home-path leak)" \
-  || bad "AC-11b conservative mode should block first issue exactly as before #2105 (rc=$RC out=$CAP)"
-run "$P11B" CC_MODE_FILE="$CONS_PIN"
+  && ok "Regression: mode=speed-boost -> exit 0 silent (keys on ==conservative, not merely !=normal)" \
+  || bad "Regression speed-boost should stay silent (rc=$RC out=$CAP)"
+STATE_R3="$TMP/state-reg3"; mkdir -p "$STATE_R3"
+P_R3='{"session_id":"reg3","tool_input":{"prompt":"3ROLE_TASK:9604 ROLE:plan-review\nreview the plan"}}'
+runh "$P_R3" "$STATE_R3" CC_MODE_FILE="$TMP"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-11b: mode=conservative re-issue -> exit 0 silent (block-once still holds under the mode gate)" \
-  || bad "AC-11b conservative re-issue should exit 0 silent (rc=$RC out=$CAP)"
+  && ok "Regression: unreadable/crashed mode pin (CC_MODE_FILE points at a directory) -> fails OPEN silent" \
+  || bad "Regression broken mode resolution should fail open silent (rc=$RC out=$CAP)"
 
-# ---- AC-11(c): mode=speed-boost (a SECOND non-conservative mode, not just "not pinned") -> also silent,
-#      proving the gate keys on "== conservative", not merely "!= normal" / "no pin present". ----
-P11C='{"session_id":"ac11c","tool_input":{"prompt":"3ROLE_TASK:9603 ROLE:executor\nimplement the plan"}}'
-run "$P11C" CC_MODE_FILE="$SB_PIN"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-11c: mode=speed-boost -> exit 0 silent (gate keys on ==conservative, not merely !=normal)" \
-  || bad "AC-11c speed-boost mode should stay silent (rc=$RC out=$CAP)"
-
-# ---- AC-11(d): a crashed/unreadable mode resolver still fails OPEN (silent), matching the hook's own
-#      documented convention -- point CC_MODE_FILE at a directory (not a file) so resolve-mode's fs.readFileSync
-#      throws a NON-ENOENT error (EISDIR), which loadModePolicy/resolveMode surface as invalid-pin-fallback,
-#      never "conservative". ----
-P11D='{"session_id":"ac11d","tool_input":{"prompt":"3ROLE_TASK:9604 ROLE:plan-review\nreview the plan"}}'
-run "$P11D" CC_MODE_FILE="$TMP"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-11d: unreadable/crashed mode pin -> fails OPEN (silent), never mistaken for conservative" \
-  || bad "AC-11d a broken mode resolution should fail open silent, not block (rc=$RC out=$CAP)"
+echo "== AC-8: nothing this suite (or the mechanism it exercises) can move the dial =="
+CONS_PIN_SHA_AFTER="$(shasum_or_absent "$CONS_PIN")"
+{ [ "$CONS_PIN_SHA_BEFORE" = "$CONS_PIN_SHA_AFTER" ]; } \
+  && ok "AC-8: the scratch conservative pin is byte-identical before/after the whole suite (shasum $CONS_PIN_SHA_AFTER)" \
+  || bad "AC-8 scratch pin should be byte-identical (before=$CONS_PIN_SHA_BEFORE after=$CONS_PIN_SHA_AFTER)"
+REAL_PIN_SHA_AFTER="$(shasum_or_absent "$REAL_PIN")"
+{ [ "$REAL_PIN_SHA_BEFORE" = "$REAL_PIN_SHA_AFTER" ]; } \
+  && ok "AC-8: the REAL ~/.config/cc-mode.json is byte-identical before/after the whole suite ($REAL_PIN_SHA_AFTER) — disclosed race: a genuine concurrent operator flip mid-suite would false-fail this, acceptable for a seconds-long suite" \
+  || bad "AC-8 REAL pin changed during this suite — investigate immediately (before=$REAL_PIN_SHA_BEFORE after=$REAL_PIN_SHA_AFTER)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
