@@ -1,0 +1,12 @@
+{
+  "_composition_contract": "#2105 — this file is one of TWO disjoint lane-policy tables (the other is #1939's config/lane-modes.json). LANE axis: the two doormen (this ticket's hooks/mode-pin-lane-gate.sh and #1939's hooks/lane-ceiling-gate.sh, when it lands) are INDEPENDENT CONJUNCT PreToolUse gates registered at the same two edges — each refuses on its own predicate, so the effective ceiling any spawn actually experiences is min(pin-ceiling, computed-ceiling) BY CONSTRUCTION: a second gate can only refuse MORE, never permit more (tighten-only). PROVIDER axis: openrouter_dispatch is a pure function of (this table, the operator pin at ~/.config/cc-mode.json) ALONE — a computed reading from #1939's decision-maker (e.g. .ai-workspace/status/lane-mode.json) is NEVER consulted for the provider axis and cannot move it by one byte (AC 16). This file never gains a T/nudge-target column — that lives exclusively in #1939's own config/lane-modes.json table. Canonical mode ids are the operator's own words (conservative, normal, speed-boost); #1939/#2035's spelling token-conservative is accepted as an input ALIAS for conservative (see aliases below) so the human vocabulary boundary between the two subsystems never forces a rename on either side. lane_ceiling values are #2035 SS1's C column verbatim (2/4/9) — a committed check (scripts/check-mode-policy-lane-ceiling-parity.mjs) cross-checks these three numbers against that same upstream design doc so the two disjoint tracked tables cannot silently drift apart (AC 17(a)).",
+  "default_mode": "normal",
+  "modes": {
+    "conservative": { "lane_ceiling": 2, "openrouter_dispatch": "permitted" },
+    "normal": { "lane_ceiling": 4, "openrouter_dispatch": "forbidden" },
+    "speed-boost": { "lane_ceiling": 9, "openrouter_dispatch": "forbidden" }
+  },
+  "aliases": {
+    "token-conservative": "conservative"
+  }
+}

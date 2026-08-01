@@ -154,6 +154,20 @@ read -r SEAT_MODEL SEAT_DISPATCH < <(
 # or a seat whose row carries no dispatch field) and any SSOT-unresolvable case fail-opens silently.
 [ "$SEAT_DISPATCH" = "subprocess-openrouter" ] || exit 0
 
+# --- #2105 D3 backstop: mode-awareness ---------------------------------------------------------------------
+# In non-conservative mode the Agent-tool spawn of this seat IS the sanctioned primary (D3's own dispatch
+# helpers refuse the subprocess-openrouter path themselves outside conservative mode) — so this gate stays
+# COMPLETELY SILENT: no advisory, no marker write, no audit line. Firing on every sanctioned normal-mode
+# plan-review/executor spawn would train every spawn to carry the bypass token, deadening the gate for the
+# case it exists to catch. In conservative mode this hook's behavior is byte-identical to today (unchanged
+# below this point). Fail-open on any mode-resolution failure (a crashed resolver here is still advisory-
+# only, unlike the lane doorman/dispatch helpers, so the existing fail-open-on-any-parse-error convention
+# already covers it — MODE_VAL stays empty, which is != "conservative", so this ALSO fails open silently;
+# that is the correct direction for a hook whose whole job is "stay out of the way unless conservative").
+MODE_RESOLVE_OUT="$(node "$LEDGER_HELPER" resolve-mode 2>/dev/null)"
+MODE_VAL="$(printf '%s\n' "$MODE_RESOLVE_OUT" | command grep -m1 '^mode=' | cut -d= -f2)"
+[ "$MODE_VAL" = "conservative" ] || exit 0
+
 # --- per-signature block-once marker ---
 mkdir -p "$STATE_DIR" 2>/dev/null
 find "$STATE_DIR" -type f -mtime +"$TTL_DAYS" -delete 2>/dev/null   # bounded GC (mirrors the model-policy gate).
