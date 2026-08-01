@@ -46,6 +46,15 @@ jobs:
           done
           if [ "$found" = "0" ]; then echo "no smoke tests yet (bootstrap) — skipping"; fi
 
+      # The PREVENTION half of #2205. Fixing the one step below stops that step; this stops the NEXT
+      # one. It flags any step scoped to the push event inside a workflow that also runs on
+      # pull_request — the exact shape below used to have — unless the step states, in a
+      # `# push-only-ok:` comment, why it is a genuine post-merge action rather than a gate.
+      # Deliberately runs on BOTH events: a lint that only ran post-merge would be the very defect
+      # it exists to catch.
+      - name: No push-only merge gates (#2205 prevention)
+        run: node scripts/check-push-only-gates.mjs
+
       # #2205 — this step used to carry `if: github.event_name == 'push'`, which made it
       # STRUCTURALLY incapable of preventing anything. It ran only AFTER a merge landed on master,
       # at which point the subject is immutable without a history rewrite. MEASURED 2026-08-01:
