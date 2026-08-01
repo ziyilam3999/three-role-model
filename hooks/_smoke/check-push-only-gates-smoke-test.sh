@@ -89,12 +89,24 @@ OUT5=$(run_checker); RC5=$?
   || bad "case-5 failed — negative spelling evaded the checker (rc=$RC5 out=$OUT5)"
 
 # ── Case 6 — CONTROL for case 5. An `if:` that admits BOTH events is not push-only and must pass,
-#    even though it mentions github.event_name and 'push'.
+#    even though it mentions github.event_name and 'push'. The predicate additionally requires
+#    evidence the fixture was EXAMINED ("(1 examined") -- see case 6a, the power check this enables
+#    (#2214): `rc=0` alone is also what an EMPTY workflows dir reports, so an `rc=0`-only predicate
+#    is decoration that a deleted fixture would pass just as happily.
 write_wf "$BOTH" "" "github.event_name == 'push' || github.event_name == 'pull_request'"
 OUT6=$(run_checker); RC6=$?
-[ "$RC6" = "0" ] \
+{ [ "$RC6" = "0" ] && printf '%s' "$OUT6" | command grep -q '(1 examined'; } \
   && ok "case-6 (control): an if: that admits BOTH events is not push-only and passes" \
   || bad "case-6 failed — false positive on a both-events condition (rc=$RC6 out=$OUT6)"
+
+# ── Case 6a — POWER CHECK (#2214) for case 6. Delete the fixture (empty workflows dir) and re-run:
+#    the SAME strengthened predicate must now FAIL. An empty scan also reports rc=0, so this proves
+#    case 6's green was not indistinguishable from "no fixture on disk".
+rm -f "$FIX"/.github/workflows/*.yml
+OUT6E=$(run_checker); RC6E=$?
+{ [ "$RC6E" = "0" ] && printf '%s' "$OUT6E" | command grep -q '(1 examined'; } \
+  && bad "case-6a failed — case 6's predicate still passes with the fixture deleted (rc=$RC6E out=$OUT6E)" \
+  || ok "case-6a (power check): case 6's predicate correctly fails when its fixture is deleted"
 
 # ── Case 7 — the REAL repo, read-only. This is the arm that would have caught #2205 before it merged,
 #    and the arm that goes red the day someone reintroduces the shape.
@@ -199,11 +211,19 @@ OUT11=$(run_checker); RC11=$?
 
 # ── Case 12 — CONTROL for case 11. Same context object, but a condition that also admits PRs must
 #    NOT be flagged. Without this, case 11 could be passing because the checker flags everything.
+#    Strengthened with "(1 examined" per #2214 -- see case 12a.
 write_wf "$(printf 'on:\n  push:\n    branches: [master]\n  pull_request:\n    branches: [master]')" "" "github.event.pull_request == null || github.event_name == 'pull_request'"
 OUT12=$(run_checker); RC12=$?
-[ "$RC12" = "0" ] \
+{ [ "$RC12" = "0" ] && printf '%s' "$OUT12" | command grep -q '(1 examined'; } \
   && ok "case-12 (control): a null-PR-context condition that ALSO admits pull_request is not push-only" \
   || bad "case-12 failed — false positive on a both-events context condition (rc=$RC12 out=$OUT12)"
+
+# ── Case 12a — POWER CHECK (#2214) for case 12. Delete-the-input: the strengthened predicate must fail.
+rm -f "$FIX"/.github/workflows/*.yml
+OUT12E=$(run_checker); RC12E=$?
+{ [ "$RC12E" = "0" ] && printf '%s' "$OUT12E" | command grep -q '(1 examined'; } \
+  && bad "case-12a failed — case 12's predicate still passes with the fixture deleted (rc=$RC12E out=$OUT12E)" \
+  || ok "case-12a (power check): case 12's predicate correctly fails when its fixture is deleted"
 
 # ── Case 13 — RED-ARM for the round-2 reopening of case 9. Case 9 proved the annotation no longer
 #    leaks DOWN-to-UP when the comment is flush against its step. It had no power over the shape
@@ -267,9 +287,25 @@ jobs:
         run: echo hi
 YML
 OUT14=$(run_checker); RC14=$?
-{ [ "$RC14" = "0" ] && printf '%s' "$OUT14" | command grep -q '0 push-only step(s) found'; } \
+# Strengthened with "(1 examined" (#2214): the original grep 'grep 0 push-only step(s) found' ALSO
+# matches the empty-scan report ("scanned 0 workflow file(s) (0 examined ...); 0 push-only step(s)
+# found") -- i.e. it passed with NO fixture on disk. Requiring "(1 examined" makes case 14 -- which
+# the file itself calls the most important control below -- actually prove the fixture was read.
+{ [ "$RC14" = "0" ] \
+  && printf '%s' "$OUT14" | command grep -q '0 push-only step(s) found' \
+  && printf '%s' "$OUT14" | command grep -q '(1 examined'; } \
   && ok "case-14 (control): fork/draft guards are PR-ONLY steps and are not mistaken for push-only ones" \
   || bad "case-14 failed — false positive on a PR-only fork/draft guard (rc=$RC14 out=$OUT14)"
+
+# ── Case 14a — POWER CHECK (#2214) for case 14, the file's OWN self-described "most important
+#    control". Delete-the-input: the strengthened predicate must fail.
+rm -f "$FIX"/.github/workflows/*.yml
+OUT14E=$(run_checker); RC14E=$?
+{ [ "$RC14E" = "0" ] \
+  && printf '%s' "$OUT14E" | command grep -q '0 push-only step(s) found' \
+  && printf '%s' "$OUT14E" | command grep -q '(1 examined'; } \
+  && bad "case-14a failed — case 14's predicate still passes with the fixture deleted (rc=$RC14E out=$OUT14E)" \
+  || ok "case-14a (power check): case 14's predicate correctly fails when its fixture is deleted"
 
 # ── Case 15 — RED-ARM for the worst failure this checker can have: skipping a whole file while
 #    exiting 0. YAML mappings are UNORDERED and GitHub accepts `jobs:` before `on:`. The trigger scan
@@ -310,12 +346,19 @@ OUT16=$(run_checker); RC16=$?
 
 # ── Case 17 — CONTROL for case 16. Same ref pin, but the condition also admits pull_request, so it is
 #    not push-only. Without this, case 16 could be green because the checker flags any mention of
-#    github.ref.
+#    github.ref. Strengthened with "(1 examined" per #2214 -- see case 17a.
 write_wf "$BOTH" "" "github.ref == 'refs/heads/master' || github.event_name == 'pull_request'"
 OUT17=$(run_checker); RC17=$?
-[ "$RC17" = "0" ] \
+{ [ "$RC17" = "0" ] && printf '%s' "$OUT17" | command grep -q '(1 examined'; } \
   && ok "case-17 (control): a ref pin that ALSO admits pull_request is not push-only" \
   || bad "case-17 failed — false positive on a both-events ref condition (rc=$RC17 out=$OUT17)"
+
+# ── Case 17a — POWER CHECK (#2214) for case 17. Delete-the-input: the strengthened predicate must fail.
+rm -f "$FIX"/.github/workflows/*.yml
+OUT17E=$(run_checker); RC17E=$?
+{ [ "$RC17E" = "0" ] && printf '%s' "$OUT17E" | command grep -q '(1 examined'; } \
+  && bad "case-17a failed — case 17's predicate still passes with the fixture deleted (rc=$RC17E out=$OUT17E)" \
+  || ok "case-17a (power check): case 17's predicate correctly fails when its fixture is deleted"
 
 # ── Case 18 — the counter's OWN oracle. Cases 7 and 15 both lean on `examined`, but neither can tell
 #    `examined` apart from a second name for `scanned`: in both, every file present IS examined. This
@@ -328,5 +371,177 @@ OUT18=$(run_checker); RC18=$?
 { [ "$RC18" = "0" ] && printf '%s' "$OUT18" | command grep -q 'scanned 1 workflow file(s) (0 examined, 1 skipped'; } \
   && ok "case-18 (counter oracle): a skipped workflow counts as scanned-but-NOT-examined — the two numbers are not synonyms" \
   || bad "case-18 failed — 'examined' does not distinguish a skipped file from a checked one (rc=$RC18 out=$OUT18)"
+
+# ── Case 19 — RED-ARM (#2214, AC-1): the annotation-ownership monotonicity defect, attribution arm
+#    (probe-A shape). Step 1 carries `# push-only-ok:` as the LAST LINE OF ITS OWN BODY (indented to
+#    match its `if:`/`run:` lines, i.e. BODY indent, not the step-marker indent) -- a placement this
+#    file's own doctrine sanctions (:20-22). Step 2, immediately after with no blank line, is a real
+#    unannotated push-only gate. Before the fix, `stepsOf()`'s preamble walk-up claimed ANY trailing
+#    comment for the NEXT step regardless of indentation, so step 1's own annotation was sliced out of
+#    its body and into step 2's preamble: step 2's `allow` credited itself with step 1's reason, and
+#    step 1 -- which never earned an exemption of its own -- was FAILed instead. Asserting on
+#    ATTRIBUTION (which step is FAILed, which is `allow`ed, and crediting whom) rather than exit code
+#    alone is required: the exit code is ALREADY non-zero on the unfixed checker for this shape (an
+#    `exit != 0` assertion would be green today and have zero power over this defect).
+cat > "$FIX/.github/workflows/fixture.yml" <<'YML'
+name: fixture
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: annotated publish
+        if: github.event_name == 'push'
+        run: echo publish
+        # push-only-ok: publishes the release tag, which only exists after the merge lands
+      - name: real unannotated gate
+        if: github.event_name == 'push'
+        run: echo gate
+YML
+OUT19=$(run_checker); RC19=$?
+{ [ "$RC19" != "0" ] \
+  && printf '%s' "$OUT19" | command grep -q 'FAIL:.*"real unannotated gate"' \
+  && printf '%s' "$OUT19" | command grep -q 'allow .*"annotated publish"'; } \
+  && ok "case-19 (RED-ARM, #2214 AC-1): a body-trailing annotation stays with its own step -- the neighbouring gate is FAILed by name, never granted the stolen reason" \
+  || bad "case-19 failed — annotation ownership still transfers to the neighbour (rc=$RC19 out=$OUT19):
+$OUT19"
+
+# ── Case 20 — RED-ARM (#2214, AC-3): the probe-A shape with one blank line between the trailing
+#    annotation and the next step. Blank lines are transparent by design (the walk-up skips them), so
+#    this must yield the IDENTICAL verdict to case 19 -- the owner keeps its own pass, the gate is
+#    flagged by name -- proving the blank line does not reopen the leak from a different angle.
+cat > "$FIX/.github/workflows/fixture.yml" <<'YML'
+name: fixture
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: annotated publish
+        if: github.event_name == 'push'
+        run: echo publish
+        # push-only-ok: publishes the release tag, which only exists after the merge lands
+
+      - name: real unannotated gate
+        if: github.event_name == 'push'
+        run: echo gate
+YML
+OUT20=$(run_checker); RC20=$?
+{ [ "$RC20" != "0" ] \
+  && printf '%s' "$OUT20" | command grep -q 'FAIL:.*"real unannotated gate"' \
+  && printf '%s' "$OUT20" | command grep -q 'allow .*"annotated publish"'; } \
+  && ok "case-20 (RED-ARM, #2214 AC-3): the blank-line variant of case 19 yields the identical, correct verdict" \
+  || bad "case-20 failed — blank-line variant still transfers ownership (rc=$RC20 out=$OUT20):
+$OUT20"
+
+# ── Case 21 — RED-ARM (#2214, AC-2): the silent-green arm (probe-B shape, exit-code flip). The
+#    annotation-owning step's push-only-ness is expressed ONLY at the JOB level (`if:` sits beside
+#    `runs-on:`, not inside any step), so the step-level detector never examines it and it is never
+#    checked for its own annotation. Its trailing last-line-of-body annotation sits directly above an
+#    unannotated push-only GATE. Before the fix this was the fully silent failure mode: the stolen
+#    annotation exempted the gate, and the checker printed "ok: no unannotated push-only steps" at
+#    rc=0 while a real merge gate walked free. #2210 (job-level `if:` detection) stays explicitly out
+#    of scope -- this fixture's job-level `if:` is inert scaffolding to reach the invisible-donor
+#    shape, not a claim that #2210 is fixed here; only the FAIL-naming-the-gate assertion matters.
+cat > "$FIX/.github/workflows/fixture.yml" <<'YML'
+name: fixture
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  j:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: donor (job-level push-only)
+        run: echo donor
+        # push-only-ok: publishes the release tag, which only exists after the merge lands
+      - name: real unannotated gate
+        if: github.event_name == 'push'
+        run: echo gate
+YML
+OUT21=$(run_checker); RC21=$?
+{ [ "$RC21" != "0" ] && printf '%s' "$OUT21" | command grep -q 'FAIL:.*"real unannotated gate"'; } \
+  && ok "case-21 (RED-ARM, #2214 AC-2): the silent exit-0 green flips to a loud FAIL naming the gate" \
+  || bad "case-21 failed — still a silent green (rc=$RC21 out=$OUT21):
+$OUT21"
+
+# ── Case 22 — REGRESSION CONTROL (#2214, AC-4, probe-D shape). NOT part of "the existing suite" --
+#    this is NEW coverage for a case that was already correct before this fix and must stay correct
+#    after it. The annotation sits MID-BODY (between `- name:` and `if:`, several lines before the
+#    next step even begins), so it is nowhere near the preamble walk-up boundary this fix changes.
+#    Confirms the fix is scoped to the boundary defect and does not touch mid-body annotations.
+cat > "$FIX/.github/workflows/fixture.yml" <<'YML'
+name: fixture
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: annotated publish
+        # push-only-ok: publishes the release tag, which only exists after the merge lands
+        if: github.event_name == 'push'
+        run: echo publish
+      - name: real unannotated gate
+        if: github.event_name == 'push'
+        run: echo gate
+YML
+OUT22=$(run_checker); RC22=$?
+{ [ "$RC22" != "0" ] \
+  && printf '%s' "$OUT22" | command grep -q 'FAIL:.*"real unannotated gate"' \
+  && printf '%s' "$OUT22" | command grep -q 'allow .*"annotated publish"'; } \
+  && ok "case-22 (control, #2214 AC-4 probe-D): a mid-body annotation is unaffected by the boundary fix" \
+  || bad "case-22 failed — mid-body annotation attribution broke (rc=$RC22 out=$OUT22):
+$OUT22"
+
+# ── Case 23 — PINNED DECISION (#2214 review note N1). No AC in the original plan decided the
+#    disposition of a comment at BODY indentation sitting between two steps, above a real push-only
+#    gate, where the PRECEDING step is NOT itself push-only (no `if:` at all). Measured before this
+#    case existed: rc=0, the gate was silently granted the neighbour's comment. Two fixes both satisfy
+#    every OTHER AC in this suite: one that keeps this green (grant), one that flips it red (flag).
+#    DECIDED: flag. The comment is body-indented, so under the ownership rule it belongs to the
+#    PRECEDING step's own body -- and since that step is not push-only, the annotation is simply
+#    unused there. It must never be treated as available for the neighbour to inherit: the gate has
+#    earned no annotation of its own and must be flagged. This matches the plan's stated tie-break
+#    (line 28: prefer the loud error over the silent one) and is NOT actually undecidable under the
+#    indentation-based ownership rule -- a body-indented comment structurally reads as body content of
+#    the step it is inside, full stop, regardless of whether that step needs it.
+cat > "$FIX/.github/workflows/fixture.yml" <<'YML'
+name: fixture
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup (not push-only)
+        run: echo setup
+        # push-only-ok: publishes the release tag, which only exists after the merge lands
+      - name: real unannotated gate
+        if: github.event_name == 'push'
+        run: echo gate
+YML
+OUT23=$(run_checker); RC23=$?
+{ [ "$RC23" != "0" ] && printf '%s' "$OUT23" | command grep -q 'FAIL:.*"real unannotated gate"'; } \
+  && ok "case-23 (#2214 N1, pinned FLAG decision): a body-indented comment owned by a non-push-only step never exempts the adjacent gate" \
+  || bad "case-23 failed — the N1 ambiguity still resolves to a silent grant (rc=$RC23 out=$OUT23):
+$OUT23"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

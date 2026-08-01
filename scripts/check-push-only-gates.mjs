@@ -162,16 +162,39 @@ function stepsOf(lines) {
   // Reproduced live before this fix; the round-1 fixture differed by exactly one blank line and so
   // had no power over it.
   //
-  // Walking up over blanks AND comments, and keeping the TOPMOST comment seen, associates the block
-  // downward to the step it precedes. Over-claiming in this direction is the safe error: the worst
-  // case is a trailing comment being read as the next step's preamble, which can only STRIP an
-  // annotation from the step above (a loud false positive), never grant one it did not earn.
-  const preStarts = starts.map(({ i }) => {
+  // Walking up over blanks, and keeping the TOPMOST comment seen, associates that block downward to
+  // the step it precedes -- but ONLY when a candidate comment's OWN indentation exactly matches this
+  // step's marker indent (the "comment lines immediately above it" doctrine placement, :20-22). A
+  // comment indented DEEPER than the marker -- i.e. lined up with body content such as `if:`/`run:` --
+  // reads as the LAST LINE OF THE PRECEDING STEP'S OWN BODY (the other doctrine-sanctioned placement)
+  // and is never claimed here; it stays inside that step's own body slice below. A comment indented
+  // SHALLOWER than the marker (job/file-level) is claimed by neither side -- unowned is the safe
+  // default when a line matches no doctrine placement.
+  //
+  // This indentation gate is what makes the two placements MUTUALLY EXCLUSIVE, and it is the actual
+  // #2214 fix. Before it existed, the walk-up claimed ANY trailing comment for the next step's
+  // preamble regardless of indent, so a `# push-only-ok:` written as the last line of a step's OWN
+  // body -- a placement this file's doctrine sanctions -- was cut out of that step's body and INTO
+  // the next step's preamble at the exact same slice index: the strip and the grant were literally
+  // the same event, not two separable outcomes as an earlier version of this comment claimed.
+  // MEASURED (#2214, two independent probes): on the minimal two-adjacent-push-only-step shape the
+  // checker exited non-zero but with INVERTED attribution -- the donor step (which wrote the
+  // annotation for itself) was FAILed, and the thief (the real unannotated gate next to it) was
+  // `allow`ed, credited with the donor's own reason. When the thief's neighbour is additionally
+  // invisible to the step-level `if:` detector (its push-only-ness lives at the job level instead),
+  // the theft is completely silent: exit 0, "ok: no unannotated push-only steps", while a real
+  // unannotated gate walks free. The prior comment here asserted the opposite of both measurements;
+  // it has been rewritten to match what was actually run, not what seemed true from reading the code.
+  const preStarts = starts.map(({ i, indent }) => {
     let top = i;
     for (let j = i - 1; j >= 0; j--) {
       const t = lines[j].trim();
       if (t === '') continue;               // blank lines are transparent, not terminators
-      if (t.startsWith('#')) { top = j; continue; }
+      if (t.startsWith('#')) {
+        const commentIndent = lines[j].length - lines[j].trimStart().length;
+        if (commentIndent === indent) { top = j; continue; }
+        break;                              // deeper (body-owned) or shallower (unowned): stop here
+      }
       break;                                // real YAML content ends the preamble
     }
     return top;
