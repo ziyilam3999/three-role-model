@@ -107,9 +107,21 @@ jobs:
           set -euo pipefail
 
           # `sync` is first-class here, not a concession. This repo is the PUBLIC mirror of a private
-          # canonical source, and `sync:` is the established prefix for every lockstep port (17 of the
-          # last 20 master commits used it). The type list was simply never taught about the one
-          # commit class this repo produces most.
+          # canonical source, and `sync:` is the established prefix for every lockstep port. The type
+          # list was simply never taught about the one commit class this repo produces most.
+          #
+          # MEASURED over the last 20 origin/master first-parent subjects (#2205 review round 2 —
+          # an earlier draft of this line said "17 of the last 20 used it", which conflated two
+          # different populations):
+          #     14  lowercase `sync...:`      <- actually use the sync prefix
+          #      3  feat/fix                  <- pass on other types
+          #     17  PASS this grammar          = 14 + 3, which is where the wrong "17 used sync" came from
+          #      3  FAIL                       <- `Sync:` x2 and a bare `Sync #1640 ...`
+          # Those 3 failures are CAPITALISED, and the grammar is deliberately case-sensitive, so they
+          # are real failures rather than a gap to paper over: Conventional Commits types are lowercase,
+          # and the whole point of moving this gate pre-merge is that the next one gets caught and
+          # renamed while renaming is still free. They are pre-existing history and nothing here
+          # rewrites them.
           GRAMMAR='^(feat|fix|docs|chore|refactor|test|style|perf|ci|build|revert|sync)(\(.+\))?(!)?: .+'
 
           FAILED=0

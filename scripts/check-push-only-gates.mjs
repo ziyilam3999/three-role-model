@@ -47,14 +47,38 @@ function workflowFiles() {
   return names.filter((n) => n.endsWith('.yml') || n.endsWith('.yaml')).sort();
 }
 
+// The `on:` block, as a line range. Scoping matters in BOTH directions: a step that merely MENTIONS
+// "pull_request" must not fake a trigger, and a real trigger must not be missed.
+//
+// This used to slice `lines[0..indexOf('jobs:')]`, which silently assumed `on:` always precedes
+// `jobs:`. YAML mappings are UNORDERED and GitHub accepts them in any order, so a workflow that
+// writes `jobs:` first left an empty head region -> no trigger found -> the ENTIRE file skipped
+// while the job exited 0. That is the worst failure this file can have, and it was reachable by
+// nothing more than key order (#2205 review round 2, blocker 3). Reproduced before the fix.
+//
+// Reading the actual block instead: from the top-level `on:` key to the next top-level key
+// (column 0). Comments and blank lines inside the block are kept so the inline-list arm can still
+// see a commented-out form, and the zero-indent anchor means a nested `on:` deep in a step cannot
+// be mistaken for the trigger block.
+function onBlock(lines) {
+  const start = lines.findIndex((l) => /^["']?on["']?\s*:/.test(l));
+  if (start === -1) return [];              // no `on:` at all -> no PR reachability
+  const out = [lines[start]];
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === '' || /^\s*#/.test(l)) { out.push(l); continue; }
+    if (/^\S/.test(l)) break;               // a new top-level key ends the block
+    out.push(l);
+  }
+  return out;
+}
+
 // Does this workflow's `on:` block name pull_request? Handles the block form
 //   on:
 //     pull_request:
 // and the inline list form `on: [push, pull_request]`.
-// Scoped to the region before `jobs:` so a step that merely MENTIONS the string cannot fake it.
 function triggersOnPullRequest(lines) {
-  const jobsAt = lines.findIndex((l) => /^jobs:\s*$/.test(l));
-  const head = jobsAt === -1 ? lines : lines.slice(0, jobsAt);
+  const head = onBlock(lines);
   return head.some((l) => {
     const bare = l.replace(/#.*$/, '');
     return /^\s*pull_request(_target)?\s*:/.test(bare)              // block form
@@ -82,12 +106,27 @@ function isPushOnlyCondition(value) {
   // `github.event.pull_request` is null, so this is exactly "not a PR" wearing context-object
   // clothing instead of event_name clothing. The old `if (!/github\.event_name/) return false;`
   // early-exit made it structurally unreachable -- the condition never mentions event_name at all.
-  const nullPrContext = /github\.event\.pull_request\s*==\s*null/.test(v)
-    || /!\s*github\.event\.pull_request\b/.test(v);
-  if (!positivePush && !negativePr && !nullPrContext) return false;
+  //
+  // `(?![\w.])` is LOAD-BEARING and replaces a `\b`, which was a live FALSE POSITIVE (#2205 review
+  // round 2, blocker 2). `\b` is satisfied by the following `.`, so `!github.event.pull_request` also
+  // matched inside `!github.event.pull_request.head.repo.fork` -- the standard fork guard -- and
+  // inside `!github.event.pull_request.draft`. Both are PR-ONLY steps, the exact opposite of this
+  // defect, and the only escape offered was a `# push-only-ok:` annotation, i.e. the lint demanded
+  // the author write a false statement to get past it. A guard that can only be satisfied by lying
+  // teaches people to disable it. The lookahead pins the match to the whole PR object, not a field
+  // read off it. Reproduced before the fix.
+  const nullPrContext = /github\.event\.pull_request(?![\w.])\s*==\s*null/.test(v)
+    || /!\s*github\.event\.pull_request(?![\w.])/.test(v);
+  // A FOURTH spelling, and per the round-2 review the commonest one in the wild: pinning the ref to
+  // the default branch. On a pull_request event `github.ref` is `refs/pull/<n>/merge`, never
+  // `refs/heads/<branch>`, so this is push-to-that-branch-only in effect even though it names
+  // neither the event nor the PR object.
+  const defaultBranchRef = /github\.ref\s*==\s*['"]refs\/heads\/[^'"]+['"]/.test(v);
+  if (!positivePush && !negativePr && !nullPrContext && !defaultBranchRef) return false;
   // An `if:` that ALSO admits pull_request is not push-only — e.g.
   //   if: github.event_name == 'push' || github.event_name == 'pull_request'
-  if ((positivePush || nullPrContext) && /==\s*['"]pull_request['"]/.test(v)) return false;
+  if ((positivePush || nullPrContext || defaultBranchRef)
+      && /==\s*['"]pull_request['"]/.test(v)) return false;
   return true;
 }
 
@@ -107,10 +146,35 @@ function stepsOf(lines) {
   // `# push-only-ok:` comment silently exempted step N-1 as well. That is the #1590 monotonicity
   // shape: a justification written for one step erasing the gate on another. Reproduced before the
   // fix -- a step with NO annotation of its own passed because the next step had one.
+  // BLANK LINES DO NOT BREAK THE ASSOCIATION. The first version walked up over CONTIGUOUS comment
+  // lines only, so a single blank line between an annotation and the step it describes reopened the
+  // exact leak this was written to close (#2205 review round 2, blocker 1):
+  //
+  //     - name: unannotated REAL GATE      <- gets the exemption it never earned
+  //       if: github.event_name == 'push'
+  //     # push-only-ok: publishes the release tag
+  //                                        <- one blank line
+  //     - name: publish                    <- gets flagged instead
+  //
+  // With the blank line present, the next step's walk-up stops immediately (its preamble is empty),
+  // so its body starts at its own line -- which leaves the comment inside the PREVIOUS step's body,
+  // and annotationReason() scans the body. The annotation and the flag land on opposite steps.
+  // Reproduced live before this fix; the round-1 fixture differed by exactly one blank line and so
+  // had no power over it.
+  //
+  // Walking up over blanks AND comments, and keeping the TOPMOST comment seen, associates the block
+  // downward to the step it precedes. Over-claiming in this direction is the safe error: the worst
+  // case is a trailing comment being read as the next step's preamble, which can only STRIP an
+  // annotation from the step above (a loud false positive), never grant one it did not earn.
   const preStarts = starts.map(({ i }) => {
-    let pre = i;
-    while (pre - 1 >= 0 && /^\s*#/.test(lines[pre - 1])) pre--;
-    return pre;
+    let top = i;
+    for (let j = i - 1; j >= 0; j--) {
+      const t = lines[j].trim();
+      if (t === '') continue;               // blank lines are transparent, not terminators
+      if (t.startsWith('#')) { top = j; continue; }
+      break;                                // real YAML content ends the preamble
+    }
+    return top;
   });
   return starts.map(({ i, indent }, k) => {
     // Body: to the next step's PREAMBLE, or to a line that dedents out of the steps list.
@@ -144,6 +208,15 @@ function annotationReason(step) {
 const problems = [];
 const notes = [];
 let scanned = 0;
+// `scanned` counts files OPENED; `examined` counts files whose steps were actually inspected.
+// They are reported separately because they answer different questions, and conflating them was a
+// real gap (#2205 review round 2, blocker 3): `scanned++` runs BEFORE the not-PR-triggered `continue`
+// below, so a file that was opened and immediately skipped still incremented it. A caller asserting
+// only on `scanned` therefore proves the directory was READ, never that anything was CHECKED --
+// and since a mis-detected trigger skips a whole file silently, that is precisely the state an
+// oracle needs to be able to see. Reproduced: reordering `jobs:` above `on:` in a workflow carrying
+// the verbatim #2205 defect kept `scanned 1` while examining nothing.
+let examined = 0;
 let pushOnlySeen = 0;
 
 for (const file of workflowFiles()) {
@@ -158,6 +231,7 @@ for (const file of workflowFiles()) {
     notes.push(`skip ${rel} — workflow does not trigger on pull_request`);
     continue;
   }
+  examined++;
 
   for (const step of stepsOf(lines)) {
     const ifLine = step.body.find((l) => /^\s*if:\s*/.test(l));
@@ -186,7 +260,10 @@ for (const file of workflowFiles()) {
 }
 
 for (const n of notes) console.log(n);
-console.log(`scanned ${scanned} workflow file(s); ${pushOnlySeen} push-only step(s) found`);
+console.log(
+  `scanned ${scanned} workflow file(s) (${examined} examined, ${scanned - examined} skipped as `
+  + `not pull_request-triggered); ${pushOnlySeen} push-only step(s) found`
+);
 
 if (problems.length) {
   console.error('');
