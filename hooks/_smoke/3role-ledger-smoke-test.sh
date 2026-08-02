@@ -3115,4 +3115,262 @@ for RROLE_2 in execution-review plan-review; do
     || bad "1936 AC-2($RROLE_2) leg(iv-b) failed (rc=$RC out=$OUT)"
 done
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2088 — `check --merge-head <ref>`: the opt-in, check-time-ONLY ref-scoped resolution arm. AC labels
+# below map 1:1 to the #2088 plan's Binary AC-3..AC-7 and AC-11. AC-1/AC-2 (the "green, live" ACs) are
+# NOT encoded here — they hardcode real, currently-open PR shas that perish the moment either PR merges;
+# the executor ran them manually against the real ai-brain/three-role-model repos and reports the result
+# separately. Every fixture below is hermetic (mktemp -d throwaway git repos, no network, no real ai-brain
+# ref touched) EXCEPT where noted. Per plan-review r3's N1: AC-5(b)/AC-11(a)/AC-11(b) specifically exercise
+# candidate 2 (task-bound refs in the RUNNING HELPER's own home repo, aiBrainToplevel()) and therefore use
+# the established COPY-not-symlink hermetic pattern (3role-ledger-smoke-test.sh:1148-1156's own precedent)
+# so aiBrainToplevel() resolves to the THROWAWAY repo, never real ai-brain — proven, not merely asserted,
+# by each of those three blocks asserting the enumerated candidate namespace itself (heads/remotes checks).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+MH_SID="sess-2088-mh"
+
+# ---- AC-3: an unreviewed PR still BLOCKs -- a verdict:"PASS" FIELD alone buys nothing ---------------------
+AC3REPO="$(mktemp -d)"
+( cd "$AC3REPO" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+AC3_SHA1=$(git -C "$AC3REPO" rev-parse HEAD)
+T_AC3="2088ac3"
+mk_sub "$MH_SID" ac3p1; mk_sub "$MH_SID" ac3r1; mk_sub "$MH_SID" ac3e1
+node "$LED" append --session "$MH_SID" --task "$T_AC3" --role planner --agent ac3p1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC3" --role plan-review --agent ac3r1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC3" --role executor --agent ac3p1 --artifact "PR #2088ac3" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC3" --role execution-review --agent ac3e1 --artifact ".ai-workspace/reviews/2088-smoke-ac3-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC3REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC3" --merge-head "$AC3_SHA1" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | grep -qi "execution-review"; } \
+  && ok "[proof] 2088-AC3 RED: verdict:PASS field + artifact nowhere (disk, merge-head, task-bound) -> exit 2, names execution-review" \
+  || bad "2088-AC3 RED failed (rc=$RC out=$OUT)"
+
+# Power control (oracle can say YES): commit that artifact (flush-left Decision: PASS) into AC3REPO -> exit 0.
+# rm -f the WORKING COPY right after commit -- git cat-file/show read the OBJECT STORE, never the working
+# tree, so this is a valid "committed but not checked out here" state; leaving the working copy in place
+# would let the OLD disk arm satisfy the row too, and the test would pass for the WRONG reason (N1 hazard).
+mkdir -p "$AC3REPO/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC3REPO/.ai-workspace/reviews/2088-smoke-ac3-execreview.md"
+( cd "$AC3REPO" && git add .ai-workspace/reviews/2088-smoke-ac3-execreview.md && git commit -q -m "fixture: AC-3 power control" )
+rm -f "$AC3REPO/.ai-workspace/reviews/2088-smoke-ac3-execreview.md"
+AC3_SHA2=$(git -C "$AC3REPO" rev-parse HEAD)
+OUT=$(cd "$AC3REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC3" --merge-head "$AC3_SHA2" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 2088-AC3 power control (oracle can say YES): commit the SAME artifact into the fixture head -> exit 0" \
+  || bad "2088-AC3 power control failed (rc=$RC out=$OUT)"
+rm -rf "$AC3REPO"
+
+# ---- AC-7: byte-stability for non-opt-in callers (the AC-3 fixture, WITHOUT --merge-head) -----------------
+# Uses the SAME T_AC3/MH_SID ledger (its cited artifact resolves nowhere on disk regardless of cwd) --
+# cwd is irrelevant here since no --merge-head is passed, so the new ref arm is never even reachable.
+OLD_LED_2088="$DIR/_fixtures/3role-ledger-pre2088-snapshot.mjs"
+OUT_NEW=$(node "$LED" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_NEW=$?
+OUT_OLD=$(node "$OLD_LED_2088" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_OLD=$?
+IDENTICAL="no"; [ "$OUT_NEW" = "$OUT_OLD" ] && IDENTICAL="yes"
+{ [ "$RC_NEW" = "2" ] && [ "$RC_OLD" = "2" ] && [ "$IDENTICAL" = "yes" ]; } \
+  && ok "[proof] 2088-AC7: AC-3 fixture WITHOUT --merge-head -> byte-identical stdout+exit between the pre-#2088 snapshot and this branch's helper (both exit 2)" \
+  || bad "2088-AC7 failed (rc_new=$RC_NEW rc_old=$RC_OLD identical=$IDENTICAL)"
+
+# ---- AC-4: content at the ref outranks the verdict field (the #2261-direction arm) -------------------------
+AC4REPO="$(mktemp -d)"
+( cd "$AC4REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$AC4REPO/.ai-workspace/reviews"
+printf '## Review\nDecision: NEEDS-WORK\n' > "$AC4REPO/.ai-workspace/reviews/2088-smoke-ac4-execreview.md"
+( cd "$AC4REPO" && git add .ai-workspace/reviews/2088-smoke-ac4-execreview.md && git commit -q -m "fixture: AC-4 needs-work" )
+# rm -f the working copy (see the AC-3 power-control comment above -- otherwise the OLD disk arm would
+# satisfy this row too, via VERDICT_RE's "## Review" match, and the test would pass for the WRONG reason.
+rm -f "$AC4REPO/.ai-workspace/reviews/2088-smoke-ac4-execreview.md"
+AC4_SHA1=$(git -C "$AC4REPO" rev-parse HEAD)
+T_AC4="2088ac4"
+mk_sub "$MH_SID" ac4p1; mk_sub "$MH_SID" ac4r1; mk_sub "$MH_SID" ac4e1
+node "$LED" append --session "$MH_SID" --task "$T_AC4" --role planner --agent ac4p1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC4" --role plan-review --agent ac4r1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC4" --role executor --agent ac4p1 --artifact "PR #2088ac4" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC4" --role execution-review --agent ac4e1 --artifact ".ai-workspace/reviews/2088-smoke-ac4-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC4REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC4" --merge-head "$AC4_SHA1" 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } \
+  && ok "[proof] 2088-AC4 RED: committed artifact carries VERDICT_RE-passing NEEDS-WORK (no flush-left affirmative Decision line) despite verdict:PASS field -> exit 2" \
+  || bad "2088-AC4 RED failed (rc=$RC out=$OUT)"
+
+# Falsification: flip the SAME committed blob to Decision: PASS -> exit 0 (the discriminator is the ref's own content).
+printf '## Review\nDecision: PASS\n' > "$AC4REPO/.ai-workspace/reviews/2088-smoke-ac4-execreview.md"
+( cd "$AC4REPO" && git add .ai-workspace/reviews/2088-smoke-ac4-execreview.md && git commit -q -m "fixture: AC-4 falsification, flip to PASS" )
+rm -f "$AC4REPO/.ai-workspace/reviews/2088-smoke-ac4-execreview.md"
+AC4_SHA2=$(git -C "$AC4REPO" rev-parse HEAD)
+OUT=$(cd "$AC4REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC4" --merge-head "$AC4_SHA2" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 2088-AC4 falsification: flip the SAME blob to Decision: PASS -> exit 0" \
+  || bad "2088-AC4 falsification failed (rc=$RC out=$OUT)"
+rm -rf "$AC4REPO"
+
+# ---- AC-5(a): candidate-set boundary -- artifact on a NON-task-bound, non-merge-head branch is never
+# consulted (uses candidate 1 only -- no aiBrainToplevel() dependency, no hermetic copy needed). ----------
+AC5REPO="$(mktemp -d)"
+( cd "$AC5REPO" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+AC5_MERGEHEAD=$(git -C "$AC5REPO" rev-parse HEAD)
+git -C "$AC5REPO" checkout -q -b unrelated-branch
+mkdir -p "$AC5REPO/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC5REPO/.ai-workspace/reviews/2088-smoke-ac5a-execreview.md"
+git -C "$AC5REPO" add .ai-workspace/reviews/2088-smoke-ac5a-execreview.md
+git -C "$AC5REPO" commit -q -m "fixture: AC-5a artifact on an unrelated branch"
+git -C "$AC5REPO" checkout -q -
+T_AC5A="2088ac5a"
+mk_sub "$MH_SID" ac5ap1; mk_sub "$MH_SID" ac5ar1; mk_sub "$MH_SID" ac5ae1
+node "$LED" append --session "$MH_SID" --task "$T_AC5A" --role planner --agent ac5ap1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC5A" --role plan-review --agent ac5ar1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC5A" --role executor --agent ac5ap1 --artifact "PR #2088ac5a" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC5A" --role execution-review --agent ac5ae1 --artifact ".ai-workspace/reviews/2088-smoke-ac5a-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC5REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC5A" --merge-head "$AC5_MERGEHEAD" 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } \
+  && ok "[proof] 2088-AC5(a) RED: artifact committed ONLY on a non-task-bound, non-merge-head branch -> never consulted, exit 2" \
+  || bad "2088-AC5(a) RED failed (rc=$RC out=$OUT)"
+rm -rf "$AC5REPO"
+
+# ---- AC-5(b): candidate-set boundary -- artifact on a LOCAL-ONLY <task>-* branch (refs/heads/, no
+# origin-tracking counterpart) is never consulted. Exercises candidate 2 -> hermetic helper-copy pattern. --
+AC5B_HOME="$(mktemp -d)"
+( cd "$AC5B_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+AC5B_MERGEHEAD=$(git -C "$AC5B_HOME" rev-parse HEAD)
+AC5B_DEFAULT_BRANCH=$(git -C "$AC5B_HOME" branch --show-current)
+mkdir -p "$AC5B_HOME/hooks"
+cp "$LED" "$AC5B_HOME/hooks/3role-ledger.mjs"
+LED_AC5B="$AC5B_HOME/hooks/3role-ledger.mjs"
+T_AC5B="2088ac5b"
+git -C "$AC5B_HOME" checkout -q -b "${T_AC5B}-localonly"
+mkdir -p "$AC5B_HOME/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC5B_HOME/.ai-workspace/reviews/2088-smoke-ac5b-execreview.md"
+git -C "$AC5B_HOME" add .ai-workspace/reviews/2088-smoke-ac5b-execreview.md
+git -C "$AC5B_HOME" commit -q -m "fixture: AC-5b local-only task-bound branch"
+# Checkout BACK to the default branch (no artifact there) before running check -- otherwise the artifact
+# would be physically present on disk (we'd still be checked out on the branch that has it), and the OLD
+# disk arm would satisfy the row too, defeating the whole point of testing refs/heads/ exclusion (N1).
+git -C "$AC5B_HOME" checkout -q "$AC5B_DEFAULT_BRANCH"
+AC5B_HEADS_MATCH=$(git -C "$AC5B_HOME" for-each-ref --format='%(refname)' "refs/heads/${T_AC5B}-*")
+AC5B_REMOTES_MATCH=$(git -C "$AC5B_HOME" for-each-ref --format='%(refname)' "refs/remotes/origin/${T_AC5B}-*")
+mk_sub "$MH_SID" ac5bp1; mk_sub "$MH_SID" ac5br1; mk_sub "$MH_SID" ac5be1
+node "$LED_AC5B" append --session "$MH_SID" --task "$T_AC5B" --role planner --agent ac5bp1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED_AC5B" append --session "$MH_SID" --task "$T_AC5B" --role plan-review --agent ac5br1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED_AC5B" append --session "$MH_SID" --task "$T_AC5B" --role executor --agent ac5bp1 --artifact "PR #2088ac5b" >/dev/null
+node "$LED_AC5B" append --session "$MH_SID" --task "$T_AC5B" --role execution-review --agent ac5be1 --artifact ".ai-workspace/reviews/2088-smoke-ac5b-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC5B_HOME" && node "$LED_AC5B" check --session "$MH_SID" --task "$T_AC5B" --merge-head "$AC5B_MERGEHEAD" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && [ -n "$AC5B_HEADS_MATCH" ] && [ -z "$AC5B_REMOTES_MATCH" ]; } \
+  && ok "[proof] 2088-AC5(b) RED: artifact on a LOCAL-ONLY task-bound branch (refs/heads/, no origin-tracking counterpart) -> refs/heads/ never consulted, exit 2 (hermetic: candidate-2 repo == this fixture, heads populated + remotes empty asserted)" \
+  || bad "2088-AC5(b) RED failed (rc=$RC out=$OUT heads=$AC5B_HEADS_MATCH remotes=$AC5B_REMOTES_MATCH)"
+
+# Falsification / oracle-can-say-YES: push arm-(b)'s branch to a fixture origin under its task-bound name ->
+# exit 0. Stated plainly (per the plan): that flip IS the residual attack -- proof of the BOUNDARY only.
+AC5B_ORIGIN="$(mktemp -d)"
+( cd "$AC5B_ORIGIN" && git init -q --bare )
+git -C "$AC5B_HOME" remote add origin "$AC5B_ORIGIN"
+git -C "$AC5B_HOME" push -q origin "${T_AC5B}-localonly"
+git -C "$AC5B_HOME" fetch -q origin >/dev/null 2>&1
+OUT=$(cd "$AC5B_HOME" && node "$LED_AC5B" check --session "$MH_SID" --task "$T_AC5B" --merge-head "$AC5B_MERGEHEAD" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 2088-AC5(b) falsification: push the SAME branch to a fixture origin under its task-bound name -> exit 0 (this flip IS the residual attack, pinned honestly by AC-11 -- boundary-proof only)" \
+  || bad "2088-AC5(b) falsification failed (rc=$RC out=$OUT)"
+rm -rf "$AC5B_HOME" "$AC5B_ORIGIN"
+
+# ---- AC-6: worktree-dangle tail (the #2023 class) -----------------------------------------------------------
+AC6REPO="$(mktemp -d)"
+( cd "$AC6REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+mkdir -p "$AC6REPO/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC6REPO/.ai-workspace/reviews/2088-smoke-ac6-execreview.md"
+( cd "$AC6REPO" && git add .ai-workspace/reviews/2088-smoke-ac6-execreview.md && git commit -q -m "fixture: AC-6 worktree-dangle tail" )
+AC6_SHA1=$(git -C "$AC6REPO" rev-parse HEAD)
+T_AC6="2088ac6"
+mk_sub "$MH_SID" ac6p1; mk_sub "$MH_SID" ac6r1; mk_sub "$MH_SID" ac6e1
+node "$LED" append --session "$MH_SID" --task "$T_AC6" --role planner --agent ac6p1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC6" --role plan-review --agent ac6r1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$MH_SID" --task "$T_AC6" --role executor --agent ac6p1 --artifact "PR #2088ac6" >/dev/null
+# A DANGLING worktree-subtree path: this exact directory tree does not exist anywhere on disk.
+# NOTE: deliberately rooted OUTSIDE /Users//home (not a home-path literal, so privacy-scan.sh's
+# PRIVACY_HOMEPATH_ERE never matches this fixture string) -- the AC-6 mechanism under test only
+# needs an absolute path containing a `.claude/worktrees/<slug>/` segment for the worktree-dangle
+# tail-stripping regex to fire; it does not need to look like a real home directory.
+DANGLE_PATH="/opt/nonexistent-2088-smoke/coding_projects/ai-brain/.claude/worktrees/2088ac6-quarantined-slug/.ai-workspace/reviews/2088-smoke-ac6-execreview.md"
+node "$LED" append --session "$MH_SID" --task "$T_AC6" --role execution-review --agent ac6e1 --artifact "$DANGLE_PATH" --verdict PASS >/dev/null
+OUT=$(cd "$AC6REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC6" --merge-head "$AC6_SHA1" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 2088-AC6: worktree-dangle path (worktree gone from disk) resolves via the branch-relative tail at the ref -> exit 0" \
+  || bad "2088-AC6 failed (rc=$RC out=$OUT)"
+
+# Falsification: ALSO remove the blob from the ref -> exit 2.
+git -C "$AC6REPO" rm -q .ai-workspace/reviews/2088-smoke-ac6-execreview.md
+git -C "$AC6REPO" commit -q -m "fixture: AC-6 falsification, remove the blob"
+AC6_SHA2=$(git -C "$AC6REPO" rev-parse HEAD)
+OUT=$(cd "$AC6REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC6" --merge-head "$AC6_SHA2" 2>&1); RC=$?
+[ "$RC" = "2" ] \
+  && ok "[proof] 2088-AC6 falsification: also remove the blob from the ref -> exit 2" \
+  || bad "2088-AC6 falsification failed (rc=$RC out=$OUT)"
+rm -rf "$AC6REPO"
+
+# ---- AC-11(a): residual-pinning -- minted, PUSHED task-bound evidence IS accepted (documented, not fixed).
+# Exercises candidate 2 -> hermetic helper-copy pattern (aiBrainToplevel() must resolve to THIS fixture). --
+AC11A_HOME="$(mktemp -d)"
+( cd "$AC11A_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+AC11A_UNRELATED_HEAD=$(git -C "$AC11A_HOME" rev-parse HEAD)
+AC11A_DEFAULT_BRANCH=$(git -C "$AC11A_HOME" branch --show-current)
+mkdir -p "$AC11A_HOME/hooks"
+cp "$LED" "$AC11A_HOME/hooks/3role-ledger.mjs"
+LED_AC11A="$AC11A_HOME/hooks/3role-ledger.mjs"
+T_AC11A="2088ac11a"
+git -C "$AC11A_HOME" checkout -q -b "${T_AC11A}-minted"
+mkdir -p "$AC11A_HOME/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC11A_HOME/.ai-workspace/reviews/2088-smoke-ac11a-execreview.md"
+git -C "$AC11A_HOME" add .ai-workspace/reviews/2088-smoke-ac11a-execreview.md
+git -C "$AC11A_HOME" commit -q -m "fixture: AC-11a minted evidence, never reviewed"
+AC11A_ORIGIN="$(mktemp -d)"
+( cd "$AC11A_ORIGIN" && git init -q --bare )
+git -C "$AC11A_HOME" remote add origin "$AC11A_ORIGIN"
+git -C "$AC11A_HOME" push -q origin "${T_AC11A}-minted"
+git -C "$AC11A_HOME" fetch -q origin >/dev/null 2>&1
+# Checkout BACK to the default/seed branch (no artifact there) before running check -- otherwise the
+# artifact would be physically present on disk (still checked out on the minted branch), and the OLD disk
+# arm would satisfy the row too -- exit 0 for the wrong reason, never genuinely exercising candidate 2 (N1).
+git -C "$AC11A_HOME" checkout -q "$AC11A_DEFAULT_BRANCH"
+mk_sub "$MH_SID" ac11ap1; mk_sub "$MH_SID" ac11ar1; mk_sub "$MH_SID" ac11ae1
+node "$LED_AC11A" append --session "$MH_SID" --task "$T_AC11A" --role planner --agent ac11ap1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED_AC11A" append --session "$MH_SID" --task "$T_AC11A" --role plan-review --agent ac11ar1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED_AC11A" append --session "$MH_SID" --task "$T_AC11A" --role executor --agent ac11ap1 --artifact "PR #2088ac11a" >/dev/null
+node "$LED_AC11A" append --session "$MH_SID" --task "$T_AC11A" --role execution-review --agent ac11ae1 --artifact ".ai-workspace/reviews/2088-smoke-ac11a-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC11A_HOME" && node "$LED_AC11A" check --session "$MH_SID" --task "$T_AC11A" --merge-head "$AC11A_UNRELATED_HEAD" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "[proof] 2088-AC11(a) residual-pin (pushed variant): minted+pushed <task>-minted evidence, unrelated merge-head -> exit 0 (DOCUMENTED residual, tracked #2268, NOT a fix)" \
+  || bad "2088-AC11(a) failed (rc=$RC out=$OUT)"
+rm -rf "$AC11A_HOME" "$AC11A_ORIGIN"
+
+# ---- AC-11(b): residual-pinning -- LOCALLY-MINTED mirror variant (no push, no network, no remote). --------
+# Pins the r2 refutation: candidate 2 reads the local mirror, whose membership costs ONE local command.
+AC11B_HOME="$(mktemp -d)"
+( cd "$AC11B_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+AC11B_UNRELATED_HEAD=$(git -C "$AC11B_HOME" rev-parse HEAD)
+AC11B_DEFAULT_BRANCH=$(git -C "$AC11B_HOME" branch --show-current)
+mkdir -p "$AC11B_HOME/hooks"
+cp "$LED" "$AC11B_HOME/hooks/3role-ledger.mjs"
+LED_AC11B="$AC11B_HOME/hooks/3role-ledger.mjs"
+T_AC11B="2088ac11b"
+git -C "$AC11B_HOME" checkout -q -b scratch-ac11b
+mkdir -p "$AC11B_HOME/.ai-workspace/reviews"
+printf '## Review\nDecision: PASS\n' > "$AC11B_HOME/.ai-workspace/reviews/2088-smoke-ac11b-execreview.md"
+git -C "$AC11B_HOME" add .ai-workspace/reviews/2088-smoke-ac11b-execreview.md
+git -C "$AC11B_HOME" commit -q -m "fixture: AC-11b minted evidence, never reviewed (on a SCRATCH ref, never a <task>-* name)"
+AC11B_SCRATCH_SHA=$(git -C "$AC11B_HOME" rev-parse HEAD)
+# Populate the candidate namespace with ONE local command -- no push, no network, no remote configured --
+# then delete the scratch branch (the evidence survives ONLY in the remote-tracking namespace afterward).
+git -C "$AC11B_HOME" checkout -q "$AC11B_DEFAULT_BRANCH"
+git -C "$AC11B_HOME" update-ref "refs/remotes/origin/${T_AC11B}-minted-local" "$AC11B_SCRATCH_SHA"
+git -C "$AC11B_HOME" branch -D scratch-ac11b -q
+# Assert: NO remote configured throughout, refs/heads/<task>-* is EMPTY (proves AC-5 arm (b) has no power here).
+AC11B_REMOTES=$(git -C "$AC11B_HOME" remote)
+AC11B_HEADS_MATCH=$(git -C "$AC11B_HOME" for-each-ref --format='%(refname)' "refs/heads/${T_AC11B}-*")
+mk_sub "$MH_SID" ac11bp1; mk_sub "$MH_SID" ac11br1; mk_sub "$MH_SID" ac11be1
+node "$LED_AC11B" append --session "$MH_SID" --task "$T_AC11B" --role planner --agent ac11bp1 --artifact "$TMP/plan.md" >/dev/null
+node "$LED_AC11B" append --session "$MH_SID" --task "$T_AC11B" --role plan-review --agent ac11br1 --artifact "$TMP/rev.md" >/dev/null
+node "$LED_AC11B" append --session "$MH_SID" --task "$T_AC11B" --role executor --agent ac11bp1 --artifact "PR #2088ac11b" >/dev/null
+node "$LED_AC11B" append --session "$MH_SID" --task "$T_AC11B" --role execution-review --agent ac11be1 --artifact ".ai-workspace/reviews/2088-smoke-ac11b-execreview.md" --verdict PASS >/dev/null
+OUT=$(cd "$AC11B_HOME" && node "$LED_AC11B" check --session "$MH_SID" --task "$T_AC11B" --merge-head "$AC11B_UNRELATED_HEAD" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && [ -z "$AC11B_REMOTES" ] && [ -z "$AC11B_HEADS_MATCH" ]; } \
+  && ok "[proof] 2088-AC11(b) residual-pin (locally-minted mirror variant): git update-ref populates refs/remotes/origin/<task>-* with ZERO push/network/remote -> exit 0 (DOCUMENTED residual, tracked #2268, NOT a fix; git remote empty + refs/heads/<task>-* empty asserted)" \
+  || bad "2088-AC11(b) failed (rc=$RC out=$OUT remotes=$AC11B_REMOTES heads=$AC11B_HEADS_MATCH)"
+rm -rf "$AC11B_HOME"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
