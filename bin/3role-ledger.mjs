@@ -4147,15 +4147,15 @@ function cmdLintRoutes(opts) {
 //   - openrouter_dispatch: whether tools/openrouter-*-dispatch.sh may reach OpenRouter at all.
 // Fail-safe direction (D1): EVERY failure shape (absent/unreadable/unparseable pin, unknown mode value,
 // broken/absent tracked table) resolves to `normal` — the harm asymmetry is that an accidental non-Anthropic
-// dispatch violates the operator's directive AND a data-posture boundary, while 4 lanes is the operator's own
-// declared normal-mode default. Garbage state can never resolve to speed-boost and can never resolve to
+// dispatch violates the operator's directive AND a data-posture boundary, while 3 lanes is the operator's own
+// declared normal-mode default (#2216, 2026-08-01 — lowered from 4). Garbage state can never resolve to speed-boost and can never resolve to
 // openrouter_dispatch=permitted.
 // Fixture seams (mirrors CC_ROUTES_JSON): CC_MODE_FILE (the pin) and CC_MODE_POLICY_JSON (the tracked table).
 // No smoke may ever omit both — the real ~/.config/cc-mode.json is NEVER read or written by any test arm.
 
 const MODE_FALLBACK = Object.freeze({
   mode: 'normal',
-  lane_ceiling: 4,
+  lane_ceiling: 3,
   openrouter_dispatch: 'forbidden',
 });
 
