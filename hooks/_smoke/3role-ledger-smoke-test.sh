@@ -43,6 +43,25 @@ OLD_LED="$AC23B_FIXTURE"
 mk_sub() { mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"; printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user"}\n' "$2" "$1" > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"; }
 nlines() { [ -f "$LEDFILE" ] && grep -c . "$LEDFILE" || echo 0; }
 
+# #2309 (R5.2 migration) — append a DIARY line (a real assistant Bash tool_use) to an agent's transcript,
+# recording the EXACT ledger-append invocation clause 3's proof predicate (commandProvesLedgerAppend) looks
+# for: a COMMAND-POSITION `3role-ledger.mjs … append … --task T --role R --verdict V` invocation. Models
+# what a REAL self-appending agent's own transcript carries by execution time (R5.1/V9: 27/30 real composed
+# writes prove exactly this shape). Call AFTER mk_sub/mk_tagged (which CREATE the transcript file) -- this
+# APPENDS to it, never overwrites.
+mk_diary() { # <session> <agentId> <task> <role> <verdict>
+  node -e '
+    const fs = require("fs");
+    const [ , file, task, role, verdict ] = process.argv;
+    const cmd = "node hooks/3role-ledger.mjs append --task " + task + " --role " + role +
+      " --verdict " + verdict + " --closed-at 2026-01-01T00:00:00.000Z";
+    const rec = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+      { type: "tool_use", name: "Bash", input: { command: cmd } }
+    ] } });
+    fs.appendFileSync(file, rec + "\n");
+  ' "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl" "$3" "$4" "$5"
+}
+
 # artifact fixtures
 printf '## ELI5\na plan\n### Binary AC\n- AC1\n' > "$TMP/plan.md"
 printf '## Review\nverdict: PASS\n' > "$TMP/rev.md"
@@ -1400,6 +1419,12 @@ AC3SID="sess-1580-ac3"; AC3TASK="ac3round"
 AC3F="$THREE_ROLE_LEDGER_DIR/$AC3SID/$AC3TASK.jsonl"
 mk_tagged "$AC3SID" "ac3-ra1" "$AC3TASK" "plan-review"
 mk_tagged "$AC3SID" "ac3-ra2" "$AC3TASK" "plan-review"
+# #2309 (R5.2/N2 migration) — BOTH round-1 (ra1) and round-2 (ra2) carry a verdict-INTRODUCING close below
+# (BLOCK, then PASS), each a same-round merge onto its own bare spawn row -- clause 3's trigger fires on
+# both, so BOTH fixture agents need a diary recording the exact close their own command below executes (a
+# real self-appending agent's transcript would already carry this by execution time -- R5.1/V9).
+mk_diary "$AC3SID" "ac3-ra1" "$AC3TASK" "plan-review" "BLOCK"
+mk_diary "$AC3SID" "ac3-ra2" "$AC3TASK" "plan-review" "PASS"
 # round-1: spawn, then close with verdict BLOCK + model M1 (two separate calls — the real spawn-hook /
 # close-hook shape).
 node "$LED" append --session "$AC3SID" --task "$AC3TASK" --role plan-review --agent ac3-ra1 --model-version "MODEL-ONE" >/dev/null
@@ -3040,6 +3065,11 @@ for RROLE_15 in execution-review plan-review; do
   T15="1936ac15-${RROLE_15}"
   mk_baseline3_1936 "$T15" "$RROLE_15"
   mk_sub "$S1936" "ac15-${RROLE_15}-A1"; mk_sub "$S1936" "ac15-${RROLE_15}-A2"
+  # #2309 (R5.2/N2 migration) — BOTH A1 (round-1's attribution-free FAIL introduction, step (1) below) and
+  # A2 (the doctrine PASS introduction, arm (a) below) are verdict-introducing writes onto their own bare
+  # rows -- clause 3 fires on both, so BOTH need a diary (without A1's, the block never reaches (a): N2).
+  mk_diary "$S1936" "ac15-${RROLE_15}-A1" "$T15" "$RROLE_15" "FAIL"
+  mk_diary "$S1936" "ac15-${RROLE_15}-A2" "$T15" "$RROLE_15" "PASS"
   # (1) full FAIL review round, three-write lifecycle: spawn -> mid-turn self-append -> stop-shaped closed-at.
   node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --agent "ac15-${RROLE_15}-A1" >/dev/null
   node "$LED" append --session "$S1936" --task "$T15" --role "$RROLE_15" --artifact "$TMP/rev.md" --verdict FAIL >/dev/null
@@ -3075,6 +3105,12 @@ for RROLE_2 in execution-review plan-review; do
   T2="1936ac2-${RROLE_2}"
   mk_baseline3_1936 "$T2" "$RROLE_2"
   mk_sub "$S1936" "ac2-${RROLE_2}-RA1"; mk_sub "$S1936" "ac2-${RROLE_2}-RA2"
+  # #2309 (R5.2/N2 migration) — leg(iv-a)'s SECOND append below (--verdict PASS, no --agent) is a
+  # verdict-introducing write onto RA2's own bare round-2 row; RA1 needs none (its FAIL close is the FIRST
+  # write ever for this task+role -- no prior row for clause 3 to key off). N2: "the RA2 fixture transcript
+  # gains the two recorded appends" -- both the artifact-only and the verdict append, mirroring a real
+  # two-command self-append (only the verdict one is load-bearing for clause 3's proof).
+  mk_diary "$S1936" "ac2-${RROLE_2}-RA2" "$T2" "$RROLE_2" "PASS"
   node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --agent "ac2-${RROLE_2}-RA1" --artifact "$TMP/rev.md" --verdict FAIL --closed-at "2026-01-01T00:15:00Z" >/dev/null
   node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --agent "ac2-${RROLE_2}-RA2" >/dev/null   # bare round-2 spawn -- the #1821 shield row
 
@@ -3372,5 +3408,230 @@ OUT=$(cd "$AC11B_HOME" && node "$LED_AC11B" check --session "$MH_SID" --task "$T
   && ok "[proof] 2088-AC11(b) residual-pin (locally-minted mirror variant): git update-ref populates refs/remotes/origin/<task>-* with ZERO push/network/remote -> exit 0 (DOCUMENTED residual, tracked #2268, NOT a fix; git remote empty + refs/heads/<task>-* empty asserted)" \
   || bad "2088-AC11(b) failed (rc=$RC out=$OUT remotes=$AC11B_REMOTES heads=$AC11B_HEADS_MATCH)"
 rm -rf "$AC11B_HOME"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2309 AC-9⁗ / AC-13′ — CLAUSE 3 (the bound-but-verdict-less terminal-evidence guard, overlayAppend) plus
+# round 5's dead-row new-row diversion. Landed HERE, committed, so the specification is DURABLE (N1: three
+# prior rounds' "lab" builds lived only under a wipeable /private/tmp scratch path and were never committed
+# anywhere -- this section IS the landing the plan-review asked for). Dedicated session (sess-zzc3-fixture), a
+# fresh task per arm (per-arm isolation, R2.7/R5.4 fixture protocol). A plain mk_sub transcript is REAL but
+# SILENT (proves nothing, the exact shape mk_sub-only fixtures elsewhere in this suite needed migrating
+# away from -- see the #1580 AC-3 / #1936 AC-15 / AC-2 leg(iv-a) sections above); mk_sub/mk_tagged + the
+# NEW mk_diary helper genuinely RECORDS the self-append clause 3's proof predicate looks for.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+S9="sess-zzc3-fixture"
+
+# ---- arm (a): proof-less merge onto an OPEN bare row, NO --agent -------------------------------------
+T9A="zzc3a"
+mk_sub "$S9" "ac9a-p1"
+node "$LED" append --session "$S9" --task "$T9A" --role plan-review --agent "ac9a-p1" >/dev/null
+F9A="$THREE_ROLE_LEDGER_DIR/$S9/$T9A.jsonl"
+BEFORE9A=$(cat "$F9A")
+node "$LED" append --session "$S9" --task "$T9A" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9A=$?
+AFTER9A=$(cat "$F9A")
+{ [ "$RC9A" != "0" ] && [ "$BEFORE9A" = "$AFTER9A" ]; } \
+  && ok "#2309 AC-9⁗(a): proof-less no-agent verdict onto an OPEN bare row -> rc!=0, ledger byte-unchanged" \
+  || bad "#2309 AC-9⁗(a) FAILED (rc=$RC9A before=$BEFORE9A after=$AFTER9A)"
+
+# ---- arm (b): same, but the write ASSERTS the target's own id + --self-authored (no proof) -----------
+T9B="zzc3b"
+mk_sub "$S9" "ac9b-p1"
+node "$LED" append --session "$S9" --task "$T9B" --role plan-review --agent "ac9b-p1" >/dev/null
+F9B="$THREE_ROLE_LEDGER_DIR/$S9/$T9B.jsonl"
+BEFORE9B=$(cat "$F9B")
+node "$LED" append --session "$S9" --task "$T9B" --role plan-review --agent "ac9b-p1" --self-authored --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9B=$?
+AFTER9B=$(cat "$F9B")
+{ [ "$RC9B" != "0" ] && [ "$BEFORE9B" = "$AFTER9B" ]; } \
+  && ok "#2309 AC-9⁗(b): --agent+--self-authored ASSERTION (no proof) onto an OPEN bare row -> rc!=0, unchanged (an assertion never satisfies the guard)" \
+  || bad "#2309 AC-9⁗(b) FAILED (rc=$RC9B before=$BEFORE9B after=$AFTER9B)"
+
+# ---- arm (c): same as (a), but the target's transcript ECHO-MENTIONS the append command ---------------
+T9C="zzc3c"
+mk_sub "$S9" "ac9c-p1"
+node -e '
+  const fs = require("fs");
+  const [ , file, task, role, verdict ] = process.argv;
+  const inner = "node hooks/3role-ledger.mjs append --task " + task + " --role " + role + " --verdict " + verdict;
+  const cmd = "echo \"" + inner.replace(/"/g, "\\\"") + "\"";
+  const rec = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+    { type: "tool_use", name: "Bash", input: { command: cmd } }
+  ] } });
+  fs.appendFileSync(file, rec + "\n");
+' "$THREE_ROLE_PROJECTS_ROOT/proj/$S9/subagents/agent-ac9c-p1.jsonl" "$T9C" "plan-review" "PASS"
+node "$LED" append --session "$S9" --task "$T9C" --role plan-review --agent "ac9c-p1" >/dev/null
+F9C="$THREE_ROLE_LEDGER_DIR/$S9/$T9C.jsonl"
+BEFORE9C=$(cat "$F9C")
+node "$LED" append --session "$S9" --task "$T9C" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9C=$?
+AFTER9C=$(cat "$F9C")
+{ [ "$RC9C" != "0" ] && [ "$BEFORE9C" = "$AFTER9C" ]; } \
+  && ok "#2309 AC-9⁗(c): transcript merely ECHO-MENTIONS the append command -> rc!=0, unchanged (a mention is not an execution)" \
+  || bad "#2309 AC-9⁗(c) FAILED (rc=$RC9C before=$BEFORE9C after=$AFTER9C)"
+
+# ---- arm (e): X2-shape seed (self_authored:true, no verdict, no closedAt -- still OPEN), then (a)'s attack
+T9E="zzc3e"
+mk_sub "$S9" "ac9e-p1"
+node "$LED" append --session "$S9" --task "$T9E" --role plan-review --agent "ac9e-p1" --self-authored >/dev/null
+F9E="$THREE_ROLE_LEDGER_DIR/$S9/$T9E.jsonl"
+BEFORE9E=$(cat "$F9E")
+node "$LED" append --session "$S9" --task "$T9E" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9E=$?
+AFTER9E=$(cat "$F9E")
+{ [ "$RC9E" != "0" ] && [ "$BEFORE9E" = "$AFTER9E" ]; } \
+  && ok "#2309 AC-9⁗(e): self_authored:true seed (still OPEN, no closedAt) does not disarm clause 3 -> rc!=0, unchanged" \
+  || bad "#2309 AC-9⁗(e) FAILED (rc=$RC9E before=$BEFORE9E after=$AFTER9E)"
+
+# ---- arm (g): artifact_path seed (no closedAt -- still OPEN), then (a)'s attack -----------------------
+T9G="zzc3g"
+mk_sub "$S9" "ac9g-p1"
+node "$LED" append --session "$S9" --task "$T9G" --role plan-review --agent "ac9g-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9G" --role plan-review --artifact "$TMP/rev.md" >/dev/null
+F9G="$THREE_ROLE_LEDGER_DIR/$S9/$T9G.jsonl"
+BEFORE9G=$(cat "$F9G")
+node "$LED" append --session "$S9" --task "$T9G" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9G=$?
+AFTER9G=$(cat "$F9G")
+{ [ "$RC9G" != "0" ] && [ "$BEFORE9G" = "$AFTER9G" ]; } \
+  && ok "#2309 AC-9⁗(g): artifact_path seed (still OPEN, no closedAt) does not disarm clause 3 -> rc!=0, unchanged" \
+  || bad "#2309 AC-9⁗(g) FAILED (rc=$RC9G before=$BEFORE9G after=$AFTER9G)"
+
+# ---- arm (h): live-shape composite seed (self_authored + run_kind + run_source, still OPEN), then (a) --
+T9H="zzc3h"
+mk_sub "$S9" "ac9h-p1"
+node "$LED" append --session "$S9" --task "$T9H" --role plan-review --agent "ac9h-p1" --self-authored --run-kind inferred --run-source refresh-models >/dev/null
+F9H="$THREE_ROLE_LEDGER_DIR/$S9/$T9H.jsonl"
+BEFORE9H=$(cat "$F9H")
+node "$LED" append --session "$S9" --task "$T9H" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9H=$?
+AFTER9H=$(cat "$F9H")
+{ [ "$RC9H" != "0" ] && [ "$BEFORE9H" = "$AFTER9H" ]; } \
+  && ok "#2309 AC-9⁗(h): live-shape composite seed (self_authored+run_kind+run_source, still OPEN) -> rc!=0, unchanged" \
+  || bad "#2309 AC-9⁗(h) FAILED (rc=$RC9H before=$BEFORE9H after=$AFTER9H)"
+
+# ---- arm (d′): honest ONE-command twin + sanctioned punch-out; gate reads AFTER compose (N3) ----------
+T9D="zzc3d"
+mk_tagged "$S9" "ac9d-p1" "$T9D" "plan-review"
+mk_diary "$S9" "ac9d-p1" "$T9D" "plan-review" "PASS"
+node "$LED" append --session "$S9" --task "$T9D" --role plan-review --agent "ac9d-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9D" --role plan-review --artifact "$TMP/rev.md" --verdict PASS >"$TMP/2309-ac9d.out" 2>&1; RC9D=$?
+{ [ "$RC9D" = "0" ]; } \
+  && ok "#2309 AC-9⁗(d′): honest one-command self-append (diary proves it) -> rc=0" \
+  || bad "#2309 AC-9⁗(d′) append FAILED (rc=$RC9D out=$(cat "$TMP/2309-ac9d.out"))"
+node "$LED" append --session "$S9" --task "$T9D" --role plan-review --agent "ac9d-p1" --closed-at "2026-01-01T01:00:00Z" >/dev/null
+GATE9D=$(node "$LED" gate-plan-review --session "$S9" --task "$T9D" 2>&1); GRC9D=$?
+{ [ "$GRC9D" = "0" ]; } \
+  && ok "#2309 AC-9⁗(d′): gate ALLOWS after the sanctioned punch-out composes (the gate leg reads AFTER compose)" \
+  || bad "#2309 AC-9⁗(d′) gate FAILED (rc=$GRC9D out=$GATE9D)"
+
+# ---- arm (i): honest TWO-command twin (self-append --artifact, then self-append --verdict) ------------
+T9I="zzc3i"
+mk_tagged "$S9" "ac9i-p1" "$T9I" "plan-review"
+mk_diary "$S9" "ac9i-p1" "$T9I" "plan-review" "PASS"
+node "$LED" append --session "$S9" --task "$T9I" --role plan-review --agent "ac9i-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9I" --role plan-review --artifact "$TMP/rev.md" >"$TMP/2309-ac9i-1.out" 2>&1; RC9I1=$?
+node "$LED" append --session "$S9" --task "$T9I" --role plan-review --verdict PASS >"$TMP/2309-ac9i-2.out" 2>&1; RC9I2=$?
+{ [ "$RC9I1" = "0" ] && [ "$RC9I2" = "0" ]; } \
+  && ok "#2309 AC-9⁗(i): honest two-command twin (artifact, then verdict) -> BOTH rc=0" \
+  || bad "#2309 AC-9⁗(i) FAILED (rc1=$RC9I1 rc2=$RC9I2 out1=$(cat "$TMP/2309-ac9i-1.out") out2=$(cat "$TMP/2309-ac9i-2.out"))"
+
+# ---- arm (f1′): forged no-`--agent` verdict onto a DEAD bare row -> DIVERTED to a new UNBOUND row ------
+T9F1="zzc3f1"
+mk_sub "$S9" "ac9f1-p1"
+node "$LED" append --session "$S9" --task "$T9F1" --role plan-review --agent "ac9f1-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9F1" --role plan-review --agent "ac9f1-p1" --closed-at "2026-01-01T00:00:00Z" >/dev/null   # dead: closedAt, no verdict
+F9F1="$THREE_ROLE_LEDGER_DIR/$S9/$T9F1.jsonl"
+node "$LED" append --session "$S9" --task "$T9F1" --role plan-review --verdict PASS >/dev/null 2>&1; RC9F1=$?
+DEADROW9F1=$(command grep '"agentId":"ac9f1-p1"' "$F9F1")
+NEWROW9F1=$(command grep '"verdict":"PASS"' "$F9F1")
+{ [ "$RC9F1" = "0" ] && echo "$DEADROW9F1" | command grep -qv '"verdict"' && [ -n "$NEWROW9F1" ] && ! echo "$NEWROW9F1" | command grep -q '"agentId"'; } \
+  && ok "#2309 AC-9⁗(f1′): forged no-agent verdict onto a DEAD row -> DIVERTED (rc=0), dead row stays verdict-less, new row lands UNBOUND" \
+  || bad "#2309 AC-9⁗(f1′) FAILED (rc=$RC9F1 dead=$DEADROW9F1 new=$NEWROW9F1)"
+
+# ---- arm (f2′): same DEAD-row shape, attack ALSO carries --self-authored (still no --agent) ------------
+T9F2="zzc3f2"
+mk_sub "$S9" "ac9f2-p1"
+node "$LED" append --session "$S9" --task "$T9F2" --role plan-review --agent "ac9f2-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9F2" --role plan-review --agent "ac9f2-p1" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+F9F2="$THREE_ROLE_LEDGER_DIR/$S9/$T9F2.jsonl"
+node "$LED" append --session "$S9" --task "$T9F2" --role plan-review --self-authored --verdict PASS >/dev/null 2>&1; RC9F2=$?
+DEADROW9F2=$(command grep '"agentId":"ac9f2-p1"' "$F9F2")
+NEWROW9F2=$(command grep '"verdict":"PASS"' "$F9F2")
+{ [ "$RC9F2" = "0" ] && echo "$DEADROW9F2" | command grep -qv '"verdict"' && [ -n "$NEWROW9F2" ] && ! echo "$NEWROW9F2" | command grep -q '"agentId"'; } \
+  && ok "#2309 AC-9⁗(f2′): same DEAD-row diversion with --self-authored asserted (still no --agent) -> DIVERTED (rc=0), dead row untouched" \
+  || bad "#2309 AC-9⁗(f2′) FAILED (rc=$RC9F2 dead=$DEADROW9F2 new=$NEWROW9F2)"
+
+# ---- arm (f3): f1′'s diverted UNBOUND row + a MINTED-id punch-out compose -> gate STAYS rc!=0 ----------
+node "$LED" append --session "$S9" --task "$T9F1" --role plan-review --agent "zz-minted-nonexistent-id" --closed-at "2026-01-01T02:00:00Z" >/dev/null
+GATE9F3=$(node "$LED" gate-plan-review --session "$S9" --task "$T9F1" 2>&1); GRC9F3=$?
+{ [ "$GRC9F3" != "0" ]; } \
+  && ok "#2309 AC-9⁗(f3): minted-id punch-out compose onto the diverted row -> gate STAYS rc!=0 (residual-defense pin; the read lane's own forgery-close check catches the non-resolving id)" \
+  || bad "#2309 AC-9⁗(f3) FAILED (rc=$GRC9F3 out=$GATE9F3)"
+
+# ---- arm (m): a verdict CLAIMING the dead row's OWN agentId (identity claim), no proof -> refused -------
+T9M="zzc3m"
+mk_sub "$S9" "ac9m-p1"
+node "$LED" append --session "$S9" --task "$T9M" --role plan-review --agent "ac9m-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9M" --role plan-review --agent "ac9m-p1" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+F9M="$THREE_ROLE_LEDGER_DIR/$S9/$T9M.jsonl"
+BEFORE9M=$(cat "$F9M")
+node "$LED" append --session "$S9" --task "$T9M" --role plan-review --agent "ac9m-p1" --self-authored --verdict PASS --closed-at "2026-01-01T03:00:00Z" >/dev/null 2>&1; RC9M=$?
+AFTER9M=$(cat "$F9M")
+{ [ "$RC9M" != "0" ] && [ "$BEFORE9M" = "$AFTER9M" ]; } \
+  && ok "#2309 AC-9⁗(m): verdict CLAIMING the dead row's own agentId, no proof -> rc!=0, unchanged (an identity CLAIM is never diverted, and never proof)" \
+  || bad "#2309 AC-9⁗(m) FAILED (rc=$RC9M before=$BEFORE9M after=$AFTER9M)"
+
+# ---- arm (j1)/(j2): dead bare row + a NEW reviewer's doctrine self-append -> DIVERTED, THEN the new -----
+# ---- reviewer's own REAL (tag-bound + resolvable) punch-out compose -> the honest recovery COMPLETES ----
+T9J="zzc3j"
+mk_sub "$S9" "ac9j-p1"
+node "$LED" append --session "$S9" --task "$T9J" --role plan-review --agent "ac9j-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9J" --role plan-review --agent "ac9j-p1" --closed-at "2026-01-01T00:00:00Z" >/dev/null   # dead row
+F9J="$THREE_ROLE_LEDGER_DIR/$S9/$T9J.jsonl"
+node "$LED" append --session "$S9" --task "$T9J" --role plan-review --verdict PASS >/dev/null 2>&1; RC9J1=$?   # (j1) the doctrine self-append
+DEADROW9J=$(command grep '"agentId":"ac9j-p1"' "$F9J")
+{ [ "$RC9J1" = "0" ] && echo "$DEADROW9J" | command grep -qv '"verdict"'; } \
+  && ok "#2309 AC-9⁗(j1): a NEW reviewer's doctrine self-append over a dead row -> DIVERTED (rc=0), dead row's verdict stays absent" \
+  || bad "#2309 AC-9⁗(j1) FAILED (rc=$RC9J1 dead=$DEADROW9J)"
+mk_tagged "$S9" "ac9j-p2" "$T9J" "plan-review"   # the new reviewer's OWN real spawn -- tag-bound, resolvable
+node "$LED" append --session "$S9" --task "$T9J" --role plan-review --agent "ac9j-p2" --closed-at "2026-01-01T02:00:00Z" >/dev/null   # (j2) the new reviewer's punch-out compose
+GATE9J=$(node "$LED" gate-plan-review --session "$S9" --task "$T9J" 2>&1); GRC9J=$?
+{ [ "$GRC9J" = "0" ]; } \
+  && ok "#2309 AC-9⁗(j2): the new reviewer's REAL punch-out composes onto the diverted row -> gate ALLOWS (the honest cross-agent recovery COMPLETES)" \
+  || bad "#2309 AC-9⁗(j2) FAILED (rc=$GRC9J out=$GATE9J)"
+
+# ---- arm (l): a subprocess-shaped write (no --agent, --dispatch/--transcript/--nonce) over a dead row --
+T9L="zzc3l"
+mk_sub "$S9" "ac9l-p1"
+node "$LED" append --session "$S9" --task "$T9L" --role plan-review --agent "ac9l-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9L" --role plan-review --agent "ac9l-p1" --closed-at "2026-01-01T00:00:00Z" >/dev/null   # dead row
+F9L="$THREE_ROLE_LEDGER_DIR/$S9/$T9L.jsonl"
+node "$LED" append --session "$S9" --task "$T9L" --role plan-review --dispatch subprocess-openrouter --transcript "$TMP/rev.md" --nonce "zz-nonce-2309l" --verdict PASS >/dev/null 2>&1; RC9L=$?
+DEADROW9L=$(command grep '"agentId":"ac9l-p1"' "$F9L")
+NEWROW9L=$(command grep '"verdict":"PASS"' "$F9L")
+{ [ "$RC9L" = "0" ] && echo "$DEADROW9L" | command grep -qv '"verdict"' && [ -n "$NEWROW9L" ] && ! echo "$NEWROW9L" | command grep -q '"agentId"'; } \
+  && ok "#2309 AC-9⁗(l): a subprocess-shaped write (no --agent) over a dead row -> DIVERTED (rc=0), new unbound row, dead row untouched (the subprocess GATE leg is out of this fixture's scope, named)" \
+  || bad "#2309 AC-9⁗(l) FAILED (rc=$RC9L dead=$DEADROW9L new=$NEWROW9L)"
+
+# ---- AC-13′(a): can't-tell -- an OPEN row whose own agent's transcript is UNREADABLE (removed) ----------
+T13A="zzc13a"
+mk_sub "$S9" "ac13a-p1"
+node "$LED" append --session "$S9" --task "$T13A" --role plan-review --agent "ac13a-p1" >/dev/null
+rm -f "$THREE_ROLE_PROJECTS_ROOT/proj/$S9/subagents/agent-ac13a-p1.jsonl"
+F13A="$THREE_ROLE_LEDGER_DIR/$S9/$T13A.jsonl"
+BEFORE13A=$(cat "$F13A")
+ERR13A=$(node "$LED" append --session "$S9" --task "$T13A" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" 2>&1 >/dev/null); RC13A=$?
+AFTER13A=$(cat "$F13A")
+{ [ "$RC13A" != "0" ] && [ "$BEFORE13A" = "$AFTER13A" ] \
+    && echo "$ERR13A" | command grep -q "agent-ac13a-p1.jsonl" \
+    && echo "$ERR13A" | command grep -qi "documented operator override" \
+    && ! echo "$ERR13A" | command grep -q "THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE"; } \
+  && ok "#2309 AC-13′(a): can't-tell (unreadable transcript) -> rc!=0, unchanged, stderr names the PATH + 'documented operator override', NEVER the kill-switch's own env-var name" \
+  || bad "#2309 AC-13′(a) FAILED (rc=$RC13A before=$BEFORE13A after=$AFTER13A err=$ERR13A)"
+
+# ---- AC-13′(b): same can't-tell shape, WITH the kill-switch set -> rc=0 + an AUDIT line on stderr -------
+T13B="zzc13b"
+mk_sub "$S9" "ac13b-p1"
+node "$LED" append --session "$S9" --task "$T13B" --role plan-review --agent "ac13b-p1" >/dev/null
+rm -f "$THREE_ROLE_PROJECTS_ROOT/proj/$S9/subagents/agent-ac13b-p1.jsonl"
+ERR13B=$(THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE=1 node "$LED" append --session "$S9" --task "$T13B" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" 2>&1 >/dev/null); RC13B=$?
+{ [ "$RC13B" = "0" ] && echo "$ERR13B" | command grep -q "AUDIT"; } \
+  && ok "#2309 AC-13′(b): kill-switch set -> rc=0 AND an AUDIT line on stderr" \
+  || bad "#2309 AC-13′(b) FAILED (rc=$RC13B err=$ERR13B)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

@@ -298,6 +298,14 @@
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
 //   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
 //   THREE_ROLE_PROJECTS_ROOT (default ~/.claude/projects)
+//   THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE=1 (#2309) — documented operator escape for overlayAppend's clause 3
+//                            (the bound-but-verdict-less terminal-evidence guard, see its own comment block
+//                            above the clause): skips the can't-tell rejection when the target row's own
+//                            transcript could not be read/does not prove the incoming verdict AND the write
+//                            is not eligible for round 5's dead-row diversion (an identity-claiming write —
+//                            arm (m) — always needs this or a real self-append; never printed in the
+//                            rejection's own stderr text — an integrity gate names the remedy CLASS, never a
+//                            runnable defeat token). On-use: audited to stderr AND the internal bypass log.
 //   CC_ROLES_ENV             (#1448) — explicit per-role-model config path. When SET it is AUTHORITATIVE +
 //                            TERMINAL (never falls through to ~/.config / plugin / repo defaults), so a smoke
 //                            sets CC_ROLES_ENV=/nonexistent to simulate "no config" (=> every role opus).
@@ -1028,6 +1036,84 @@ function agentBoundToTag(session, agentId, task, role) {
     if (firstRecordText(content).includes(tag)) return true;
   }
   return false;
+}
+
+// #2309 (R3.1) — strip anything the transcript's own COMMAND could have used to merely PRINT rather than
+// EXECUTE the ledger invocation: single/double-quoted string bodies (an `echo "…"`/`printf '…'`/`node -e
+// "…"` argument) and heredoc bodies (`cat <<EOF … EOF`). What remains is tested for a COMMAND-POSITION
+// ledger-append invocation below — this is what makes a transcript that merely ECHO-MENTIONS the append
+// command (AC-9⁗ arm (c)) fail to prove: with the quoted/heredoc text removed, the mentioned invocation
+// vanishes from the text commandProvesLedgerAppend() ever sees.
+function stripQuotedAndHeredocBodies(cmd) {
+  let s = String(cmd == null ? '' : cmd);
+  s = s.replace(/<<[-~]?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[\s\S]*?\n\s*\2\b/g, '<<HEREDOC>>');
+  s = s.replace(/'[^']*'/g, "''");
+  s = s.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  return s;
+}
+
+// #2309 (R3.1) — does CMD EXECUTE `3role-ledger.mjs … append …` for this exact (task, role, verdict) at
+// COMMAND POSITION — i.e. all four tokens co-occur within ONE shell segment (env-assignment prefixes and
+// `&&`/`||`/`;`/`|`/newline separators are fine; a segment that is itself the argument of an echo/printf/
+// heredoc was already erased above, so it can never match here)? Nothing about the INCOMING write's own
+// flag shape matters — only what the TARGET's own transcript actually shows it ran.
+function commandProvesLedgerAppend(cmd, task, role, verdict) {
+  const stripped = stripQuotedAndHeredocBodies(cmd);
+  const segs = stripped.split(/&&|\|\||;|\||\n/);
+  const taskRe = new RegExp('--task[= ]["\']?' + escapeRegExp(String(task)) + '(["\'\\s]|$)');
+  const roleRe = new RegExp('--role[= ]["\']?' + escapeRegExp(String(role)) + '(["\'\\s]|$)');
+  const verdictRe = new RegExp('--verdict[= ]["\']?' + escapeRegExp(String(verdict)) + '(["\'\\s]|$)');
+  for (const seg of segs) {
+    const t = seg.trim();
+    if (!t) continue;
+    if (!/3role-ledger\.mjs/.test(t)) continue;
+    if (!/\bappend\b/.test(t)) continue;
+    if (!taskRe.test(t) || !roleRe.test(t) || !verdictRe.test(t)) continue;
+    return true;
+  }
+  return false;
+}
+
+// #2309 (R3.1/R4.1) — clause 3's PROOF leg: resolve the TARGET ROW's own agent's transcript (from
+// prior.agentId + prior.session_id — never from the incoming write's claim, never newest-mtime, mirroring
+// agentBoundToTag's doc comment above) and test whether it records an EXECUTED self-append of the given
+// verdict for (task, role) at command position. Returns {found, proves, path}: found=false is the
+// can't-tell case (no readable transcript at the expected location — missing/unreadable/no session_id);
+// found=true+proves=false is "the transcript exists but does not record the append" (a mention inside
+// echo/printf/heredoc/a quoted string does NOT count); proves=true is the honest self-append case. Fails
+// closed to `empty` on any read/parse trouble — never fabricates proof on a can't-tell path.
+function priorAgentTranscriptProves(prior, task, role, verdict) {
+  const empty = { found: false, proves: false, path: '' };
+  if (!prior || !prior.agentId) return empty;
+  const aid = String(prior.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return empty;
+  const sess = sanitize(prior.session_id || '');
+  if (!sess) return empty;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return empty; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let proves = false;
+    for (const ln of content.split('\n')) {
+      if (!ln.trim()) continue;
+      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+      const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+      if (!isAsst) continue;
+      const c = j.message && j.message.content;
+      if (!Array.isArray(c)) continue;
+      for (const blk of c) {
+        if (!blk || blk.type !== 'tool_use') continue;
+        if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+        const cmd = String((blk.input && blk.input.command) || '');
+        if (commandProvesLedgerAppend(cmd, task, role, verdict)) { proves = true; break; }
+      }
+      if (proves) break;
+    }
+    return { found: true, proves, path: f };
+  }
+  return empty;
 }
 
 // #1575 §1b — the gate's universal verdict screen vocabulary, ONE allowlist shared by the gate (via
@@ -2076,6 +2162,69 @@ function overlayAppend(session, task, role, fields) {
       }
     }
   }
+  // #2309 (R3.1/R4.1/R5.3) — CLAUSE 3: a verdict-INTRODUCING write landing on a BOUND row that carries no
+  // verdict yet. Clause 1/2 above (both keyed on priorHasTerminalEvidence()/prior.verdict) protect a row
+  // that already HAS terminal evidence; this closes the gap the cairn stone named ("key off the last
+  // VERDICT-BEARING row, not merely the last same-role row") — a bound row with NO verdict (whether truly
+  // bare, or DEAD: it gained closedAt/self_authored/artifact_path from an honest punch-out that never
+  // recorded a verdict — 6 such live rows exist today) is exactly the shape a forged `--verdict PASS
+  // --closed-at …` can merge onto for free, with no proof required. Trigger (R4.1's one-token re-key of
+  // R3.1's design — SUPERSEDES the original `!priorHasTerminalEvidence(prior)` term): prior row has a
+  // bound agentId, carries NO verdict yet (!prior.verdict), the incoming write introduces a verdict, and
+  // this is a SAME-round merge (an incoming --agent, if any, equals prior.agentId) — a genuinely NEW round
+  // (a DISTINCT incoming --agent) is isNewRound's claim below, outside this clause's by construction (R4.1
+  // honest-writer inventory item vi: relink-plan-review lands as a new-round write).
+  const clause3IncomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  const clause3SameRound = !clause3IncomingAgentId || (!!prior && clause3IncomingAgentId === prior.agentId);
+  let divertNewRound3 = false;
+  if (prior && prior.agentId && !prior.verdict && ('verdict' in fields) && clause3SameRound) {
+    // Proof — an EXECUTED self-append by the TARGET row's own agent (never the incoming claim, never
+    // newest-mtime). Nothing about the INCOMING command's flag shape can pre-empt the trigger — citing the
+    // target's own id via --agent and asserting --self-authored are ASSERTIONS, and an assertion never
+    // satisfies a guard (R3.1).
+    const proof = priorAgentTranscriptProves(prior, task, role, fields.verdict);
+    if (!proof.proves) {
+      // #2309 R5.3 — the ONE construct round 5 adds, applied ONLY in clause 3's two failure branches (no
+      // readable transcript / transcript does not prove, both collapsed into !proof.proves above): when the
+      // evidence structurally CANNOT exist — the target row is a DEAD round (closedAt stamped, verdict
+      // never recorded) — AND the incoming write carries NO identity claim at all (no --agent — the
+      // doctrine self-append shape), merging onto the dead row would MISATTRIBUTE the verdict and refusing
+      // would STRAND an honest reviewer with no runnable remedy (the manufactured-blocker class this ticket
+      // exists to kill). Neither is acceptable, so this write is DIVERTED to a NEW row instead (the
+      // isNewRound machinery below, widened by one OR-term) — the dead row's own verdict-less state is
+      // never touched, and the new row starts from an empty base, carrying only what THIS write provides.
+      // A write that CLAIMS the dead row's agentId (inAgent3 true) is NOT diverted — it stays fully guarded
+      // by the kill-switch-or-reject branch below (arm (m): identity-claiming forgeries over a dead row).
+      const inAgent3 = !!clause3IncomingAgentId;
+      const deadNoClaim3 = !!(prior.closedAt && !inAgent3);
+      if (deadNoClaim3) {
+        divertNewRound3 = true;
+      } else if (process.env.THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE === '1') {
+        // Documented operator escape (this comment block IS the pointer AC-13′ requires — see also the
+        // "Env overrides" list near the top of this file). An INTEGRITY gate's rejection names the failure,
+        // the evidence it wanted, and the remedy CLASS — never a runnable defeat token (R4.2) — so this
+        // switch's name is deliberately NEVER printed to the blocked actor's stderr, only used here and
+        // audited both to stderr (this line) and the internal bypass log.
+        console.error('AUDIT: clause-3 terminal-evidence guard bypassed via documented operator override ' +
+          '(role=' + role + ' task=' + sanitize(task) + ' agentId=' + prior.agentId + ')');
+        writeBypassLog('3role-ledger-clause3', 'THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE', 'PERMIT',
+          { task: sanitize(task), role: sanitize(role) });
+      } else {
+        throw new GuardRejection(
+          'terminal-evidence guard (#2309 clause 3): role ' + role + ' carries a BOUND, verdict-less row ' +
+          '(agentId ' + prior.agentId + ') and this write would introduce a verdict onto it, but ' +
+          (proof.found
+            ? ('that agent\'s own transcript (' + proof.path + ') does not record an EXECUTED self-append ' +
+               'of this exact verdict at command position (a mention inside echo/printf/a quoted string ' +
+               'does not count)')
+            : ('that agent\'s own transcript could not be read (expected ' + PROJECTS_ROOT + '/*/' +
+               sanitize(prior.session_id || '') + '/subagents/agent-' + prior.agentId + '.jsonl)')) +
+          ' — a documented operator override exists for a genuinely can\'t-tell case (see this clause\'s ' +
+          'own comment above overlayAppend); otherwise spawn/cite the row\'s own agent\'s real self-append.'
+        );
+      }
+    }
+  }
   // #1580 Fix B — ROUND BOUNDARY. A NEW, DISTINCT --agent arriving over a prior row that ALREADY had an
   // agentId is the unforgeable-ish signal of a genuinely NEW round (a fresh subagent spawn), not a
   // same-round compose. When detected: retain the just-superseded round's row VERBATIM as history (pushed
@@ -2087,7 +2236,7 @@ function overlayAppend(session, task, role, fields) {
   // no prior row yet, so when the spawn's --agent later arrives `prior.agentId` is still absent and this
   // stays false — that write correctly MERGES onto the close, one round, one line.
   const incomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
-  const isNewRound = !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
+  const isNewRound = divertNewRound3 || !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
   for (const ln of olderRoundLines) kept.push(ln);
   if (isNewRound) kept.push(JSON.stringify(prior));
   // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
