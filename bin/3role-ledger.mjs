@@ -812,17 +812,30 @@ function resolveEffectiveTier(o) {
 
 // Parse `--key value` flags. An empty next-arg ("") IS consumed (so `--skip-reason ""` records an
 // explicit empty reason → caught as a non-specific skip). A flag with no following value → "".
+//
+// #2189 D7 L1 (R9-B1/R11-B4/R13-B3) — AMBIGUOUS-FLAG REFUSAL lives HERE, in the shared parser every
+// subcommand and every flag transits, never in a per-flag or per-call-site check (a duplicate check
+// bolted onto one call site greens only the sampled flags and leaves every other flag — including one
+// invented at test time — last-wins). Any `--flag` NAME occurring more than once in argv is ambiguous
+// BY CONSTRUCTION (different values -> which one did the caller mean; identical values -> still two
+// independent occurrences a future edit could silently diverge) and is recorded on the non-enumerable
+// `__dupFlags` property so it never contaminates `Object.keys`/`JSON.stringify`/spread of the returned
+// options object for any existing caller. The dispatcher below refuses BEFORE any subcommand runs.
 function parseArgs(argv) {
   const o = {};
+  const seenCount = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
+      seenCount[key] = (seenCount[key] || 0) + 1;
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--')) { o[key] = ''; }
       else { o[key] = next; i++; }
     }
   }
+  const dupFlags = Object.keys(seenCount).filter((k) => seenCount[k] > 1);
+  Object.defineProperty(o, '__dupFlags', { value: dupFlags, enumerable: false });
   return o;
 }
 
@@ -4358,6 +4371,20 @@ function resolveModeAlias(policy, rawMode) {
   return '';
 }
 
+// #2189 AC-4(e1)/D6 — same resolution, but reports WHETHER the match went through an alias spelling
+// (vs the literal canonical mode key). Used ONLY by the read path (resolveMode()); the write path
+// (cmdSetMode) refuses an alias outright rather than needing this distinction. Returns
+// { resolved: '' | <canonical mode key>, viaAlias: boolean }.
+function resolveModeAliasDetailed(policy, rawMode) {
+  const m = String(rawMode == null ? '' : rawMode).trim();
+  if (!m) return { resolved: '', viaAlias: false };
+  if (policy.modes[m]) return { resolved: m, viaAlias: false };
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const aliased = aliases[m];
+  if (aliased && policy.modes[aliased]) return { resolved: aliased, viaAlias: true };
+  return { resolved: '', viaAlias: false };
+}
+
 // The single choke point (D1). Never throws — every failure shape resolves to a SAFE mode, loudly labeled
 // via `source`. Returns { mode, ceiling, openrouter_dispatch, source, reason, set_at, task }.
 function resolveMode() {
@@ -4402,7 +4429,7 @@ function resolveMode() {
              openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch, source: 'invalid-pin-fallback',
              reason: 'unparseable-pin', set_at: '', task: '' };
   }
-  const resolved = resolveModeAlias(policy, pin.mode);
+  const { resolved, viaAlias } = resolveModeAliasDetailed(policy, pin.mode);
   if (!resolved) {
     // AC 3(b) — an unknown mode value in the pin resolves the same as unparseable.
     return { mode: MODE_FALLBACK.mode, ceiling: MODE_FALLBACK.lane_ceiling,
@@ -4410,8 +4437,15 @@ function resolveMode() {
              reason: 'unknown-mode-value', set_at: '', task: '' };
   }
   const row = policy.modes[resolved];
-  return { mode: resolved, ceiling: row.lane_ceiling, openrouter_dispatch: row.openrouter_dispatch,
-           source: 'pin', reason: String(pin.reason == null ? '' : pin.reason),
+  // #2189 AC-4(e1)/D6 — ALIASES MAY DESCRIBE, NEVER UNLOCK. A pin whose `mode` field is an ALIAS
+  // spelling (never producible by set-mode any more, per AC-4(e2) — but a hand-edited or legacy pin
+  // file can still carry one) may still inform the READING axis (lane_ceiling — the mapped row's real
+  // number), but the AUTHORISATION axis is clamped to 'forbidden' regardless of the row's own value:
+  // the operator never selected the literal canonical mode, so the road never opens on an alias click.
+  const dispatchAxis = viaAlias ? 'forbidden' : row.openrouter_dispatch;
+  const reasonText = String(pin.reason == null ? '' : pin.reason);
+  return { mode: resolved, ceiling: row.lane_ceiling, openrouter_dispatch: dispatchAxis,
+           source: 'pin', reason: viaAlias ? (reasonText ? reasonText + ' [alias-non-authorizing]' : 'alias-non-authorizing') : reasonText,
            set_at: String(pin.set_at == null ? '' : pin.set_at), task: String(pin.task == null ? '' : pin.task) };
 }
 
@@ -4448,25 +4482,46 @@ function ambientIdentity(o) {
   return 'unknown';
 }
 
-// set-mode --mode <m> [--reason <text>] [--task <id>] [--session <id>] — validates against the tracked
+// set-mode --mode <m> --reason <text> [--task <id>] [--session <id>] — validates against the tracked
 // table, refuses an unknown mode with the pin file BYTE-UNCHANGED (AC 3(c)), and writes ATOMICALLY
 // (temp-file-plus-rename in the pin's OWN directory, AC 19) so the pin is, at every instant, either the
 // prior valid state or the new valid state — never a torn intermediate. Every SUCCESSFUL flip appends one
 // audit line to the unified override/audit log (never on a refusal, AC 20(a)).
 function cmdSetMode(o) {
+  // #2189 AC-1(c) — `--reason` is REQUIRED, not optional (closes the #2240-class reason-blanking write:
+  // a reason-less flip used to be silently ACCEPTED). Refused before the policy table is even loaded, so
+  // the pin file is byte-unchanged on every path through this refusal.
+  if (!o.reason) {
+    console.log('BLOCK: set-mode: --reason is required (a reason-less mode change is refused, #2240/#2189)');
+    process.exit(2);
+  }
   const loaded = loadModePolicy();
   if (!loaded.ok) {
     console.log('BLOCK: set-mode: ' + loaded.error);
     process.exit(2);
   }
   const policy = loaded.policy;
-  const requested = o.mode;
-  const resolved = resolveModeAlias(policy, requested);
-  if (!resolved) {
-    console.log('BLOCK: set-mode: unknown mode "' + (requested || '') + '" — valid: ' +
-      Object.keys(policy.modes).concat(Object.keys(policy.aliases || {})).join(', '));
+  const requested = String(o.mode == null ? '' : o.mode).trim();
+  // #2189 AC-4(e2)/D6 — ALIASES MAY DESCRIBE, NEVER UNLOCK: `set-mode` is the AUTHORISATION-axis
+  // writer, so it accepts ONLY a literal canonical mode key from the tracked table — never an alias
+  // spelling (e.g. #2035's `token-conservative`). Resolving the alias here (as this code used to) would
+  // write-time-expand an operator's click on the alias LABEL into the literal permitted mode without the
+  // operator ever having selected it. Refusing the alias at this single choke point closes BOTH measured
+  // live paths (D7 FINDING 1 — the CLI ships no evidence input; this is a validation refusal, not one).
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const isCanonical = Object.prototype.hasOwnProperty.call(policy.modes, requested);
+  const isAlias = !isCanonical && Object.prototype.hasOwnProperty.call(aliases, requested);
+  if (isAlias) {
+    console.log('BLOCK: set-mode: "' + requested + '" is an ALIAS, not an operator-selectable mode — ' +
+      'aliases may describe a reading surface (lane vocabulary) but can never author the pin\'s ' +
+      'authorisation axis (#2189 D6). Select the literal mode instead: ' + Object.keys(policy.modes).join(', '));
     process.exit(2);
   }
+  if (!isCanonical) {
+    console.log('BLOCK: set-mode: unknown mode "' + requested + '" — valid: ' + Object.keys(policy.modes).join(', '));
+    process.exit(2);
+  }
+  const resolved = requested;
   const pinPath = resolveModePinPath();
   // Read the PRIOR mode for the audit line's transition= field (best-effort; unresolvable -> 'unknown').
   let priorMode = 'unknown';
@@ -4521,6 +4576,15 @@ function cmdSetMode(o) {
 
 const [, , cmd, ...rest] = process.argv;
 const opts = parseArgs(rest);
+// #2189 D7 L1 (c2) — refuse the WHOLE invocation on any ambiguous (repeated-name) flag, BEFORE any
+// subcommand dispatch, argv-RESOLVED occurrences only (never raw text-token counts). Nothing is written
+// by any subcommand on this path — the refusal happens before cmdSetMode/cmdAppend/etc. ever run.
+if (opts.__dupFlags && opts.__dupFlags.length) {
+  console.log('BLOCK: ' + (cmd || '') + ': ambiguous flag(s) ' +
+    opts.__dupFlags.map((k) => '--' + k).join(', ') +
+    ' — each occurs more than once; refusing rather than picking a reading (cause=ambiguous-flag)');
+  process.exit(2);
+}
 try {
   if (cmd === 'append') cmdAppend(opts);
   else if (cmd === 'check') cmdCheck(opts);
