@@ -3634,4 +3634,63 @@ ERR13B=$(THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE=1 node "$LED" append --session "$S9"
   && ok "#2309 AC-13′(b): kill-switch set -> rc=0 AND an AUDIT line on stderr" \
   || bad "#2309 AC-13′(b) FAILED (rc=$RC13B err=$ERR13B)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2437 — W3 (hasRefArmAffirmative) SHAPE-TOLERANCE: the ref arm's flush-left affirmative Decision:/verdict
+# check now tolerates ordinary human markdown around the verdict — emphasis-wrapping `**` at column 0
+# (`**Decision: PASS**`), closing decoration between the keyword and its colon (`**Decision**: PASS`), and/or
+# ONE bounded parenthetical qualifier (`Decision (final): PASS`) — while the impersonation-resistance
+# (quoted/indented/prose-led lines) and the VALUE check (a decorated FAIL must still fail) are untouched.
+# Companion to the gate's #2437 section in hooks/three-role-instrumentation-gate-smoke-test.sh; same corpus.
+#
+# Vectors are read AT RUNTIME from the shared corpus (D3, hooks/_fixtures/2437-line-anchored-receipt-vectors.tsv,
+# entrypoint=w3 rows) so the CORPUS CONTENT is what this section tests, not a hardcoded copy (AC-9d).
+# Mirrors the #2437 plan's probe-w3.sh: the plan-review artifact exists ONLY as a blob at a merge-head ref
+# (never on disk), so `check --merge-head` is forced onto the W3 ref arm being tested.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+CORPUS_2437_W3="$DIR/_fixtures/2437-line-anchored-receipt-vectors.tsv"
+MH_SID_2437="sess-2437-w3"
+n2437w3=0
+
+# w3row2437 <tag> <verdict-line> : commit ONE corpus row's verdict-line as the SOLE content of a
+# plan-review review file at a fresh throwaway repo's HEAD, rm the working copy (ref-arm-only — no disk
+# fallback), then assert `check --merge-head` against the row's own accept/reject tag.
+w3row2437() {
+  local tag="$1" vline="$2"
+  n2437w3=$((n2437w3+1)); local t="w2437-$n2437w3"
+  local REPO; REPO="$(mktemp -d)"
+  ( cd "$REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+  mkdir -p "$REPO/.ai-workspace/reviews"
+  printf '## Review\n%s\n' "$vline" > "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
+  ( cd "$REPO" && git add ".ai-workspace/reviews/2437-w3-$n2437w3.md" && git commit -q -m "fixture: #2437 w3 vector $n2437w3" )
+  rm -f "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
+  local SHA; SHA=$(git -C "$REPO" rev-parse HEAD)
+  mk_sub "$MH_SID_2437" "w2437p$n2437w3"; mk_sub "$MH_SID_2437" "w2437r$n2437w3"
+  mk_sub "$MH_SID_2437" "w2437e$n2437w3"; mk_sub "$MH_SID_2437" "w2437v$n2437w3"
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role planner --agent "w2437p$n2437w3" --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role plan-review --agent "w2437r$n2437w3" --artifact ".ai-workspace/reviews/2437-w3-$n2437w3.md" --verdict PASS >/dev/null
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role executor --agent "w2437e$n2437w3" --artifact "branch feat/2437-w3-$n2437w3" >/dev/null
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role execution-review --agent "w2437v$n2437w3" --artifact "$TMP/er.md" >/dev/null
+  local OUT RC
+  OUT=$(cd "$REPO" && node "$LED" check --session "$MH_SID_2437" --task "$t" --merge-head "$SHA" 2>&1); RC=$?
+  rm -rf "$REPO"
+  if [ "$tag" = accept ]; then
+    { [ "$RC" = "0" ]; } && ok "#2437 w3 accept: [$vline] -> exit 0" || bad "#2437 w3 accept should exit 0: [$vline] (rc=$RC out=$OUT)"
+  else
+    { [ "$RC" != "0" ]; } && ok "#2437 w3 reject: [$vline] -> exit !=0" || bad "#2437 w3 reject should exit !=0: [$vline] (rc=$RC out=$OUT)"
+  fi
+}
+
+printf '## ELI5\nplan\ncairn: "w3 probe"\n### Binary AC\n- AC1\n' > "$TMP/plan.md"
+printf '## Review\nDecision: PASS\n' > "$TMP/er.md"
+
+[ -f "$CORPUS_2437_W3" ] || bad "#2437 corpus missing at $CORPUS_2437_W3"
+if [ -f "$CORPUS_2437_W3" ]; then
+  while IFS=$'\t' read -r c_entry c_route c_tag c_vector; do
+    case "$c_entry" in
+      \#*|"") continue ;;
+      w3) w3row2437 "$c_tag" "$c_vector" ;;
+    esac
+  done < "$CORPUS_2437_W3"
+fi
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
