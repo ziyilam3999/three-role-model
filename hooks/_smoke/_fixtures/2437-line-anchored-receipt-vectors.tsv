@@ -1,0 +1,20 @@
+# 2437-line-anchored-receipt-vectors.tsv -- D3 (plan .ai-workspace/plans/2026-08-11-2437-line-anchored-receipt-predicates.md).
+# Format: entrypoint	route	tag	vector -- read AT RUNTIME by hooks/three-role-instrumentation-gate-smoke-test.sh (entrypoint=gate)
+# and hooks/3role-ledger-smoke-test.sh (entrypoint=w3). entrypoint=gate route in {awk,revfile,4a}; entrypoint=w3 route is "-".
+# tag in {accept,reject}. Every vector below is quoted verbatim in the plan's Binary AC-1..AC-8 (14 distinct strings).
+# DO NOT hand-edit a vector string without also updating the plan's AC text -- AC-9(b) greps for exact byte match.
+gate	awk	accept	cairn (reviewer): "reviewer hit"
+gate	revfile	accept	cairn (reviewer): "reviewer hit"
+gate	4a	accept	cairn (planner): "planner hit"
+gate	revfile	accept	**cairn**: "reviewer hit"
+gate	awk	accept	- **cairn (reviewer):** "reviewer hit"
+gate	awk	reject	Decision noted -- as discussed the cairn: search returned hits
+gate	4a	reject	- some note cairn (reviewer): X
+gate	4a	reject	## cairn "hit"
+w3	-	accept	**Decision: PASS**
+w3	-	accept	Decision (final): PASS
+w3	-	accept	**Decision**: PASS-WITH-FIXES
+w3	-	reject	> Decision: PASS
+w3	-	reject	  Decision: PASS
+w3	-	reject	**Decision: FAIL**
+w3	-	reject	The reviewer noted Decision: PASS earlier

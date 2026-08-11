@@ -545,7 +545,14 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # 1-6 hashes + optional space) is also accepted — the colon after `cairn` is still mandatory, so a bare
   # `## cairn` section title (no colon) still fails; still line-anchored (a heading-then-prose mention must
   # still fail; see AC2/AC3's power tests).
-  grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn:' "$APLAN" 2>/dev/null \
+  # #2437: all four prior widenings (#1518/#1607/#1628 above) only ever extended the char class BEFORE the
+  # keyword. This adds the never-covered position BETWEEN `cairn` and its colon: an optional closing-decoration
+  # run (`[*\`]*`, e.g. `**cairn**:`) and/or ONE bounded parenthetical qualifier (`([[:space:]]*\([^()]*\))?`,
+  # e.g. `cairn (reviewer):` — a single non-nesting `(...)` group, so arbitrary prose between keyword and colon
+  # stays rejected), composable with each other and with the existing prefix decoration (`- **cairn (reviewer):**`).
+  # The receipt CONTRACT is unchanged: still line-anchored (a mid-prose/decoration-then-prose mention must still
+  # fail; see AC-5's power tests) and the colon after `cairn` is still mandatory (`## cairn "hit"` still fails).
+  grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn[*`]*([[:space:]]*\([^()]*\))?[*`]*:' "$APLAN" 2>/dev/null \
     || block "the active plan ($APLAN) carries no \`cairn:\` citation line — prove the PLANNER searched memory (cairn/AWM/project-index). Add a \`cairn: \"<hit>\"\` or \`cairn: no hits for <q>\` line, then re-complete. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
 
   # 4b doc — resolve the plan-REVIEWER's review from the LEDGER's plan-review artifact_path for THIS task
@@ -571,9 +578,11 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # #1518: same decoration-prefix tolerance as the 4a leg above (still line-anchored — a mid-prose mention
   # must still fail; see AC6c/AC7c's power tests). #1607: same ALTERNATING decoration+whitespace widening as
   # the 4a leg above (still line-anchored — see #1607 AC6's power test). #1628: same `#`-heading widening as
-  # the 4a leg above (colon after `cairn` still mandatory; see AC1b's power test).
+  # the 4a leg above (colon after `cairn` still mandatory; see AC1b's power test). #2437: same
+  # between-keyword-and-colon widening (closing decoration + one bounded parenthetical qualifier) as the 4a
+  # leg above, in LOCKSTEP — see the 4a leg's #2437 comment for the full rationale.
   if [ -n "$AREVIEW" ] && [ -f "$AREVIEW" ] && [ "$AREVIEW" != "$APLAN" ]; then
-    grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn:' "$AREVIEW" 2>/dev/null \
+    grep -Eiq '^[[:space:]]*([-*+>`#]+[[:space:]]*)*cairn[*`]*([[:space:]]*\([^()]*\))?[*`]*:' "$AREVIEW" 2>/dev/null \
       || block "the plan-review ($AREVIEW) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   elif grep -Eq '^## Review' "$APLAN" 2>/dev/null; then
     # N3 (POSIX-awk ERE, NOT the grep ERE above): `-` is placed FIRST in the bracket expression so it is
@@ -583,7 +592,11 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
     # regex CONSTANT (and inside a bracket expression generally), `#` is a LITERAL character, NOT a comment
     # introducer — the comment-introducer reading only applies to bare awk PROGRAM text outside a regex/string
     # literal. So this stays a single-quoted, byte-exact widen with no risk of truncating the program.
-    awk '/^## Review/{r=1} r&&/^[[:space:]]*([-*+>`#]+[[:space:]]*)*[Cc]airn:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
+    # #2437 (Rule 18, live-verified on this host's awk 20200816/one-true-awk): the SAME between-keyword-and-colon
+    # group as the 4a/4b-grep legs above — `[*\`]*` (closing decoration) then an optional `\([^()]*\)` bounded
+    # parenthetical qualifier (escaped literal parens, non-nesting) then `[*\`]*` again, immediately before the
+    # mandatory colon. `#` stays a literal bracket-expression member throughout (unchanged from #1628).
+    awk '/^## Review/{r=1} r&&/^[[:space:]]*([-*+>`#]+[[:space:]]*)*[Cc]airn[*`]*([[:space:]]*\([^()]*\))?[*`]*:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
       || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   fi
 fi

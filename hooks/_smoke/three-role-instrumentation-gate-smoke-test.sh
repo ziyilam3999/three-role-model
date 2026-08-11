@@ -1506,4 +1506,74 @@ appendL --session sH5 --task 14605 --role planner --agent agP --artifact "$D/.ai
 runC 14605 sH5 THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "PLANNER searched memory"; } && ok "#1628 AC2: heading-then-prose-4a '# TODO cairn: later' still-blocks (anti-vacuity power test) -> BLOCK" || bad "#1628 AC2 heading-then-prose-4a should block (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2437 — cairn: RECEIPT SHAPE-TOLERANCE (BETWEEN keyword and colon: closing decoration + ONE bounded
+# parenthetical qualifier). 6th line-anchored-receipt sighting (#1518 decoration-prefix, #1607 alternating
+# decoration, #1628 heading lead-in above — all three widened only the position BEFORE the keyword). Widens
+# ALL THREE #1269 check-sites (4a grep, 4b separate-review-file grep, 4b in-plan `## Review` awk route) to
+# also accept a parenthetical qualifier (`cairn (reviewer):`) and/or closing decoration (`**cairn**:`)
+# between `cairn` and its colon, composable with the existing prefix decoration. The receipt CONTRACT is
+# unchanged (still line-anchored; colon still mandatory; the #1269 planner-exclusion is untouched).
+#
+# Vectors are read AT RUNTIME from the shared corpus (D3, hooks/_fixtures/2437-line-anchored-receipt-vectors.tsv)
+# so the CORPUS CONTENT is what this section tests, not a hardcoded copy of it (AC-9d proves this by mutation).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+CORPUS_2437="$DIR/_fixtures/2437-line-anchored-receipt-vectors.tsv"
+
+# gate2437 <route> <tag> <receipt> : build ONE fixture for a gate-family corpus row per the route semantics
+# (mirrors the #2437 plan's probe-gate.sh):
+#   awk     = receipt lives in the plan's OWN `## Review` section (AREVIEW==APLAN -> awk arm, the #1269 route)
+#   revfile = receipt lives in a SEPARATE reviews/<id>.md (grep arm)
+#   4a      = receipt is the PLANNER's only receipt (4a leg)
+# then assert the live gate's verdict against the corpus row's own accept/reject tag.
+n2437=24369
+gate2437() {
+  local route="$1" tag="$2" receipt="$3"
+  n2437=$((n2437+1))
+  local t="$n2437"
+  local s="g2437-$t"
+  local D="$TMP/g2437-$t"
+  printf '#%s\n' "$t" >> "$TMP/perf-1269.md"   # perf-card leg: token-bounded citation for this dynamically-allocated taskId
+  case "$route" in
+    awk)
+      mkdir -p "$D/.ai-workspace/plans"
+      printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n\n## Review\nDecision: PASS\n%s\n' "$receipt" > "$D/.ai-workspace/plans/p.md"
+      ledger_complete "$s" "$t"
+      appendL --session "$s" --task "$t" --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+      appendL --session "$s" --task "$t" --role plan-review --agent agR --artifact "$D/.ai-workspace/plans/p.md"
+      ;;
+    revfile)
+      mkplan "$D" yes
+      mkdir -p "$D/.ai-workspace/reviews"
+      printf '## Review\nDecision: PASS\n%s\n' "$receipt" > "$D/.ai-workspace/reviews/$t.md"
+      ledger_complete "$s" "$t"
+      appendL --session "$s" --task "$t" --role planner     --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+      appendL --session "$s" --task "$t" --role plan-review --agent agR --artifact "$D/.ai-workspace/reviews/$t.md"
+      ;;
+    4a)
+      mkdir -p "$D/.ai-workspace/plans"
+      printf '## ELI5\nplan\n%s\n### Binary AC\n- AC1\n\nbody\n' "$receipt" > "$D/.ai-workspace/plans/p.md"
+      ledger_complete "$s" "$t"
+      appendL --session "$s" --task "$t" --role planner --agent agP --artifact "$D/.ai-workspace/plans/p.md"
+      ;;
+    *) bad "#2437 gate2437: unknown route '$route'"; return ;;
+  esac
+  runC "$t" "$s" THREE_ROLE_PLANS_DIR="$D/.ai-workspace/plans"
+  if [ "$tag" = accept ]; then
+    { [ "$RC" = "0" ] && echo "$CAP" | grep -qi "OK"; } && ok "#2437 gate/$route accept: [$receipt] -> ALLOW" || bad "#2437 gate/$route accept should ALLOW: [$receipt] (rc=$RC out=$CAP)"
+  else
+    { [ "$RC" = "2" ]; } && ok "#2437 gate/$route reject: [$receipt] -> BLOCK" || bad "#2437 gate/$route reject should BLOCK: [$receipt] (rc=$RC out=$CAP)"
+  fi
+}
+
+[ -f "$CORPUS_2437" ] || bad "#2437 corpus missing at $CORPUS_2437"
+if [ -f "$CORPUS_2437" ]; then
+  while IFS="$(printf '\t')" read -r c_entry c_route c_tag c_vector; do
+    case "$c_entry" in
+      \#*|"") continue ;;
+      gate) gate2437 "$c_route" "$c_tag" "$c_vector" ;;
+    esac
+  done < "$CORPUS_2437"
+fi
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

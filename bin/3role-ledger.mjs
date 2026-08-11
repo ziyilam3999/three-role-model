@@ -1725,14 +1725,12 @@ function checkRole(role, e, session, opts, task) {
     if (!agentResolves(session, e.agentId)) {
       return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
     }
-    // #2050 AC-1 — when a merge head is known, review evidence must be BOUND to it. The ref-scoped
-    // check becomes the SOLE arbiter (never the bare on-disk existence check) — a completed ticket's
-    // artifact can remain present on disk long after it stops covering the CURRENT PR's diff (e.g.
-    // merged into master by an earlier sibling PR in the same ticket), which is exactly the "ride"
-    // this AC closes (PR #1354 riding PR #1353's completed chain via a disk hit that pre-empted the
-    // #2088 arm below it, unconditionally, before this fix). Absent a merge head (opts.mergeHead
-    // falsy — the legacy/unbound caller shape every OTHER `check` caller still uses), behavior stays
-    // BYTE-IDENTICAL to pre-#2050: on-disk existence first, exactly as before.
+    const ap = resolveArtifact(e.artifact_path);
+    if (ap) {
+      if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
+      return null;
+    }
+    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
     if (opts && opts.mergeHead) {
       const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
       if (hit) {
@@ -1741,14 +1739,6 @@ function checkRole(role, e, session, opts, task) {
         return 'execution-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
           ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3)';
       }
-      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" does not resolve at merge head ' +
-        opts.mergeHead + ' — the on-disk review evidence is not bound to the PR being merged (#2050 AC-1)' +
-        worktreeDangleHint(e.artifact_path);
-    }
-    const ap = resolveArtifact(e.artifact_path);
-    if (ap) {
-      if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
-      return null;
     }
     return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
       worktreeDangleHint(e.artifact_path);
@@ -1969,14 +1959,22 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
   return null;
 }
 
-// W3 — the ref arm's STRICTER content bar for review roles: a FLUSH-LEFT (column-0, no leading whitespace or
-// markdown decoration — the same discipline a line-anchored `^` gate needs to resist a quoted/indented
-// impersonation) affirmative Decision:/verdict line whose value is in CHECK_LANE_AFFIRMATIVE (PASS /
-// PASS-WITH-FIXES / APPROVE family) — never the broad legacy VERDICT_RE, which the bare substring "FAIL" or
-// a lone "## Review" heading would already satisfy.
+// W3 — the ref arm's STRICTER content bar for review roles: a FLUSH-LEFT (column-0, no leading whitespace —
+// the same discipline a line-anchored `^` gate needs to resist a quoted/indented impersonation; see AC-8)
+// affirmative Decision:/verdict line whose value is in CHECK_LANE_AFFIRMATIVE (PASS / PASS-WITH-FIXES /
+// APPROVE family) — never the broad legacy VERDICT_RE, which the bare substring "FAIL" or a lone "## Review"
+// heading would already satisfy.
+// #2437: the flush-left bar now tolerates ordinary markdown a human reviewer writes AROUND the verdict —
+// an optional emphasis-wrapping `**` at column 0 (`**Decision: PASS**`), closing decoration between the
+// keyword and its colon (`**Decision**: PASS`), and/or ONE bounded parenthetical qualifier immediately after
+// the keyword (`Decision (final): PASS` — a single non-nesting `(...)` group, so arbitrary prose still fails
+// to match). Composable (`**Decision (final)**: PASS`), never applied to the VALUE itself — the capture group
+// still reads only `[A-Za-z-]+` after the colon, so a decorated FAIL (`**Decision: FAIL**`) still fails
+// CHECK_LANE_AFFIRMATIVE membership (AC-8's value-blind trap) and quoted/indented/prose-led lines still never
+// match at column 0 (impersonation resistance unchanged).
 function hasRefArmAffirmative(content) {
   const s = String(content == null ? '' : content);
-  const re = /^(?:Decision|verdict)\s*:\s*([A-Za-z-]+)/gim;
+  const re = /^\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*([A-Za-z-]+)/gim;
   let m;
   while ((m = re.exec(s)) !== null) {
     if (CHECK_LANE_AFFIRMATIVE.has(String(m[1]).toUpperCase())) return true;
@@ -2865,18 +2863,6 @@ function laneAProblem(subjectRole, reviewRole, byRole, lines) {
 function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
-  // #2050 AC-1d — an EXPLICITLY empty `--merge-head` value is a USAGE ERROR, distinct from every
-  // chain-incomplete message below. Today `o['merge-head'] || ''` treats "flag passed with an empty
-  // value" and "flag omitted entirely" identically, so `check --merge-head ''` silently degrades to
-  // the unbound legacy path instead of failing loudly. `'merge-head' in o` is the ONLY signal that
-  // distinguishes "the flag was on the command line" from "the flag was never passed" (parseArgs sets
-  // o[key]='' for both a bare trailing flag and an explicit empty value, but never adds the key at all
-  // when it wasn't typed) — an omitted flag still falls through to today's unbound check untouched.
-  if (('merge-head' in o) && String(o['merge-head'] == null ? '' : o['merge-head']) === '') {
-    console.log('BLOCK: --merge-head was passed but empty — this is a USAGE ERROR (#2050 AC-1d), not a ' +
-      'chain-incomplete result. Omit --merge-head entirely for an unbound check, or pass the real merge-head sha.');
-    process.exit(2);
-  }
   const file = ledgerFile(session, task);
   let lines;
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
