@@ -3746,11 +3746,63 @@ function legacyResolveRoleModel(role, withEffort, withVersion) {
   printRoleModel(model, effort, version, withEffort, withVersion);
 }
 
+// #2401 S1 -- is `config/` tracked in git's index but absent on disk (the sparse-checkout
+// omission signature), genuinely not tracked at all (a legitimate plugin-dormant install), or is
+// the answer unknowable (git errored)? Returns 'tracked' | 'not-tracked' | 'unknown'. Deliberately
+// mirrors cairn/lib/persist-root-resolve.mjs's discriminator (same shape, different directory) --
+// duplicated rather than cross-imported because hooks/ ships flat (see this file's own header
+// comment: "FLAT file... because setup.sh only symlinks flat hook files").
+function configDirGitTrackedState(repoRoot) {
+  let res;
+  try {
+    res = spawnSync('git', ['-C', repoRoot, 'ls-files', '--', 'config'], { encoding: 'utf8' });
+  } catch (e) { return 'unknown'; }
+  if (!res || res.error || res.status !== 0) return 'unknown';
+  if (typeof res.stdout !== 'string') return 'unknown';
+  return res.stdout.trim().length > 0 ? 'tracked' : 'not-tracked';
+}
+
+// Returns a non-empty problem string when config/ is a sparse-checkout omission (or git
+// can't say), else ''. NOTE the fail-CLOSED-on-can't-tell polarity here is the OPPOSITE of this
+// file's isGitTracked() (which deliberately fails OPEN on a can't-tell for artifact-provenance
+// checks) -- here the downstream consequence of guessing wrong is a SILENT all-opus fallback with
+// zero signal, so "git could not answer" must be treated as unsafe to assume "not tracked"
+// (plan-review N2, #2401).
+function configDirSparseOmissionProblem(repoRoot) {
+  const configDir = path.join(repoRoot, 'config');
+  let isDir = false;
+  try { isDir = fs.statSync(configDir).isDirectory(); } catch (e) { isDir = false; }
+  if (isDir) return ''; // on disk -> today's behavior, unchanged
+  const state = configDirGitTrackedState(repoRoot);
+  if (state === 'not-tracked') return ''; // genuinely configless install (plugin-dormant) -> quiet, unchanged
+  const reason = state === 'tracked'
+    ? 'is tracked in git\'s index but absent on disk (this looks like a sparse-checkout worktree that omitted config/)'
+    : 'could not be confirmed tracked/untracked (git ls-files errored) -- treated as unsafe to assume absent';
+  return 'CONFIG-SPARSE-OMISSION: ' + configDir + ' ' + reason +
+    ' -- refusing to silently fall back to opus. Restore config/ in this worktree, or set CC_ROLES_ENV explicitly.';
+}
+
 function cmdResolveRoleModel(o) {
   const role = o.role;
   if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research)'); process.exit(2); }
   const withEffort = ('with-effort' in o);
   const withVersion = ('with-version' in o);
+
+  // #2401 S1 -- loud-or-correct gate, BEFORE any SSOT/legacy config resolution below. Skipped
+  // when CC_ROLES_ENV is explicitly set: that caller has already opted out of config/ entirely
+  // (test isolation / an explicit override), so a config/ omission elsewhere is none of its
+  // concern -- matches Step 2's existing "explicit legacy-only override" precedence.
+  if (!('CC_ROLES_ENV' in process.env)) {
+    let selfDir;
+    try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+    catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    const repoRoot = path.join(selfDir, '..');
+    const sparseProblem = configDirSparseOmissionProblem(repoRoot);
+    if (sparseProblem) {
+      process.stderr.write(sparseProblem + '\n');
+      process.exit(3);
+    }
+  }
 
   // Step 1 — corrupt/unreadable SSOT: unconditional fail-safe, checked BEFORE any CC_ROLES_ENV override
   // (S7 a-control: a present, differently-configured legacy view must NEVER rescue a broken SSOT).
