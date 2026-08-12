@@ -180,10 +180,21 @@ resolve_path(){
 # not answer" into "not tracked" would be a silent fail-open in the dangerous direction). Prints a
 # non-empty marker line on stdout when the gate must abort; prints nothing and returns 0 when the
 # quiet plugin-dormant path should stand.
+#
+# #2401 B2 (execution-review r2, 2026-08-12) -- exit 128 carrying git's own "not a git repository"
+# text is a DEFINITIVE answer, not an ambiguous can't-tell: it conclusively means this tree is not
+# a git checkout at all, so scripts/ cannot possibly be tracked here -- exactly the plugin-dormant
+# / non-git-install case Decision A's third state and note 2401-n2 require stay quiet. Every OTHER
+# non-zero exit (git present but erroring some other way -- corrupt repo, bad HEAD, unparseable
+# output) still goes LOUD below, unchanged. This query is already bounded by construction (a
+# single-file pathspec, per NB-3 -- no B1-class overflow risk here), so only B2 applies to this twin.
 sparse_scripts_omission_marker() {
   local repo_root="$1" tracked_out rc
-  tracked_out="$(git -C "$repo_root" ls-files -- scripts/privacy-scan.sh 2>/dev/null)"; rc=$?
+  tracked_out="$(git -C "$repo_root" ls-files -- scripts/privacy-scan.sh 2>&1)"; rc=$?
   if [ "$rc" != "0" ]; then
+    if [ "$rc" = "128" ] && printf '%s' "$tracked_out" | /usr/bin/grep -qi "not a git repository"; then
+      return 0
+    fi
     echo "CONFIG-SPARSE-OMISSION: git could not confirm whether scripts/privacy-scan.sh is tracked (ls-files exited $rc) -- treating as unsafe to assume absent."
     return 0
   fi
