@@ -171,6 +171,29 @@ resolve_path(){
   esac
 }
 
+# #2401 S2 -- distinguish "scripts/ genuinely isn't part of this install" (plugin-dormant: the
+# public three-role-model plugin ports this hook file but never scripts/privacy-scan.sh, so the
+# quiet skip below is intentional and correct there) from "scripts/ is tracked in this repo's
+# index but a sparse-checkout worktree omitted it on disk" (must go LOUD -- silently skipping the
+# privacy leg in THAT case is exactly the defect this closes). A git error / can't-tell state also
+# goes LOUD (mirrors 3role-ledger.mjs's #2401 S1 fix, N2 in the plan review: collapsing "git could
+# not answer" into "not tracked" would be a silent fail-open in the dangerous direction). Prints a
+# non-empty marker line on stdout when the gate must abort; prints nothing and returns 0 when the
+# quiet plugin-dormant path should stand.
+sparse_scripts_omission_marker() {
+  local repo_root="$1" tracked_out rc
+  tracked_out="$(git -C "$repo_root" ls-files -- scripts/privacy-scan.sh 2>/dev/null)"; rc=$?
+  if [ "$rc" != "0" ]; then
+    echo "CONFIG-SPARSE-OMISSION: git could not confirm whether scripts/privacy-scan.sh is tracked (ls-files exited $rc) -- treating as unsafe to assume absent."
+    return 0
+  fi
+  if [ -n "$tracked_out" ]; then
+    echo "CONFIG-SPARSE-OMISSION: scripts/privacy-scan.sh is tracked in git's index but absent on disk at $PRIVACY_SCANNER (this looks like a sparse-checkout worktree that omitted scripts/) -- refusing to silently skip the privacy leg."
+    return 0
+  fi
+  return 0
+}
+
 # Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
 # (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
@@ -199,9 +222,31 @@ if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
       [ -n "$PRIV_CARD" ] && LEGA_ARGS+=(--perf-log "$PRIV_CARD")
     fi
     PRIVACY_ON=0
-    if [ "${THREE_ROLE_ARTIFACT_PRIVACY_OFF:-}" != "1" ] && [ -f "$PRIVACY_SCANNER" ]; then
-      LEGA_ARGS+=(--enforce-artifact-privacy)
-      PRIVACY_ON=1
+    if [ "${THREE_ROLE_ARTIFACT_PRIVACY_OFF:-}" != "1" ]; then
+      if [ -f "$PRIVACY_SCANNER" ]; then
+        LEGA_ARGS+=(--enforce-artifact-privacy)
+        PRIVACY_ON=1
+      elif [ -n "${THREE_ROLE_PRIVACY_SCANNER:-}" ]; then
+        : # explicit test-only path override (mirrors CC_ROLES_ENV isolation elsewhere in this
+          # file's ecosystem) — the missing file is a deliberate test fixture, not a sparse-cone
+          # signature; the sparse check below only ever applies to the real co-located default.
+      else
+        # #2401 S2 -- before falling quiet, check whether this is a sparse-checkout omission
+        # rather than a genuine plugin-dormant install. Only reachable here because
+        # THREE_ROLE_PRIVACY_SCANNER is unset, so $PRIVACY_SCANNER IS the real co-located default.
+        SPARSE_SCRIPTS_MARKER="$(sparse_scripts_omission_marker "$(dirname "${BASH_SOURCE[0]}")/..")"
+        if [ -n "$SPARSE_SCRIPTS_MARKER" ]; then
+          {
+            echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+            echo "  $SPARSE_SCRIPTS_MARKER"
+            echo "  A sparse-checkout worktree that omits scripts/ must not silently skip the artifact-privacy leg --"
+            echo "  that would make a sparse worktree a strictly WEAKER completion gate than the primary clone."
+            echo "  Fix: restore scripts/ in this worktree (or run from one whose cone includes it)."
+            echo "  Kill-switch (this leg ONLY, intentional opt-out): THREE_ROLE_ARTIFACT_PRIVACY_OFF=1. Master: THREE_ROLE_INSTRUMENT_OFF=1."
+          } >&2
+          exit 2
+        fi
+      fi
     fi
     if [ "$PRIVACY_ON" = "1" ]; then
       TRACKED_OUT="$(PRIVACY_SCAN_BIN="$PRIVACY_SCANNER" node "$LEDGER_HELPER" "${LEGA_ARGS[@]}" 2>&1)"; TRC=$?
