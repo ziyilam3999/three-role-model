@@ -288,9 +288,35 @@ ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-revi
   --agent ew1 --artifact "/tmp/x/repo/.claude/worktrees/897-foo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
 echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && ok "#897 worktree artifact path -> WARN on stderr" || bad "#897 should WARN on a .claude/worktrees/ artifact path (got: $ERR)"
 
+# #2462 AC-6 widened the durability flag to ALSO cover any absolute/tilde path (not just worktree-shaped
+# ones) — an absolute `/tmp/...` path is now itself one of the three enumerated ephemeral shapes ("temp/
+# scratch dir"), so it is REQUIRED to warn too (r2b/N3: checked on the RAW argument). The #897 negative
+# control therefore now uses a genuinely repo-RELATIVE path (the only shape that stays silent) to represent
+# "a stable path" — an absolute path, /tmp/-rooted or not, is never durable/portable/git-trackable at a
+# stable location and must warn under the new, stricter contract.
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact ".ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable repo-relative path (got: $ERR)" || ok "#897 stable repo-relative artifact path -> no #897 worktree warn"
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && bad "#2462 AC-6 should NOT warn on a stable repo-relative path (got: $ERR)" || ok "#2462 AC-6: stable repo-relative artifact path -> no durability warn"
+
+# #2462 AC-6 — the WIDENED shapes, positive arms: a bare absolute /tmp path (temp/scratch dir) and a
+# tilde-anchored absolute path (the LIVE reproducer: this task's own round-3 plan-review self-append cited
+# exactly this shape, silently, pre-fix) both now WARN with the distinct #2462 AC-6 token.
 ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
   --agent ew1 --artifact "/tmp/x/repo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
-echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable primary path (got: $ERR)" || ok "#897 stable primary artifact path -> no warn"
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && ok "#2462 AC-6: absolute /tmp path -> WARN on stderr (temp/scratch shape)" || bad "#2462 AC-6 should WARN on an absolute /tmp artifact path (got: $ERR)"
+
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact "~/coding_projects/ai-brain-wt-2462-plan-fold-r2/.ai-workspace/plans/x.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && ok "#2462 AC-6: tilde-anchored worktree-absolute path -> WARN on stderr (the live #2462 round-3 reproducer's own shape)" || bad "#2462 AC-6 should WARN on a tilde-anchored artifact path (got: $ERR)"
+
+# #2462 AC-6 — the executor's PR-URL/branch-string artifact is a bare non-path token: never matches either
+# shape, so it must keep unchanged (unflagged) behavior (the over-blocking guard).
+ERR=$(node "$LED" append --session "$WSID" --task "${WTASK}exec" --role executor \
+  --agent ew1 --artifact "PR #2462" 2>&1 >/dev/null)
+{ echo "$ERR" | grep -q 'WARN (3role-ledger #897)' || echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)'; } \
+  && bad "#2462 AC-6 should NOT warn on the executor's PR-URL/branch-string artifact (got: $ERR)" \
+  || ok "#2462 AC-6: executor PR-URL/branch-string artifact -> no durability warn (over-blocking guard)"
 
 # ---------------------------------------------------------------------------
 # #2028 — worktreeDangleHint's regex must fire on a WORKTREE PATH REGARDLESS OF A LEADING SLASH: both an
@@ -3195,9 +3221,15 @@ OUT=$(cd "$AC3REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC3" --m
   || bad "2088-AC3 power control failed (rc=$RC out=$OUT)"
 rm -rf "$AC3REPO"
 
-# ---- AC-7: byte-stability for non-opt-in callers (the AC-3 fixture, WITHOUT --merge-head) -----------------
-# Uses the SAME T_AC3/MH_SID ledger (its cited artifact resolves nowhere on disk regardless of cwd) --
-# cwd is irrelevant here since no --merge-head is passed, so the new ref arm is never even reachable.
+# ---- AC-7: byte-stability, MEASURED not assumed (#2462 AC-5 r1/B4) -----------------------------------------
+# Uses the SAME T_AC3/MH_SID ledger, WITHOUT --merge-head. #2462 flipped the ref arm DEFAULT-ON, so
+# candidate 2 (refs/remotes/origin/<task>-* + origin/master, in the REAL ai-brain repo hosting this helper
+# file -- aiBrainToplevel()) IS now reachable here even with no --merge-head passed; this fixture's cited
+# path (.ai-workspace/reviews/2088-smoke-ac3-execreview.md) simply does not resolve at either candidate in
+# the real repo (no refs/remotes/origin/2088ac3-* ref exists, and the path is absent from origin/master --
+# reverified live), so this specific fixture stays byte-identical to the pre-#2088 baseline. This is a
+# measured, not assumed, outcome (a DIFFERENT fixture citing a path that DOES exist on origin/master would
+# now diverge -- see the #2462 AC-1 drift-proof arm below, which pins exactly that divergence).
 OLD_LED_2088="$DIR/_fixtures/3role-ledger-pre2088-snapshot.mjs"
 OUT_NEW=$(node "$LED" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_NEW=$?
 OUT_OLD=$(node "$OLD_LED_2088" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_OLD=$?
@@ -3654,6 +3686,12 @@ n2437w3=0
 # w3row2437 <tag> <verdict-line> : commit ONE corpus row's verdict-line as the SOLE content of a
 # plan-review review file at a fresh throwaway repo's HEAD, rm the working copy (ref-arm-only — no disk
 # fallback), then assert `check --merge-head` against the row's own accept/reject tag.
+# #2480 O1 note: the execution-review row is ALSO committed at this same merge head (a plain, non-
+# shape-tested "Decision: PASS") rather than left disk-only — O1 scopes the disk-hit-no-longer-satisfies
+# rule to the execution-review row in merge-head context, so a disk-only $TMP/er.md (pre-#2480 shape)
+# would now BLOCK this fixture for a reason unrelated to the W3 shape-tolerance property under test here.
+# The plan-review row (the actual target of this section) and both accept/reject expectations are
+# unchanged — only the execution-review row's evidence source moved from disk to the committed tree.
 w3row2437() {
   local tag="$1" vline="$2"
   n2437w3=$((n2437w3+1)); local t="w2437-$n2437w3"
@@ -3661,15 +3699,17 @@ w3row2437() {
   ( cd "$REPO" && git init -q && git config user.email t@t.co && git config user.name t )
   mkdir -p "$REPO/.ai-workspace/reviews"
   printf '## Review\n%s\n' "$vline" > "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
-  ( cd "$REPO" && git add ".ai-workspace/reviews/2437-w3-$n2437w3.md" && git commit -q -m "fixture: #2437 w3 vector $n2437w3" )
-  rm -f "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
+  printf '## Review\nDecision: PASS\n' > "$REPO/.ai-workspace/reviews/2437-w3-er-$n2437w3.md"
+  ( cd "$REPO" && git add ".ai-workspace/reviews/2437-w3-$n2437w3.md" ".ai-workspace/reviews/2437-w3-er-$n2437w3.md" \
+    && git commit -q -m "fixture: #2437 w3 vector $n2437w3" )
+  rm -f "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md" "$REPO/.ai-workspace/reviews/2437-w3-er-$n2437w3.md"
   local SHA; SHA=$(git -C "$REPO" rev-parse HEAD)
   mk_sub "$MH_SID_2437" "w2437p$n2437w3"; mk_sub "$MH_SID_2437" "w2437r$n2437w3"
   mk_sub "$MH_SID_2437" "w2437e$n2437w3"; mk_sub "$MH_SID_2437" "w2437v$n2437w3"
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role planner --agent "w2437p$n2437w3" --artifact "$TMP/plan.md" >/dev/null
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role plan-review --agent "w2437r$n2437w3" --artifact ".ai-workspace/reviews/2437-w3-$n2437w3.md" --verdict PASS >/dev/null
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role executor --agent "w2437e$n2437w3" --artifact "branch feat/2437-w3-$n2437w3" >/dev/null
-  node "$LED" append --session "$MH_SID_2437" --task "$t" --role execution-review --agent "w2437v$n2437w3" --artifact "$TMP/er.md" >/dev/null
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role execution-review --agent "w2437v$n2437w3" --artifact ".ai-workspace/reviews/2437-w3-er-$n2437w3.md" >/dev/null
   local OUT RC
   OUT=$(cd "$REPO" && node "$LED" check --session "$MH_SID_2437" --task "$t" --merge-head "$SHA" 2>&1); RC=$?
   rm -rf "$REPO"
@@ -3691,6 +3731,67 @@ if [ -f "$CORPUS_2437_W3" ]; then
       w3) w3row2437 "$c_tag" "$c_vector" ;;
     esac
   done < "$CORPUS_2437_W3"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2462 AC-1 — drift-proof arm: the #2088 ref-scoped resolution arm is now DEFAULT-ON (no --merge-head
+# required to activate it — see resolveArtifactAtRef()'s doc comment). Proves the exact `:537` shape the
+# instrumentation gate runs (check --session S --task T --reject-vacuous-oracle --enforce-role-models
+# --enforce-artifact-role-kind, all WITHOUT --merge-head) resolves an artifact that exists ONLY at a
+# refs/remotes/origin/<task>-* ref in the RUNNING HELPER's own home repo (candidate container 2 — P5a: this
+# candidate set never depended on --merge-head's value, so "starved of every other candidate" here means
+# absent from disk AND absent from any --merge-head, which this invocation doesn't even pass).
+#
+# CC_ROLES_ENV=/nonexistent (the established M3 NO-CONFIG pattern above) isolates the mechanism under test
+# (ref-arm resolution) from the orthogonal model-policy axis, which the M1-M7/R1-R7/V1-V6 sections above
+# already exercise exhaustively — one seed per mechanism (#2462 AC-5's own discipline).
+#
+# Uses plumbing-only git ops (hash-object/mktree/commit-tree/update-ref) against the REAL repo hosting $LED
+# (this is aiBrainToplevel()'s resolution target — it derives from the ledger file's OWN location, not cwd
+# or THREE_ROLE_LEDGER_DIR) so no working-tree/index/HEAD state is ever touched; the fixture ref is deleted
+# again immediately after use either way.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+HOME_REPO_2462="$(cd "$DIR" && git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$HOME_REPO_2462" ]; then
+  bad "#2462 AC-1 drift-proof arm: could not resolve the home repo toplevel from $DIR -- cannot run"
+else
+  T2462D="2462driftfixw$$"
+  REL2462D=".ai-workspace/reviews/2462-drift-fixture-$$.md"
+  REF2462D="refs/remotes/origin/${T2462D}-fixture"
+  SCRATCH_INDEX_2462="$TMP/2462-drift-scratch.index"
+  BLOB2462D=$(printf '## Review\nDecision: PASS\n' | git -C "$HOME_REPO_2462" hash-object -w --stdin)
+  # A nested repo-relative path needs the full tree built via an ISOLATED scratch index (GIT_INDEX_FILE,
+  # scoped per-command via inline env-var prefix -- never `export`, so it can never leak into any other git
+  # invocation in this script) -- plain `mktree` only accepts single-level entries, not a path with slashes.
+  rm -f "$SCRATCH_INDEX_2462"
+  GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" update-index --add --cacheinfo 100644 "$BLOB2462D" "$REL2462D"
+  TREE2462D=$(GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" write-tree)
+  COMMIT2462D=$(git -C "$HOME_REPO_2462" commit-tree "$TREE2462D" -m "fixture: #2462 AC-1 drift-proof arm (isolated, no working-tree/index/HEAD mutation)")
+  git -C "$HOME_REPO_2462" update-ref "$REF2462D" "$COMMIT2462D"
+  rm -f "$SCRATCH_INDEX_2462"
+
+  SID2462D="sess-2462-drift"
+  mk_sub "$SID2462D" "d2462p1"; mk_sub "$SID2462D" "d2462r1"
+  mk_sub "$SID2462D" "d2462e1"; mk_sub "$SID2462D" "d2462v1"
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role planner --agent "d2462p1" --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role plan-review --agent "d2462r1" --artifact "$REL2462D" --verdict PASS >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role executor --agent "d2462e1" --artifact "branch feat/2462-drift" >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role execution-review --agent "d2462v1" --artifact "$TMP/er.md" >/dev/null
+
+  # accept arm: the fixture ref exists, NO --merge-head passed -> the default-on ref arm must still resolve
+  # it via candidate 2 -> the :537 shape exits 0.
+  OUT2462A=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$SID2462D" --task "$T2462D" --reject-vacuous-oracle --enforce-role-models --enforce-artifact-role-kind 2>&1); RC2462A=$?
+  { [ "$RC2462A" = "0" ]; } \
+    && ok "#2462 AC-1 drift-proof: artifact resolvable ONLY at refs/remotes/origin/<task>-* (no --merge-head passed) -> the :537 shape exits 0" \
+    || bad "#2462 AC-1 drift-proof accept FAILED (rc=$RC2462A out=$OUT2462A)"
+
+  # reject arm (also #2462 AC-1's own named FAIL seed): delete the ref -> no candidate resolves anywhere
+  # (not on disk, not at any bounded ref) -> the :537 shape exits 2, naming the role.
+  git -C "$HOME_REPO_2462" update-ref -d "$REF2462D" >/dev/null 2>&1
+  OUT2462B=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$SID2462D" --task "$T2462D" --reject-vacuous-oracle --enforce-role-models --enforce-artifact-role-kind 2>&1); RC2462B=$?
+  { [ "$RC2462B" = "2" ] && echo "$OUT2462B" | command grep -qi "plan-review"; } \
+    && ok "#2462 AC-1 drift-proof: same fixture with the ref ABSENT -> the :537 shape exits 2 naming plan-review" \
+    || bad "#2462 AC-1 drift-proof reject FAILED (rc=$RC2462B out=$OUT2462B)"
 fi
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
