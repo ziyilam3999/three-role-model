@@ -54,17 +54,26 @@
 //     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
 //     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
 //     promotes a missing stamp to a BLOCK.
-//   check --session S --task T --merge-head <ref-or-sha>                                        (#2088)
-//     OPT-IN, check-time-ONLY ref-scoped resolution arm. Without this flag, behavior is byte-identical to
-//     today (W5). WITH it: a planner/plan-review/execution-review artifact_path that fails the ordinary
-//     filesystem resolution gets ONE more chance — committed git evidence at a BOUNDED candidate-ref set:
-//     (1) the passed --merge-head ref, read in the repo `check` runs from; (2) refs/remotes/origin/<task>-*
-//     (the LOCAL MIRROR namespace — refs/heads/ is never consulted) plus origin/master, in the RUNNING
-//     HELPER's own home repo (aiBrainToplevel()). Content is read AT THE REF (never disk); planner still
-//     needs PLAN_RE, but a plan-review/execution-review artifact resolved via this arm needs the STRICTER
-//     W3 bar — a flush-left affirmative Decision:/verdict line in CHECK_LANE_AFFIRMATIVE — never the legacy
-//     VERDICT_RE substring match. No other ref is ever consulted. See the #2088 plan for the full honesty
-//     contract (this arm is no weaker than the disk arm — never "harder to fool").
+//   check --session S --task T [--merge-head <ref-or-sha>]                            (#2088, default-on #2462)
+//     Check-time-ONLY ref-scoped resolution arm — DEFAULT-ON as of #2462 (was opt-in-behind---merge-head
+//     under #2088; that gate was measured to leave master permanently unable to prove a branch-only role
+//     artifact, since the completion gate and the merge gates' ledger leg never pass --merge-head — #2462
+//     AC-1). A planner/plan-review/execution-review artifact_path that fails the ordinary filesystem
+//     resolution now ALWAYS gets one more chance — committed git evidence at a BOUNDED candidate-ref set:
+//     (1) the passed --merge-head ref (when one was given), read in the repo `check` runs from — "does this
+//     artifact ship with the thing being merged?"; (2) refs/remotes/origin/<task>-* (the LOCAL MIRROR
+//     namespace — refs/heads/ is never consulted) plus origin/master, in the RUNNING HELPER's own home repo
+//     (aiBrainToplevel()) — consulted UNCONDITIONALLY, independent of whether --merge-head was passed (P5a:
+//     this candidate set never depended on --merge-head's value even under #2088). Content is read AT THE
+//     REF (never disk); planner still needs PLAN_RE, but a plan-review/execution-review artifact resolved
+//     via this arm needs the STRICTER W3 bar (hasRefArmAffirmative) — a flush-left affirmative
+//     Decision:/verdict line in CHECK_LANE_AFFIRMATIVE (now also tolerating one optional column-0 ATX
+//     heading prefix, #2462 AC-1b) — never the legacy VERDICT_RE substring match. No other ref is ever
+//     consulted. See the #2088 plan for the full honesty contract (this arm is no weaker than the disk arm
+//     — never "harder to fool"); see the #2462 plan for the default-on rationale + monotonicity proof.
+//     Plain `check` (no flags at all) is THEREFORE NO LONGER byte-identical to the pre-#2088 baseline — it
+//     now additionally consults refs/remotes/origin/<task>-* + origin/master with zero network I/O. The
+//     pinned `2088-AC7` byte-identity fixture is superseded explicitly for this reason (#2462 AC-5).
 //   check --session S --task T --enforce-tracked-artifacts                                    (#1509)
 //     Leg A — TRACKED, not merely present. Opt-in (base `check` stays existence-only — ~29% of the real
 //     .ai-workspace/plans+reviews backlog is present-but-untracked today, so making this the DEFAULT would
@@ -1725,20 +1734,35 @@ function checkRole(role, e, session, opts, task) {
     if (!agentResolves(session, e.agentId)) {
       return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
     }
-    const ap = resolveArtifact(e.artifact_path);
-    if (ap) {
-      if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
-      return null;
+    // #2480 O1 — when a merge head is known (opts.mergeHead truthy), the bare on-disk hit no longer
+    // satisfies THIS row: review evidence must be bound to the commit actually being merged, so only
+    // committed-tree resolution (the ref arm just below — the merge head, task-bound refs, or
+    // origin/master) counts. Scope is EXECUTION-REVIEW ONLY (planner/plan-review keep disk-first
+    // unconditionally — M5-control pins this). Absent a merge head this row stays BYTE-IDENTICAL to
+    // pre-#2480: the disk arm is still consulted first (scope exclusion 5 / AC-2).
+    if (!(opts && opts.mergeHead)) {
+      const ap = resolveArtifact(e.artifact_path);
+      if (ap) {
+        if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
+        return null;
+      }
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
         return 'execution-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
           ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3)';
       }
+    }
+    if (opts && opts.mergeHead) {
+      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" does not resolve at merge head ' +
+        opts.mergeHead + ' — the on-disk review evidence is not bound to the PR being merged (#2050 AC-1)' +
+        worktreeDangleHint(e.artifact_path);
     }
     return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
       worktreeDangleHint(e.artifact_path);
@@ -1761,9 +1785,11 @@ function checkRole(role, e, session, opts, task) {
         '## ELI5, ### Binary AC, ## Binary acceptance criteria, ### Acceptance criteria, ## Acceptance, or ## AC';
       return null;
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && PLAN_RE.test(content)) return null;
@@ -1780,9 +1806,11 @@ function checkRole(role, e, session, opts, task) {
       if (!fileHas(ap, VERDICT_RE)) return 'plan-review artifact "' + ap + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
       return null;
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
@@ -1859,11 +1887,14 @@ function repoToplevelFor(absPath) {
   } catch (e) { return null; }
 }
 
-// ── #2088 — opt-in, check-time-ONLY, ref-scoped resolution arm ─────────────────────────────────────────────
-// `check --merge-head <ref-or-sha>` teaches the checker ONE more place to look for a role artifact that
-// fails today's plain filesystem resolution: committed git evidence at a BOUNDED set of candidate refs —
-// never the object store at large, never a push, never network I/O. See the #2088 plan's "§The bounded ref
-// set" for the full rationale (W1-W7 are the hard constraints this code must never violate); this block is
+// ── #2088 — check-time-ONLY, ref-scoped resolution arm (DEFAULT-ON as of #2462) ───────────────────────────
+// `check` teaches the checker ONE more place to look for a role artifact that fails today's plain
+// filesystem resolution: committed git evidence at a BOUNDED set of candidate refs — never the object
+// store at large, never a push, never network I/O. `--merge-head <ref-or-sha>`, when passed, additionally
+// widens the candidate set with the current merge head; it is no longer REQUIRED to activate this arm
+// (#2462 AC-1 — plain `check` with no flags now consults refs/remotes/origin/<task>-* + origin/master too).
+// See the #2088 plan's "§The bounded ref set" for the full rationale (W1-W7 are the hard constraints this
+// code must never violate — still honored) and the #2462 plan for the default-on decision; this block is
 // the mechanical half.
 
 // #2023 dangle-class normalizer: derive a REPO-RELATIVE candidate path for a git `<ref>:<path>` lookup
@@ -1935,17 +1966,21 @@ function candidateTaskRefs(repoDir, task) {
 }
 
 // Orchestrates the two candidate containers (§The bounded ref set): (1) the merge head, in the repo `check`
-// runs from — "does this artifact ship with the thing being merged?"; (2) task-bound refs (+ origin/master)
-// in the running helper's OWN home repo — the cross-repo / plugin-sync-ordering case. Returns
-// {ref, repoDir, relPath} for the FIRST candidate whose blob exists, or null (no candidate resolves — the
-// caller falls through to its existing "not found" problem). No ref outside this bounded set is ever
-// consulted.
+// runs from — "does this artifact ship with the thing being merged?" — consulted ONLY when a mergeHead was
+// actually passed (there is no meaningful cwd-repo-at-mergeHead candidate without one); (2) task-bound refs
+// (+ origin/master) in the running helper's OWN home repo — the cross-repo / plugin-sync-ordering case,
+// consulted UNCONDITIONALLY (#2462 AC-1 default-on: this candidate never depended on mergeHead's value even
+// under #2088 — candidateTaskRefs() never reads it). Returns {ref, repoDir, relPath} for the FIRST candidate
+// whose blob exists, or null (no candidate resolves — the caller falls through to its existing "not found"
+// problem). No ref outside this bounded set is ever consulted.
 function resolveArtifactAtRef(rawPath, mergeHead, task) {
-  if (!rawPath || !mergeHead) return null;
-  const cwdRepo = process.cwd();
-  const cwdRel = repoRelativeCandidate(rawPath, cwdRepo);
-  if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
-    return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
+  if (!rawPath) return null;
+  if (mergeHead) {
+    const cwdRepo = process.cwd();
+    const cwdRel = repoRelativeCandidate(rawPath, cwdRepo);
+    if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
+      return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
+    }
   }
   const homeRepo = aiBrainToplevel();
   if (homeRepo) {
@@ -1972,9 +2007,18 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
 // still reads only `[A-Za-z-]+` after the colon, so a decorated FAIL (`**Decision: FAIL**`) still fails
 // CHECK_LANE_AFFIRMATIVE membership (AC-8's value-blind trap) and quoted/indented/prose-led lines still never
 // match at column 0 (impersonation resistance unchanged).
+// #2462 AC-1b: ONE additional enumerated shape -- an optional column-0 markdown ATX heading prefix
+// (`#{1,6}` + required whitespace) immediately before the Decision/verdict keyword -- the repo's own
+// convention (real 2318 blobs open `## Decision: PASS`; P10). Still column-0-anchored (the `#` itself must
+// be the very first character of the line -- no leading whitespace before it, so `> ## Decision: PASS` and
+// `  ## Decision: PASS` still fail the anchor) and still never applied to the VALUE -- a decorated-and-headed
+// FAIL still fails CHECK_LANE_AFFIRMATIVE. A quoted/fenced decision line that does NOT begin the line with
+// `#`/`*`/the bare keyword (e.g. a backtick-wrapped inline-code quotation, `` `## Decision: PASS` ``) still
+// never matches -- the backtick is the first character consumed by `^` and satisfies none of the three
+// leading alternatives (r1/N7, pinned in hooks/_fixtures/2437-line-anchored-receipt-vectors.tsv).
 function hasRefArmAffirmative(content) {
   const s = String(content == null ? '' : content);
-  const re = /^\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*([A-Za-z-]+)/gim;
+  const re = /^(?:#{1,6}[ \t]+)?\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*([A-Za-z-]+)/gim;
   let m;
   while ((m = re.exec(s)) !== null) {
     if (CHECK_LANE_AFFIRMATIVE.has(String(m[1]).toUpperCase())) return true;
@@ -2455,15 +2499,37 @@ function cmdAppend(o) {
   // Effort is now written ONLY via the explicit --effort flag above: the spawn hook stamps ASSIGNED, the
   // SubagentStop hook stamps OBSERVED (`effort.level`), and every other append (self-record, close-out)
   // passes none — overlayAppend's per-key "provided" discipline then PRESERVES the role's real value untouched.
-  // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
-  // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
-  // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
-  // primary-clone path after merge+FF; cite THAT. Warn (stderr is visible to the orchestrator, unlike an
-  // exit-0 hook nudge — #769) but do NOT block: the path may legitimately still exist this instant.
-  if (fields.artifact_path && /\/\.claude\/worktrees\//.test(String(fields.artifact_path))) {
-    console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
-      'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
-      'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
+  // #897/#2462 AC-6 — DURABILITY FLAG at append time. #897 (original): a build worktree is transient
+  // (quarantined at cleanup), so an artifact_path under `.claude/worktrees/<slug>/` DANGLES the moment the
+  // worktree is removed — and the completion gate (which checks the artifact file EXISTS) then BLOCKs.
+  // #2462 (widened): the SAME durability failure recurs for a home/tilde-anchored or otherwise machine-local
+  // absolute path, and for a temp/scratch dir — none of these are a stable, git-trackable repo-relative
+  // location either (the live #2462 reproducer: this very task's own round-3 plan-review self-append cited
+  // `~/coding_projects/ai-brain-wt-2462-plan-fold-r2/.ai-workspace/plans/...` — silent, rc=0, pre-fix). The
+  // committed artifact lives at a stable repo-relative path after merge+FF; cite THAT. WARN (stderr is
+  // visible to the orchestrator, unlike an exit-0 hook nudge — #769) but do NOT block: the cited path may
+  // legitimately still exist this instant, and a role whose real artifact genuinely is ephemeral-shaped must
+  // never be BRICKED by this leg (AC-6's own over-blocking guard) — only the executor's PR-URL/branch/sha
+  // artifact_path and a genuine repo-relative path are UNFLAGGED by construction (neither shape below ever
+  // matches a bare token or a path with no leading `/`/`~` and no worktree segment).
+  //
+  // Checked against the RAW --artifact ARGUMENT (o.artifact), never the possibly-rewritten `fields.artifact_
+  // path`: normalizeArtifact() collapses a HOME-rooted absolute path to `~/...` but leaves an absolute path
+  // OUTSIDE $HOME untouched — so a detector reading only the post-normalize value for a leading `~` would
+  // silently miss that case (checking the raw argument catches both, uniformly).
+  {
+    const rawArtifactArg = ('artifact' in o) ? String(o.artifact == null ? '' : o.artifact).trim() : '';
+    if (rawArtifactArg && /(^|\/)\.claude\/worktrees\//.test(rawArtifactArg)) {
+      console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
+        'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
+        'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
+    } else if (rawArtifactArg && (rawArtifactArg === '~' || rawArtifactArg.startsWith('~/') || rawArtifactArg.startsWith('/'))) {
+      console.error('WARN (3role-ledger #2462 AC-6): --artifact "' + rawArtifactArg + '" cites an ephemeral or ' +
+        'anchored location (a home/tilde-anchored or otherwise machine-local absolute path, or a temp/scratch ' +
+        'dir) — not a stable, git-trackable repo-relative path. It will not survive a worktree quarantine, a ' +
+        'different checkout, or a different machine. Re-append with a repo-relative --artifact path (from this ' +
+        'repo\'s own root), then re-complete.');
+    }
   }
   // #1769: a BARE repoint (no --agent, no --verdict, no --skip-reason — i.e. only artifact_path and/or the
   // best-effort model fields are being provided) merges onto overlayAppend's "prior" row: whichever line was
@@ -2863,6 +2929,20 @@ function laneAProblem(subjectRole, reviewRole, byRole, lines) {
 function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
+  // #2480 O4 / #2050 AC-1d — an EXPLICITLY empty `--merge-head` value is a USAGE ERROR, distinct from
+  // every chain-incomplete message below. `o['merge-head'] || ''` (the checkOpts read further down)
+  // treats "flag passed with an empty value" and "flag omitted entirely" identically, so
+  // `check --merge-head ''` would silently degrade to the unbound legacy path instead of failing
+  // loudly. `'merge-head' in o` is the ONLY signal that distinguishes "the flag was on the command
+  // line" from "the flag was never passed" (parseArgs sets o[key]='' for both a bare trailing flag and
+  // an explicit empty value, but never adds the key at all when it wasn't typed) — an omitted flag
+  // still falls through to today's unbound check untouched (M6-control). Raised BEFORE the ledger-file
+  // read below so this stays a distinct usage error, not "no role-ledger found" (M6).
+  if (('merge-head' in o) && String(o['merge-head'] == null ? '' : o['merge-head']) === '') {
+    console.log('BLOCK: --merge-head was passed but empty — this is a USAGE ERROR (#2050 AC-1d), not a ' +
+      'chain-incomplete result. Omit --merge-head entirely for an unbound check, or pass the real merge-head sha.');
+    process.exit(2);
+  }
   const file = ledgerFile(session, task);
   let lines;
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
@@ -2875,8 +2955,10 @@ function cmdCheck(o) {
   for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
   // #1276: the vacuous-oracle rejection is OPT-IN via --reject-vacuous-oracle (only the instrumentation
   // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
-  // #2088: --merge-head is likewise OPT-IN (W5) — absent/empty leaves checkRole()'s ref-scoped arm entirely
-  // unconsulted, so `check`'s behavior for every existing caller is byte-identical to pre-#2088.
+  // #2088: --merge-head only widens checkRole()'s ref-scoped arm with the current merge head as an EXTRA
+  // candidate; the arm itself is DEFAULT-ON as of #2462 (task-bound refs + origin/master are consulted
+  // regardless of whether this flag is present — see resolveArtifactAtRef()). Absent/empty just means the
+  // merge-head candidate is skipped, not that the whole arm is skipped.
   const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '' };
   const problems = [];
   // #1947 M-B (execution-review round-2 FAIL) — D2 promised "check output labels these rows distinctly", but
@@ -3309,6 +3391,73 @@ function cmdResolveArtifact(o) {
   const abs = resolveArtifact(e.artifact_path); // expands ~ / CLAUDE_PROJECT_DIR / cwd / $HOME, '' if not on disk
   if (!abs) process.exit(1);
   console.log(abs);
+  process.exit(0);
+}
+
+// #2462 AC-4 — resolve-artifacts-for-task --task T [--merge-head R]: the RAW per-row resolution primitive
+// the corpus verifier (scripts/2462-branch-only-artifact-corpus-verifier.mjs) shells out to, so its
+// resolution predicate is the SAME code checkRole()/resolveArtifact()/resolveArtifactAtRef() run for `check`
+// — never a second hand-written copy that could silently drift from it. Unlike `check` (session-scoped, role-
+// completeness-gated), this walks EVERY ledger file for the task ACROSS ALL SESSION DIRS under LEDGER_DIR
+// (AC-4's cross-session population predicate) and reports EVERY row found (including superseded round
+// history — AC-4 says "every ledger row", not "the current effective row per role"), one JSON object per
+// line on stdout: {session, role, ref: <the artifact_path/oracle string>, resolved: bool, via: <string>}.
+// Never a pass/fail gate itself — exit 0 whenever ≥1 ledger file was found for the task (even if some rows
+// fail to resolve; the caller decides), exit 1 when NO ledger file exists for this task anywhere (so the
+// caller can distinguish "task not in the population" from "task found, rows examined").
+function cmdResolveArtifactsForTask(o) {
+  const task = o.task;
+  if (!task) { console.error('resolve-artifacts-for-task: --task is required'); process.exit(2); }
+  const mergeHead = o['merge-head'] || '';
+  const t = sanitize(task);
+  let sessionDirs = [];
+  try { sessionDirs = fs.readdirSync(LEDGER_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); }
+  catch (e) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  const files = [];
+  for (const sd of sessionDirs) {
+    const f = path.join(LEDGER_DIR, sd, t + '.jsonl');
+    if (fileExists(f)) files.push({ session: sd, file: f });
+  }
+  if (files.length === 0) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  for (const { session, file } of files) {
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { continue; }
+    for (const ln of lines) {
+      let row;
+      try { row = JSON.parse(ln); } catch (e) { continue; }
+      if (!row || !row.role) continue;
+      const role = row.role;
+      if (classifySkip(row).skip) {
+        console.log(JSON.stringify({ session, role, ref: '', resolved: true, via: 'inline-skip' }));
+        continue;
+      }
+      if (role === 'executor') {
+        const ok = !!(row.artifact_path && String(row.artifact_path).trim());
+        console.log(JSON.stringify({ session, role, ref: row.artifact_path || '', resolved: ok, via: ok ? 'string' : 'empty' }));
+        continue;
+      }
+      const rawRef = (role === 'execution-review' && row.oracle) ? stripOraclePrefix(row.oracle) : row.artifact_path;
+      if (!rawRef || !String(rawRef).trim()) {
+        console.log(JSON.stringify({ session, role, ref: rawRef || '', resolved: false, via: 'empty' }));
+        continue;
+      }
+      const contentRe = role === 'planner' ? PLAN_RE : VERDICT_RE;
+      const disk = resolveArtifact(rawRef);
+      if (disk) {
+        const ok = fileHas(disk, contentRe);
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? 'disk' : 'disk-content-fail', at: disk }));
+        continue;
+      }
+      const hit = resolveArtifactAtRef(rawRef, mergeHead, task);
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        const ok = content !== null && (role === 'planner' ? PLAN_RE.test(content) : hasRefArmAffirmative(content));
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? ('ref:' + hit.ref) : ('ref-content-fail:' + hit.ref), at: hit.repoDir + ':' + hit.relPath }));
+        continue;
+      }
+      console.log(JSON.stringify({ session, role, ref: rawRef, resolved: false, via: 'not-found' }));
+    }
+  }
   process.exit(0);
 }
 
@@ -4653,6 +4802,7 @@ try {
   else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
+  else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
@@ -4665,10 +4815,10 @@ try {
   else if (cmd === 'resolve-mode') cmdResolveMode(opts);
   else if (cmd === 'set-mode') cmdSetMode(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
-      '[--merge-head R (check, opt-in ref-scoped resolution arm, #2088)] ' +
+      '[--merge-head R (check, widens the DEFAULT-ON ref-scoped resolution arm, #2088/#2462)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
       '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
