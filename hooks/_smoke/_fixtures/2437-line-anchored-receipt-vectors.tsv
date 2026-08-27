@@ -3,6 +3,11 @@
 # and hooks/3role-ledger-smoke-test.sh (entrypoint=w3). entrypoint=gate route in {awk,revfile,4a}; entrypoint=w3 route is "-".
 # tag in {accept,reject}. Every vector below is quoted verbatim in the plan's Binary AC-1..AC-8 (14 distinct strings).
 # DO NOT hand-edit a vector string without also updating the plan's AC text -- AC-9(b) greps for exact byte match.
+# #2462 AC-1b (2026-08-21) APPENDED two new w3 rows below the #2437 set (existing rows byte-unchanged, per
+# this header's own rule) -- pinning the ONE new enumerated W3 shape: an optional column-0 ATX heading
+# prefix (`#{1,6}` + whitespace), the repo's own convention (P10: real 2318 blobs open `## Decision: PASS`),
+# plus one new reject covering a column-0 quoted/fenced decision line (r1/N7) so the widening cannot also
+# admit a backtick-quoted impersonation of that same shape. Quoted verbatim in the #2462 plan's AC-1b.
 gate	awk	accept	cairn (reviewer): "reviewer hit"
 gate	revfile	accept	cairn (reviewer): "reviewer hit"
 gate	4a	accept	cairn (planner): "planner hit"
@@ -18,3 +23,12 @@ w3	-	reject	> Decision: PASS
 w3	-	reject	  Decision: PASS
 w3	-	reject	**Decision: FAIL**
 w3	-	reject	The reviewer noted Decision: PASS earlier
+w3	-	accept	## Decision: PASS
+w3	-	reject	`## Decision: PASS`
+w3	-	accept	## Decision: **PASS**
+w3	-	accept	Decision: **PASS**
+w3	-	accept	**Decision:** PASS
+w3	-	accept	## **Decision:** **PASS**
+w3	-	reject	## Decision: NEEDS-WORK
+w3	-	reject	## Decision: **FAIL**
+w3	-	reject	Decision: *** PASS
