@@ -218,6 +218,15 @@ fi
 # used elsewhere in this file's ecosystem) — unset in production, so production always resolves the real
 # co-located scanner; the smoke uses it to point at a deliberately-mutated copy (AC5 home-path sourcing proof,
 # AC11a forced-abort proof) without touching the real scanner.
+# #1660 SL-10 (design surface S-6) — this leg's role-chain artifacts (plans/reviews/receipts) are formally
+# re-based onto this SAME engine contract: no separate class list is kept here, the presence-guarded
+# `scripts/privacy-scan.sh` binary IS the single source of the scanned class set. Two DISTINCT absence shapes
+# below are deliberately NOT the same outcome: (1) THREE_ROLE_PRIVACY_SCANNER explicitly set to a missing path
+# (a declared test-only override) stays DORMANT/no-block — the caller asked for this; (2) the real co-located
+# default missing on disk while `scripts/privacy-scan.sh` is still TRACKED in git's index (a sparse-checkout
+# omission, or a ported plugin hook that dropped the scanner but kept the tracked path) REFUSES loudly via
+# sparse_scripts_omission_marker() below — never a silent skip. See hooks/1660-sl10-rolechain-rebase-smoke-
+# test.sh for the RED (needle blocks) / GREEN (scrubbed passes) / scanner-absent (REFUSES) proof.
 PRIVACY_SCANNER="${THREE_ROLE_PRIVACY_SCANNER:-$(dirname "${BASH_SOURCE[0]}")/../scripts/privacy-scan.sh}"
 if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
   if [ -f "$LEDGER_HELPER" ]; then
@@ -284,11 +293,12 @@ if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
           echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
           echo "  artifact-privacy leg FAILED (#1537 — SHIP_PIPELINE does NOT exempt this leg): $TRACKED_OUT"
           echo "  A tagged 3-role completion's SHIPPED, git-tracked planner / plan-review / execution-review artifacts —"
-          echo "  AND this run's cited perf-log card, when it is git-tracked inside ai-brain — must be CLEAN of three"
-          echo "  regulated token classes: a home-absolute-path, the operator's personal email, or a frozen brand token"
-          echo "  (the #1588 class: an artifact's OWN prose, including its own privacy-report table, can itself carry"
-          echo "  the leak). Counts only above — the matched bytes are never re-printed (scanning the scanner's own"
-          echo "  output would itself be a second leak)."
+          echo "  AND this run's cited perf-log card, when it is git-tracked inside ai-brain — must be CLEAN of all FOUR"
+          echo "  regulated token classes (re-based, #1660 SL-10, onto the SL-3 engine's own four-class registry —"
+          echo "  see scripts/privacy-scan.sh): a home-absolute-path, the operator's personal email, a frozen brand"
+          echo "  token, or a credential-shaped secret. (The #1588 class: an artifact's OWN prose, including its own"
+          echo "  privacy-report table, can itself carry the leak.) Counts only above — the matched bytes are never"
+          echo "  re-printed (scanning the scanner's own output would itself be a second leak)."
           echo "  Fix: scrub the token from the cited artifact, git add + commit it, then re-complete."
           echo "  Kill-switch (this leg ONLY): THREE_ROLE_ARTIFACT_PRIVACY_OFF=1. Master (whole family): THREE_ROLE_INSTRUMENT_OFF=1."
         } >&2

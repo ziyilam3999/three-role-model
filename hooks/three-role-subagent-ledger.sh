@@ -36,9 +36,10 @@
 #
 # #1516 — this is also the ONLY writer that stamps the EXPLICIT `closedAt` field (an ISO timestamp, passed
 # via 3role-ledger.mjs's --closed-at flag) — because this hook fires exclusively at a real SubagentStop, it
-# is the one trustworthy place to say "this role is truly done". The research seat's agent-kanban board
-# punch-out depends on this stamp being close-exclusive (never inferred from agentId, which can also be
-# present at spawn/dispatch for a backgrounded role — see the #1516 plan's rationale).
+# is the one trustworthy place to say "this role is truly done". The research (and, cc-ship-tail-lane
+# 2026-08-23, ship-tail) seat's agent-kanban board punch-out depends on this stamp being close-exclusive
+# (never inferred from agentId, which can also be present at spawn/dispatch for a backgrounded role — see
+# the #1516 plan's rationale).
 
 # #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
 # This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
@@ -118,7 +119,7 @@ read -r TASKID ROLE SELFAUTH < <(
     if (!mTask) process.exit(0);                 // untagged subagent -> no-op (parent prints "")
     const taskId = mTask[1];
     let role="";
-    const mRole = brief.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research)/i);
+    const mRole = brief.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research|ship-tail)/i);
     if (mRole) { role = mRole[1].toLowerCase(); }
     else {
       // keyword-classify (CORROBORATION only) — longest/most-specific match first.
@@ -178,8 +179,8 @@ EFFORT_FLAG=""
 # SubagentStop, gated above on "must resolve to a real /subagents/agent-*.jsonl transcript"), so it is the
 # ONE place a close-stamp can be trustworthy -- never inferred from agentId (which is also present at
 # spawn/dispatch for a backgrounded role, see the plan's "why explicit, not inferred" section). Stamped on
-# EVERY role's close (harmless additive field for the four chain roles; load-bearing for research's
-# board punch-out in agent-kanban).
+# EVERY role's close (harmless additive field for the four chain roles; load-bearing for research's AND
+# ship-tail's board punch-out in agent-kanban).
 CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # #1640 S11 -- re-sense the reroute stamp at CLOSE too (not just at spawn): a role resumed mid-session under a
 # base-url that changed since spawn gets its stamp refreshed at its own authoritative close edge. Same

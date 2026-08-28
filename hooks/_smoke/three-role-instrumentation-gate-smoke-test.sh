@@ -1264,12 +1264,19 @@ PRIVACY_SCAN_TEST_PATTERN=SYNTHBRANDTOKEN1537 "$SCANNER_BIN" --working "$GITROOT
 rm -f /tmp/1537-ac4-hp.err /tmp/1537-ac4-bt.err /tmp/1537-ac4-em.err
 
 # ---- AC5: home-path needle SOURCED from hooks/lib-privacy-ere.sh, proven by mutation (BLOCK -> ALLOW flip) ----
+# The mutated lib is DERIVED from the REAL hooks/lib-privacy-ere.sh (single-needle sed substitution,
+# same pattern as hooks/lib-privacy-ere-selftest.sh:46), not hand-fabricated -- so every OTHER variable
+# the real lib defines (incl. the #1660-SL-3 fail-closed-mandatory PRIVACY_CREDENTIAL_ERE) survives into
+# the mutated copy untouched, and only the home-path needle is neutered. A future lib rename that makes
+# the sed substitution a no-op leaves the mutated lib byte-identical to the real one -- home-path still
+# fires, AC5 fails LOUD, never silently vacuous.
 MUT="$TMP/1537-mutated-scanner"
 mkdir -p "$MUT/scripts" "$MUT/hooks" "$MUT/lib"
 cp "$DIR/../scripts/privacy-scan.sh" "$MUT/scripts/privacy-scan.sh"
 cp "$DIR/../scripts/privacy-denylist-count.mjs" "$MUT/scripts/privacy-denylist-count.mjs"
 cp "$DIR/../lib/privacy-denylist.mjs" "$MUT/lib/privacy-denylist.mjs"
-printf 'PRIVACY_HOMEPATH_ERE="NEVERMATCHXYZ_IMPOSSIBLE_1537_PATTERN"\n' > "$MUT/hooks/lib-privacy-ere.sh"
+sed -E 's/^PRIVACY_HOMEPATH_ERE=.*/PRIVACY_HOMEPATH_ERE="NEVERMATCHXYZ_IMPOSSIBLE_1537_PATTERN"/' \
+  "$DIR/lib-privacy-ere.sh" > "$MUT/hooks/lib-privacy-ere.sh"
 chmod +x "$MUT/scripts/privacy-scan.sh"
 ledgerP 1537p8 "$GITROOT_P/.ai-workspace/plans/1537p-plan-homepath.md"
 runP "$(privPayload 1537p8 "$CLEANPERF")" THREE_ROLE_PRIVACY_SCANNER="$MUT/scripts/privacy-scan.sh"

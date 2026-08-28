@@ -2901,7 +2901,13 @@ export RULE12_LOG="$TMP/s3-rc-rule12-audit.log"
 # ---- S3-AC1 (DELTA): routed_since is a COMMITTED per-seat pin in the REAL SSOT (config/cc-routes.json),
 #      for EVERY seat with a declared `dispatch` route (plan-review + executor, the only two today).
 #      Before (measured this session against origin/master fa7ecd7fa7 blobs, premise correction 1): 0. ----
-RC_REAL_ROUTES="$DIR/../config/cc-routes.json"
+# PORT-NOTE: config/cc-routes.json (ai-brain's routing SSOT) is deliberately NOT bundled — internal
+# operational config; bundling would also activate the route-dispatch gate against routes consumers do not have.
+# Degrade-gracefully: SKIP the governance assertion when the SSOT is absent (ai-brain CI asserts it for real).
+RC_REAL_ROUTES="$ROOT/config/cc-routes.json"
+if [ ! -f "$RC_REAL_ROUTES" ]; then
+  echo "SKIP: #2169 S3-AC1 routed_since governance assertion (routes SSOT not bundled: $RC_REAL_ROUTES)"
+else
 S3AC1_COUNT=$(/usr/bin/grep -c '"routed_since"' "$RC_REAL_ROUTES" 2>/dev/null); S3AC1_COUNT="${S3AC1_COUNT:-0}"
 S3AC1_MISSING=$(node -e '
   const routes = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
@@ -2915,6 +2921,7 @@ S3AC1_MISSING=$(node -e '
 { [ "$S3AC1_COUNT" -ge 1 ] && [ -z "$S3AC1_MISSING" ]; } \
   && ok "#2169 S3-AC1: config/cc-routes.json routed_since occurrences=$S3AC1_COUNT (before=0, DELTA) -- every dispatch-declared seat carries the pin (none missing: '$S3AC1_MISSING')" \
   || bad "#2169 S3-AC1 FAILED (count=$S3AC1_COUNT missing=[$S3AC1_MISSING])"
+fi
 
 # ---- R-C fixture routes -------------------------------------------------------------------------------
 # routes-rc.json: plan-review dispatch=subprocess-openrouter WITH a committed routed_since pin.
@@ -4564,7 +4571,7 @@ fi
 # any earlier section's fixtures.
 # =====================================================================================================
 S5SID="sess-2169s5"
-S5HOOK="$DIR/three-role-spawn-ledger.sh"
+S5HOOK="$ROOT/hooks/three-role-spawn-ledger.sh"
 
 # helper: run the spawn-ledger hook with a JSON payload, same convention as
 # hooks/three-role-spawn-ledger-smoke-test.sh's own run(). Sets S5RC, S5CAP.
