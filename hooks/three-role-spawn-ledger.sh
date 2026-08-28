@@ -31,14 +31,16 @@
 # TIMING (honest, not oversold — rewritten #1516, was overstated as "removes the manual-CLI requirement,
 # early win realized mainly for backgrounded spawns"): this hook now fires on TWO edges with DIFFERENT
 # scopes, and the timing story is different on each.
-#   - PostToolUse (the four chain roles + research): fires when the tool call RETURNS. For a FOREGROUND
-#     spawn that is COMPLETION (≈ the same moment as SubagentStop) — the "early" win is realized only for a
-#     run_in_background spawn, where PostToolUse fires at DISPATCH. Unchanged since #1187.
-#   - PreToolUse (research ONLY — #1516): fires at DISPATCH, always, foreground or backgrounded. This is
-#     what makes a research row genuinely MID-FLIGHT-visible: the badge renders the instant the spawn is
-#     sent, carrying the role's ASSIGNED {tier, effort, version}, not just at completion.
+#   - PostToolUse (the four chain roles + research + ship-tail): fires when the tool call RETURNS. For a
+#     FOREGROUND spawn that is COMPLETION (≈ the same moment as SubagentStop) — the "early" win is realized
+#     only for a run_in_background spawn, where PostToolUse fires at DISPATCH. Unchanged since #1187.
+#   - PreToolUse (research + ship-tail — #1516, widened cc-ship-tail-lane 2026-08-23): fires at DISPATCH,
+#     always, foreground or backgrounded. This is what makes a research OR ship-tail row genuinely
+#     MID-FLIGHT-visible: the badge renders the instant the spawn is sent, carrying the role's ASSIGNED
+#     {tier, effort, version}, not just at completion.
 #   Chain roles are DELIBERATELY excluded from the PreToolUse edge (a chain-role PreToolUse payload writes
-#   NOTHING — see the load-bearing `hookEvent==="PreToolUse" && role!=="research"` no-op above).
+#   NOTHING — see the load-bearing `hookEvent==="PreToolUse" && role!=="research" && role!=="ship-tail"`
+#   no-op above).
 #   #1575 CORRECTION (this comment was factually stale — the premise below no longer holds and is fixed
 #   here, not just retightened in wording): three-role-transition-gate.sh is NO LONGER a presence-only
 #   plan-review check (that was the #1575 defect). It now requires COMPLETION evidence — an affirmative
@@ -54,10 +56,15 @@
 #   section) and its dispatch-time row IS its useful signal, so it remains the one role safe to move earlier.
 #
 # Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1 (uniform family switch) OR THREE_ROLE_SPAWN_LEDGER_OFF=1 (dedicated).
-# Tag regexes are the EXACT sibling enum-anchored forms (group [1]) — see three-role-transition-gate.sh:39-40
-# and three-role-subagent-ledger.sh:95,99 (both stay the FOUR-role form; only THIS hook's role alternation
-# is widened to include "research" — #1516). No `set -e` (a recorder must never let a non-zero leak into a
-# decision — #749). Env overrides for the smoke: THREE_ROLE_LEDGER_DIR, THREE_ROLE_PROJECTS_ROOT.
+# Tag regexes are the EXACT sibling enum-anchored forms (group [1]) — see three-role-transition-gate.sh:78
+# and three-role-model-policy-gate.sh:111 (both stay the FOUR-role form, deliberately — a chain-role-only
+# gate, unaffected by operational-seat widenings). three-role-subagent-ledger.sh's own role-extraction
+# regex (currently line ~119) is a DIFFERENT, WIDER alternation (already carried "research"; cc-ship-tail-
+# lane 2026-08-23 widens it further to also carry "ship-tail") — it is NOT one of the two four-role forms
+# this comment used to (incorrectly) cite by line number; correcting that stale citation here. Only THIS
+# hook's role alternation and three-role-subagent-ledger.sh's are widened to include "research"/"ship-tail"
+# — #1516, #2462-ship-tail. No `set -e` (a recorder must never let a non-zero leak into a decision — #749).
+# Env overrides for the smoke: THREE_ROLE_LEDGER_DIR, THREE_ROLE_PROJECTS_ROOT.
 #
 # PORT-NOTE: cites `parent-claude.md Invariant #6` (ai-brain doctrine); plugin ships doctrine as 3-role-model.md
 #   (Leg 4). Comment only — safe forward-ref. The ledger helper now lives at bin/3role-ledger.mjs.
@@ -88,10 +95,15 @@ command -v node >/dev/null 2>&1 || exit 0
 # Parse: tags from tool_input.prompt (+ .description, .message, joined), session_id, and the agentId via a
 # DEFENSIVE multi-source extractor over tool_response. Emits "<taskId> <role> <session> <agentId>" (each "-"
 # when absent) or "" when the task tag is absent, no role can be resolved (tag NOR subagent_type==cc-research),
-# OR (#1516) the event is PreToolUse and the resolved role is not "research" (-> no-op). R2-PINNED regex: the
-# EXACT sibling form /ROLE:\s*(planner|...)/i with the role at capture group [1] — NO left-boundary variant
-# (one form only) — #1516 widens the alternation to include "research", nothing else.
-read -r TASKID ROLE SESSION AGENTID < <(
+# OR (#1516) the event is PreToolUse and the resolved role is neither "research" nor "ship-tail" (-> no-op).
+# R2-PINNED regex: the EXACT sibling form /ROLE:\s*(planner|...)/i with the role at capture group [1] — NO
+# left-boundary variant (one form only) — #1516 widened the alternation to include "research"; cc-ship-tail-
+# lane (2026-08-23) widens it again to include "ship-tail", nothing else.
+# review-round-counter-per-plan — a 5th field PLANPATH, resolved ONLY for a plan-review spawn: the same
+# match-then-statSync-existence-gate capability hooks/review-round-state.mjs's resolvePlanPath already has,
+# applied to the SAME prompt text this hook already parses (never tool_response, never the reviewer's own
+# artifact). "-" when unresolved (no match, or the matched path doesn't exist on disk from this spawn's cwd).
+read -r TASKID ROLE SESSION AGENTID PLANPATH DISPATCHNONCE < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const ti=d.tool_input||{};
@@ -100,7 +112,7 @@ read -r TASKID ROLE SESSION AGENTID < <(
     const mTask=prompt.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
     // #1516 -- widened to include "research" (was the four chain roles only). A ROLE:research tag is the
     // PRIMARY signal (mechanism belt #1: the tag).
-    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research)/i);
+    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research|ship-tail)/i);
     // require the task tag always; else un-attributable -> no-op (parent prints "").
     if(!mTask){ process.exit(0); }
     let role = mRole ? mRole[1].toLowerCase() : "";
@@ -120,7 +132,7 @@ read -r TASKID ROLE SESSION AGENTID < <(
     // gate on intent alone (see the plan'\''s "why PreToolUse is safe" section). Do NOT widen this to any
     // other role, ever.
     const hookEvent=String(d.hook_event_name||"");
-    if(hookEvent==="PreToolUse" && role!=="research"){ process.exit(0); }
+    if(hookEvent==="PreToolUse" && role!=="research" && role!=="ship-tail"){ process.exit(0); }
 
     // --- DEFENSIVE multi-source agentId extractor over tool_response (string OR object). ---
     const tr=d.tool_response;
@@ -141,8 +153,41 @@ read -r TASKID ROLE SESSION AGENTID < <(
       // (b2) a bare subagents/agent-<id>.jsonl path occasionally echoed back in the response.
       if(!agent){ const m2=s.match(/subagents\/agent-([0-9A-Za-z_-]+)\.jsonl/); if(m2) agent=clean(m2[1]); }
     }
+
+    // review-round-counter-per-plan (plan Intent #2, spawn edge) -- for a plan-review spawn ONLY, resolve
+    // the plan-review round PLAN identity from the SAME prompt text parsed above (never tool_response,
+    // never the reviewer own future artifact). Mirrors the resolvePlanPath function in
+    // hooks/review-round-state.mjs: match the .ai-workspace/plans/*.md shape, then statSync-gate it against
+    // the cwd of this spawn -- a matched-but-nonexistent path resolves to nothing (the same existence
+    // discipline the guard already applies, distinct from the deliberately statSync-free textual extraction
+    // the reconciler uses).
+    let planPath = "-";
+    if (role === "plan-review") {
+      const mPlan = prompt.match(new RegExp("[.\\w/-]*\\.ai-workspace/plans/[^\\s\"\\x27`)]+\\.md"));
+      if (mPlan) {
+        const path = require("path");
+        const fs = require("fs");
+        let p = mPlan[0];
+        const cwd = String(d.cwd || "");
+        if (!path.isAbsolute(p) && cwd) p = path.join(cwd, p);
+        try { if (fs.statSync(p).isFile()) planPath = p; } catch (e) { /* unresolved -> "-" */ }
+      }
+    }
+    // #2169 slice 5 (S5-AC1/AC5, design decision 4) -- a 6th field DISPATCHNONCE: the delivery-receipt
+    // stamp RAW token, minted ONLY from a DEDICATED DISPATCH-NONCE:<token> LINE in the SAME joined
+    // prompt text parsed above -- never a bare substring match anywhere in the text. The ^...$ anchors
+    // (multiline flag) require the WHOLE line to consist of nothing but the label + token: a prose
+    // sentence that merely MENTIONS DISPATCH-NONCE: mid-line (e.g. ...the DISPATCH-NONCE: line in the
+    // brief carries the token...) is NOT preceded by a line start at that position, so it never matches
+    // -- this is the exact matched-the-word-line-inside-a-sentence regression (carried pitfall #5) this
+    // anchoring exists to prevent (S5-AC5, mint discipline). "-" when no dedicated line is present.
+    let dispatchNonce = "-";
+    {
+      const mDN = prompt.match(/^DISPATCH-NONCE:[ \t]*([0-9A-Za-z._-]+)[ \t]*$/m);
+      if (mDN) dispatchNonce = mDN[1];
+    }
     // (c) empty -> degrade to {role}-only.
-    process.stdout.write(mTask[1] + " " + role + " " + (session||"-") + " " + (agent||"-"));
+    process.stdout.write(mTask[1] + " " + role + " " + (session||"-") + " " + (agent||"-") + " " + planPath + " " + dispatchNonce);
   ' 2>/dev/null
 )
 
@@ -177,6 +222,17 @@ ASSIGNED_FLAGS=""
 [ "$ATIER" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-tier $ATIER"
 [ "$AVERSION" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-version $AVERSION"
 [ "$AEFFORT" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --effort $AEFFORT"
+# review-round-counter-per-plan (plan Intent #2, spawn edge) — the plan-review round's PLAN identity,
+# resolved above (statSync-gated against this spawn's own cwd) ONLY for a plan-review spawn. "-" means
+# unresolved (no match, or the matched path did not exist) — omit the flag entirely rather than stamp a
+# sentinel string onto the ledger.
+[ "$PLANPATH" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --reviewed-plan $PLANPATH"
+# #2169 slice 5 (S5-AC1, design decision 4) — the delivery-receipt MINT flag. DISPATCHNONCE is "-" unless
+# the prompt carried a genuine DEDICATED DISPATCH-NONCE:<token> line (see the mint-discipline comment at
+# the node -e block above); when present, pass the RAW token through — hooks/3role-ledger.mjs's cmdAppend
+# hashes it before it ever touches disk (the row never carries the plaintext). Safe to interpolate unquoted:
+# the token is regex-restricted to [0-9A-Za-z._-]+, no shell metacharacters possible.
+[ "$DISPATCHNONCE" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --dispatch-nonce $DISPATCHNONCE"
 
 # Append. NEVER --artifact (no path -> no dangle; artifact composes later via overlay-merge). Pass --agent
 # ONLY when an agentId was extracted; otherwise the degraded {role}-only line (SubagentStop fills agentId).

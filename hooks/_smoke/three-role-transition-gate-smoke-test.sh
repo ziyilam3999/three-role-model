@@ -14,7 +14,7 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
 HOOK="$ROOT/hooks/three-role-transition-gate.sh"
-SPAWN_LEDGER="$DIR/three-role-spawn-ledger.sh"
+SPAWN_LEDGER="$ROOT/hooks/three-role-spawn-ledger.sh"
 LED="$ROOT/bin/3role-ledger.mjs"
 
 fail=0

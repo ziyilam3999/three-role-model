@@ -17,6 +17,15 @@
 //                                        [--verdict V] [--self-authored]
 //                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
 //                                        [--closed-at ISO]                                       (#1516)
+//                                        [--dispatch-nonce TOK] [--receipt TOK]        (#2169 slice 5, AC-34)
+//                                        [--reviewed-plan P]              (review-round-counter-per-plan)
+//     --reviewed-plan is an ordinary own-key overlay field (normalizeArtifact()'d like --artifact): the
+//     plan-review round's PLAN identity, resolved from the DISPATCH context (never from the reviewer's own
+//     artifact_path — that stays the reviewer's OWN artifact per #861). Written by three writers: the spawn
+//     edge (three-role-spawn-ledger.sh), the subprocess dispatch helper (tools/openrouter-role-dispatch.sh),
+//     and cmdReconcileSpawns (add-only-when-missing, textual extraction with NO existence check — see
+//     findPlanPathTextual below). hooks/review-round-state.mjs's sweepLedger consumes it as the L0 tier of
+//     its plan-identity read ladder. Optional + additive (check/checkRole never reference it).
 //     --closed-at is an EXPLICIT overlay flag, written ONLY by three-role-subagent-ledger.sh (the sole
 //     writer that fires exclusively at SubagentStop/close) — never inferred, never defaulted. It is the
 //     research seat's punch-out signal for the agent-kanban board: a research row WITHOUT it is in-flight,
@@ -46,6 +55,17 @@
 //     auto-capture path above, unchanged). Every OTHER append (self-record, close-out --artifact) passes NONE
 //     of the three, so overlayAppend's per-key "provided" discipline (#855) PRESERVES whatever a role's real
 //     line already carries — an orchestrator's --artifact-only close-out can never clobber a role's effort.
+//     #2169 slice 5 (design decision 4, AC-34 delivery-receipt guard) — --dispatch-nonce/--receipt.
+//     --dispatch-nonce TOK is the MINTING flag: the spawn edge (three-role-spawn-ledger.sh today; the
+//     subprocess dispatch helper too, slice 6) passes the raw token it saw on a genuine
+//     DISPATCH-NONCE:<token> DEDICATED line (never a mere prose mention — mint discipline, S5-AC5). This
+//     CLI layer hashes it (hashDispatchNonce, one-way) before it ever reaches overlayAppend — the stored
+//     row NEVER carries the plaintext. A row carrying this field is "STAMPED". --receipt TOK is the PROOF
+//     flag: any append that carries --verdict AND lands on a stamped row must supply the matching raw
+//     token here (hashed at comparison time) or the append is REFUSED — a stamped row's guard requires
+//     genuine delivery proof, never a bare claim. Echoing the row's own STORED (already-hashed) value back
+//     as --receipt can never satisfy this (hashing an already-hashed value never reproduces it — S5-AC6
+//     harvest ban). A row with no dispatch_nonce (every legacy row) is completely unaffected (S5-AC4).
 //   check --session S --task T [--require-provenance]
 //     Exit 0 (+ "OK ...") iff all four required roles (planner, plan-review, executor, execution-review)
 //     are present AND satisfied; otherwise exit 2 (+ "BLOCK: <reason>"). A role is satisfied by EITHER
@@ -54,17 +74,26 @@
 //     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
 //     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
 //     promotes a missing stamp to a BLOCK.
-//   check --session S --task T --merge-head <ref-or-sha>                                        (#2088)
-//     OPT-IN, check-time-ONLY ref-scoped resolution arm. Without this flag, behavior is byte-identical to
-//     today (W5). WITH it: a planner/plan-review/execution-review artifact_path that fails the ordinary
-//     filesystem resolution gets ONE more chance — committed git evidence at a BOUNDED candidate-ref set:
-//     (1) the passed --merge-head ref, read in the repo `check` runs from; (2) refs/remotes/origin/<task>-*
-//     (the LOCAL MIRROR namespace — refs/heads/ is never consulted) plus origin/master, in the RUNNING
-//     HELPER's own home repo (aiBrainToplevel()). Content is read AT THE REF (never disk); planner still
-//     needs PLAN_RE, but a plan-review/execution-review artifact resolved via this arm needs the STRICTER
-//     W3 bar — a flush-left affirmative Decision:/verdict line in CHECK_LANE_AFFIRMATIVE — never the legacy
-//     VERDICT_RE substring match. No other ref is ever consulted. See the #2088 plan for the full honesty
-//     contract (this arm is no weaker than the disk arm — never "harder to fool").
+//   check --session S --task T [--merge-head <ref-or-sha>]                            (#2088, default-on #2462)
+//     Check-time-ONLY ref-scoped resolution arm — DEFAULT-ON as of #2462 (was opt-in-behind---merge-head
+//     under #2088; that gate was measured to leave master permanently unable to prove a branch-only role
+//     artifact, since the completion gate and the merge gates' ledger leg never pass --merge-head — #2462
+//     AC-1). A planner/plan-review/execution-review artifact_path that fails the ordinary filesystem
+//     resolution now ALWAYS gets one more chance — committed git evidence at a BOUNDED candidate-ref set:
+//     (1) the passed --merge-head ref (when one was given), read in the repo `check` runs from — "does this
+//     artifact ship with the thing being merged?"; (2) refs/remotes/origin/<task>-* (the LOCAL MIRROR
+//     namespace — refs/heads/ is never consulted) plus origin/master, in the RUNNING HELPER's own home repo
+//     (aiBrainToplevel()) — consulted UNCONDITIONALLY, independent of whether --merge-head was passed (P5a:
+//     this candidate set never depended on --merge-head's value even under #2088). Content is read AT THE
+//     REF (never disk); planner still needs PLAN_RE, but a plan-review/execution-review artifact resolved
+//     via this arm needs the STRICTER W3 bar (hasRefArmAffirmative) — a flush-left affirmative
+//     Decision:/verdict line in CHECK_LANE_AFFIRMATIVE (now also tolerating one optional column-0 ATX
+//     heading prefix, #2462 AC-1b) — never the legacy VERDICT_RE substring match. No other ref is ever
+//     consulted. See the #2088 plan for the full honesty contract (this arm is no weaker than the disk arm
+//     — never "harder to fool"); see the #2462 plan for the default-on rationale + monotonicity proof.
+//     Plain `check` (no flags at all) is THEREFORE NO LONGER byte-identical to the pre-#2088 baseline — it
+//     now additionally consults refs/remotes/origin/<task>-* + origin/master with zero network I/O. The
+//     pinned `2088-AC7` byte-identity fixture is superseded explicitly for this reason (#2462 AC-5).
 //   check --session S --task T --enforce-tracked-artifacts                                    (#1509)
 //     Leg A — TRACKED, not merely present. Opt-in (base `check` stays existence-only — ~29% of the real
 //     .ai-workspace/plans+reviews backlog is present-but-untracked today, so making this the DEFAULT would
@@ -337,6 +366,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
@@ -345,11 +375,13 @@ const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude
 const PROJECTS_ROOT = process.env.THREE_ROLE_PROJECTS_ROOT || path.join(HOME, '.claude', 'projects');
 
 const REQUIRED_ROLES = ['planner', 'plan-review', 'executor', 'execution-review'];
-// #1495 — RECORDABLE_ROLES is a STRICT SUPERSET used ONLY by cmdAppend's role guard, so the ad-hoc
-// research/search seat can be ledger-visible (recorded) without ever becoming a required/gating role.
-// Every completion-time loop (cmdCheck, --enforce-role-models, provenance, cmdRefreshModels) MUST keep
-// iterating REQUIRED_ROLES, never this superset — that is what keeps a research row non-gating (G1).
-const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research'];
+// #1495 — RECORDABLE_ROLES is a STRICT SUPERSET used ONLY by cmdAppend's role guard, so ad-hoc
+// operational seats (research, ship-tail) can be ledger-visible (recorded) without ever becoming a
+// required/gating role. Every completion-time loop (cmdCheck, --enforce-role-models, provenance,
+// cmdRefreshModels) MUST keep iterating REQUIRED_ROLES, never this superset — that is what keeps a
+// research OR ship-tail row non-gating (G1). cc-ship-tail-lane (2026-08-23) added 'ship-tail' here
+// ONLY — never to REQUIRED_ROLES, which would brick every completion gate lacking a ship-tail row.
+const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research', 'ship-tail'];
 // A plan is recognized by a MARKDOWN HEADING (2-4 `#`) naming an acceptance-criteria / ELI5 section.
 // Anchored to a heading-line start (`^#{2,4}` + `m` flag) so prose that merely contains the word
 // "acceptance" ("we await acceptance from QA") can NEVER match — only a real heading does. Accepts the
@@ -366,6 +398,19 @@ const NONSPECIFIC_RE = /^(n\/?a|skip(ped)?|none|null|tbd|inline|-+|\.+)$/i;
 function sanitize(s) { return String(s == null ? '' : s).replace(/[^0-9A-Za-z._-]/g, ''); }
 function ledgerFile(session, task) {
   return path.join(LEDGER_DIR, sanitize(session), sanitize(task) + '.jsonl');
+}
+
+// #2169 slice 5 (S5-AC6, design decision 4) — the delivery-receipt HASH. A row is stamped with a ONE-WAY
+// hash of the raw `DISPATCH-NONCE:<token>` value the spawn edge (or the subprocess dispatch helper, slice
+// 6) saw delivered — NEVER the plaintext token itself. This is what makes "harvest the value STORED on the
+// row and echo it straight back as --receipt" structurally fail the delivery-receipt guard below: hashing
+// an already-hashed value never reproduces the original hash, so a caller who only ever read the ledger
+// (never the genuine DISPATCH-NONCE: line delivered to ITS OWN dispatch) cannot construct a valid receipt.
+// A fixed, namespaced prefix (never itself secret) just keeps this hash's domain distinct from any other
+// hash this file might someday mint — it adds no security value on its own.
+function hashDispatchNonce(raw) {
+  const s = String(raw == null ? '' : raw);
+  return crypto.createHash('sha256').update('3role-dispatch-nonce:' + s).digest('hex');
 }
 function fileExists(p) { try { return fs.statSync(p).isFile(); } catch (e) { return false; } }
 function fileHas(p, re) { try { return re.test(fs.readFileSync(p, 'utf8')); } catch (e) { return false; } }
@@ -966,6 +1011,17 @@ function extractTagsFromText(text) {
   return result;
 }
 
+// review-round-counter-per-plan — TEXTUAL plan-path extraction from a transcript's first-record text, for
+// the reconciler's `reviewed_plan` capture obligation. Same match shape as
+// hooks/review-round-state.mjs's findPlanPathIn, but deliberately carries NO fs.statSync existence check:
+// a historical plan file may have moved or been cleaned up since the round closed, and the plan identity
+// this field records is the BASENAME, not a live file (AC-11 — "including when the named plan file does
+// NOT exist on disk"). Returns '' on no match (fails closed to "nothing extracted", never a guess).
+function findPlanPathTextual(text) {
+  const m = String(text == null ? '' : text).match(/[.\w/-]*\.ai-workspace\/plans\/[^\s"'`)]+\.md/);
+  return m ? m[0] : '';
+}
+
 // #1851 D3/D6 — per-session INCREMENTAL CHECKPOINT sidecar for cmdReconcileSpawns. Dotted filename (hidden
 // from the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use, same precedent as the existing
 // `.reconcile-watermark`). Schema-versioned: an unreadable, corrupt, or schema-mismatched file is treated as
@@ -1059,6 +1115,10 @@ function agentBoundToTag(session, agentId, task, role) {
 // vanishes from the text commandProvesLedgerAppend() ever sees.
 function stripQuotedAndHeredocBodies(cmd) {
   let s = String(cmd == null ? '' : cmd);
+  // #2467 — the shell itself joins a backslash immediately followed by a newline into one
+  // logical line before tokenizing; do the same here first, or a continued invocation's four
+  // required tokens land in different \n-split segments below and can never co-occur.
+  s = s.replace(/\\\n/g, '');
   s = s.replace(/<<[-~]?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[\s\S]*?\n\s*\2\b/g, '<<HEREDOC>>');
   s = s.replace(/'[^']*'/g, "''");
   s = s.replace(/"(?:[^"\\]|\\.)*"/g, '""');
@@ -1466,6 +1526,18 @@ function seatDispatchIsSubprocess(role) {
   if (!routesLoaded.ok) return { ok: false, seat: null };
   const seat = (routesLoaded.routes.seats || {})[role];
   if (!seat || !isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
+  // #1918 n2 (execution-review hand-off) — overlay a valid SLUG pin HERE, where the OBSERVED-model
+  // comparison actually bites for a subprocess seat: checkSubprocessProvenance's `info.servedModel !==
+  // decl.seat.model` check below (the operative provenance gate for a dispatch=subprocess-openrouter row).
+  // Deliberately NOT wired at resolveExpectedSide's tier_equivalent — the file's own #1947 AC-2/M3 comment
+  // explains why the completion-gate's tier leg never reads that field for these two seats in the first
+  // place (it reads `agent_tool_fallback` instead), so pinning it there would be inert AND would open a
+  // second, unrelated place a pin could silently diverge from what this function (and every one of its 4
+  // callers) actually sees. Silent overlay here — no stderr diagnostic from THIS shared helper (it fires on
+  // every plain `check`, not just a dispatch; resolve-route/resolveRoute already surfaces SEAT-PIN-HONORED/
+  // REFUSED at the one place — dispatch time — an operator actually watches).
+  const pin = resolveSlugPin(role, routesLoaded.routes, seat);
+  if (pin.pinned) return { ok: true, seat: Object.assign({}, seat, { model: pin.slug }) };
   return { ok: true, seat };
 }
 
@@ -1601,6 +1673,90 @@ function checkSubprocessProvenance(role, e, session, task) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2169 slice 3 — R-C route-change clause (design decision 3, .ai-workspace/plans/2026-08-25-2075-phase3-
+// recut.md). A genuinely subprocess-shaped (E2) incoming write may supersede a prior E1 (agentId-bound,
+// terminal) row ONLY IF (i) the seat's SSOT (config/cc-routes.json) CURRENTLY declares a dispatch:subprocess-*
+// route for this role, AND (ii) the prior row's closedAt STRICTLY pre-dates that seat's committed
+// routed_since value. Both terms are re-read FRESH from the SSOT here, at guard time — NEVER from the
+// incoming write's own claim (a forged/self-declared routed_since on the write itself carries zero weight).
+// Soundness: SSOT-gated, not writer-gated (an operator's committed routes.json decides, not the caller);
+// no deletion (the superseded E1 row survives verbatim as history — see the isNewRound wiring below); full
+// E2 verification unchanged (reuses checkSubprocessProvenance UNCHANGED, the #2051 "one evaluator, no
+// mirror" discipline); a post-flip sanctioned E1 fallback (closedAt >= routed_since) is PERMANENTLY outside
+// this clause's reach — that shape is a deliberate D3 fallback, not stale evidence.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Returns {allowed, since, reason}. `reason` explains a refusal; on allow, `since` carries the routed_since
+// value (for the caller's ROUTE-DRIFT audit note) and `reason` is ''.
+function evaluateRouteChangeSupersession(role, prior, fields, session, task) {
+  const refuse = (reason) => ({ allowed: false, since: '', reason });
+  if (!isSubprocessDispatch(fields.dispatch)) {
+    return refuse('the incoming write carries no subprocess-openrouter/-ollama --dispatch marker — R-C only ' +
+      'ever supersedes a prior E1 row with verified E2 (subprocess) evidence, never a bare verdict flip');
+  }
+  const routesLoaded = loadRoutesConfig();
+  // AC-27 — a CC_ROUTES_JSON override EXERCISED on the R-C path is audited, never silent, regardless of
+  // whether this evaluation ultimately allows or refuses (the override was still consulted to reach a
+  // decision). Mirrors the existing enforce-role-models ROUTES-OVERRIDE audit line (same writeBypassLog call
+  // shape) — one audit vocabulary, not two.
+  if (('CC_ROUTES_JSON' in process.env) && routesLoaded.ok) {
+    writeBypassLog('3role-ledger-route-change', 'ROUTES-OVERRIDE', 'PERMIT',
+      { task: sanitize(task), role: sanitize(role), route_config: routesLoaded.configPath });
+  }
+  if (!routesLoaded.ok) {
+    return refuse('R-C refused: SSOT unreadable (' + routesLoaded.error + ')');
+  }
+  const seat = (routesLoaded.routes.seats || {})[role];
+  if (!seat || !isSubprocessDispatch(seat.dispatch)) {
+    return refuse('R-C refused: SSOT does not currently declare seat "' + role + '" dispatch:subprocess-* ' +
+      '(no committed route to supersede onto)');
+  }
+  const since = seat.routed_since;
+  if (!since || isNaN(Date.parse(String(since)))) {
+    return refuse('R-C refused: SSOT seat "' + role + '" has no valid committed routed_since pin');
+  }
+  if (!prior.closedAt || isNaN(Date.parse(String(prior.closedAt)))) {
+    return refuse('R-C refused: the prior row has no valid closedAt to compare against routed_since (cannot ' +
+      'prove it pre-dates the route flip — fails closed rather than guessing)');
+  }
+  if (!(Date.parse(String(prior.closedAt)) < Date.parse(String(since)))) {
+    return refuse('R-C refused: the prior row\'s closedAt (' + prior.closedAt + ') does not strictly pre-date ' +
+      'seat "' + role + '"\'s committed routed_since (' + since + ') — a post-flip E1 fallback is permanently ' +
+      'outside R-C\'s reach (sanctioned by design, never treated as stale)');
+  }
+  // Full E2 verification unchanged (#2051 discipline: one evaluator, no mirror). Built ONLY from the
+  // incoming write's OWN fields — never composed with the stale prior row, so the prior's agentId/model can
+  // never leak into (or weaken) this check.
+  const verify = checkSubprocessProvenance(role, fields, session, task);
+  if (verify === null) {
+    return refuse('R-C refused: the incoming write is not admissible as subprocess-openrouter/-ollama ' +
+      'evidence under the current SSOT');
+  }
+  if (verify !== '') {
+    return refuse('R-C refused: ' + verify);
+  }
+  return { allowed: true, since, reason: '' };
+}
+
+// #2169 slice 3 — AC-31a: ROUTES-STALE advisory (never blocks a write). Fresh SSOT read: when this seat is
+// declared dispatch:subprocess-* AND the row's OWN prior line is ITSELF a subprocess (E2) row whose closedAt
+// pre-dates the seat's own committed routed_since pin, the pin is stale relative to what has already been
+// OBSERVED running — genuine subprocess evidence exists from before the pin claims routing began.
+function checkRoutesStale(role, prior) {
+  if (!prior || !isSubprocessDispatch(prior.dispatch)) return;
+  const decl = seatDispatchIsSubprocess(role);
+  if (!decl.ok) return;
+  const since = decl.seat.routed_since;
+  if (!since || isNaN(Date.parse(String(since)))) return;
+  if (!prior.closedAt || isNaN(Date.parse(String(prior.closedAt)))) return;
+  if (Date.parse(String(prior.closedAt)) < Date.parse(String(since))) {
+    console.error('ROUTES-STALE: seat "' + role + '"\'s committed routed_since (' + since + ') post-dates an ' +
+      'already-observed subprocess dispatch on this very row (closedAt ' + prior.closedAt + ') — the pin may ' +
+      'need to move earlier to reflect when routing actually began.');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 // #2075 Phase 1 — D1's shared Provenance Record primitive: ONE strength lattice (E1 > E2 > E3), consulted by
 // every reader AND writer instead of ~14 sites each re-deriving "which vendor produced this row?" ad hoc.
 //
@@ -1695,6 +1851,16 @@ function cmdProvenanceKind(o) {
 // ONLY by the instrumentation-gate's `check --reject-vacuous-oracle` — additionally REJECTS an
 // execution-review oracle that exists + carries a PASS token but is vacuous (0 real assertions).
 function checkRole(role, e, session, opts, task) {
+  // #2169 slice 4, AC-28a — a `pending: true` row (the dispatch helper's pre-launch identity/liveness
+  // stamp, design decision 1) is NEVER terminal: it must never be counted as a completed role by the
+  // check/gate lanes, regardless of whichever other identity fields (dispatch/run_id/run_kind/run_source)
+  // ride along on the same stamp. Checked FIRST, before the subprocess-provenance arm, so this holds
+  // uniformly for every role/seat shape — never incidental on some OTHER field (e.g. a missing
+  // transcript_path) happening to also refuse it.
+  if (e && e.pending) {
+    return role + ' carries a pending:true stamp (an in-flight dispatch — the pre-launch identity/liveness ' +
+      'marker, not completed evidence) — wait for the atomic post-exit write that clears pending';
+  }
   // #1947 M1/M2 — try the subprocess-openrouter arm FIRST. It returns null (not admissible for this row/SSOT
   // state) for every ordinary Agent-tool-dispatched role, so this is a pure addition for everyone else.
   const sub = checkSubprocessProvenance(role, e, session, task);
@@ -1725,20 +1891,37 @@ function checkRole(role, e, session, opts, task) {
     if (!agentResolves(session, e.agentId)) {
       return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
     }
-    const ap = resolveArtifact(e.artifact_path);
-    if (ap) {
-      if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
-      return null;
+    // #2480 O1 — when a merge head is known (opts.mergeHead truthy), the bare on-disk hit no longer
+    // satisfies THIS row: review evidence must be bound to the commit actually being merged, so only
+    // committed-tree resolution (the ref arm just below — the merge head, task-bound refs, or
+    // origin/master) counts. Scope is EXECUTION-REVIEW ONLY (planner/plan-review keep disk-first
+    // unconditionally — M5-control pins this). Absent a merge head this row stays BYTE-IDENTICAL to
+    // pre-#2480: the disk arm is still consulted first (scope exclusion 5 / AC-2).
+    if (!(opts && opts.mergeHead)) {
+      const ap = resolveArtifact(e.artifact_path);
+      if (ap) {
+        if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
+        return null;
+      }
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
         return 'execution-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
-          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3)';
+          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3 — ' +
+          'tolerates an optional column-0 markdown heading prefix and `**` bold decoration around the ' +
+          'keyword/value, but the value itself must still be affirmative)';
       }
+    }
+    if (opts && opts.mergeHead) {
+      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" does not resolve at merge head ' +
+        opts.mergeHead + ' — the on-disk review evidence is not bound to the PR being merged (#2050 AC-1)' +
+        worktreeDangleHint(e.artifact_path);
     }
     return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
       worktreeDangleHint(e.artifact_path);
@@ -1761,9 +1944,11 @@ function checkRole(role, e, session, opts, task) {
         '## ELI5, ### Binary AC, ## Binary acceptance criteria, ### Acceptance criteria, ## Acceptance, or ## AC';
       return null;
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && PLAN_RE.test(content)) return null;
@@ -1780,14 +1965,18 @@ function checkRole(role, e, session, opts, task) {
       if (!fileHas(ap, VERDICT_RE)) return 'plan-review artifact "' + ap + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
       return null;
     }
-    // #2088 — opt-in ref-scoped arm (only consulted when --merge-head was passed; W5 byte-identical otherwise).
-    if (opts && opts.mergeHead) {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts.mergeHead, task);
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
         return 'plan-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
-          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3)';
+          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3 — ' +
+          'tolerates an optional column-0 markdown heading prefix and `**` bold decoration around the ' +
+          'keyword/value, but the value itself must still be affirmative)';
       }
     }
     return 'plan-review artifact_path "' + (e.artifact_path || '') + '" not found' +
@@ -1859,11 +2048,14 @@ function repoToplevelFor(absPath) {
   } catch (e) { return null; }
 }
 
-// ── #2088 — opt-in, check-time-ONLY, ref-scoped resolution arm ─────────────────────────────────────────────
-// `check --merge-head <ref-or-sha>` teaches the checker ONE more place to look for a role artifact that
-// fails today's plain filesystem resolution: committed git evidence at a BOUNDED set of candidate refs —
-// never the object store at large, never a push, never network I/O. See the #2088 plan's "§The bounded ref
-// set" for the full rationale (W1-W7 are the hard constraints this code must never violate); this block is
+// ── #2088 — check-time-ONLY, ref-scoped resolution arm (DEFAULT-ON as of #2462) ───────────────────────────
+// `check` teaches the checker ONE more place to look for a role artifact that fails today's plain
+// filesystem resolution: committed git evidence at a BOUNDED set of candidate refs — never the object
+// store at large, never a push, never network I/O. `--merge-head <ref-or-sha>`, when passed, additionally
+// widens the candidate set with the current merge head; it is no longer REQUIRED to activate this arm
+// (#2462 AC-1 — plain `check` with no flags now consults refs/remotes/origin/<task>-* + origin/master too).
+// See the #2088 plan's "§The bounded ref set" for the full rationale (W1-W7 are the hard constraints this
+// code must never violate — still honored) and the #2462 plan for the default-on decision; this block is
 // the mechanical half.
 
 // #2023 dangle-class normalizer: derive a REPO-RELATIVE candidate path for a git `<ref>:<path>` lookup
@@ -1910,15 +2102,25 @@ function readBlobAtRef(repoDir, ref, relPath) {
 }
 
 // Candidate 2's ref set, in repoDir (the RUNNING HELPER's own home repo — see aiBrainToplevel() and the
-// plan's "which helper copy runs" contract): refs/remotes/origin/<task>-* — the LOCAL MIRROR namespace ONLY
-// (refs/heads/ is deliberately never consulted, r1 N3 / r2 B1-R2) — plus origin/master (an already-shipped
-// artifact). No network I/O: for-each-ref reads whatever is ALREADY in the local ref store, however it got
-// there (a real fetch from origin, `git update-ref`, or `git fetch .` all look identical here — see the
-// plan's §residual for why that is an accepted, pinned gap, not a defect of this function).
+// plan's "which helper copy runs" contract): refs/remotes/origin/<task> (task-EXACT, #2497) +
+// refs/remotes/origin/<task>-* — the LOCAL MIRROR namespace ONLY (refs/heads/ is deliberately never
+// consulted, r1 N3 / r2 B1-R2) — plus origin/master (an already-shipped artifact). No network I/O:
+// for-each-ref reads whatever is ALREADY in the local ref store, however it got there (a real fetch from
+// origin, `git update-ref`, or `git fetch .` all look identical here — see the plan's §residual for why
+// that is an accepted, pinned gap, not a defect of this function).
+//
+// #2497: the dash-glob `<task>-*` alone structurally EXCLUDES a branch named EXACTLY `<task>` (the glob
+// demands a trailing `-` + >=1 char) — so a PR whose head branch is exactly the task id (no slug suffix)
+// had NO task-bound candidate here at all. Fix is the minimal bounded addition below: the task-EXACT ref
+// `refs/remotes/origin/<task>` (a literal ref name, never a glob) is pushed as one more candidate, derived
+// solely from sanitize(task) — the ledger row's own key, never a caller-supplied free ref. Never widened to
+// a bare `<task>*` glob (that would leak a sibling task's ref, e.g. task `700` matching `7001-x`); the exact
+// literal name matches ONLY the ref of that exact name (git ref matching is complete-component, not glob).
 function candidateTaskRefs(repoDir, task) {
   const refs = [];
   const t = sanitize(task);
   if (repoDir && t) {
+    refs.push('refs/remotes/origin/' + t);
     try {
       const res = spawnSync('git', ['-C', repoDir, 'for-each-ref', '--format=%(refname)',
         'refs/remotes/origin/' + t + '-*'], { encoding: 'utf8' });
@@ -1935,17 +2137,21 @@ function candidateTaskRefs(repoDir, task) {
 }
 
 // Orchestrates the two candidate containers (§The bounded ref set): (1) the merge head, in the repo `check`
-// runs from — "does this artifact ship with the thing being merged?"; (2) task-bound refs (+ origin/master)
-// in the running helper's OWN home repo — the cross-repo / plugin-sync-ordering case. Returns
-// {ref, repoDir, relPath} for the FIRST candidate whose blob exists, or null (no candidate resolves — the
-// caller falls through to its existing "not found" problem). No ref outside this bounded set is ever
-// consulted.
+// runs from — "does this artifact ship with the thing being merged?" — consulted ONLY when a mergeHead was
+// actually passed (there is no meaningful cwd-repo-at-mergeHead candidate without one); (2) task-bound refs
+// (+ origin/master) in the running helper's OWN home repo — the cross-repo / plugin-sync-ordering case,
+// consulted UNCONDITIONALLY (#2462 AC-1 default-on: this candidate never depended on mergeHead's value even
+// under #2088 — candidateTaskRefs() never reads it). Returns {ref, repoDir, relPath} for the FIRST candidate
+// whose blob exists, or null (no candidate resolves — the caller falls through to its existing "not found"
+// problem). No ref outside this bounded set is ever consulted.
 function resolveArtifactAtRef(rawPath, mergeHead, task) {
-  if (!rawPath || !mergeHead) return null;
-  const cwdRepo = process.cwd();
-  const cwdRel = repoRelativeCandidate(rawPath, cwdRepo);
-  if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
-    return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
+  if (!rawPath) return null;
+  if (mergeHead) {
+    const cwdRepo = process.cwd();
+    const cwdRel = repoRelativeCandidate(rawPath, cwdRepo);
+    if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
+      return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
+    }
   }
   const homeRepo = aiBrainToplevel();
   if (homeRepo) {
@@ -1972,9 +2178,31 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
 // still reads only `[A-Za-z-]+` after the colon, so a decorated FAIL (`**Decision: FAIL**`) still fails
 // CHECK_LANE_AFFIRMATIVE membership (AC-8's value-blind trap) and quoted/indented/prose-led lines still never
 // match at column 0 (impersonation resistance unchanged).
+// #2462 AC-1b: ONE additional enumerated shape -- an optional column-0 markdown ATX heading prefix
+// (`#{1,6}` + required whitespace) immediately before the Decision/verdict keyword -- the repo's own
+// convention (real 2318 blobs open `## Decision: PASS`; P10). Still column-0-anchored (the `#` itself must
+// be the very first character of the line -- no leading whitespace before it, so `> ## Decision: PASS` and
+// `  ## Decision: PASS` still fail the anchor) and still never applied to the VALUE -- a decorated-and-headed
+// FAIL still fails CHECK_LANE_AFFIRMATIVE. A quoted/fenced decision line that does NOT begin the line with
+// `#`/`*`/the bare keyword (e.g. a backtick-wrapped inline-code quotation, `` `## Decision: PASS` ``) still
+// never matches -- the backtick is the first character consumed by `^` and satisfies none of the three
+// leading alternatives (r1/N7, pinned in hooks/_fixtures/2437-line-anchored-receipt-vectors.tsv).
+// ledger-w3-accept-heading-decision-line (2026-08-27): the ticket's "heading is refused" premise was STALE
+// (heading tolerance already shipped above, #2462 AC-1b) -- the REAL gap was the post-colon VALUE: a bold-
+// wrapped verdict word (`## Decision: **PASS**`, the exact incident line) still failed on master because of
+// the `**` around PASS, not the `##`. The post-colon tail now ALSO tolerates up to two bounded `\*{0,2}` star
+// runs around the value -- `Decision: **PASS**`, `**Decision:** PASS`, and the composed
+// `## **Decision:** **PASS**` (bolded keyword's closing `**` + bolded value's opening `**`, needs BOTH slots)
+// all now match. Still accept-only: the star runs stay `{0,2}` (bounded, never `+`/unbounded -- `Decision: ***
+// PASS` still fails to match), and the capture group is UNCHANGED (`[A-Za-z-]+` immediately after the star
+// slots) -- a decorated NEEDS-WORK/FAIL/REJECT still fails CHECK_LANE_AFFIRMATIVE membership no matter how it
+// is starred. Named accept-side-only risk (carried from plan-review, not a ship-gate hole): a few malformed-
+// but-affirmative forms also now match -- `Decision: * PASS` (single star), unbalanced `Decision: **PASS`,
+// inner-spaced `Decision: ** PASS **` -- but the SAME decorations on a NEGATIVE value still reject, so no
+// negative verdict can ever satisfy W3 through this widening.
 function hasRefArmAffirmative(content) {
   const s = String(content == null ? '' : content);
-  const re = /^\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*([A-Za-z-]+)/gim;
+  const re = /^(?:#{1,6}[ \t]+)?\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*\*{0,2}\s*\*{0,2}([A-Za-z-]+)/gim;
   let m;
   while ((m = re.exec(s)) !== null) {
     if (CHECK_LANE_AFFIRMATIVE.has(String(m[1]).toUpperCase())) return true;
@@ -2032,13 +2260,20 @@ function checkTrackedRole(role, e) {
 
 // ── #1537 — artifact PRIVACY scan over the SHIPPED, git-tracked 3-role artifacts ──────────────────────────
 // Sibling of Leg A directly above: Leg A proves the cited artifact is git-TRACKED; this leg proves that
-// TRACKED artifact's own PROSE is CLEAN of the three regulated token classes (home-path / personal-email /
-// brand — #1588: an artifact's OWN privacy-report table can itself quote the token). Reuses the SAME
-// resolveDiskPathForRole() Leg A already computes (one resolution site, no re-typed regex) and shells out to
-// the canonical `scripts/privacy-scan.sh --working <path>` (count-based, fail-CLOSED, never echoes the
-// matched bytes). The scanner's OWN absolute path is resolved ONCE by the BASH caller (which already
-// presence-guards it for the ai-brain-only / plugin-dormant discipline) and passed in via the PRIVACY_SCAN_BIN
-// env var — this file never hardcodes or re-derives that path.
+// TRACKED artifact's own PROSE is CLEAN of all FOUR regulated token classes (home-path / email / brand-
+// regulated / credential-secret — #1588: an artifact's OWN privacy-report table can itself quote the token).
+// Re-based (#1660 SL-10, design surface S-6) formally onto the #1660 SL-3 ENGINE CONTRACT: this leg never
+// lists or re-types its own class set — it shells out to the canonical `scripts/privacy-scan.sh --working
+// <path>` (count-based, fail-CLOSED, never echoes the matched bytes), which OWNS the four-class registry (see
+// that script's own header) and scans all four unconditionally on every `--working` invocation. Because the
+// class set lives ONLY in the engine, this leg (and its bash caller below) inherit any future class the
+// engine adds with ZERO code change here — KEEP the delegation, never reimplement scanning. Reuses the SAME
+// resolveDiskPathForRole() Leg A already computes (one resolution site, no re-typed regex). The scanner's OWN
+// absolute path is resolved ONCE by the BASH caller (which already presence-guards it for the ai-brain-only /
+// plugin-dormant discipline — and REFUSES rather than silently skipping when the scanner is tracked-but-
+// missing-on-disk, the #2401 S2 sparse-checkout-omission case, distinct from a genuine plugin-dormant install
+// where scripts/ was never tracked at all) and passed in via the PRIVACY_SCAN_BIN env var — this file never
+// hardcodes or re-derives that path.
 const PRIVACY_ROLES = TRACKED_ROLES;   // the same three disk-path roles Leg A already tracked-checks.
 
 // Run the canonical scanner over one resolved artifact path. Returns null when CLEAN (rc 0); otherwise a
@@ -2098,6 +2333,138 @@ function executorKindProblem(byRole) {
     'executor\'s real artifact is a PR URL / commit sha / branch — never a plan document; cite the actual PR/commit.';
 }
 
+// ── #2496 — check-time-ONLY, in-session SIBLING-TOKEN resolution arm (merge-head-gated) ──────────────────
+// `check --task <T> --merge-head <sha>` sometimes finds `<T>.jsonl` absent, or present but missing one or
+// more REQUIRED_ROLES rows, even though the REAL 4-role review chain ran and closed under a longer,
+// sibling token in the SAME session (a multi-slice epic files its authoritative ledger as
+// `<T>-scanner-build.jsonl` while every per-slice PR's branch collapses to the bare `<T>` token —
+// enforce-review-or-lfah.sh derives TASKID from the head branch's LEADING DIGITS only). This arm teaches
+// `check` one more place to look: an in-session sibling ledger `<T>-….jsonl` (token-boundary-safe — task
+// "166" can never match "1660-….jsonl", since the separator immediately follows the sanitized token),
+// accepted ONLY when BOTH hold:
+//   (a) the sibling is itself a genuinely COMPLETE 4-role ledger — planner / plan-review / executor judged
+//       by the exact SAME checkRole() predicate `check` already applies to the bare token (never a second
+//       hand-written copy of it);
+//   (b) the sibling carries at least one execution-review row — iterated over ALL of that sibling's rows,
+//       never the last-row-wins byRole merge (a merged epic ledger's LAST row may be an unrelated slice) —
+//       that satisfies BOTH conjuncts of a binding deliberately STRICTER than checkRole()'s own ref arm:
+//         ADDED-BY-PR: the row's artifact_path resolves as a blob at --merge-head AND does NOT resolve at
+//           refs/remotes/origin/master, in the SAME repo `check` runs from (process.cwd() — the identical
+//           repo resolveArtifactAtRef()'s candidate 1 uses for its own merge-head lookup) — i.e. genuinely
+//           part of THIS PR's own diff, never a shipped sibling's review file merely riding along in the
+//           merge-head tree by inheritance (the confirmed false-allow this tightening exists to close: a
+//           review file that has already reached origin/master is present in EVERY off-master slice's tree
+//           whether or not that slice was ever reviewed).
+//         GENUINE: that SAME row passes checkRole('execution-review', row, ...) — resolvable agentId /
+//           oracle / subprocess provenance + verdict content, exactly as `check` demands of any
+//           execution-review row today.
+// Fail-CLOSED on every ambiguity, never "assume": no candidate sibling, an unreadable origin/master ref (a
+// configured/expected ref that cannot be verified makes ADDED-BY-PR unprovable, not falsified), a sibling
+// missing a required role or failing its predicate, or no execution-review row satisfying both conjuncts.
+// Merge-head-gated (cmdCheck's own trigger, below): with no --merge-head there is no binding evidence to
+// test ADDED-BY-PR against, so this arm never even runs — today's unbound-check behavior is byte-preserved.
+// A NAMED-RISK residual is carried, not fixed, here (registered `2496-genuine-content-forgery-path-
+// collision` via hooks/named-risk-notes.mjs): GENUINE reads verdict CONTENT from the author-controlled
+// merge-head blob (checkRole's own pre-existing #2050/#2480 property), so a deliberately-crafted forged
+// blob at an EXISTING sibling row's artifact_path can still satisfy both conjuncts. Pre-existing, not
+// widened by this arm beyond cross-slice agentId borrowing within one session; execution-review disposes it.
+
+// siblingLedgerCandidates: every `<T>-….jsonl` file in the session's ledger dir, sorted for determinism.
+// The regex anchors the separator immediately after the sanitized token, so a shorter numeric prefix (task
+// "166") can never match a longer sibling ("1660-….jsonl") — the token-boundary discipline this whole
+// class of bug is about (R1/AC-2).
+function siblingLedgerCandidates(session, task) {
+  const dir = path.join(LEDGER_DIR, sanitize(session));
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const t = sanitize(task);
+  if (!t) return [];
+  const re = new RegExp('^' + escapeRegExp(t) + '-.+\\.jsonl$');
+  return names.filter(n => re.test(n)).sort().map(n => ({
+    file: path.join(dir, n),
+    siblingTask: n.slice(0, -'.jsonl'.length),
+  }));
+}
+
+// ADDED-BY-PR, evaluated against the SAME repo `check` runs from (process.cwd()). Returns false on ANY
+// ambiguity (unreadable origin/master, a path that cannot be mapped into this repo, absent-at-merge-head,
+// present-at-master) — the R4 fail-closed contract: a can't-verify origin/master is treated as unprovable,
+// never as "assume absent" (which would let ADDED-BY-PR pass on nothing).
+function rowIsAddedByPr(row, mergeHead) {
+  const cwdRepo = process.cwd();
+  const masterRef = 'refs/remotes/origin/master';
+  let verify;
+  try { verify = spawnSync('git', ['-C', cwdRepo, 'rev-parse', '--verify', '--quiet', masterRef], { encoding: 'utf8' }); }
+  catch (e) { return false; }
+  if (verify.error || verify.status !== 0) return false;      // unreadable/unresolvable origin/master -> unprovable.
+  const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo);
+  if (!relPath) return false;                                  // can't map artifact_path into the merge-head's own repo.
+  if (!refHasBlob(cwdRepo, mergeHead, relPath)) return false;   // must be present at the merge head itself.
+  if (refHasBlob(cwdRepo, masterRef, relPath)) return false;    // must NOT already be present on origin/master.
+  return true;
+}
+
+// The tightened binding (ADDED-BY-PR AND GENUINE) for one execution-review row. GENUINE reuses checkRole()
+// verbatim — never a second hand-written admissibility copy.
+function rowSatisfiesTightenedBinding(row, session, task, checkOpts) {
+  if (!rowIsAddedByPr(row, checkOpts && checkOpts.mergeHead)) return false;
+  return checkRole('execution-review', row, session, checkOpts, task) === null;
+}
+
+// Is `siblingFile` itself a genuinely-complete 4-role ledger, AND does it carry at least one
+// execution-review row satisfying the tightened binding? Returns the qualifying row (for the stdout note)
+// or null. `checkOpts`/`task` are passed straight through from the outer `check` invocation so every
+// predicate call is byte-identical to what the bare-token loop already runs (reuse, never a fork).
+function siblingQualifies(siblingFile, session, task, checkOpts) {
+  let lines;
+  try { lines = fs.readFileSync(siblingFile, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) { return null; }
+  const byRole = {};
+  const execReviewRows = [];
+  for (const ln of lines) {
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    if (!j || !j.role) continue;
+    byRole[j.role] = j;                                   // last-row-wins, for the three non-execution-review roles.
+    if (j.role === 'execution-review') execReviewRows.push(j);
+  }
+  for (const role of ['planner', 'plan-review', 'executor']) {
+    const e = byRole[role];
+    if (!e) return null;
+    if (checkRole(role, e, session, checkOpts, task)) return null;
+  }
+  if (!execReviewRows.length) return null;
+  for (const row of execReviewRows) {         // iterate ALL rows — never the last-row-wins merge (L3019 class).
+    if (rowSatisfiesTightenedBinding(row, session, task, checkOpts)) return row;
+  }
+  return null;
+}
+
+// Orchestrator: scan every in-session sibling ledger (token-boundary-safe) for the FIRST that qualifies.
+// Merge-head-gated at the entry — callers pass checkOpts.mergeHead unconditionally; an absent/empty value
+// short-circuits to null with zero directory I/O (Intent #2's gate, satisfied here too, belt & suspenders
+// with the call-site gate in cmdCheck).
+function resolveSiblingForCheck(session, task, checkOpts) {
+  const mergeHead = checkOpts && checkOpts.mergeHead;
+  if (!mergeHead) return null;
+  for (const cand of siblingLedgerCandidates(session, task)) {
+    const row = siblingQualifies(cand.file, session, task, checkOpts);
+    if (row) return { siblingTask: cand.siblingTask, siblingFile: cand.file, row };
+  }
+  return null;
+}
+
+// Visibility, never silence (Intent #4): a resolver-granted ALLOW prints an explicit note naming the
+// sibling ledger + the merge-head-bound artifact, same discipline as the ROUTE-BYPASS:/DISPATCH: notes —
+// always distinguishable from a plain bare-token pass.
+function printSiblingResolveAllow(task, sib) {
+  console.log('SIBLING-RESOLVE: task ' + sanitize(task) + ' unresolved at the bare token; resolved via ' +
+    'in-session sibling ledger "' + sib.siblingTask + '" — execution-review artifact "' +
+    (sib.row.artifact_path || '') + '" is bound to this merge head (present at the merge head, absent at ' +
+    'origin/master — added by this PR, not inherited) and passes the genuine-provenance battery (#2496).');
+  console.log('OK: role-ledger complete for task ' + sanitize(task) +
+    ' (planner, plan-review, executor, execution-review all resolved via sibling ledger "' + sib.siblingTask + '")');
+}
+
 // OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
 // path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
 // `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
@@ -2124,11 +2491,46 @@ function overlayAppend(session, task, role, fields) {
       kept.push(ln);
     } catch (e) { kept.push(ln); }
   }
+  // ledger-concurrent-append-agent-disambiguation Fix B — TARGET-ROW SELECTION BY AGENT IDENTITY. When
+  // this write carries an explicit agentId, bind to the row that ALREADY carries that SAME agentId,
+  // wherever it sits among this role's rows — never a position-based "last same-role row" heuristic.
+  // This is what makes a SubagentStop completion stamp (three-role-subagent-ledger.sh, always passes
+  // --agent) — or any other explicit --agent cmdAppend call — land on the STOPPING/NAMED agent's OWN
+  // row even when a sibling lane's row was written later (the measured SL-14 completion-refile bug: the
+  // old "prior = last same-role line" heuristic misread a same-agent close-out as a distinct-agent NEW
+  // ROUND — isNewRound below — and forked a fresh, empty artifact-less stub instead of merging onto the
+  // repairing agent's own real row). Search from the END so the common single-occurrence case resolves
+  // immediately and a genuine same-agent multi-write history still resolves to its most recent line. A
+  // miss (no existing row carries this agentId — the genuinely-NEW-round case, #1580 Fix B) falls
+  // through to the ORIGINAL "last same-role row" selection unchanged, so isNewRound's fork-a-fresh-row
+  // behavior for real new rounds is untouched (#1580 non-regression). A call with NO agentId at all
+  // (a bare self-append/repoint) also falls through unchanged — cmdAppend's own ambiguity refusal (Fix
+  // A) runs BEFORE this function is ever called, so a bare write only ever reaches here when at most
+  // one artifact-less candidate exists for this role.
   let prior = null;
-  if (priorSameRoleLines.length) {
-    try { prior = JSON.parse(priorSameRoleLines[priorSameRoleLines.length - 1]); } catch (e) { prior = null; }
+  let priorIdx = -1;
+  const bindAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  if (bindAgentId) {
+    for (let i = priorSameRoleLines.length - 1; i >= 0; i--) {
+      let j;
+      try { j = JSON.parse(priorSameRoleLines[i]); } catch (e) { continue; }
+      if (j && j.agentId === bindAgentId) { prior = j; priorIdx = i; break; }
+    }
   }
-  const olderRoundLines = priorSameRoleLines.slice(0, -1);
+  if (priorIdx === -1 && priorSameRoleLines.length) {
+    priorIdx = priorSameRoleLines.length - 1;
+    try { prior = JSON.parse(priorSameRoleLines[priorIdx]); } catch (e) { prior = null; }
+  }
+  const olderRoundLines = priorSameRoleLines.filter((_, i) => i !== priorIdx);
+  // #2169 slice 3, AC-31a — ROUTES-STALE advisory. Scoped to a genuinely subprocess-shaped incoming write
+  // (never fires for the vast majority of ordinary Agent-tool appends across the rest of this file) so this
+  // stays a pure addition with zero output-shape impact on any pre-existing non-subprocess fixture.
+  if (isSubprocessDispatch(fields.dispatch)) checkRoutesStale(role, prior);
+  // #2169 slice 3 — set by clause 2's R-C escape hatch below (allow-arm only); consumed by the isNewRound
+  // computation further down, alongside clause 3's divertNewRound3, so a sanctioned R-C supersession starts
+  // a genuinely FRESH row (no deletion — the superseded E1 row is retained verbatim as history) instead of
+  // Frankensteining the new E2 evidence onto the old E1 row's stale agentId/model fields.
+  let divertRouteChange = false;
   // #1575 1a / #1580 Fix A — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: terminal evidence is
   // EVIDENCE, a bare re-append is an ASSERTION, and the weak must never erase the strong. #1580 widens the
   // outer TRIGGER from "prior carries a verdict" to "prior carries ANY terminal evidence"
@@ -2172,14 +2574,26 @@ function overlayAppend(session, task, role, fields) {
       const closedAtOk = !prior.closedAt ||
         (('closedAt' in fields) && !!fields.closedAt && String(fields.closedAt) > String(prior.closedAt));
       if (!(boundNew && distinctAgent && closedAtOk)) {
-        throw new GuardRejection(
-          'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
-          prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
-          ' — superseding it requires a NEW, ATTRIBUTED review in the SAME command: an --agent whose ' +
-          'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
-          'prior agentId, AND a --closed-at strictly newer than the prior closedAt. A bare or same-agent ' +
-          'verdict flip is refused; spawn a genuinely NEW plan-review/review subagent and cite it.'
-        );
+        // #2169 slice 3 — R-C route-change clause (design decision 3): the ordinary bound-agent supersession
+        // test above just failed (expected — a subprocess-openrouter write never carries --agent). Give a
+        // genuinely subprocess-shaped (E2) write ONE more, narrowly SSOT-gated chance before refusing outright.
+        const rc = evaluateRouteChangeSupersession(role, prior, fields, session, task);
+        if (rc.allowed) {
+          divertRouteChange = true;
+          console.error('ROUTE-DRIFT: role ' + role + ' seat routed to subprocess dispatch since ' + rc.since +
+            ' — prior row (closedAt ' + prior.closedAt + ', verdict "' + prior.verdict + '") superseded by a ' +
+            'verified subprocess (E2) write per the R-C route-change clause (#2169 slice 3, design decision 3).');
+        } else {
+          throw new GuardRejection(
+            'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
+            prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
+            ' — superseding it requires EITHER a NEW, ATTRIBUTED review in the SAME command (an --agent whose ' +
+            'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
+            'prior agentId, AND a --closed-at strictly newer than the prior closedAt) OR a sanctioned R-C ' +
+            'route-change supersession (' + rc.reason + '). A bare or same-agent verdict flip is refused; ' +
+            'spawn a genuinely NEW plan-review/review subagent and cite it, or satisfy R-C\'s SSOT-gated terms.'
+          );
+        }
       }
     }
   }
@@ -2257,7 +2671,13 @@ function overlayAppend(session, task, role, fields) {
   // no prior row yet, so when the spawn's --agent later arrives `prior.agentId` is still absent and this
   // stays false — that write correctly MERGES onto the close, one round, one line.
   const incomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
-  const isNewRound = divertNewRound3 || !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
+  // #2169 slice 3 — a sanctioned R-C route-change supersession (divertRouteChange, set by clause 2's escape
+  // hatch above) is ALSO a round boundary: the new E2 evidence must never compose onto the superseded E1
+  // row's stale agentId/artifact_path/verdict — it starts a genuinely fresh row, carrying only what THIS
+  // write provides, with the old E1 row retained verbatim as history (same "no deletion" mechanic as
+  // divertNewRound3 and the ordinary distinct-agent round boundary below).
+  const isNewRound = divertNewRound3 || divertRouteChange ||
+    !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
   for (const ln of olderRoundLines) kept.push(ln);
   if (isNewRound) kept.push(JSON.stringify(prior));
   // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
@@ -2275,6 +2695,10 @@ function overlayAppend(session, task, role, fields) {
   // (APPROVE / PASS / BLOCK / SHIP-WITH-FIXES / APPROVE-WITH-NOTES). Read-only downstream: the agent-kanban
   // board surfaces it as a colored pill. Overlay only when provided (back-compat: absent ⇒ no verdict).
   if ('verdict' in fields) entry.verdict = fields.verdict;
+  // #1657 registry row 2 (cairn-search receipt) — the structured `cairn` field, overlaid onto the SAME
+  // row this role's own append already writes (own-key "provided" discipline: absent ⇒ untouched, same
+  // as every other overlay field here). Read via hooks/guardlib-receipt.mjs's cairn-search checker.
+  if ('cairn' in fields) entry.cairn = fields.cairn;
   // #1100 item 3: provenance stamp — overlay only when provided (back-compat: absent ⇒ unstamped).
   if ('self_authored' in fields) entry.self_authored = fields.self_authored;
   // #1516 — the EXPLICIT close-stamp. Overlay only when provided (own-key "provided" discipline, same as
@@ -2282,7 +2706,14 @@ function overlayAppend(session, task, role, fields) {
   // on SubagentStop) passes this — never the spawn-time hook — which is what makes "closedAt present" a
   // trustworthy punch-out signal instead of a value that could land at dispatch. Optional + additive:
   // check/checkRole never reference it, so a chain-role line gains it harmlessly too.
-  if ('closedAt' in fields) entry.closedAt = fields.closedAt;
+  if ('closedAt' in fields) {
+    entry.closedAt = fields.closedAt;
+    // #2169 slice 4, AC-28b — an append carrying closedAt is the dispatch helper's atomic post-exit write
+    // (design decision 1(ii)): it clears the pre-launch `pending` liveness stamp in the SAME write. Own-key
+    // "closedAt provided" is the trigger (not a separate flag) — mirrors every other clear-on-provide rule
+    // in this function.
+    delete entry.pending;
+  }
   // #1465 — OPTIONAL model+effort provenance. Overlay only when this call resolved a value (own-key
   // presence is the "provided" signal, same discipline as every other field above); an unprovided key
   // PERSISTS the prior line's value, so "model resolved at spawn-time self-append" composes with
@@ -2290,6 +2721,13 @@ function overlayAppend(session, task, role, fields) {
   if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
   if ('modelTier' in fields) entry.modelTier = fields.modelTier;
   if ('effort' in fields) entry.effort = fields.effort;
+  // review-round-counter-per-plan — `reviewed_plan`, an ordinary own-key overlay (same discipline as every
+  // field above): the plan-review round's PLAN identity, resolved from the DISPATCH context by the caller
+  // (spawn edge / dispatch helper / reconciler), never derived here. An unprovided key persists whatever the
+  // prior line already carried — this is what lets a spawn-time stamp (three-role-spawn-ledger.sh or the
+  // dispatch helper) compose with a later close-only `--artifact` repoint without either writer clobbering
+  // the other, exactly like agentId/artifact_path already compose (#855).
+  if ('reviewed_plan' in fields) entry.reviewed_plan = fields.reviewed_plan;
   // #1640 S11 — the RUN-TIME reroute stamp. Overlay only when THIS call's --sense-reroute actually resolved
   // one (own-key "provided" discipline, same as every field above): the spawn edge (three-role-spawn-ledger.sh)
   // and the SubagentStop edge (three-role-subagent-ledger.sh) both pass --sense-reroute on every call, but
@@ -2306,6 +2744,21 @@ function overlayAppend(session, task, role, fields) {
   if ('dispatch' in fields) entry.dispatch = fields.dispatch;
   if ('transcript_path' in fields) entry.transcript_path = fields.transcript_path;
   if ('nonce' in fields) entry.nonce = fields.nonce;
+  // #2169 slice 5 (S5-AC1, design decision 4) — the delivery-receipt STAMP. Own-key "provided" overlay,
+  // same discipline as dispatch/transcript_path/nonce above: an unprovided key persists the prior line's
+  // value, so a spawn-time stamp composes with a later close-only verdict append exactly like every other
+  // field here. The VALUE stored is hashDispatchNonce()'s one-way hash (minted by cmdAppend from the raw
+  // --dispatch-nonce token), never the plaintext — see that function's own comment for why. A row carrying
+  // this field is "STAMPED"; the delivery-receipt guard just below is scoped entirely to that presence.
+  if ('dispatch_nonce' in fields) entry.dispatch_nonce = fields.dispatch_nonce;
+  // #2169 slice 4, design decision 1 — the PENDING liveness stamp. A pre-launch dispatch write looks like
+  // {"role":"executor","dispatch":"subprocess-openrouter","run_kind":"bound","run_source":"dispatch-helper",
+  // "pending":true} — identity/liveness only, NEVER terminal evidence (never read by the terminal-evidence
+  // guard's clause 1/2 above — priorHasTerminalEvidence() does not test this field, by design), and
+  // deliberately erasable by a bare skip (AC-28c, the skip clear-list below): the stamp is an ASSERTION; the
+  // EVIDENCE (verdict/closedAt/etc) is what clause 1/2 protects, never the reverse. Cleared the moment a
+  // `closedAt` write lands (the atomic post-exit close, AC-28b, above) or a bare skip supersedes it.
+  if ('pending' in fields) entry.pending = fields.pending;
   // #2075 D1 — run_id is an ordinary own-key overlay (same discipline as every field above): E1 -> agentId,
   // E2 -> nonce, E3 -> absent. run_source is diagnostic-only, same discipline, never consulted by a gate.
   if ('run_id' in fields) entry.run_id = fields.run_id;
@@ -2363,14 +2816,69 @@ function overlayAppend(session, task, role, fields) {
       delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
     }
   }
+  // #2169 slice 4, AC-28d + #1590 carried pitfall — a GENUINE subprocess-openrouter evidence BUNDLE (every
+  // one of dispatch + transcript_path + nonce + verdict + artifact_path present on THIS write, own-key
+  // "provided" discipline) is exactly as strong as the agentId/oracle supersession just above and must
+  // likewise clear a prior operator's skip_reason note: the sanctioned full-evidence close (design decision
+  // 1(ii)'s atomic post-exit write) legitimately closes out a row an operator had earlier marked skip. A
+  // BARE `--dispatch` marker (the pre-launch pending stamp — dispatch/run_id/run_kind/run_source/pending,
+  // with no transcript/nonce/verdict/artifact yet) carries none of that weight and must NOT erase the note —
+  // the assertion-erases-assertion trap (#1590 class): a bare marker must never masquerade as an evidence
+  // bundle.
+  const dispatchEvidenceBundleComplete = ('dispatch' in fields) && isSubprocessDispatch(fields.dispatch) &&
+    ('transcript_path' in fields) && !!fields.transcript_path &&
+    ('nonce' in fields) && !!fields.nonce &&
+    ('verdict' in fields) && !!fields.verdict &&
+    ('artifact_path' in fields) && !!fields.artifact_path;
+  if (dispatchEvidenceBundleComplete) {
+    delete entry.skip_reason;
+  }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
     delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+    // #2169 slice 5 — dispatch_nonce joins the clear-list for the SAME reason as dispatch/transcript_path/
+    // nonce just above: it is provenance OF a real dispatch, and a skip is a declaration that no (or no
+    // longer relevant) run happened. This is what lets an operator reclaim a stamped-but-in-flight row
+    // exactly like they can already reclaim a `pending`-stamped one (S4 precedent) — the stamp is never
+    // terminal evidence, so it must remain erasable by a bare skip.
+    delete entry.dispatch_nonce;
     // #2075 D1 — run_id/run_kind/run_source join the clear-list too: a skip line must not carry a stale
     // claimed provenance kind (join the SAME reasoning as modelVersion/dispatch above — these are provenance
     // OF a real run, and a skip is a declaration that no run happened).
     delete entry.run_id; delete entry.run_kind; delete entry.run_source;
+    // review-round-counter-per-plan (plan Intent #1) — a skip row must not carry a stale plan identity: a
+    // skip declares "no run happened for this round", so any inherited reviewed_plan is dead weight a later
+    // merge could otherwise resurrect onto a round that was never actually reviewed.
+    delete entry.reviewed_plan;
+    // #2169 slice 4, AC-28c — the pending liveness stamp is a bare ASSERTION (design decision 1), so a
+    // legitimate skip erases it exactly like every other stale claimed-provenance field above. This is what
+    // makes an in-flight dispatch reclaimable by an operator skip without a separate escape hatch.
+    delete entry.pending;
+  }
+  // #2169 slice 5 (S5-AC2/AC3/AC4/AC6/AC7, design decision 4) — DELIVERY-RECEIPT GUARD. A write that
+  // carries a verdict (own-key "provided" trigger, matching every other clause's convention above) and
+  // lands on a row that is — or becomes, via THIS same call — dispatch_nonce-STAMPED must prove delivery:
+  // --receipt must hash (hashDispatchNonce) to the EXACT stored value. A row with no dispatch_nonce (every
+  // legacy row on disk today, and any row this call never stamps) is entirely untouched by this clause —
+  // S5-AC4's load-bearing counterfactual: a proof-less verdict append onto such a row still succeeds
+  // unchanged. Checked LAST (after the skip clear-list above), so a call that ALSO carries --skip-reason
+  // never trips it (its verdict/dispatch_nonce would already have been cleared by the block above by the
+  // time this runs). Throws BEFORE kept.push/fs.writeFileSync — the row is untouched on refusal, matching
+  // every other guard in this function.
+  if (('verdict' in fields) && fields.verdict && entry.dispatch_nonce) {
+    const receiptHash = (('receipt' in fields) && fields.receipt) ? hashDispatchNonce(fields.receipt) : '';
+    if (!receiptHash || receiptHash !== entry.dispatch_nonce) {
+      throw new GuardRejection(
+        'delivery-receipt guard (#2169 slice 5, AC-34, design decision 4): role ' + role + '\'s row is ' +
+        'dispatch_nonce-STAMPED (a genuine DISPATCH-NONCE:<token> dedicated line was delivered to this ' +
+        'dispatch) and this write carries a verdict, but no --receipt <token> was supplied, or it does not ' +
+        'match the delivered token. No value PRINTED on this row proves a caller\'s identity — the stored ' +
+        'dispatch_nonce is a ONE-WAY HASH, never the plaintext, so echoing it straight back as --receipt can ' +
+        'never satisfy this guard. Re-run this SAME append with --receipt "<the exact token from THIS ' +
+        'dispatch\'s own DISPATCH-NONCE: line>" to supply genuine proof of delivery.'
+      );
+    }
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
@@ -2385,9 +2893,22 @@ function cmdAppend(o) {
   const fields = {};
   if ('agent' in o) fields.agentId = o.agent;
   if ('artifact' in o) fields.artifact_path = normalizeArtifact(o.artifact);   // #1199 Part B: cwd-independent + home-tilde.
+  // review-round-counter-per-plan — the plan-review round's PLAN identity (never the reviewer's own
+  // artifact — that stays `--artifact`/artifact_path). normalizeArtifact() applies the same cwd-independent
+  // + home-tilde treatment as --artifact; for an absolute path it never statSyncs for existence (only its
+  // relative-path branches do, and those defer to verbatim on a miss rather than failing), so a moved/
+  // deleted historical plan file's path is still stored intact.
+  if ('reviewed-plan' in o) fields.reviewed_plan = normalizeArtifact(o['reviewed-plan']);
   if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
   if ('oracle' in o) fields.oracle = o.oracle;
   if ('verdict' in o) fields.verdict = o.verdict;
+  // #1657 registry row 2 (cairn-search receipt) — the STRUCTURED copy of a role's `cairn:` prose citation,
+  // captured on the SAME row as everything else this role's own self-append already writes (planner/
+  // plan-review append this at whichever call actually records their row — the field is populated at
+  // WRITE time, not backfilled later, per the plan-review note on capture timing). Read via
+  // `node hooks/guardlib-receipt.mjs check --type cairn-search --session S --task T [--role R]`.
+  // Ordinary own-key overlay (see overlayAppend) — omitting this flag on a later call leaves it untouched.
+  if ('cairn' in o) fields.cairn = o.cairn;
   // #1947 S3 — the subprocess-openrouter provenance fields (D2/M1/M2). Written ONLY by
   // tools/openrouter-role-dispatch.sh's own self-append (or the role's own self-append, mirroring today's
   // agentId self-append convention) — `check`'s admissibility gate (checkSubprocessProvenance) reads these
@@ -2396,6 +2917,20 @@ function cmdAppend(o) {
   if ('dispatch' in o) fields.dispatch = o.dispatch;
   if ('transcript' in o) fields.transcript_path = normalizeArtifact(o.transcript);
   if ('nonce' in o) fields.nonce = o.nonce;
+  // #2169 slice 5 (design decision 4, AC-34) — the delivery-receipt STAMP + PROOF flags.
+  // --dispatch-nonce <RAW TOKEN>: the MINTING side (the Agent-tool spawn edge today; the subprocess
+  // dispatch helper too, slice 6) supplies the raw token it saw on a genuine DISPATCH-NONCE:<token>
+  // dedicated line. This CLI layer hashes it (hashDispatchNonce) BEFORE handing it to overlayAppend —
+  // the ledger row NEVER stores the plaintext, only the one-way hash (S5-AC6 harvest ban).
+  // --receipt <RAW TOKEN>: the PROOF side — a verdict-carrying append's claim of delivery. Passed through
+  // RAW (never pre-hashed here); overlayAppend's delivery-receipt guard hashes it at comparison time
+  // against the row's stored dispatch_nonce. The flag is spelled --receipt (never --run — that name
+  // collided with Phase 2's AC-13).
+  if ('dispatch-nonce' in o && o['dispatch-nonce']) fields.dispatch_nonce = hashDispatchNonce(o['dispatch-nonce']);
+  if ('receipt' in o) fields.receipt = o.receipt;
+  // #2169 slice 4 — the pending liveness stamp CLI flag. Flag presence is the "provided" signal (same
+  // discipline as --self-authored above); a bare `--pending` (no value) is true, `--pending false` is false.
+  if ('pending' in o) fields.pending = (o.pending !== 'false');
   // #2075 Phase 1, D1 — the provenance-kind fields. Written ONLY by the writer that obtained the identity
   // (three-role-subagent-ledger.sh -> witnessed; the dispatch helper -> bound; cmdReconcileSpawns /
   // cmdRefreshModels -> inferred, stamped internally below, never via this flag). --run-kind is WRITE-ONCE /
@@ -2455,15 +2990,80 @@ function cmdAppend(o) {
   // Effort is now written ONLY via the explicit --effort flag above: the spawn hook stamps ASSIGNED, the
   // SubagentStop hook stamps OBSERVED (`effort.level`), and every other append (self-record, close-out)
   // passes none — overlayAppend's per-key "provided" discipline then PRESERVES the role's real value untouched.
-  // #897: a build worktree is transient (quarantined at cleanup), so an artifact_path under
-  // `.claude/worktrees/<slug>/` DANGLES the moment the worktree is removed — and the completion gate
-  // (which checks the artifact file EXISTS) then BLOCKs. The committed artifact also lives at a stable
-  // primary-clone path after merge+FF; cite THAT. Warn (stderr is visible to the orchestrator, unlike an
-  // exit-0 hook nudge — #769) but do NOT block: the path may legitimately still exist this instant.
-  if (fields.artifact_path && /\/\.claude\/worktrees\//.test(String(fields.artifact_path))) {
-    console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
-      'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
-      'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
+  // #897/#2462 AC-6 — DURABILITY FLAG at append time. #897 (original): a build worktree is transient
+  // (quarantined at cleanup), so an artifact_path under `.claude/worktrees/<slug>/` DANGLES the moment the
+  // worktree is removed — and the completion gate (which checks the artifact file EXISTS) then BLOCKs.
+  // #2462 (widened): the SAME durability failure recurs for a home/tilde-anchored or otherwise machine-local
+  // absolute path, and for a temp/scratch dir — none of these are a stable, git-trackable repo-relative
+  // location either (the live #2462 reproducer: this very task's own round-3 plan-review self-append cited
+  // `~/coding_projects/ai-brain-wt-2462-plan-fold-r2/.ai-workspace/plans/...` — silent, rc=0, pre-fix). The
+  // committed artifact lives at a stable repo-relative path after merge+FF; cite THAT. WARN (stderr is
+  // visible to the orchestrator, unlike an exit-0 hook nudge — #769) but do NOT block: the cited path may
+  // legitimately still exist this instant, and a role whose real artifact genuinely is ephemeral-shaped must
+  // never be BRICKED by this leg (AC-6's own over-blocking guard) — only the executor's PR-URL/branch/sha
+  // artifact_path and a genuine repo-relative path are UNFLAGGED by construction (neither shape below ever
+  // matches a bare token or a path with no leading `/`/`~` and no worktree segment).
+  //
+  // Checked against the RAW --artifact ARGUMENT (o.artifact), never the possibly-rewritten `fields.artifact_
+  // path`: normalizeArtifact() collapses a HOME-rooted absolute path to `~/...` but leaves an absolute path
+  // OUTSIDE $HOME untouched — so a detector reading only the post-normalize value for a leading `~` would
+  // silently miss that case (checking the raw argument catches both, uniformly).
+  {
+    const rawArtifactArg = ('artifact' in o) ? String(o.artifact == null ? '' : o.artifact).trim() : '';
+    if (rawArtifactArg && /(^|\/)\.claude\/worktrees\//.test(rawArtifactArg)) {
+      console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
+        'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
+        'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
+    } else if (rawArtifactArg && (rawArtifactArg === '~' || rawArtifactArg.startsWith('~/') || rawArtifactArg.startsWith('/'))) {
+      console.error('WARN (3role-ledger #2462 AC-6): --artifact "' + rawArtifactArg + '" cites an ephemeral or ' +
+        'anchored location (a home/tilde-anchored or otherwise machine-local absolute path, or a temp/scratch ' +
+        'dir) — not a stable, git-trackable repo-relative path. It will not survive a worktree quarantine, a ' +
+        'different checkout, or a different machine. Re-append with a repo-relative --artifact path (from this ' +
+        'repo\'s own root), then re-complete.');
+    }
+  }
+  // ledger-concurrent-append-agent-disambiguation Fix A — AMBIGUITY REFUSAL, fail-closed. Runs BEFORE
+  // the #1769 warn below AND before the overlayAppend call (~line 2762 as of this fix) — i.e. before
+  // ANY of overlayAppend's internal machinery (clause-1/2 terminal-evidence, clause-3 transcript-proof
+  // #2309, #1580 isNewRound) ever runs, so this refusal structurally pre-empts all of it (plan-review
+  // round-2 R2). Trigger keys STRICTLY on the ABSENCE of --agent — an append carrying --verdict and/or
+  // --skip-reason is STILL "bare" for this rule (R1): the canonical review-role self-append shape is
+  // exactly `--verdict <PASS|FAIL> --artifact <p>`, no --agent, so a predicate that exempted --verdict
+  // (like #1769's isBareRepoint below) would leave that shape completely uncovered. Deliberately does
+  // NOT reuse #1769's isBareRepoint — a DIFFERENT, narrower trigger (only the truly bare no-flags-at-all
+  // case) protecting a DIFFERENT, WARN-only concern (the reused-task-id case, #1749).
+  //
+  // Count ONLY artifact-less same-role rows for this task (a row that already carries an artifact_path
+  // is complete evidence, not an ambiguous merge candidate). More than one such row means overlayAppend's
+  // target-row selection cannot honestly tell which row this write is for — merging onto whichever one
+  // happens to be selected would silently cross-wire the artifact onto the wrong lane's row (the measured
+  // SL-8/SL-9 concurrent cross-wire incident). REFUSE outright (non-zero exit, ledger file untouched —
+  // this block only ever READS the file) rather than guess; the remedy is a plain, actionable retry with
+  // --agent naming the specific target row.
+  {
+    const hasAgent = ('agent' in o);
+    if (!hasAgent) {
+      const artifactLessRows = [];
+      try {
+        const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
+        for (const ln of raw) {
+          try {
+            const j = JSON.parse(ln);
+            if (j && j.role === role && !j.artifact_path) artifactLessRows.push(j);
+          } catch (e) { /* skip unparsable line */ }
+        }
+      } catch (e) { /* no ledger file yet -> artifactLessRows stays [] */ }
+      if (artifactLessRows.length > 1) {
+        const ids = artifactLessRows.map((r) => (r.agentId || '(no agentId)')).join(', ');
+        console.error('BLOCK (3role-ledger fix-A ambiguity, ledger-concurrent-append-agent-disambiguation): ' +
+          'role ' + role + ' has ' + artifactLessRows.length + ' artifact-less rows for task ' +
+          sanitize(task) + ' (agentIds: ' + ids + ') — a bare append (no --agent; this trigger fires ' +
+          'regardless of --verdict/--skip-reason) cannot tell which row this write is for. Merging onto ' +
+          'whichever row happens to be selected would silently cross-wire this artifact onto the wrong ' +
+          'lane\'s row. Pass --agent <the specific row\'s agentId> to pin the target unambiguously.');
+        process.exit(2);
+      }
+    }
   }
   // #1769: a BARE repoint (no --agent, no --verdict, no --skip-reason — i.e. only artifact_path and/or the
   // best-effort model fields are being provided) merges onto overlayAppend's "prior" row: whichever line was
@@ -2553,16 +3153,38 @@ function cmdInherit(o) {
   };
   // Precondition 1 — PARENT-LEG RELATION: the parent's own ledgered PLANNER artifact (the reviewed plan
   // file) must NAME the leg task id (a genuine leg is a sub-slice of the parent's plan; #1064 discipline).
+  // #2174 — the plain disk resolver can HIT a STALE copy (the last-merged primary-clone file, per the
+  // #897/#2023 ~/-rooted stable-path doctrine) that SHADOWS the fresher branch copy plan-review actually
+  // reviewed while the parent task's branch is still unmerged (the #2169 blocker). When the disk-resolved
+  // copy misses OR fails the leg-naming test, ALSO consult the SAME bounded trusted-ref candidate set
+  // checkRole's planner/plan-review arms already use (#2088/#2462: resolveArtifactAtRef/candidateTaskRefs),
+  // keyed to the PARENT id — NEVER the leg id (AC-2(a): a leg-keyed ref must NOT satisfy this precondition,
+  // or the candidate set could be forged by anyone who can push a `<leg>-*` branch). No merge head is passed
+  // (inherit-plan-review takes no --merge-head); the candidate set is refs/remotes/origin/<parent>-* +
+  // origin/master in the helper's own home repo — refs/heads/ is deliberately never consulted (AC-2(b)).
+  // Content is read AT THE REF (W2 — readBlobAtRef, never disk content paired with ref existence) and must
+  // carry BOTH a plan marker (PLAN_RE) AND the leg-naming token — the same bar as the disk arm (AC-2(c): a
+  // parent-ref blob that exists but doesn't name the leg still refuses). Fail-closed otherwise, with a block
+  // message naming both copies consulted.
   {
-    const ap = resolveArtifact(planner.artifact_path);   // already existence+PLAN_RE-verified by checkRole above.
-    let content = '';
-    try { content = fs.readFileSync(ap, 'utf8'); } catch (e) { /* fall through -> relation test fails below */ }
     const legToken = sanitize(task);
     const legRe = new RegExp('(^|[^0-9A-Za-z._-])' + legToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9A-Za-z._-])');
-    if (!legToken || !legRe.test(content)) {
-      blockPrecond('parent planner artifact "' + ap + '" does not name leg task ' + legToken +
-        ' — a genuine leg must be listed in the parent plan (the #1064 discipline: tag CHILD ids, not the ' +
-        'epic\'s). Add the leg id to the plan (an honest, visible edit), or provide the correct --parent.');
+    const ap = resolveArtifact(planner.artifact_path);   // already existence+PLAN_RE-verified by checkRole above.
+    let diskContent = '';
+    try { diskContent = fs.readFileSync(ap, 'utf8'); } catch (e) { /* fall through -> disk arm fails below */ }
+    const diskNamesLeg = !!(legToken && legRe.test(diskContent));
+    if (!diskNamesLeg) {
+      const hit = resolveArtifactAtRef(planner.artifact_path, undefined, parent);
+      const refContent = hit ? readBlobAtRef(hit.repoDir, hit.ref, hit.relPath) : null;
+      const refNamesLeg = !!(hit && refContent !== null && PLAN_RE.test(refContent) && legToken && legRe.test(refContent));
+      if (!refNamesLeg) {
+        blockPrecond('parent planner artifact "' + ap + '" (disk)' +
+          (hit ? ' and ref ' + hit.ref + ' (' + hit.repoDir + ')' : ' and no parent-keyed ref candidate ' +
+            '(refs/remotes/origin/' + sanitize(parent) + '-* + origin/master) resolved') +
+          ' does not name leg task ' + legToken +
+          ' — a genuine leg must be listed in the parent plan (the #1064 discipline: tag CHILD ids, not the ' +
+          'epic\'s). Add the leg id to the plan (an honest, visible edit), or provide the correct --parent.');
+      }
     }
   }
   // Precondition 2 — PARENT VERDICT condition: the parent's plan-review row must carry an AFFIRMATIVE
@@ -2863,10 +3485,31 @@ function laneAProblem(subjectRole, reviewRole, byRole, lines) {
 function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
+  // #2480 O4 / #2050 AC-1d — an EXPLICITLY empty `--merge-head` value is a USAGE ERROR, distinct from
+  // every chain-incomplete message below. `o['merge-head'] || ''` (the checkOpts read further down)
+  // treats "flag passed with an empty value" and "flag omitted entirely" identically, so
+  // `check --merge-head ''` would silently degrade to the unbound legacy path instead of failing
+  // loudly. `'merge-head' in o` is the ONLY signal that distinguishes "the flag was on the command
+  // line" from "the flag was never passed" (parseArgs sets o[key]='' for both a bare trailing flag and
+  // an explicit empty value, but never adds the key at all when it wasn't typed) — an omitted flag
+  // still falls through to today's unbound check untouched (M6-control). Raised BEFORE the ledger-file
+  // read below so this stays a distinct usage error, not "no role-ledger found" (M6).
+  if (('merge-head' in o) && String(o['merge-head'] == null ? '' : o['merge-head']) === '') {
+    console.log('BLOCK: --merge-head was passed but empty — this is a USAGE ERROR (#2050 AC-1d), not a ' +
+      'chain-incomplete result. Omit --merge-head entirely for an unbound check, or pass the real merge-head sha.');
+    process.exit(2);
+  }
   const file = ledgerFile(session, task);
   let lines;
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
   catch (e) {
+    // #2496 — before giving up, try the merge-head-gated in-session sibling-token resolver (Intent #1/#2):
+    // the bare token may be genuinely absent while a complete, merge-head-bound review chain exists under a
+    // sibling token in the SAME session (the confirmed live class). No --merge-head -> resolveSiblingForCheck
+    // returns null immediately with zero directory I/O, so the byte-preserved unbound path below is UNCHANGED.
+    const sibAbsent = resolveSiblingForCheck(session, task,
+      { mergeHead: o['merge-head'] || '', rejectVacuousOracle: ('reject-vacuous-oracle' in o) });
+    if (sibAbsent) { printSiblingResolveAllow(task, sibAbsent); process.exit(0); }
     console.log('BLOCK: no role-ledger found for task ' + sanitize(task) + ' in this session (' + file +
       '). Append a ledger line per role: node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> ...');
     process.exit(2);
@@ -2875,10 +3518,19 @@ function cmdCheck(o) {
   for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
   // #1276: the vacuous-oracle rejection is OPT-IN via --reject-vacuous-oracle (only the instrumentation
   // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
-  // #2088: --merge-head is likewise OPT-IN (W5) — absent/empty leaves checkRole()'s ref-scoped arm entirely
-  // unconsulted, so `check`'s behavior for every existing caller is byte-identical to pre-#2088.
+  // #2088: --merge-head only widens checkRole()'s ref-scoped arm with the current merge head as an EXTRA
+  // candidate; the arm itself is DEFAULT-ON as of #2462 (task-bound refs + origin/master are consulted
+  // regardless of whether this flag is present — see resolveArtifactAtRef()). Absent/empty just means the
+  // merge-head candidate is skipped, not that the whole arm is skipped.
   const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '' };
   const problems = [];
+  // #2496 — tracks ONLY the "missing X ledger line" problems the REQUIRED_ROLES loop below pushes (never
+  // any other problem class: checkRole content failures, laneA/laneB, model-policy, tracked, kind,
+  // privacy). This is the sibling resolver's trigger set — see the SIBLING-RESOLVE attempt near the end of
+  // this function, gated on `problems.length === missingRoleProblems.length` (i.e. the ONLY reason this
+  // bare token is blocked is one-or-more literally-missing required-role rows — the confirmed live class;
+  // an unrelated problem on an otherwise-present row is never silently papered over by a sibling).
+  const missingRoleProblems = [];
   // #1947 M-B (execution-review round-2 FAIL) — D2 promised "check output labels these rows distinctly", but
   // the string `dispatch=subprocess-openrouter` previously appeared ONLY in comments and in BLOCK-reason
   // text — never on the success path, so a subprocess-verified row was indistinguishable in `check`'s output
@@ -2887,7 +3539,7 @@ function cmdCheck(o) {
   const dispatchLabels = [];
   for (const role of REQUIRED_ROLES) {
     const e = byRole[role];
-    if (!e) { problems.push('missing ' + role + ' ledger line'); continue; }
+    if (!e) { const m = 'missing ' + role + ' ledger line'; problems.push(m); missingRoleProblems.push(m); continue; }
     const r = checkRole(role, e, session, checkOpts, task);
     if (r) { problems.push(r); continue; }
     // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
@@ -2935,6 +3587,11 @@ function cmdCheck(o) {
     // and is therefore COMPLETELY UNAFFECTED by anything below (routesLoaded.ok stays false for them, exactly
     // reproducing today's roleModelFromCfg-only comparison).
     const routesLoaded = ('CC_ROLES_ENV' in process.env) ? { ok: false, routes: null, configPath: '' } : loadRoutesConfig();
+    // #1918 n4/D3b — the whole-file pin diagnostic (malformed/unreadable pin file), announced ONCE for this
+    // whole enforce-role-models pass, AFTER routesLoaded is resolved (never masking the #2401/SSOT-corrupt
+    // fail-safes above) and gated the SAME way the per-role tier-pin overlay below is (seatPinBlind() inside
+    // announceSeatPinFileProblem() already covers CC_ROLES_ENV/CC_ROUTES_JSON).
+    announceSeatPinFileProblem();
     if (found) {
       lintRoleConfig(cfg, routesLoaded.ok ? routesLoaded.routes : null);   // S8(b): SSOT-vocabulary hint, additive-only.
       // #1640 S10 binding point 4 — an enforcement run under a caller-supplied CC_ROUTES_JSON audits itself
@@ -2987,7 +3644,21 @@ function cmdCheck(o) {
           // declared non-Anthropic tier (which an Anthropic observation could never equal anyway). This is
           // BYTE-IDENTICAL to the pre-#1640 comparison for every role whose seat is not SSOT-declared non-
           // Anthropic (expectedSide.tier === legacyExpected in that case).
-          const expected = roleModelFromCfg(cfg, role);
+          let expected = roleModelFromCfg(cfg, role);
+          // #1918 D2/AC3/AC4(b)/AC5(b) — TIER pin overlay on the completion gate's OWN tier-mismatch
+          // comparison (the actual gate this role's Anthropic-observed transcript is judged against).
+          // Gated on `routesLoaded.ok`, which is ALREADY forced false under CC_ROLES_ENV (line ~3022) —
+          // resolveTierPin() independently self-excludes CC_ROUTES_JSON too (seatPinBlind(), D3b), so this
+          // stays pin-blind under BOTH terminal test seams (AC6) and never reachable before the clean-SSOT
+          // resolve above (D3c/n4). A malformed/off-vocabulary pin resolves `expected` UNCHANGED (AC4/AC5).
+          const seatPin = routesLoaded.ok ? resolveTierPin(role) : { pinned: false };
+          if (seatPin.refusalNote) process.stderr.write(seatPin.refusalNote + '\n');
+          if (seatPin.pinned) {
+            process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' completion-gate expected tier pinned to "' +
+              seatPin.tier + '"' + (seatPin.reason ? ' reason="' + seatPin.reason + '"' : '') +
+              (seatPin.set_at ? ' set_at=' + seatPin.set_at : '') + '\n');
+            expected = seatPin.tier;
+          }
           const pin = roleVersionFromCfg(cfg, role, expected);
           if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
             writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
@@ -3209,6 +3880,17 @@ function cmdCheck(o) {
       }
     }
   }
+  // #2496 — the merge-head-gated in-session sibling-token resolver (Intent #1/#2). Fires ONLY when the
+  // SOLE reason this bare token is blocked is one-or-more literally-missing required-role rows (the
+  // confirmed live class — a stub ledger under the bare token while the real chain closed under a
+  // sibling) AND a merge-head was passed (no binding evidence otherwise). Every other problem class
+  // (checkRole content failures on a PRESENT row, laneA/laneB, model-policy, tracked, kind, privacy) is
+  // NEVER papered over — `problems.length === missingRoleProblems.length` requires missing-role rows to be
+  // the ONLY thing in `problems`.
+  if (checkOpts.mergeHead && missingRoleProblems.length > 0 && problems.length === missingRoleProblems.length) {
+    const sib = resolveSiblingForCheck(session, task, checkOpts);
+    if (sib) { printSiblingResolveAllow(task, sib); process.exit(0); }
+  }
   if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
   // #1947 M-B — print AFTER the problems-guard (so it only reaches stdout on genuine roles-satisfied paths,
   // matching AC-5(d)/AC-6(d)'s "check exits 0 AND its output labels the row" contract) but BEFORE the final
@@ -3309,6 +3991,73 @@ function cmdResolveArtifact(o) {
   const abs = resolveArtifact(e.artifact_path); // expands ~ / CLAUDE_PROJECT_DIR / cwd / $HOME, '' if not on disk
   if (!abs) process.exit(1);
   console.log(abs);
+  process.exit(0);
+}
+
+// #2462 AC-4 — resolve-artifacts-for-task --task T [--merge-head R]: the RAW per-row resolution primitive
+// the corpus verifier (scripts/2462-branch-only-artifact-corpus-verifier.mjs) shells out to, so its
+// resolution predicate is the SAME code checkRole()/resolveArtifact()/resolveArtifactAtRef() run for `check`
+// — never a second hand-written copy that could silently drift from it. Unlike `check` (session-scoped, role-
+// completeness-gated), this walks EVERY ledger file for the task ACROSS ALL SESSION DIRS under LEDGER_DIR
+// (AC-4's cross-session population predicate) and reports EVERY row found (including superseded round
+// history — AC-4 says "every ledger row", not "the current effective row per role"), one JSON object per
+// line on stdout: {session, role, ref: <the artifact_path/oracle string>, resolved: bool, via: <string>}.
+// Never a pass/fail gate itself — exit 0 whenever ≥1 ledger file was found for the task (even if some rows
+// fail to resolve; the caller decides), exit 1 when NO ledger file exists for this task anywhere (so the
+// caller can distinguish "task not in the population" from "task found, rows examined").
+function cmdResolveArtifactsForTask(o) {
+  const task = o.task;
+  if (!task) { console.error('resolve-artifacts-for-task: --task is required'); process.exit(2); }
+  const mergeHead = o['merge-head'] || '';
+  const t = sanitize(task);
+  let sessionDirs = [];
+  try { sessionDirs = fs.readdirSync(LEDGER_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); }
+  catch (e) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  const files = [];
+  for (const sd of sessionDirs) {
+    const f = path.join(LEDGER_DIR, sd, t + '.jsonl');
+    if (fileExists(f)) files.push({ session: sd, file: f });
+  }
+  if (files.length === 0) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  for (const { session, file } of files) {
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { continue; }
+    for (const ln of lines) {
+      let row;
+      try { row = JSON.parse(ln); } catch (e) { continue; }
+      if (!row || !row.role) continue;
+      const role = row.role;
+      if (classifySkip(row).skip) {
+        console.log(JSON.stringify({ session, role, ref: '', resolved: true, via: 'inline-skip' }));
+        continue;
+      }
+      if (role === 'executor') {
+        const ok = !!(row.artifact_path && String(row.artifact_path).trim());
+        console.log(JSON.stringify({ session, role, ref: row.artifact_path || '', resolved: ok, via: ok ? 'string' : 'empty' }));
+        continue;
+      }
+      const rawRef = (role === 'execution-review' && row.oracle) ? stripOraclePrefix(row.oracle) : row.artifact_path;
+      if (!rawRef || !String(rawRef).trim()) {
+        console.log(JSON.stringify({ session, role, ref: rawRef || '', resolved: false, via: 'empty' }));
+        continue;
+      }
+      const contentRe = role === 'planner' ? PLAN_RE : VERDICT_RE;
+      const disk = resolveArtifact(rawRef);
+      if (disk) {
+        const ok = fileHas(disk, contentRe);
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? 'disk' : 'disk-content-fail', at: disk }));
+        continue;
+      }
+      const hit = resolveArtifactAtRef(rawRef, mergeHead, task);
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        const ok = content !== null && (role === 'planner' ? PLAN_RE.test(content) : hasRefArmAffirmative(content));
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? ('ref:' + hit.ref) : ('ref-content-fail:' + hit.ref), at: hit.repoDir + ':' + hit.relPath }));
+        continue;
+      }
+      console.log(JSON.stringify({ session, role, ref: rawRef, resolved: false, via: 'not-found' }));
+    }
+  }
   process.exit(0);
 }
 
@@ -3554,10 +4303,14 @@ function cmdReconcileSpawns(o) {
       if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
       const identity = t.dev + ':' + t.ino;
       const cachedEntry = !dueForFullRederive ? checkpoint.files[identity] : undefined;
-      let discovery, winners;
+      let discovery, winners, reviewedPlan;
       if (cachedEntry && t.size >= cachedEntry.size) {
         discovery = cachedEntry.discovery || null;
         winners = Array.isArray(cachedEntry.winners) ? cachedEntry.winners : [];
+        // review-round-counter-per-plan — a checkpoint written BEFORE this field existed simply lacks the
+        // key; falls back to '' (no crash, no phantom extraction) and gets picked up on the next full
+        // re-derive (periodic, #1851 D6) or the next time this file's size actually changes.
+        reviewedPlan = cachedEntry.reviewedPlan || '';
         firstRecordsCached++;
       } else {
         const line = readFirstNonEmptyLine(t.file);
@@ -3565,9 +4318,10 @@ function cmdReconcileSpawns(o) {
         const extracted = extractTagsFromText(text);
         discovery = extracted.discovery;
         winners = extracted.winners;
+        reviewedPlan = findPlanPathTextual(text);
         firstRecordsRead++;
       }
-      newFilesCache[identity] = { size: t.size, discovery, winners };
+      newFilesCache[identity] = { size: t.size, discovery, winners, reviewedPlan };
       if (discovery) groups.add(discovery.task + ' ' + discovery.role);
       for (const w of winners) {
         const key = w.task + ' ' + w.role;
@@ -3642,6 +4396,20 @@ function cmdReconcileSpawns(o) {
           if (tier && (!prior || !prior.modelTier)) { fields.modelTier = tier; hasChange = true; }
         }
         if (needSelfAuthored && facts.selfAuthored) { fields.self_authored = true; hasChange = true; }
+      }
+
+      // review-round-counter-per-plan — reviewed_plan backfill, add-only-when-missing (never overwrites a
+      // present value — a genuine spawn-time/dispatch-helper stamp always wins). Gated to plan-review rows:
+      // the field's meaning ("the plan THIS round was of") is plan-review-specific. The textual extraction
+      // was already computed per-transcript above (findPlanPathTextual, no statSync) and cached in
+      // newFilesCache keyed by the WINNING transcript's own (dev, ino) identity — a plain Map lookup, no
+      // second file read here. Side benefit, not load-bearing for any AC: legacy rows whose transcripts
+      // still exist get opportunistically backfilled on later sweeps.
+      if (role === 'plan-review' && (!prior || !prior.reviewed_plan)) {
+        const winTr = transcriptByAgentId.get(agentId);
+        const winCache = winTr ? newFilesCache[winTr.dev + ':' + winTr.ino] : null;
+        const reviewedPlanRaw = winCache && winCache.reviewedPlan ? winCache.reviewedPlan : '';
+        if (reviewedPlanRaw) { fields.reviewed_plan = normalizeArtifact(reviewedPlanRaw); hasChange = true; }
       }
 
       if (!hasChange) continue;
@@ -3784,7 +4552,7 @@ function configDirSparseOmissionProblem(repoRoot) {
 
 function cmdResolveRoleModel(o) {
   const role = o.role;
-  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research)'); process.exit(2); }
+  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research|ship-tail)'); process.exit(2); }
   const withEffort = ('with-effort' in o);
   const withVersion = ('with-version' in o);
 
@@ -3849,11 +4617,24 @@ function cmdResolveRoleModel(o) {
       printRoleModel('opus', '', 'opus', withEffort, withVersion);
       return;
     }
-    const tier = ident.tierEquivalent;
+    let tier = ident.tierEquivalent;
+    // #1918 D2/D3(c) — TIER pin overlay, AFTER the clean-SSOT resolve above (D3c) and AFTER the #2401
+    // sparse-omission guard at the top of this function — a pin can never mask a config/ sparse-omission or
+    // rescue a broken SSOT, it only overlays an ALREADY-clean resolve. resolveTierPin() is itself seam-blind
+    // (D3b) and fails safe to `false` on a malformed/off-vocabulary pin, so `tier` only ever changes here to
+    // an already-declared value.
+    announceSeatPinFileProblem();
+    const pin = resolveTierPin(role);
+    if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
+    if (pin.pinned) {
+      process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' tier pinned to "' + pin.tier + '"' +
+        (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+      tier = pin.tier;
+    }
     const { found: legacyFound, cfg: legacyCfg } = loadRoleConfig();
     if (legacyFound) lintRoleConfig(legacyCfg);
     const effort = legacyFound ? roleEffortFromCfg(legacyCfg, role) : '';
-    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || seat.model || tier;
+    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || (pin.pinned ? tier : (seat.model || tier));
     printRoleModel(tier, effort, version, withEffort, withVersion);
     return;
   }
@@ -4292,13 +5073,28 @@ function resolveRoute(routes, seatKey) {
   const seats = (routes && routes.seats) || {};
   const seatRow = seats[seatKey];
   if (!seatRow) return { ok: false, reason: 'ROUTE-SEAT-NOT-FOUND: no seat "' + seatKey + '" in the SSOT' };
-  const cap = checkCapability(routes, seatRow);
+  // #1918 D2/AC7 — SLUG pin overlay, AFTER the seat lookup, BEFORE the C-2/C-3 guards below: those guards
+  // check the SEAT ROW's declared task_class/provider/data_sensitivity (properties of the SEAT, never the
+  // model id), so overlaying ONLY `.model` here means a pinned slug is validated through the exact same C-2/
+  // C-3 gate an unpinned slug would be — never a bypass. Diagnostics go to STDERR ONLY (never stdout — the
+  // caller may be `--json`, and tools/openrouter-role-dispatch.sh forwards this function's stderr separately
+  // from the JSON payload it parses; mixing them would corrupt that JSON.parse).
+  announceSeatPinFileProblem();
+  const pin = resolveSlugPin(seatKey, routes, seatRow);
+  if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
+  let effectiveSeat = seatRow;
+  if (pin.pinned) {
+    effectiveSeat = Object.assign({}, seatRow, { model: pin.slug });
+    process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' slug pinned to "' + pin.slug + '"' +
+      (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+  }
+  const cap = checkCapability(routes, effectiveSeat);
   if (!cap.ok) return { ok: false, reason: cap.reason };
-  const sens = checkDataSensitivity(routes, seatRow);
-  if (sens.ok) return { ok: true, seatKey, seat: seatRow, acceptance: null };
+  const sens = checkDataSensitivity(routes, effectiveSeat);
+  if (sens.ok) return { ok: true, seatKey, seat: effectiveSeat, acceptance: null };
   // C-3 refused -- C-3W (#1880) gets exactly one more chance, never ahead of C-2, never widening C-3 itself.
-  const acc = checkAcceptance(routes, seatRow);
-  if (acc.ok) return { ok: true, seatKey, seat: seatRow, acceptance: acc.acceptance };
+  const acc = checkAcceptance(routes, effectiveSeat);
+  if (acc.ok) return { ok: true, seatKey, seat: effectiveSeat, acceptance: acc.acceptance };
   return { ok: false, reason: sens.reason };
 }
 
@@ -4361,6 +5157,317 @@ function cmdLintRoutes(opts) {
   console.log('OK: routes lint clean (' + loaded.configPath + ')');
   process.exit(0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1918 — Operator Seat-Pin Overlay: set-seat-pin / clear-seat-pin / list-seat-pins. A machine-local, never-
+// tracked, sparse pin (~/.config/cc-seat-pins.json, mirroring #2105's cc-mode.json precedent — resolveModePinPath
+// above already cites this ticket's measured-location argument) that lets a permanent seat change (TIER for an
+// ordinary Anthropic role, or SLUG for a subprocess-dispatched OpenRouter seat) apply at the very next
+// spawn/dispatch — no PR, no plugin-sync, no restart — while the committed SSOT (config/cc-routes.json,
+// config/cc-roles.env) stays the only canonical record.
+//
+// D2 (three independent resolution points, ONE contract): seat resolution is NOT behind one shared chokepoint
+// in this file — `cmdResolveRoleModel` (spawn decision + spawn-time gate), `resolveExpectedSide`/
+// `roleModelFromCfg`'s completion-gate call sites, and `resolveRoute`/`checkSubprocessProvenance` (subprocess
+// dispatch + its provenance check) are three separate code paths that never call each other. Every one of them
+// consults the SAME two functions below (`resolveTierPin` / `resolveSlugPin`) so honor / refuse / fail-safe /
+// seam-blind behavior cannot diverge across paths (plan-review B1's fix; #1918 plan D2/AC3-AC7). Per execution-
+// review hand-off n2, the SLUG pin is wired at `checkSubprocessProvenance`'s OWN served-model comparison (the
+// path the OBSERVED-model check actually bites for a subprocess seat), never at `resolveExpectedSide`'s
+// tier_equivalent (which a subprocess seat's completion-gate leg never uses for its comparison — the file's own
+// #1947 AC-2/M3 comment already explains why: `resolveExpectedSide`/`resolve-role-model` deliberately read the
+// seat's `agent_tool_fallback` tier for these two seats, never the OpenRouter vocabulary's tier_equivalent).
+//
+// Fail-safe direction (D4, mirrors #2105's D1): EVERY failure shape (absent/unreadable/unparseable pin file,
+// a per-role entry with the wrong shape, an off-vocabulary tier or slug value) resolves UNPINNED — exactly
+// today's behavior for that role/key, never a garbage/partial value, never a silent fail-open to a value the
+// SSOT never declared. A pin can only ever SELECT among values the SSOT already declares (ROLE_MODELS for a
+// tier; any provider's model_vocabulary, same-provider-as-the-seat, for a slug) — it can never invent one.
+//
+// Seam hermeticity (D3b): `seatPinBlind()` makes BOTH `CC_ROLES_ENV` and `CC_ROUTES_JSON` (the two existing
+// AUTHORITATIVE+TERMINAL test seams) pin-blind — a live pin on the machine running a hermetic smoke/fixture can
+// never pollute it. #2401 ordering (execution-review hand-off n4): every pin-consulting call site below sits
+// AFTER cmdResolveRoleModel's own #2401 sparse-omission guard (:3947-3957, which runs unconditionally before
+// Step 1) and AFTER the clean-SSOT resolve it overlays — a pin can never mask a config/ sparse-omission, because
+// the pin logic is never reached until the SSOT has already resolved cleanly.
+//
+// Fixture seam for the pin's OWN storage location (mirrors CC_MODE_FILE): CC_SEAT_PINS_FILE. The real
+// ~/.config/cc-seat-pins.json is NEVER read or written by any smoke arm.
+
+// Resolve the seat-pin file's path. Outside every repo (same #1918 measured-location argument
+// resolveModePinPath already cites) — no git verb can ever see it, so AC8 (lockstep untouched) holds by
+// construction, not by discipline.
+function resolveSeatPinPath() {
+  if ('CC_SEAT_PINS_FILE' in process.env) return process.env.CC_SEAT_PINS_FILE;
+  return path.join(HOME, '.config', 'cc-seat-pins.json');
+}
+
+// Load + shape-validate the WHOLE pin file ONCE per process (memoized — the completion-gate leg queries this
+// once per REQUIRED_ROLE, and re-reading/re-stat'ing the same file 4x per invocation is pointless). Never
+// throws. { ok, pins, error, path, absent }:
+//   ok:true,  absent:true   -> no pin file (the normal, common steady state) -> {} pins, no error.
+//   ok:true,  absent:false  -> valid JSON object -> pins is that object (per-role/per-key values are validated
+//                              lazily by resolveTierPin/resolveSlugPin, which is where the DECLARED VOCABULARY
+//                              needed to validate a value actually lives).
+//   ok:false                -> malformed: unreadable for a non-ENOENT reason, unparseable JSON, or the parsed
+//                              value is not a plain object. `error` names the pin file. Every caller must treat
+//                              this exactly like "no valid pin for any role" (fail SAFE, never partial).
+let __seatPinsFileCache = null;
+function loadSeatPinsFile() {
+  if (__seatPinsFileCache) return __seatPinsFileCache;
+  const p = resolveSeatPinPath();
+  let result;
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') { result = { ok: true, pins: {}, error: '', path: p, absent: true }; }
+    else { result = { ok: false, pins: {}, error: 'SEAT-PIN-READ-ERROR: ' + p + ': ' + (e && e.message ? e.message : e) +
+      ' -- resolving UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false }; }
+  }
+  if (!result) {
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      result = { ok: false, pins: {}, error: 'SEAT-PIN-PARSE-ERROR: ' + p + ': ' + (e && e.message ? e.message : e) +
+        ' -- pin file is malformed, resolving UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false };
+    }
+    if (!result) {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        result = { ok: false, pins: {}, error: 'SEAT-PIN-SHAPE-ERROR: ' + p + ' is not a JSON object -- resolving ' +
+          'UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false };
+      } else {
+        result = { ok: true, pins: parsed, error: '', path: p, absent: false };
+      }
+    }
+  }
+  __seatPinsFileCache = result;
+  return result;
+}
+
+// Is pin resolution reachable AT ALL right now? False under either existing terminal test seam (D3b) — a live
+// pin on the machine must never pollute a hermetic CC_ROLES_ENV/CC_ROUTES_JSON-scoped smoke or fixture run.
+function seatPinBlind() {
+  return ('CC_ROLES_ENV' in process.env) || ('CC_ROUTES_JSON' in process.env);
+}
+
+// Print the WHOLE-FILE-level pin diagnostic (malformed/unreadable/wrong-shape) ONCE per process, only when pin
+// resolution is reachable (not seam-blind) and the file genuinely has a problem (never for the normal
+// absent/ENOENT case). Per-role/per-key off-vocabulary refusals are a SEPARATE, per-call-site diagnostic
+// (resolveTierPin/resolveSlugPin's own `refusalNote`) — this only covers "the whole file could not be read".
+let __seatPinFileProblemAnnounced = false;
+function announceSeatPinFileProblem() {
+  if (__seatPinFileProblemAnnounced) return;
+  if (seatPinBlind()) return;
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) {
+    process.stderr.write(loaded.error + '\n');
+    __seatPinFileProblemAnnounced = true;
+  }
+}
+
+// TIER pin: resolve role's tier override against the declared tier vocabulary (ROLE_MODELS — the SAME
+// vocabulary roleModelFromCfg's own fail-safe already uses, D4). Returns:
+//   { pinned:false }                                    -- no eligible pin (seam-blind, file absent/broken, no
+//                                                           entry for this role, entry has no `tier` field).
+//   { pinned:true, tier, reason, set_at }                -- a VALID pin -- caller overlays it.
+//   { pinned:false, refused:'<value>', refusalNote }     -- an entry exists but is off-vocabulary -- caller
+//                                                           MUST resolve UNPINNED; refusalNote is stderr text.
+function resolveTierPin(role) {
+  if (seatPinBlind()) return { pinned: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false };
+  const roleEntry = loaded.pins[role];
+  const field = (roleEntry && typeof roleEntry === 'object' && !Array.isArray(roleEntry)) ? roleEntry.tier : null;
+  if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) return { pinned: false };
+  const tier = String(field.value);
+  if (!ROLE_MODELS.includes(tier)) {
+    return { pinned: false, refused: tier, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.tier "' + tier + '" is not a declared tier (' + ROLE_MODELS.join('|') + ') -- resolving UNPINNED ' +
+      '(fail-safe, #1918 D4)' };
+  }
+  return { pinned: true, tier, reason: field.reason ? String(field.reason) : '', set_at: field.set_at ? String(field.set_at) : '' };
+}
+
+// SLUG pin (a subprocess seat's OpenRouter model id): validated against the declared vocabulary of the SAME
+// provider the seat is already declared on (identifyModel — the same check resolve-route/identify-model already
+// use for an ordinary seat model, D4; same-provider is a deliberate extra safety net beyond the plan's literal
+// text — a slug pin that resolves to a DIFFERENT provider's vocabulary would silently send that provider's
+// model id to the wrong endpoint). `routes` must already be a loaded, valid SSOT object (never a 2nd load here
+// — a caller under CC_ROUTES_JSON validates against that fixture's OWN vocabulary; seatPinBlind() already
+// refuses before this is reached in that case, so this codepath only ever sees the real file).
+function resolveSlugPin(role, routes, seatRow) {
+  if (seatPinBlind()) return { pinned: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false };
+  const roleEntry = loaded.pins[role];
+  const field = (roleEntry && typeof roleEntry === 'object' && !Array.isArray(roleEntry)) ? roleEntry.slug : null;
+  if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) return { pinned: false };
+  const slug = String(field.value);
+  const ident = identifyModel(routes, slug);
+  const seatProvider = seatRow && seatRow.provider;
+  if (!ident.ok || (seatProvider && ident.provider !== seatProvider)) {
+    return { pinned: false, refused: slug, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.slug "' + slug + '" is not a declared model for provider "' + (seatProvider || '<unknown>') + '" (' +
+      (ident.ok ? 'it is declared under provider ' + ident.provider + ' instead' : 'not in any declared provider model_vocabulary') +
+      ') -- resolving UNPINNED (fail-safe, #1918 D4)' };
+  }
+  return { pinned: true, slug, provider: ident.provider, tierEquivalent: ident.tierEquivalent,
+    reason: field.reason ? String(field.reason) : '', set_at: field.set_at ? String(field.set_at) : '' };
+}
+
+// set-seat-pin --role <role> (--tier <t> | --slug <s>) --reason "<text>" [--task T]
+// #2189-style discipline (D5): --reason is REQUIRED on every write — a reason-less flip is refused BEFORE the
+// pin file is read or touched (mirrors cmdSetMode's #2189 AC-1(c) fix). Validates the value against the SAME
+// declared vocabulary the resolvers themselves enforce, so a bad pin is refused loudly AT SET-TIME too, not
+// only silently ignored later at resolve-time. Merges into (never replaces) the role's existing entry, so
+// setting `slug` never drops a pre-existing `tier` pin for the same role and vice versa. Atomic write
+// (temp-file-plus-rename in the pin's own directory) mirrors cmdSetMode's AC-19 discipline.
+function cmdSetSeatPin(o) {
+  const role = o.role;
+  if (!role) { console.log('BLOCK: set-seat-pin requires --role <role>'); process.exit(2); }
+  const hasTier = ('tier' in o) && o.tier;
+  const hasSlug = ('slug' in o) && o.slug;
+  if (!hasTier && !hasSlug) { console.log('BLOCK: set-seat-pin requires --tier <t> or --slug <s>'); process.exit(2); }
+  if (hasTier && hasSlug) {
+    console.log('BLOCK: set-seat-pin: pass exactly one of --tier or --slug per call (they merge into the same role entry across separate calls)');
+    process.exit(2);
+  }
+  if (!o.reason) {
+    console.log('BLOCK: set-seat-pin: --reason is required (a reason-less pin write is refused, #1918 D5 mirrors #2189/#2105)');
+    process.exit(2);
+  }
+
+  const routesLoaded = loadRoutesConfig();
+  if (hasTier) {
+    const tier = String(o.tier);
+    if (!ROLE_MODELS.includes(tier)) {
+      console.log('BLOCK: set-seat-pin: "' + tier + '" is not a declared tier (' + ROLE_MODELS.join('|') + ')');
+      process.exit(2);
+    }
+  }
+  let slugIdent = null;
+  if (hasSlug) {
+    if (!routesLoaded.ok) {
+      console.log('BLOCK: set-seat-pin: cannot validate --slug -- ' + routesLoaded.error);
+      process.exit(2);
+    }
+    const seatRow = (routesLoaded.routes.seats || {})[role];
+    const ident = identifyModel(routesLoaded.routes, String(o.slug));
+    if (!ident.ok || (seatRow && seatRow.provider && ident.provider !== seatRow.provider)) {
+      console.log('BLOCK: set-seat-pin: "' + o.slug + '" is not a declared model for provider "' +
+        (seatRow && seatRow.provider || '<unknown>') + '" (config/cc-routes.json model_vocabulary)');
+      process.exit(2);
+    }
+    slugIdent = ident;
+  }
+
+  const pinPath = resolveSeatPinPath();
+  let existingRaw;
+  try { existingRaw = fs.readFileSync(pinPath, 'utf8'); } catch (e) { existingRaw = ''; }
+  let existing = {};
+  if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- overwrite cleanly below */ } }
+  const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
+  const nowIso = new Date().toISOString();
+  const fieldObj = { value: hasTier ? String(o.tier) : String(o.slug), reason: String(o.reason), set_at: nowIso };
+  if (o.task) fieldObj.task = String(o.task);
+  if (hasTier) roleEntry.tier = fieldObj; else roleEntry.slug = fieldObj;
+  const next = Object.assign({}, existing, { [role]: roleEntry });
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort; write below surfaces a real error */ }
+  const tmpPath = path.join(dir, '.cc-seat-pins.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: set-seat-pin: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+  try {
+    writeBypassLog('3role-ledger-set-seat-pin', 'CC_SEAT_PIN', 'PERMIT',
+      { task: sanitize(o.task || ''), role, provider: slugIdent ? slugIdent.provider : '' });
+  } catch (e) { /* best-effort -- audit failure must never un-do an already-committed pin write */ }
+  console.log('OK: seat pin set -- role=' + role + ' ' + (hasTier ? 'tier=' + o.tier : 'slug=' + o.slug) + ' reason="' + o.reason + '"');
+  process.exit(0);
+}
+
+// clear-seat-pin --role <role> [--tier] [--slug] --reason "<text>"  -- neither --tier nor --slug clears BOTH
+// keys for the role. --reason required (D5, same discipline as the set verb).
+function cmdClearSeatPin(o) {
+  const role = o.role;
+  if (!role) { console.log('BLOCK: clear-seat-pin requires --role <role>'); process.exit(2); }
+  if (!o.reason) {
+    console.log('BLOCK: clear-seat-pin: --reason is required (#1918 D5)');
+    process.exit(2);
+  }
+  const clearTier = ('tier' in o);
+  const clearSlug = ('slug' in o);
+  const pinPath = resolveSeatPinPath();
+  let existingRaw;
+  try { existingRaw = fs.readFileSync(pinPath, 'utf8'); } catch (e) { existingRaw = ''; }
+  let existing = {};
+  if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- clear writes a clean file below */ } }
+  const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
+  if (clearTier || (!clearTier && !clearSlug)) delete roleEntry.tier;
+  if (clearSlug || (!clearTier && !clearSlug)) delete roleEntry.slug;
+  const next = Object.assign({}, existing);
+  if (Object.keys(roleEntry).length) next[role] = roleEntry; else delete next[role];
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort */ }
+  const tmpPath = path.join(dir, '.cc-seat-pins.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: clear-seat-pin: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+  try { writeBypassLog('3role-ledger-clear-seat-pin', 'CC_SEAT_PIN', 'PERMIT', { task: sanitize(o.task || ''), role }); } catch (e) { /* best-effort */ }
+  console.log('OK: seat pin cleared -- role=' + role + (clearTier ? ' tier' : '') + (clearSlug ? ' slug' : '') +
+    (!clearTier && !clearSlug ? ' (all keys)' : ''));
+  process.exit(0);
+}
+
+// list-seat-pins [--json] -- D5 standing visibility: role, value, reason, and AGE for every active pin, so a
+// silent permanent shadow pin is impossible. Never fails -- a broken pin file is reported, not crashed on.
+function cmdListSeatPins(o) {
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) {
+    console.log('SEAT-PIN-FILE-PROBLEM: ' + loaded.error);
+    process.exit(0);
+  }
+  const rows = [];
+  const nowMs = Date.now();
+  for (const [role, entry] of Object.entries(loaded.pins || {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const key of ['tier', 'slug']) {
+      const field = entry[key];
+      if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) continue;
+      const setAt = field.set_at ? String(field.set_at) : '';
+      let ageStr = 'unknown';
+      const setMs = setAt ? Date.parse(setAt) : NaN;
+      if (!Number.isNaN(setMs)) {
+        const ageH = Math.max(0, (nowMs - setMs) / 3600000);
+        ageStr = ageH < 48 ? ageH.toFixed(1) + 'h' : (ageH / 24).toFixed(1) + 'd';
+      }
+      rows.push({ role, key, value: String(field.value), reason: field.reason ? String(field.reason) : '', set_at: setAt, age: ageStr });
+    }
+  }
+  if ('json' in o) {
+    console.log(JSON.stringify({ path: loaded.path, absent: !!loaded.absent, pins: rows }));
+  } else if (!rows.length) {
+    console.log('OK: no active seat pins (' + loaded.path + (loaded.absent ? ' absent' : '') + ')');
+  } else {
+    for (const r of rows) {
+      console.log('PIN role=' + r.role + ' key=' + r.key + ' value=' + r.value + ' reason="' + r.reason + '" set_at=' + r.set_at + ' age=' + r.age);
+    }
+  }
+  process.exit(0);
+}
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 // #2105 — Mode switch SSOT: resolve-mode / set-mode. A tiny operator posture pin (~/.config/cc-mode.json,
@@ -4653,6 +5760,7 @@ try {
   else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
+  else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
@@ -4664,11 +5772,15 @@ try {
   else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
   else if (cmd === 'resolve-mode') cmdResolveMode(opts);
   else if (cmd === 'set-mode') cmdSetMode(opts);
+  else if (cmd === 'set-seat-pin') cmdSetSeatPin(opts);
+  else if (cmd === 'clear-seat-pin') cmdClearSeatPin(opts);
+  else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|set-seat-pin|clear-seat-pin|list-seat-pins> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
+      '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
-      '[--merge-head R (check, opt-in ref-scoped resolution arm, #2088)] ' +
+      '[--merge-head R (check, widens the DEFAULT-ON ref-scoped resolution arm, #2088/#2462)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
       '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
@@ -4678,7 +5790,10 @@ try {
       '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
       '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
-      '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)]');
+      '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
+      '[--role R (--tier T | --slug S) --reason "..." [--task T] (set-seat-pin, #1918)] ' +
+      '[--role R [--tier] [--slug] --reason "..." (clear-seat-pin, #1918)] ' +
+      '[[--json] (list-seat-pins, #1918)]');
     process.exit(2);
   }
 } catch (e) {

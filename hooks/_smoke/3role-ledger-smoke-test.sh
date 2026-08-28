@@ -288,9 +288,35 @@ ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-revi
   --agent ew1 --artifact "/tmp/x/repo/.claude/worktrees/897-foo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
 echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && ok "#897 worktree artifact path -> WARN on stderr" || bad "#897 should WARN on a .claude/worktrees/ artifact path (got: $ERR)"
 
+# #2462 AC-6 widened the durability flag to ALSO cover any absolute/tilde path (not just worktree-shaped
+# ones) — an absolute `/tmp/...` path is now itself one of the three enumerated ephemeral shapes ("temp/
+# scratch dir"), so it is REQUIRED to warn too (r2b/N3: checked on the RAW argument). The #897 negative
+# control therefore now uses a genuinely repo-RELATIVE path (the only shape that stays silent) to represent
+# "a stable path" — an absolute path, /tmp/-rooted or not, is never durable/portable/git-trackable at a
+# stable location and must warn under the new, stricter contract.
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact ".ai-workspace/reviews/r.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable repo-relative path (got: $ERR)" || ok "#897 stable repo-relative artifact path -> no #897 worktree warn"
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && bad "#2462 AC-6 should NOT warn on a stable repo-relative path (got: $ERR)" || ok "#2462 AC-6: stable repo-relative artifact path -> no durability warn"
+
+# #2462 AC-6 — the WIDENED shapes, positive arms: a bare absolute /tmp path (temp/scratch dir) and a
+# tilde-anchored absolute path (the LIVE reproducer: this task's own round-3 plan-review self-append cited
+# exactly this shape, silently, pre-fix) both now WARN with the distinct #2462 AC-6 token.
 ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
   --agent ew1 --artifact "/tmp/x/repo/.ai-workspace/reviews/r.md" 2>&1 >/dev/null)
-echo "$ERR" | grep -q 'WARN (3role-ledger #897)' && bad "#897 should NOT warn on a stable primary path (got: $ERR)" || ok "#897 stable primary artifact path -> no warn"
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && ok "#2462 AC-6: absolute /tmp path -> WARN on stderr (temp/scratch shape)" || bad "#2462 AC-6 should WARN on an absolute /tmp artifact path (got: $ERR)"
+
+ERR=$(node "$LED" append --session "$WSID" --task "$WTASK" --role execution-review \
+  --agent ew1 --artifact "~/coding_projects/ai-brain-wt-2462-plan-fold-r2/.ai-workspace/plans/x.md" 2>&1 >/dev/null)
+echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)' && ok "#2462 AC-6: tilde-anchored worktree-absolute path -> WARN on stderr (the live #2462 round-3 reproducer's own shape)" || bad "#2462 AC-6 should WARN on a tilde-anchored artifact path (got: $ERR)"
+
+# #2462 AC-6 — the executor's PR-URL/branch-string artifact is a bare non-path token: never matches either
+# shape, so it must keep unchanged (unflagged) behavior (the over-blocking guard).
+ERR=$(node "$LED" append --session "$WSID" --task "${WTASK}exec" --role executor \
+  --agent ew1 --artifact "PR #2462" 2>&1 >/dev/null)
+{ echo "$ERR" | grep -q 'WARN (3role-ledger #897)' || echo "$ERR" | grep -q 'WARN (3role-ledger #2462 AC-6)'; } \
+  && bad "#2462 AC-6 should NOT warn on the executor's PR-URL/branch-string artifact (got: $ERR)" \
+  || ok "#2462 AC-6: executor PR-URL/branch-string artifact -> no durability warn (over-blocking guard)"
 
 # ---------------------------------------------------------------------------
 # #2028 — worktreeDangleHint's regex must fire on a WORKTREE PATH REGARDLESS OF A LEADING SLASH: both an
@@ -2823,8 +2849,501 @@ p1_kind "$P1_FIX/routes.json" "p1-ac24b" "t1" "plan-review"
 { [ "$PKRC" = "0" ] && [ "$PKOUT" = "E3" ]; } \
   && ok "#2075 AC-24 arm B: stored run_kind:inferred alongside a fully-verifying nonce triple -> provenance-kind prints E3, not E2 (the label can never raise a row's kind)" \
   || bad "#2075 AC-24 arm B expected E3 (rc=$PKRC out=$PKOUT)"
-# ---------------------------------------------------------------------------
-# #1936 -- read-side history lanes: Lane B (outcome monotonicity) + Lane A (round-aware freshness).
+
+# ---- AC-26(c) (unstamped-demotion fixture -- pins the ALREADY-SHIPPED Phase-1 behavior: a legacy row
+#      with NO stored run_kind at all has nothing to protect, so ANY incoming --run-kind value (even the
+#      LOWEST rank, 'inferred') legitimately WRITES the field -- unlike AC-9 arm2(i) above, where the SAME
+#      demotion append against an ALREADY-'bound' row is a write-once no-op. Clause-1 terminal-evidence
+#      protection is a SEPARATE, independent guard: it still refuses a verdict-less skip/inherit erase
+#      against the SAME row after the run_kind stamp lands (same clause AC-23(c) above pins). Cross-ref:
+#      slice 3's AC-8c arm 2 ("a demotion cannot manufacture a flip") covers the analogous demotion-vs-
+#      R-C-route-change-clause question for Phase 3's SSOT-gated supersession rule -- this fixture is
+#      Phase-1-scoped and proves neither R-C nor the route-change clause; it exercises ONLY the write-once
+#      run_kind field + clause 1 that already ship today. ----------------------------------------------
+mk_p1_tagged "p1-ac26c" "ag-ac26c" "t1" "plan-review"
+printf '## Review\nverdict: PASS\n' > "$P1_FIX/artifacts/ac26c.md"
+p1_append "$P1_FIX/routes.json" "p1-ac26c" "t1" "plan-review" --agent "ag-ac26c" --artifact "$P1_FIX/artifacts/ac26c.md" --verdict PASS
+RK26C_BEFORE=$(p1_row_get "p1-ac26c" "t1" "plan-review" "run_kind")
+[ -z "$RK26C_BEFORE" ] \
+  && ok "#2075 AC-26c setup: the row genuinely starts UNSTAMPED -- no run_kind field at all (legacy shape)" \
+  || bad "#2075 AC-26c setup should start with no run_kind, got '$RK26C_BEFORE'"
+
+# Arm 1 (value-flip -- cannot pass vacuously): a bare --run-kind inferred append against the UNSTAMPED row
+# legitimately WRITES the field (absent -> inferred), because there is no existing stamp to protect --
+# contrast AC-9 arm2(i) above, where the identical append against an ALREADY-'bound' row is a no-op.
+p1_append "$P1_FIX/routes.json" "p1-ac26c" "t1" "plan-review" --run-kind inferred
+RK26C_AFTER=$(p1_row_get "p1-ac26c" "t1" "plan-review" "run_kind")
+VD26C_MID=$(p1_row_get "p1-ac26c" "t1" "plan-review" "verdict")
+{ [ -z "$RK26C_BEFORE" ] && [ "$RK26C_AFTER" = "inferred" ] && [ "$VD26C_MID" = "PASS" ]; } \
+  && ok "#2075 AC-26c arm1: an UNSTAMPED (legacy, no run_kind) row's demotion append legitimately CHANGES run_kind (before='' after='inferred', a real value-flip, not vacuous), and the row's terminal verdict survives the stamp untouched" \
+  || bad "#2075 AC-26c arm1 FAILED (before='$RK26C_BEFORE' after='$RK26C_AFTER' verdict_mid='$VD26C_MID')"
+
+# Arm 2 (weak erase still refused -- clause-1 protection independently survives the run_kind stamp): a
+# follow-on verdict-less skip append against the SAME row is REFUSED (nonzero rc), and the verdict is
+# untouched -- proving the newly-stamped run_kind did not weaken clause 1's terminal-evidence guard.
+p1_append_capture "$P1_FIX/routes.json" "p1-ac26c" "t1" "plan-review" --skip-reason "trying to erase"
+VD26C_AFTER=$(p1_row_get "p1-ac26c" "t1" "plan-review" "verdict")
+RK26C_FINAL=$(p1_row_get "p1-ac26c" "t1" "plan-review" "run_kind")
+{ [ "$PARC" = "2" ] && [ "$VD26C_AFTER" = "PASS" ] && [ "$RK26C_FINAL" = "inferred" ]; } \
+  && ok "#2075 AC-26c arm2: a follow-on verdict-less skip append against the same (now-stamped) row is REFUSED (rc=$PARC, clause 1 unweakened by the run_kind stamp), verdict + run_kind both survive intact" \
+  || bad "#2075 AC-26c arm2 FAILED (rc=$PARC verdict_after=$VD26C_AFTER run_kind_final=$RK26C_FINAL)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2169 slice 3 -- R-C route-change clause + routed_since (design decision 3,
+# .ai-workspace/plans/2026-08-25-2075-phase3-recut.md). S3-AC1..S3-AC12. Reuses the P1_FIX vocabulary
+# above (mk_p1_tagged / mk_p1_or_transcript / p1_append / p1_append_capture / p1_row_get / p1_check /
+# p1_kind), plus a dedicated routes-rc.json declaring a COMMITTED routed_since pin and a p1_gate helper
+# for gate-plan-review. RULE12_LOG is redirected to scratch for this block only, so the audit-line
+# assertions (S3-AC8) never touch the operator's real ~/.claude/.rule-12-overrides.log.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+export RULE12_LOG="$TMP/s3-rc-rule12-audit.log"
+
+# ---- S3-AC1 (DELTA): routed_since is a COMMITTED per-seat pin in the REAL SSOT (config/cc-routes.json),
+#      for EVERY seat with a declared `dispatch` route (plan-review + executor, the only two today).
+#      Before (measured this session against origin/master fa7ecd7fa7 blobs, premise correction 1): 0. ----
+# PORT-NOTE: config/cc-routes.json (ai-brain's routing SSOT) is deliberately NOT bundled — internal
+# operational config; bundling would also activate the route-dispatch gate against routes consumers do not have.
+# Degrade-gracefully: SKIP the governance assertion when the SSOT is absent (ai-brain CI asserts it for real).
+RC_REAL_ROUTES="$ROOT/config/cc-routes.json"
+if [ ! -f "$RC_REAL_ROUTES" ]; then
+  echo "SKIP: #2169 S3-AC1 routed_since governance assertion (routes SSOT not bundled: $RC_REAL_ROUTES)"
+else
+S3AC1_COUNT=$(/usr/bin/grep -c '"routed_since"' "$RC_REAL_ROUTES" 2>/dev/null); S3AC1_COUNT="${S3AC1_COUNT:-0}"
+S3AC1_MISSING=$(node -e '
+  const routes = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+  const seats = routes.seats || {};
+  const missing = [];
+  for (const [name, seat] of Object.entries(seats)) {
+    if (seat && typeof seat.dispatch === "string" && seat.dispatch.indexOf("subprocess-") === 0 && !seat.routed_since) missing.push(name);
+  }
+  process.stdout.write(missing.join(","));
+' "$RC_REAL_ROUTES")
+{ [ "$S3AC1_COUNT" -ge 1 ] && [ -z "$S3AC1_MISSING" ]; } \
+  && ok "#2169 S3-AC1: config/cc-routes.json routed_since occurrences=$S3AC1_COUNT (before=0, DELTA) -- every dispatch-declared seat carries the pin (none missing: '$S3AC1_MISSING')" \
+  || bad "#2169 S3-AC1 FAILED (count=$S3AC1_COUNT missing=[$S3AC1_MISSING])"
+fi
+
+# ---- R-C fixture routes -------------------------------------------------------------------------------
+# routes-rc.json: plan-review dispatch=subprocess-openrouter WITH a committed routed_since pin.
+cat > "$P1_FIX/routes-rc.json" <<'P1JSON'
+{ "seats": { "plan-review": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter", "agent_tool_fallback": "opus", "routed_since": "2026-08-20T00:00:00.000Z" } } }
+P1JSON
+# routes-rc-none.json: plan-review is an ORDINARY anthropic seat -- no dispatch declared at all (S3-AC3
+# arm 1 / S3-AC4's "flip away" leg).
+cat > "$P1_FIX/routes-rc-none.json" <<'P1JSON'
+{ "seats": { "plan-review": { "provider": "anthropic", "model": "claude-opus-5" } } }
+P1JSON
+# routes.json (existing, defined above) declares dispatch but carries NO routed_since -- reused verbatim
+# below for S3-AC3 arm 2 (no committed pin).
+
+# p1_gate $routesFile $session $task -- gate-plan-review under the P1_FIX env. Sets PGOUT/PGRC.
+p1_gate() {
+  PGOUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$1" \
+    node "$LED" gate-plan-review --session "$2" --task "$3" 2>&1); PGRC=$?
+}
+
+# ---- S3-AC2 (DELTA, AC-4 allow arm): E2 supersedes a prior terminal E1 row when the SSOT declares
+#      plan-review dispatch:subprocess-openrouter AND the prior row's closedAt strictly pre-dates the
+#      seat's committed routed_since. Before: refused (clause 2's bound-agent test always fails for a
+#      subprocess write -- it never carries --agent -- and R-C did not exist on master). --------------
+mk_p1_tagged "p1-rc2" "ag-rc2" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc2-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc2" "t1" "plan-review" --agent "ag-rc2" \
+  --artifact "$P1_FIX/artifacts/rc2-e1.md" --verdict PASS --closed-at "2026-08-01T00:00:00.000Z"
+VD_RC2_BEFORE=$(p1_row_get "p1-rc2" "t1" "plan-review" "verdict")
+DISP_RC2_BEFORE=$(p1_row_get "p1-rc2" "t1" "plan-review" "dispatch")
+mk_p1_or_transcript "$P1_FIX/transcripts/rc2.jsonl" "t1" "N-RC2" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC2\n' > "$P1_FIX/artifacts/rc2-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc2" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc2.jsonl" --nonce "N-RC2" --artifact "$P1_FIX/artifacts/rc2-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC2_AFTER=$(p1_row_get "p1-rc2" "t1" "plan-review" "verdict")
+DISP_RC2_AFTER=$(p1_row_get "p1-rc2" "t1" "plan-review" "dispatch")
+ROWS_RC2=$(wc -l < "$P1_FIX/ledger/p1-rc2/t1.jsonl" | tr -d ' ')
+{ [ "$PARC" = "0" ] && [ "$VD_RC2_BEFORE" = "PASS" ] && [ -z "$DISP_RC2_BEFORE" ] \
+  && [ "$VD_RC2_AFTER" = "FAIL" ] && [ "$DISP_RC2_AFTER" = "subprocess-openrouter" ] \
+  && [ "$ROWS_RC2" = "2" ] && echo "$PAOUT" | grep -q "^ROUTE-DRIFT:"; } \
+  && ok "#2169 S3-AC2 (AC-4 allow arm): E2 supersedes a prior terminal E1 row (verdict PASS->FAIL, dispatch absent->subprocess-openrouter, a real value-flip) when SSOT declares dispatch AND prior closedAt strictly pre-dates routed_since; old E1 row retained verbatim as history (2 surviving lines, no deletion); ROUTE-DRIFT audited on stdout/stderr" \
+  || bad "#2169 S3-AC2 FAILED (rc=$PARC before=$VD_RC2_BEFORE/$DISP_RC2_BEFORE after=$VD_RC2_AFTER/$DISP_RC2_AFTER rows=$ROWS_RC2 out=$PAOUT)"
+
+# ---- S3-AC3 (DELTA, AC-6(a)-(f)): six named refusal arms, each starting from the SAME shape (a terminal
+#      E1 row) and failing exactly ONE of R-C's preconditions. All expect rc=2 and NO supersession (verdict
+#      + dispatch unchanged). mk_rc3_e1 $session $closedAt -- shared E1 setup. ------------------------
+mk_rc3_e1() {
+  local S="$1" C="$2"
+  mk_p1_tagged "$S" "ag-$S" "t1" "plan-review"
+  printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/$S-e1.md"
+  p1_append "$P1_FIX/routes-rc.json" "$S" "t1" "plan-review" --agent "ag-$S" \
+    --artifact "$P1_FIX/artifacts/$S-e1.md" --verdict PASS --closed-at "$C"
+}
+
+# Arm 1 -- no-dispatch-declared: the SECOND write's SSOT (routes-rc-none.json) does not declare plan-review
+# dispatched at all.
+mk_rc3_e1 "p1-rc3a" "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3a.jsonl" "t1" "N-RC3A" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3A\n' > "$P1_FIX/artifacts/rc3a-e2.md"
+p1_append_capture "$P1_FIX/routes-rc-none.json" "p1-rc3a" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3a.jsonl" --nonce "N-RC3A" --artifact "$P1_FIX/artifacts/rc3a-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3A=$(p1_row_get "p1-rc3a" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3A" = "PASS" ] && echo "$PAOUT" | grep -qi "does not currently declare seat"; } \
+  && ok "#2169 S3-AC3 arm 1 (no-dispatch-declared): SSOT silent on plan-review dispatch -> R-C refused (rc=2), verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 1 FAILED (rc=$PARC verdict=$VD_RC3A out=$PAOUT)"
+
+# Arm 2 -- no committed routed_since pin: the SECOND write's SSOT (routes.json, dispatch declared, NO
+# routed_since field) cannot prove a route-flip date.
+mk_rc3_e1 "p1-rc3b" "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3b.jsonl" "t1" "N-RC3B" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3B\n' > "$P1_FIX/artifacts/rc3b-e2.md"
+p1_append_capture "$P1_FIX/routes.json" "p1-rc3b" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3b.jsonl" --nonce "N-RC3B" --artifact "$P1_FIX/artifacts/rc3b-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3B=$(p1_row_get "p1-rc3b" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3B" = "PASS" ] && echo "$PAOUT" | grep -qi "no valid committed routed_since pin"; } \
+  && ok "#2169 S3-AC3 arm 2 (no routed_since pin): SSOT declares dispatch but no committed routed_since -> R-C refused (rc=2), verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 2 FAILED (rc=$PARC verdict=$VD_RC3B out=$PAOUT)"
+
+# Arm 3 -- close-time: the prior E1 row's closedAt (2026-08-22) does NOT strictly pre-date routed_since
+# (2026-08-20) -- a sanctioned post-flip E1 fallback, permanently outside R-C's reach.
+mk_rc3_e1 "p1-rc3c" "2026-08-22T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3c.jsonl" "t1" "N-RC3C" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3C\n' > "$P1_FIX/artifacts/rc3c-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc3c" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3c.jsonl" --nonce "N-RC3C" --artifact "$P1_FIX/artifacts/rc3c-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3C=$(p1_row_get "p1-rc3c" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3C" = "PASS" ] && echo "$PAOUT" | grep -qi "does not strictly pre-date" \
+  && echo "$PAOUT" | grep -qi "permanently.*outside R-C"; } \
+  && ok "#2169 S3-AC3 arm 3 (close-time): prior closedAt (2026-08-22) does not strictly pre-date routed_since (2026-08-20) -> R-C refused (rc=2), sanctioned post-flip fallback protected, verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 3 FAILED (rc=$PARC verdict=$VD_RC3C out=$PAOUT)"
+
+# Arm 4 -- nonce mismatch: the transcript is validly bound to a DIFFERENT nonce than the one this write cites.
+mk_rc3_e1 "p1-rc3d" "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3d.jsonl" "t1" "N-RC3D-REAL" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3D-WRONG\n' > "$P1_FIX/artifacts/rc3d-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc3d" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3d.jsonl" --nonce "N-RC3D-WRONG" --artifact "$P1_FIX/artifacts/rc3d-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3D=$(p1_row_get "p1-rc3d" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3D" = "PASS" ] && echo "$PAOUT" | grep -qi "does not carry BOTH the spawn tag"; } \
+  && ok "#2169 S3-AC3 arm 4 (nonce mismatch): transcript bound to a DIFFERENT nonce -> R-C refused (rc=2), verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 4 FAILED (rc=$PARC verdict=$VD_RC3D out=$PAOUT)"
+
+# Arm 5 -- tag mismatch: the transcript's first record is tagged for a DIFFERENT task than this write cites.
+mk_rc3_e1 "p1-rc3e" "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3e.jsonl" "WRONG-TASK" "N-RC3E" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3E\n' > "$P1_FIX/artifacts/rc3e-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc3e" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3e.jsonl" --nonce "N-RC3E" --artifact "$P1_FIX/artifacts/rc3e-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3E=$(p1_row_get "p1-rc3e" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3E" = "PASS" ] && echo "$PAOUT" | grep -qi "does not carry BOTH the spawn tag"; } \
+  && ok "#2169 S3-AC3 arm 5 (tag mismatch): transcript tagged for a DIFFERENT task -> R-C refused (rc=2), verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 5 FAILED (rc=$PARC verdict=$VD_RC3E out=$PAOUT)"
+
+# Arm 6 -- served-model mismatch: the transcript's served model differs from the SSOT's declared seat model.
+mk_rc3_e1 "p1-rc3f" "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc3f.jsonl" "t1" "N-RC3F" "z-ai/glm-5.2"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC3F\n' > "$P1_FIX/artifacts/rc3f-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc3f" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc3f.jsonl" --nonce "N-RC3F" --artifact "$P1_FIX/artifacts/rc3f-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC3F=$(p1_row_get "p1-rc3f" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC3F" = "PASS" ] && echo "$PAOUT" | grep -qi "SSOT-declared seat model"; } \
+  && ok "#2169 S3-AC3 arm 6 (served-model mismatch): transcript served z-ai/glm-5.2, SSOT declares moonshotai/kimi-k3 -> R-C refused (rc=2), verdict PASS survives untouched" \
+  || bad "#2169 S3-AC3 arm 6 FAILED (rc=$PARC verdict=$VD_RC3F out=$PAOUT)"
+
+# ---- S3-AC4 (DELTA, AC-8/8b): the SSOT is FLIPPED between two guard-time evaluations of the IDENTICAL
+#      incoming write (same fields, same nonce/transcript/verdict/closed-at every time) -- the decision
+#      follows whichever SSOT is CURRENT at guard time, never a cached/stale read, and never anything the
+#      incoming write itself claims (there is no --routed-since flag on `append` at all). --------------
+mk_p1_tagged "p1-rc4" "ag-rc4" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc4-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc4" "t1" "plan-review" --agent "ag-rc4" \
+  --artifact "$P1_FIX/artifacts/rc4-e1.md" --verdict PASS --closed-at "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc4.jsonl" "t1" "N-RC4" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC4\n' > "$P1_FIX/artifacts/rc4-e2.md"
+# Guard-time read #1: SSOT declares NO dispatch (routes-rc-none.json) -> refused.
+p1_append_capture "$P1_FIX/routes-rc-none.json" "p1-rc4" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc4.jsonl" --nonce "N-RC4" --artifact "$P1_FIX/artifacts/rc4-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+RC4_RC1="$PARC"; VD_RC4_MID=$(p1_row_get "p1-rc4" "t1" "plan-review" "verdict")
+# SSOT FLIPS: the exact SAME command retried, only CC_ROUTES_JSON changed to routes-rc.json (dispatch +
+# routed_since now committed) -> allowed. Nothing about the incoming write's own flags changed at all.
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc4" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc4.jsonl" --nonce "N-RC4" --artifact "$P1_FIX/artifacts/rc4-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+RC4_RC2="$PARC"; VD_RC4_AFTER=$(p1_row_get "p1-rc4" "t1" "plan-review" "verdict")
+{ [ "$RC4_RC1" = "2" ] && [ "$VD_RC4_MID" = "PASS" ] && [ "$RC4_RC2" = "0" ] && [ "$VD_RC4_AFTER" = "FAIL" ]; } \
+  && ok "#2169 S3-AC4 (AC-8/8b, SSOT flip between guard-time reads): IDENTICAL incoming write refused under routes-rc-none.json (no dispatch declared, rc=$RC4_RC1) then ALLOWED under routes-rc.json (dispatch+routed_since committed, rc=$RC4_RC2) -- the decision follows the FRESH SSOT read at guard time, never a cached prior read nor the write's own claim" \
+  || bad "#2169 S3-AC4 FAILED (rc1=$RC4_RC1 mid=$VD_RC4_MID rc2=$RC4_RC2 after=$VD_RC4_AFTER)"
+
+# ---- S3-AC5 (DELTA, AC-8c x 3, cross-referenced by AC-26c's own comment above) ------------------------
+# Arm 1 -- a sanctioned post-flip E1 fallback is outside R-C's reach (same underlying close-time predicate
+# as S3-AC3 arm 3, named+fixtured separately per the plan's AC-8c convention).
+mk_p1_tagged "p1-rc5a" "ag-rc5a" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc5a-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc5a" "t1" "plan-review" --agent "ag-rc5a" \
+  --artifact "$P1_FIX/artifacts/rc5a-e1.md" --verdict PASS --closed-at "2026-08-21T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc5a.jsonl" "t1" "N-RC5A" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC5A\n' > "$P1_FIX/artifacts/rc5a-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc5a" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc5a.jsonl" --nonce "N-RC5A" --artifact "$P1_FIX/artifacts/rc5a-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC5A=$(p1_row_get "p1-rc5a" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "2" ] && [ "$VD_RC5A" = "PASS" ]; } \
+  && ok "#2169 S3-AC5 arm 1 (AC-8c(a), sanctioned post-flip E1 fallback outside R-C's reach): an E1 row closed AFTER routed_since is a deliberate D3 fallback, never treated as stale -- R-C refused (rc=2), verdict PASS survives" \
+  || bad "#2169 S3-AC5 arm 1 FAILED (rc=$PARC verdict=$VD_RC5A)"
+
+# Arm 2 -- a demotion cannot manufacture a flip: an intervening bare --run-kind demotion append (clause-1
+# UNGUARDED, since it carries neither skip_reason/inherited_from/verdict) must NOT loosen R-C's own
+# preconditions -- the SAME post-flip-fallback row (arm 1's shape) still refuses the identical E2
+# supersession attempt AFTER the demotion append lands.
+mk_p1_tagged "p1-rc5b" "ag-rc5b" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc5b-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc5b" "t1" "plan-review" --agent "ag-rc5b" \
+  --artifact "$P1_FIX/artifacts/rc5b-e1.md" --verdict PASS --closed-at "2026-08-21T00:00:00.000Z"
+RK_RC5B_BEFORE=$(p1_row_get "p1-rc5b" "t1" "plan-review" "run_kind")
+p1_append "$P1_FIX/routes-rc.json" "p1-rc5b" "t1" "plan-review" --run-kind inferred
+RK_RC5B_MID=$(p1_row_get "p1-rc5b" "t1" "plan-review" "run_kind")
+mk_p1_or_transcript "$P1_FIX/transcripts/rc5b.jsonl" "t1" "N-RC5B" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC5B\n' > "$P1_FIX/artifacts/rc5b-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc5b" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc5b.jsonl" --nonce "N-RC5B" --artifact "$P1_FIX/artifacts/rc5b-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC5B=$(p1_row_get "p1-rc5b" "t1" "plan-review" "verdict")
+{ [ -z "$RK_RC5B_BEFORE" ] && [ "$RK_RC5B_MID" = "inferred" ] && [ "$PARC" = "2" ] && [ "$VD_RC5B" = "PASS" ]; } \
+  && ok "#2169 S3-AC5 arm 2 (AC-8c(b), a demotion cannot manufacture a flip): a bare run_kind demotion append (''->inferred, unguarded by clause 1) lands cleanly but does NOT loosen R-C's own SSOT+closed-time preconditions -- the same post-flip-fallback row STILL refuses the E2 supersession (rc=2), verdict PASS survives" \
+  || bad "#2169 S3-AC5 arm 2 FAILED (rk_before='$RK_RC5B_BEFORE' rk_mid=$RK_RC5B_MID rc=$PARC verdict=$VD_RC5B)"
+
+# Arm 3 -- a pruned-record flip is audible: R-C's allow-condition reads ONLY the ledger row's own closedAt
+# field (never re-verifies the superseded E1 row's OWN transcript) -- so a flip is still ALLOWED, and still
+# emits ROUTE-DRIFT, even after the old E1 row's transcript has been pruned from disk.
+mk_p1_tagged "p1-rc5c" "ag-rc5c" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc5c-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc5c" "t1" "plan-review" --agent "ag-rc5c" \
+  --artifact "$P1_FIX/artifacts/rc5c-e1.md" --verdict PASS --closed-at "2026-08-01T00:00:00.000Z"
+# Prune the E1 row's own transcript (simulates the Agent-subagent transcript having been cleaned up).
+mv "$P1_FIX/projects/proj/p1-rc5c/subagents/agent-ag-rc5c.jsonl" "$TMP/_quarantine-rc5c-pruned.jsonl"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc5c.jsonl" "t1" "N-RC5C" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC5C\n' > "$P1_FIX/artifacts/rc5c-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc5c" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc5c.jsonl" --nonce "N-RC5C" --artifact "$P1_FIX/artifacts/rc5c-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC5C=$(p1_row_get "p1-rc5c" "t1" "plan-review" "verdict")
+{ [ "$PARC" = "0" ] && [ "$VD_RC5C" = "FAIL" ] && echo "$PAOUT" | grep -q "^ROUTE-DRIFT:"; } \
+  && ok "#2169 S3-AC5 arm 3 (AC-8c(c), a pruned-record flip is audible): the superseded E1 row's own transcript is GONE from disk, yet R-C still allows the sanctioned flip (rc=0, verdict PASS->FAIL) purely from the ledger row's own closedAt field, and STILL emits ROUTE-DRIFT -- the flip is audible even when the old evidence is unreachable" \
+  || bad "#2169 S3-AC5 arm 3 FAILED (rc=$PARC verdict=$VD_RC5C out=$PAOUT)"
+
+# ---- S3-AC6 (DELTA, AC-9 extended): the demotion-then-reconcile-spawns triple survives a genuine R-C flip.
+#      After a real R-C supersession (carrying --run-kind bound, mirroring the dispatch helper), a bare
+#      run_kind demotion append is a write-once no-op AND reconcile-spawns still cannot erase the row's E2
+#      evidence -- mirrors AC-9 arm2(i)/(ii) exactly, applied post-R-C. -----------------------------------
+mk_p1_tagged "p1-rc6" "ag-rc6" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc6-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc6" "t1" "plan-review" --agent "ag-rc6" \
+  --artifact "$P1_FIX/artifacts/rc6-e1.md" --verdict PASS --closed-at "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc6.jsonl" "t1" "N-RC6" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC6\n' > "$P1_FIX/artifacts/rc6-e2.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc6" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc6.jsonl" --nonce "N-RC6" --artifact "$P1_FIX/artifacts/rc6-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z" --run-kind bound
+RK_RC6_POSTFLIP=$(p1_row_get "p1-rc6" "t1" "plan-review" "run_kind")
+# demotion (write-once clamp: bound(2) vs inferred(1) -> no-op on the stored field).
+p1_append "$P1_FIX/routes-rc.json" "p1-rc6" "t1" "plan-review" --run-kind inferred
+RK_RC6_DEMOTED=$(p1_row_get "p1-rc6" "t1" "plan-review" "run_kind")
+D_RC6_MID=$(p1_row_get "p1-rc6" "t1" "plan-review" "dispatch"); N_RC6_MID=$(p1_row_get "p1-rc6" "t1" "plan-review" "nonce")
+# reconcile-spawns (E2-containment: computeVerifiedKindForProtection === 'E2' -> row skipped untouched).
+mk_p1_tagged_model "p1-rc6" "sib-rc6" "t1" "plan-review" "claude-opus-5"
+p1_reconcile "$P1_FIX/routes-rc.json" "p1-rc6"
+D_RC6_AFTER=$(p1_row_get "p1-rc6" "t1" "plan-review" "dispatch"); N_RC6_AFTER=$(p1_row_get "p1-rc6" "t1" "plan-review" "nonce")
+T_RC6_AFTER=$(p1_row_get "p1-rc6" "t1" "plan-review" "transcript_path"); RK_RC6_AFTER=$(p1_row_get "p1-rc6" "t1" "plan-review" "run_kind")
+{ [ "$RK_RC6_POSTFLIP" = "bound" ] && [ "$RK_RC6_DEMOTED" = "bound" ] \
+  && [ "$D_RC6_MID" = "subprocess-openrouter" ] && [ "$N_RC6_MID" = "N-RC6" ] \
+  && [ "$D_RC6_AFTER" = "subprocess-openrouter" ] && [ "$N_RC6_AFTER" = "N-RC6" ] \
+  && [ -n "$T_RC6_AFTER" ] && [ "$RK_RC6_AFTER" = "bound" ]; } \
+  && ok "#2169 S3-AC6 (AC-9 extended, demotion-then-reconcile-spawns triple survives a genuine R-C flip): post-flip run_kind stays 'bound' through a bare inferred demotion (write-once clamp, no-op) AND reconcile-spawns cannot erase the row's dispatch/transcript_path/nonce/run_kind (E2 containment) -- all four fields intact after both" \
+  || bad "#2169 S3-AC6 FAILED (postflip=$RK_RC6_POSTFLIP demoted=$RK_RC6_DEMOTED mid=$D_RC6_MID/$N_RC6_MID after=$D_RC6_AFTER/$N_RC6_AFTER/$T_RC6_AFTER/$RK_RC6_AFTER)"
+
+# ---- S3-AC7 (DELTA, AC-23e): a genuinely-legacy row (no stored run_kind field at all -- pre-#2075 shape)
+#      whose closedAt post-dates routed_since is refused, exactly like S3-AC3 arm 3/S3-AC5 arm 1 -- proving
+#      R-C's close-time check is independent of run_kind stamping (a legacy row has no protection FROM the
+#      run_kind field, yet R-C's own SSOT-gated close-time test still holds it). ------------------------
+mk_p1_tagged "p1-rc7" "ag-rc7" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc7-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc7" "t1" "plan-review" --agent "ag-rc7" \
+  --artifact "$P1_FIX/artifacts/rc7-e1.md" --verdict PASS --closed-at "2026-08-25T00:00:00.000Z"
+RK_RC7_BEFORE=$(p1_row_get "p1-rc7" "t1" "plan-review" "run_kind")
+mk_p1_or_transcript "$P1_FIX/transcripts/rc7.jsonl" "t1" "N-RC7" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC7\n' > "$P1_FIX/artifacts/rc7-e2.md"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc7" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc7.jsonl" --nonce "N-RC7" --artifact "$P1_FIX/artifacts/rc7-e2.md" \
+  --verdict FAIL --closed-at "2026-08-26T00:00:00.000Z"
+VD_RC7=$(p1_row_get "p1-rc7" "t1" "plan-review" "verdict")
+{ [ -z "$RK_RC7_BEFORE" ] && [ "$PARC" = "2" ] && [ "$VD_RC7" = "PASS" ] && echo "$PAOUT" | grep -qi "does not strictly pre-date"; } \
+  && ok "#2169 S3-AC7 (AC-23e, genuinely-legacy row + post-routed_since closedAt refused): a legacy (no run_kind) E1 row closed AFTER routed_since is refused by R-C's SAME close-time predicate (rc=2), independent of run_kind stamping" \
+  || bad "#2169 S3-AC7 FAILED (rk_before='$RK_RC7_BEFORE' rc=$PARC verdict=$VD_RC7 out=$PAOUT)"
+
+# ---- S3-AC8 (DELTA, AC-27): a CC_ROUTES_JSON override exercised on the R-C path emits an audit line
+#      (asserted present in the redirected RULE12_LOG), never silent -- checked against S3-AC2's own
+#      already-exercised R-C evaluation (every p1_* call above already ran under CC_ROUTES_JSON). --------
+S3AC8_COUNT=$(/usr/bin/grep -c '"hook":"3role-ledger-route-change".*"var":"ROUTES-OVERRIDE"' "$RULE12_LOG" 2>/dev/null); S3AC8_COUNT="${S3AC8_COUNT:-0}"
+{ [ "$S3AC8_COUNT" -ge 1 ]; } \
+  && ok "#2169 S3-AC8 (AC-27, CC_ROUTES_JSON override audited never silent): $S3AC8_COUNT ROUTES-OVERRIDE audit line(s) for hook=3role-ledger-route-change found in RULE12_LOG (before=0 -- the hook did not exist pre-slice-3)" \
+  || bad "#2169 S3-AC8 FAILED (count=$S3AC8_COUNT log=$RULE12_LOG)"
+
+# ---- S3-AC9 (DELTA, AC-31a): ROUTES-STALE note emitted when the committed routed_since pin post-dates an
+#      ALREADY-OBSERVED subprocess (E2) dispatch on the SAME row -- the pin is stale relative to reality. --
+mk_p1_or_transcript "$P1_FIX/transcripts/rc9-1.jsonl" "t1" "N-RC9-1" "moonshotai/kimi-k3"
+printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-RC9-1\n' > "$P1_FIX/artifacts/rc9-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc9" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc9-1.jsonl" --nonce "N-RC9-1" --artifact "$P1_FIX/artifacts/rc9-e1.md" \
+  --verdict PASS --closed-at "2026-08-10T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc9-2.jsonl" "t1" "N-RC9-2" "moonshotai/kimi-k3"
+p1_append_capture "$P1_FIX/routes-rc.json" "p1-rc9" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc9-2.jsonl" --nonce "N-RC9-2"
+{ [ "$PARC" = "0" ] && echo "$PAOUT" | grep -q "^ROUTES-STALE:"; } \
+  && ok "#2169 S3-AC9 (AC-31a, ROUTES-STALE): a genuine E2 row closed 2026-08-10, BEFORE the seat's committed routed_since (2026-08-20), triggers a ROUTES-STALE advisory on the next subprocess-shaped write against that row (before: no such note existed)" \
+  || bad "#2169 S3-AC9 FAILED (rc=$PARC out=$PAOUT)"
+
+# ---- S3-AC10 (DELTA, AC-32): protection survives a route flip BACK. After a genuine R-C supersession
+#      (SSOT declared dispatch), the seat's dispatch is REMOVED from the SSOT entirely (routes-rc-none.json)
+#      -- a bare verdict-less skip append against the now-terminal E2 row is STILL refused (clause 1
+#      protection is unaffected by the SSOT flipping back). -----------------------------------------------
+mk_p1_tagged "p1-rc10" "ag-rc10" "t1" "plan-review"
+printf '## Review\nDecision: PASS\n' > "$P1_FIX/artifacts/rc10-e1.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc10" "t1" "plan-review" --agent "ag-rc10" \
+  --artifact "$P1_FIX/artifacts/rc10-e1.md" --verdict PASS --closed-at "2026-08-01T00:00:00.000Z"
+mk_p1_or_transcript "$P1_FIX/transcripts/rc10.jsonl" "t1" "N-RC10" "moonshotai/kimi-k3"
+printf '## Review\nDecision: FAIL\nDISPATCH-NONCE:N-RC10\n' > "$P1_FIX/artifacts/rc10-e2.md"
+p1_append "$P1_FIX/routes-rc.json" "p1-rc10" "t1" "plan-review" --dispatch subprocess-openrouter \
+  --transcript "$P1_FIX/transcripts/rc10.jsonl" --nonce "N-RC10" --artifact "$P1_FIX/artifacts/rc10-e2.md" \
+  --verdict FAIL --closed-at "2026-08-24T00:00:00.000Z"
+VD_RC10_POSTFLIP=$(p1_row_get "p1-rc10" "t1" "plan-review" "verdict")
+# route flip BACK: dispatch removed from the SSOT entirely.
+p1_append_capture "$P1_FIX/routes-rc-none.json" "p1-rc10" "t1" "plan-review" --skip-reason "trying to erase after route flip-back"
+VD_RC10_AFTER=$(p1_row_get "p1-rc10" "t1" "plan-review" "verdict")
+{ [ "$VD_RC10_POSTFLIP" = "FAIL" ] && [ "$PARC" = "2" ] && [ "$VD_RC10_AFTER" = "FAIL" ]; } \
+  && ok "#2169 S3-AC10 (AC-32, protection survives a route flip BACK): after a genuine R-C supersession (verdict FAIL, dispatch=subprocess-openrouter), the seat's dispatch is REMOVED from the SSOT -- a bare skip append against the now-terminal E2 row is STILL refused (rc=2, clause 1 unweakened), verdict FAIL survives" \
+  || bad "#2169 S3-AC10 FAILED (postflip=$VD_RC10_POSTFLIP rc=$PARC after=$VD_RC10_AFTER)"
+
+# ---- S3-AC11 (PIN, AC-33 re-scoped): dedicated fixture pinning the settled split -- CHECK_LANE_AFFIRMATIVE
+#      counts a PASS-WITH-FIXES close as affirmative (Lane B stays silent, no NEGATIVE-VERDICT) AND
+#      inherit/admission gating (evaluatePlanReviewGate's strict AFFIRMATIVE_VERDICTS) still refuses it. No
+#      behavior change -- fixture-existence delta 0 -> >=1 (measured: 0 'AC-33' tokens in this file pre-
+#      slice-3). --------------------------------------------------------------------------------------
+mk_p1_tagged "p1-ac33" "ag-ac33" "t1" "plan-review"
+printf '## Review\nDecision: PASS-WITH-FIXES\n' > "$P1_FIX/artifacts/ac33.md"
+p1_append "$P1_FIX/routes.json" "p1-ac33" "t1" "plan-review" --agent "ag-ac33" \
+  --artifact "$P1_FIX/artifacts/ac33.md" --verdict PASS-WITH-FIXES --closed-at "2026-08-25T00:00:00.000Z"
+# check-lane arm: a same-role planner/executor/execution-review completion so `check` reaches its full
+# read-side lanes; the assertion is scoped to the ABSENCE of a NEGATIVE-VERDICT problem for plan-review.
+printf '## ELI5\nfixture\n### Binary AC\n- x\n' > "$P1_FIX/artifacts/ac33-plan.md"
+mk_p1_tagged "p1-ac33" "ac33-P" "t1" "planner"
+p1_append "$P1_FIX/routes.json" "p1-ac33" "t1" "planner" --agent "ac33-P" --artifact "$P1_FIX/artifacts/ac33-plan.md"
+mk_p1_tagged "p1-ac33" "ac33-E" "t1" "executor"
+p1_append "$P1_FIX/routes.json" "p1-ac33" "t1" "executor" --agent "ac33-E" --artifact "PR #ac33"
+printf 'Decision: PASS\n' > "$P1_FIX/artifacts/ac33-er.md"
+p1_append "$P1_FIX/routes.json" "p1-ac33" "t1" "execution-review" --oracle "$P1_FIX/artifacts/ac33-er.md"
+p1_check "$P1_FIX/routes.json" "p1-ac33" "t1"
+# admission-gate arm: gate-plan-review reads AFFIRMATIVE_VERDICTS strictly -- PASS-WITH-FIXES is NOT a
+# member -> refused (negative-verdict class), regardless of the check-lane's own PASS-WITH-FIXES tolerance.
+p1_gate "$P1_FIX/routes.json" "p1-ac33" "t1"
+{ ! echo "$PCOUT" | grep -q "NEGATIVE-VERDICT.*plan-review" \
+  && [ "$PGRC" = "2" ] && echo "$PGOUT" | grep -q "negative-verdict"; } \
+  && ok "#2169 S3-AC11 (PIN, AC-33 re-scoped): the settled split holds -- check-lane (Lane B) counts PASS-WITH-FIXES as affirmative (NO NEGATIVE-VERDICT problem for plan-review) AND gate-plan-review's strict AFFIRMATIVE_VERDICTS still refuses it (rc=$PGRC, class=negative-verdict) -- no behavior change, fixture pins the master-shipped split" \
+  || bad "#2169 S3-AC11 FAILED (check_out=$PCOUT gate_rc=$PGRC gate_out=$PGOUT)"
+
+# All S3 fixtures above ran; unset the redirected audit log so it never leaks into any later section.
+unset RULE12_LOG
+
+
+# =====================================================================================================
+# #2169 slice 4 — AC-28 `pending` stamp, ledger side (design decision 1, .ai-workspace/plans/
+# 2026-08-25-2075-phase3-recut.md). The ledger half of the two-stamp write protocol: (i) a pre-launch
+# `pending` stamp — identity/liveness only, never terminal evidence, deliberately erasable by a bare
+# skip (the stamp is an ASSERTION; the EVIDENCE is what is protected, not the reverse); (ii) an atomic
+# post-exit write carrying closedAt clears it in the same command. Dedicated session (sess-2169s4) so
+# agent ids/task ids never collide with any earlier section's fixtures.
+# =====================================================================================================
+S4SID="sess-2169s4"
+
+# ---- #2169 S4-AC2 (AC-28a): a `pending: true` row is NEVER terminal — check refuses to count it as a
+#      completed role, even when the OTHER three required roles are genuinely complete (isolates the
+#      pending guard from an unrelated "missing role" problem).
+S4T_AC2="2169s4-ac2"
+mk_sub "$S4SID" "${S4T_AC2}-p1"; mk_sub "$S4SID" "${S4T_AC2}-pr1"
+node "$LED" append --session "$S4SID" --task "$S4T_AC2" --role planner --agent "${S4T_AC2}-p1" --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$S4SID" --task "$S4T_AC2" --role plan-review --agent "${S4T_AC2}-pr1" --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+node "$LED" append --session "$S4SID" --task "$S4T_AC2" --role execution-review --oracle "$TMP/oracle.txt" >/dev/null
+node "$LED" append --session "$S4SID" --task "$S4T_AC2" --role executor --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id "run-s4ac2" --pending >/dev/null
+S4T_AC2_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC2.jsonl"
+S4T_AC2_ROW=$(command grep '"role":"executor"' "$S4T_AC2_LEDFILE")
+OUT=$(node "$LED" check --session "$S4SID" --task "$S4T_AC2" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | command grep -qi "carries a pending:true stamp" && echo "$S4T_AC2_ROW" | command grep -q '"pending":true'; } \
+  && ok "#2169 S4-AC2 (AC-28a): a pending:true executor row (the OTHER three required roles genuinely complete) is still NEVER counted a completed role by check — BLOCK (rc=2), named pending message, stored row carries pending:true" \
+  || bad "#2169 S4-AC2 FAILED (rc=$RC out=$OUT row=$S4T_AC2_ROW)"
+
+# ---- #2169 S4-AC3 (AC-28b): an append carrying closedAt clears pending in the SAME write ------------------
+S4T_AC3="2169s4-ac3"
+node "$LED" append --session "$S4SID" --task "$S4T_AC3" --role executor --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id "run-s4ac3" --pending >/dev/null
+S4T_AC3_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC3.jsonl"
+S4T_AC3_ROW_BEFORE=$(command grep '"role":"executor"' "$S4T_AC3_LEDFILE")
+node "$LED" append --session "$S4SID" --task "$S4T_AC3" --role executor --dispatch subprocess-openrouter --transcript "$TMP/rev.md" --nonce "n-s4ac3" --verdict PASS --artifact "PR #s4ac3" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+S4T_AC3_ROW_AFTER=$(command grep '"role":"executor"' "$S4T_AC3_LEDFILE")
+{ echo "$S4T_AC3_ROW_BEFORE" | command grep -q '"pending":true' \
+  && ! echo "$S4T_AC3_ROW_AFTER" | command grep -q '"pending"' \
+  && echo "$S4T_AC3_ROW_AFTER" | command grep -q '"closedAt":"2026-01-01T00:00:00Z"'; } \
+  && ok "#2169 S4-AC3 (AC-28b): an append carrying closedAt (the dispatch helper's atomic post-exit close) clears the pending stamp in the SAME write — before: pending:true, after: closedAt present, pending ABSENT" \
+  || bad "#2169 S4-AC3 FAILED (before=$S4T_AC3_ROW_BEFORE after=$S4T_AC3_ROW_AFTER)"
+
+# ---- #2169 S4-AC4 (AC-28c): a bare skip erases the pending stamp (stamp = erasable assertion) WHILE
+#      evidence fields on a genuinely-completed row survive the same kind of skip attempt (the guard
+#      protects the EVIDENCE, never the stamp) — BOTH polarities of design decision 1's own sentence.
+# arm 1 — pending-ONLY row (no terminal evidence): a bare skip succeeds and erases pending.
+S4T_AC4A="2169s4-ac4a"
+node "$LED" append --session "$S4SID" --task "$S4T_AC4A" --role executor --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id "run-s4ac4a" --pending >/dev/null
+S4T_AC4A_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC4A.jsonl"
+OUT=$(node "$LED" append --session "$S4SID" --task "$S4T_AC4A" --role executor --skip-reason "operator reclaimed the in-flight dispatch, process was killed" 2>&1); RC=$?
+S4T_AC4A_ROW=$(command grep '"role":"executor"' "$S4T_AC4A_LEDFILE")
+{ [ "$RC" = "0" ] && ! echo "$S4T_AC4A_ROW" | command grep -q '"pending"' && echo "$S4T_AC4A_ROW" | command grep -q '"skip_reason"'; } \
+  && ok "#2169 S4-AC4 arm 1 (AC-28c, the stamp is erasable): a bare skip over a pending-ONLY row (no terminal evidence) succeeds (rc=0) and erases the pending stamp — pending absent, skip_reason recorded" \
+  || bad "#2169 S4-AC4 arm 1 FAILED (rc=$RC row=$S4T_AC4A_ROW)"
+# arm 2 — a row carrying REAL terminal evidence (verdict+closedAt): a skip attempt is REFUSED, the row is
+# untouched byte-for-byte (the pre-existing terminal-evidence guard, unweakened by pending's addition).
+S4T_AC4B="2169s4-ac4b"
+node "$LED" append --session "$S4SID" --task "$S4T_AC4B" --role executor --dispatch subprocess-openrouter --transcript "$TMP/rev.md" --nonce "n-s4ac4b" --verdict PASS --artifact "PR #s4ac4b" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+S4T_AC4B_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC4B.jsonl"
+S4T_AC4B_ROW_BEFORE=$(command grep '"role":"executor"' "$S4T_AC4B_LEDFILE")
+OUT=$(node "$LED" append --session "$S4SID" --task "$S4T_AC4B" --role executor --skip-reason "trying to reclaim an already-completed row" 2>&1); RC=$?
+S4T_AC4B_ROW_AFTER=$(command grep '"role":"executor"' "$S4T_AC4B_LEDFILE")
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "terminal-evidence guard" && [ "$S4T_AC4B_ROW_BEFORE" = "$S4T_AC4B_ROW_AFTER" ]; } \
+  && ok "#2169 S4-AC4 arm 2 (AC-28c, evidence survives): a skip attempt against a row carrying REAL terminal evidence (verdict+closedAt) is REFUSED (rc!=0, terminal-evidence guard) — the row is byte-identical before/after; the EVIDENCE is what is protected, never the pending stamp" \
+  || bad "#2169 S4-AC4 arm 2 FAILED (rc=$RC out=$OUT before=$S4T_AC4B_ROW_BEFORE after=$S4T_AC4B_ROW_AFTER)"
+
+# ---- #2169 S4-AC5 (AC-28d + #1590 carried pitfall): skip-erasure of skip_reason fires ONLY on a genuine
+#      evidence bundle (dispatch+transcript+nonce+verdict+artifact, ALL present on ONE write); a BARE
+#      --dispatch marker (the pre-launch pending stamp shape) must NOT masquerade as that bundle.
+# arm 1 — a BARE --dispatch marker over an operator's skip note: the note stays INTACT.
+S4T_AC5A="2169s4-ac5a"
+node "$LED" append --session "$S4SID" --task "$S4T_AC5A" --role executor --skip-reason "operator note: awaiting a fresh dispatch slot" >/dev/null
+S4T_AC5A_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC5A.jsonl"
+node "$LED" append --session "$S4SID" --task "$S4T_AC5A" --role executor --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id "run-s4ac5a" --pending >/dev/null
+S4T_AC5A_ROW=$(command grep '"role":"executor"' "$S4T_AC5A_LEDFILE")
+{ echo "$S4T_AC5A_ROW" | command grep -q '"skip_reason":"operator note: awaiting a fresh dispatch slot"'; } \
+  && ok "#2169 S4-AC5 arm 1 (AC-28d, a bare marker does NOT masquerade): a BARE --dispatch pre-launch marker (no transcript/nonce/verdict/artifact) appended over an operator's skip note leaves the note INTACT (the #1590 assertion-erases-assertion trap)" \
+  || bad "#2169 S4-AC5 arm 1 FAILED (row=$S4T_AC5A_ROW)"
+# arm 2 — the sanctioned FULL evidence bundle over the same shape of skip note: the note is CLEARED.
+S4T_AC5B="2169s4-ac5b"
+node "$LED" append --session "$S4SID" --task "$S4T_AC5B" --role executor --skip-reason "operator note: awaiting a fresh dispatch slot" >/dev/null
+S4T_AC5B_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S4SID/$S4T_AC5B.jsonl"
+node "$LED" append --session "$S4SID" --task "$S4T_AC5B" --role executor --dispatch subprocess-openrouter --transcript "$TMP/rev.md" --nonce "n-s4ac5b" --verdict PASS --artifact "PR #s4ac5b" --closed-at "2026-01-01T00:00:00Z" >/dev/null
+S4T_AC5B_ROW=$(command grep '"role":"executor"' "$S4T_AC5B_LEDFILE")
+{ ! echo "$S4T_AC5B_ROW" | command grep -q '"skip_reason"' && echo "$S4T_AC5B_ROW" | command grep -q '"verdict":"PASS"'; } \
+  && ok "#2169 S4-AC5 arm 2 (AC-28d, the sanctioned full-evidence supersession still works): a GENUINE evidence bundle (dispatch+transcript+nonce+verdict+artifact, all present on ONE write) over an operator's skip note CLEARS it — the note is gone, the new verdict PASS is recorded" \
+  || bad "#2169 S4-AC5 arm 2 FAILED (row=$S4T_AC5B_ROW)"
+
+
 # `check` gains two additional, strictly-additive lanes over the role's FULL row history (never just the
 # byRole-selected last-parse-wins row): Lane B walks a review role's verdict-bearing rows and refuses to let
 # a bare/unattributed later row silently bury a recorded NEGATIVE verdict (NEGATIVE-VERDICT: problem); Lane A
@@ -3195,9 +3714,15 @@ OUT=$(cd "$AC3REPO" && node "$LED" check --session "$MH_SID" --task "$T_AC3" --m
   || bad "2088-AC3 power control failed (rc=$RC out=$OUT)"
 rm -rf "$AC3REPO"
 
-# ---- AC-7: byte-stability for non-opt-in callers (the AC-3 fixture, WITHOUT --merge-head) -----------------
-# Uses the SAME T_AC3/MH_SID ledger (its cited artifact resolves nowhere on disk regardless of cwd) --
-# cwd is irrelevant here since no --merge-head is passed, so the new ref arm is never even reachable.
+# ---- AC-7: byte-stability, MEASURED not assumed (#2462 AC-5 r1/B4) -----------------------------------------
+# Uses the SAME T_AC3/MH_SID ledger, WITHOUT --merge-head. #2462 flipped the ref arm DEFAULT-ON, so
+# candidate 2 (refs/remotes/origin/<task>-* + origin/master, in the REAL ai-brain repo hosting this helper
+# file -- aiBrainToplevel()) IS now reachable here even with no --merge-head passed; this fixture's cited
+# path (.ai-workspace/reviews/2088-smoke-ac3-execreview.md) simply does not resolve at either candidate in
+# the real repo (no refs/remotes/origin/2088ac3-* ref exists, and the path is absent from origin/master --
+# reverified live), so this specific fixture stays byte-identical to the pre-#2088 baseline. This is a
+# measured, not assumed, outcome (a DIFFERENT fixture citing a path that DOES exist on origin/master would
+# now diverge -- see the #2462 AC-1 drift-proof arm below, which pins exactly that divergence).
 OLD_LED_2088="$DIR/_fixtures/3role-ledger-pre2088-snapshot.mjs"
 OUT_NEW=$(node "$LED" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_NEW=$?
 OUT_OLD=$(node "$OLD_LED_2088" check --session "$MH_SID" --task "$T_AC3" 2>&1); RC_OLD=$?
@@ -3519,6 +4044,29 @@ GATE9D=$(node "$LED" gate-plan-review --session "$S9" --task "$T9D" 2>&1); GRC9D
   && ok "#2309 AC-9⁗(d′): gate ALLOWS after the sanctioned punch-out composes (the gate leg reads AFTER compose)" \
   || bad "#2309 AC-9⁗(d′) gate FAILED (rc=$GRC9D out=$GATE9D)"
 
+# ---- arm (d″, #2467): same as (d′), but the diary's own command is spread across a backslash line
+# continuation -- the exact shape a self-appending agent's transcript carries when the Bash tool_use
+# input wraps a long invocation onto multiple lines with trailing `\`. Before #2467 this segment-split
+# on bare \n and could never see all four required tokens in one segment, so the honest self-append
+# looked identical to a can't-tell case. ------------------------------------------------------------
+T9DC="zzc3dcont"
+mk_tagged "$S9" "ac9dc-p1" "$T9DC" "plan-review"
+node -e '
+  const fs = require("fs");
+  const [ , file, task, role ] = process.argv;
+  const cmd = "node hooks/3role-ledger.mjs append \\\n  --task " + task + " \\\n  --role " + role +
+    " \\\n  --verdict PASS --closed-at 2026-01-01T00:00:00.000Z";
+  const rec = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+    { type: "tool_use", name: "Bash", input: { command: cmd } }
+  ] } });
+  fs.appendFileSync(file, rec + "\n");
+' "$THREE_ROLE_PROJECTS_ROOT/proj/$S9/subagents/agent-ac9dc-p1.jsonl" "$T9DC" "plan-review"
+node "$LED" append --session "$S9" --task "$T9DC" --role plan-review --agent "ac9dc-p1" >/dev/null
+node "$LED" append --session "$S9" --task "$T9DC" --role plan-review --artifact "$TMP/rev.md" --verdict PASS >"$TMP/2467-ac9dc.out" 2>&1; RC9DC=$?
+{ [ "$RC9DC" = "0" ]; } \
+  && ok "#2467 AC-9⁗(d″): backslash-continued one-command self-append (diary proves it across \\\\\\n) -> rc=0" \
+  || bad "#2467 AC-9⁗(d″) append FAILED (rc=$RC9DC out=$(cat "$TMP/2467-ac9dc.out"))"
+
 # ---- arm (i): honest TWO-command twin (self-append --artifact, then self-append --verdict) ------------
 T9I="zzc3i"
 mk_tagged "$S9" "ac9i-p1" "$T9I" "plan-review"
@@ -3654,6 +4202,12 @@ n2437w3=0
 # w3row2437 <tag> <verdict-line> : commit ONE corpus row's verdict-line as the SOLE content of a
 # plan-review review file at a fresh throwaway repo's HEAD, rm the working copy (ref-arm-only — no disk
 # fallback), then assert `check --merge-head` against the row's own accept/reject tag.
+# #2480 O1 note: the execution-review row is ALSO committed at this same merge head (a plain, non-
+# shape-tested "Decision: PASS") rather than left disk-only — O1 scopes the disk-hit-no-longer-satisfies
+# rule to the execution-review row in merge-head context, so a disk-only $TMP/er.md (pre-#2480 shape)
+# would now BLOCK this fixture for a reason unrelated to the W3 shape-tolerance property under test here.
+# The plan-review row (the actual target of this section) and both accept/reject expectations are
+# unchanged — only the execution-review row's evidence source moved from disk to the committed tree.
 w3row2437() {
   local tag="$1" vline="$2"
   n2437w3=$((n2437w3+1)); local t="w2437-$n2437w3"
@@ -3661,15 +4215,17 @@ w3row2437() {
   ( cd "$REPO" && git init -q && git config user.email t@t.co && git config user.name t )
   mkdir -p "$REPO/.ai-workspace/reviews"
   printf '## Review\n%s\n' "$vline" > "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
-  ( cd "$REPO" && git add ".ai-workspace/reviews/2437-w3-$n2437w3.md" && git commit -q -m "fixture: #2437 w3 vector $n2437w3" )
-  rm -f "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
+  printf '## Review\nDecision: PASS\n' > "$REPO/.ai-workspace/reviews/2437-w3-er-$n2437w3.md"
+  ( cd "$REPO" && git add ".ai-workspace/reviews/2437-w3-$n2437w3.md" ".ai-workspace/reviews/2437-w3-er-$n2437w3.md" \
+    && git commit -q -m "fixture: #2437 w3 vector $n2437w3" )
+  rm -f "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md" "$REPO/.ai-workspace/reviews/2437-w3-er-$n2437w3.md"
   local SHA; SHA=$(git -C "$REPO" rev-parse HEAD)
   mk_sub "$MH_SID_2437" "w2437p$n2437w3"; mk_sub "$MH_SID_2437" "w2437r$n2437w3"
   mk_sub "$MH_SID_2437" "w2437e$n2437w3"; mk_sub "$MH_SID_2437" "w2437v$n2437w3"
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role planner --agent "w2437p$n2437w3" --artifact "$TMP/plan.md" >/dev/null
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role plan-review --agent "w2437r$n2437w3" --artifact ".ai-workspace/reviews/2437-w3-$n2437w3.md" --verdict PASS >/dev/null
   node "$LED" append --session "$MH_SID_2437" --task "$t" --role executor --agent "w2437e$n2437w3" --artifact "branch feat/2437-w3-$n2437w3" >/dev/null
-  node "$LED" append --session "$MH_SID_2437" --task "$t" --role execution-review --agent "w2437v$n2437w3" --artifact "$TMP/er.md" >/dev/null
+  node "$LED" append --session "$MH_SID_2437" --task "$t" --role execution-review --agent "w2437v$n2437w3" --artifact ".ai-workspace/reviews/2437-w3-er-$n2437w3.md" >/dev/null
   local OUT RC
   OUT=$(cd "$REPO" && node "$LED" check --session "$MH_SID_2437" --task "$t" --merge-head "$SHA" 2>&1); RC=$?
   rm -rf "$REPO"
@@ -3692,5 +4248,435 @@ if [ -f "$CORPUS_2437_W3" ]; then
     esac
   done < "$CORPUS_2437_W3"
 fi
+
+# ledger-w3-accept-heading-decision-line AC-4 — NON-corpus hold-out probes. Deliberately NEVER added to
+# the TSV (an implementation overfitted to the enumerated corpus rows must still fail these): a bold-
+# decorated APPROVE with a DIFFERENT heading depth (###, not ##) must still accept, and a bold-decorated
+# REJECT (a negative verdict word never in CHECK_LANE_AFFIRMATIVE) must still reject even with the exact
+# same `**`-around-value decoration the new accept vectors use. Per-direction answer-key guard
+# (feedback_an_enumerated_control_is_an_answer_key_hold_one_out_per_direction).
+w3row2437 accept '### Decision: **APPROVE**'
+w3row2437 reject '## Decision: **REJECT**'
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2462 AC-1 — drift-proof arm: the #2088 ref-scoped resolution arm is now DEFAULT-ON (no --merge-head
+# required to activate it — see resolveArtifactAtRef()'s doc comment). Proves the exact `:537` shape the
+# instrumentation gate runs (check --session S --task T --reject-vacuous-oracle --enforce-role-models
+# --enforce-artifact-role-kind, all WITHOUT --merge-head) resolves an artifact that exists ONLY at a
+# refs/remotes/origin/<task>-* ref in the RUNNING HELPER's own home repo (candidate container 2 — P5a: this
+# candidate set never depended on --merge-head's value, so "starved of every other candidate" here means
+# absent from disk AND absent from any --merge-head, which this invocation doesn't even pass).
+#
+# CC_ROLES_ENV=/nonexistent (the established M3 NO-CONFIG pattern above) isolates the mechanism under test
+# (ref-arm resolution) from the orthogonal model-policy axis, which the M1-M7/R1-R7/V1-V6 sections above
+# already exercise exhaustively — one seed per mechanism (#2462 AC-5's own discipline).
+#
+# Uses plumbing-only git ops (hash-object/mktree/commit-tree/update-ref) against the REAL repo hosting $LED
+# (this is aiBrainToplevel()'s resolution target — it derives from the ledger file's OWN location, not cwd
+# or THREE_ROLE_LEDGER_DIR) so no working-tree/index/HEAD state is ever touched; the fixture ref is deleted
+# again immediately after use either way.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+HOME_REPO_2462="$(cd "$DIR" && git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$HOME_REPO_2462" ]; then
+  bad "#2462 AC-1 drift-proof arm: could not resolve the home repo toplevel from $DIR -- cannot run"
+else
+  T2462D="2462driftfixw$$"
+  REL2462D=".ai-workspace/reviews/2462-drift-fixture-$$.md"
+  REF2462D="refs/remotes/origin/${T2462D}-fixture"
+  SCRATCH_INDEX_2462="$TMP/2462-drift-scratch.index"
+  BLOB2462D=$(printf '## Review\nDecision: PASS\n' | git -C "$HOME_REPO_2462" hash-object -w --stdin)
+  # A nested repo-relative path needs the full tree built via an ISOLATED scratch index (GIT_INDEX_FILE,
+  # scoped per-command via inline env-var prefix -- never `export`, so it can never leak into any other git
+  # invocation in this script) -- plain `mktree` only accepts single-level entries, not a path with slashes.
+  rm -f "$SCRATCH_INDEX_2462"
+  GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" update-index --add --cacheinfo 100644 "$BLOB2462D" "$REL2462D"
+  TREE2462D=$(GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" write-tree)
+  COMMIT2462D=$(git -C "$HOME_REPO_2462" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$TREE2462D" -m "fixture: #2462 AC-1 drift-proof arm (isolated, no working-tree/index/HEAD mutation)")
+  git -C "$HOME_REPO_2462" update-ref "$REF2462D" "$COMMIT2462D"
+  rm -f "$SCRATCH_INDEX_2462"
+
+  SID2462D="sess-2462-drift"
+  mk_sub "$SID2462D" "d2462p1"; mk_sub "$SID2462D" "d2462r1"
+  mk_sub "$SID2462D" "d2462e1"; mk_sub "$SID2462D" "d2462v1"
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role planner --agent "d2462p1" --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role plan-review --agent "d2462r1" --artifact "$REL2462D" --verdict PASS >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role executor --agent "d2462e1" --artifact "branch feat/2462-drift" >/dev/null
+  node "$LED" append --session "$SID2462D" --task "$T2462D" --role execution-review --agent "d2462v1" --artifact "$TMP/er.md" >/dev/null
+
+  # accept arm: the fixture ref exists, NO --merge-head passed -> the default-on ref arm must still resolve
+  # it via candidate 2 -> the :537 shape exits 0.
+  OUT2462A=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$SID2462D" --task "$T2462D" --reject-vacuous-oracle --enforce-role-models --enforce-artifact-role-kind 2>&1); RC2462A=$?
+  { [ "$RC2462A" = "0" ]; } \
+    && ok "#2462 AC-1 drift-proof: artifact resolvable ONLY at refs/remotes/origin/<task>-* (no --merge-head passed) -> the :537 shape exits 0" \
+    || bad "#2462 AC-1 drift-proof accept FAILED (rc=$RC2462A out=$OUT2462A)"
+
+  # reject arm (also #2462 AC-1's own named FAIL seed): delete the ref -> no candidate resolves anywhere
+  # (not on disk, not at any bounded ref) -> the :537 shape exits 2, naming the role.
+  git -C "$HOME_REPO_2462" update-ref -d "$REF2462D" >/dev/null 2>&1
+  OUT2462B=$(CC_ROLES_ENV=/nonexistent node "$LED" check --session "$SID2462D" --task "$T2462D" --reject-vacuous-oracle --enforce-role-models --enforce-artifact-role-kind 2>&1); RC2462B=$?
+  { [ "$RC2462B" = "2" ] && echo "$OUT2462B" | command grep -qi "plan-review"; } \
+    && ok "#2462 AC-1 drift-proof: same fixture with the ref ABSENT -> the :537 shape exits 2 naming plan-review" \
+    || bad "#2462 AC-1 drift-proof reject FAILED (rc=$RC2462B out=$OUT2462B)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2497 — candidateTaskRefs() gains a task-EXACT candidate ref: refs/remotes/origin/<task> (a literal,
+# non-glob ref name), alongside the pre-existing refs/remotes/origin/<task>-* dash-glob. Before this fix,
+# a PR whose head branch is named EXACTLY the task id (no slug suffix -- the recurring, live PR #1488
+# shape) had NO task-bound candidate at all: the dash-glob demands a trailing `-` + >=1 char, so it
+# structurally excluded an exact-name branch. A branch-only execution-review artifact committed on such a
+# branch was therefore unresolvable and `check` blocked even with all four roles genuinely complete.
+#
+# AC-1's PRE-FIX RED half (does the CURRENT master helper genuinely block on this shape, and is that
+# genuinely caused by the dash-glob exclusion rather than some unrelated repo-resolution failure) is a
+# ONE-OFF, manually run verification pasted into this PR's body -- deliberately NOT baked as a permanent
+# smoke arm here, because a live `git merge-base HEAD origin/master` re-extraction would stop meaning
+# "pre-fix" the instant this branch merges (HEAD would then equal origin/master, silently degrading the
+# "pre-fix" helper into the CURRENT fixed one -- a vacuous RED with no warning). Same reasoning the #2174
+# section above documents for its own one-off delta proof ("see the PR body for that one-off red/green
+# proof; this section carries the permanent GREEN + adversarial-REJECT assertions"). This section is that
+# permanent half: the FIXED, CURRENT $LED resolving the new candidate (AC-1 GREEN) plus three adversarial
+# controls (AC-2 dead / AC-3 W3-preserved / AC-4 boundedness hold-out) that run every time this file runs,
+# against the real repo hosting $LED -- byte-identical plumbing-only technique to the #2462 AC-1
+# drift-proof arm above (hash-object/update-index/write-tree/commit-tree/update-ref, isolated scratch
+# index, no working-tree/index/HEAD mutation, fixture refs deleted on every exit path).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+HOME_REPO_2497="$(cd "$DIR" && git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$HOME_REPO_2497" ]; then
+  bad "#2497 AC-1..4 arm: could not resolve the home repo toplevel from $DIR -- cannot run"
+else
+  IDX2497="$TMP/2497-scratch.index"
+  # mint2497 <ref> <relpath> <content>: commits CONTENT at RELPATH as a blob reachable from REF, via an
+  # ISOLATED scratch index (GIT_INDEX_FILE, never touching $HOME_REPO_2497's real working-tree/index/HEAD)
+  # -- identical technique to the #2462 AC-1 drift-proof arm's inline version above.
+  mint2497() {
+    local ref="$1" relpath="$2" content="$3"
+    local blob; blob=$(printf '%s' "$content" | git -C "$HOME_REPO_2497" hash-object -w --stdin)
+    rm -f "$IDX2497"
+    GIT_INDEX_FILE="$IDX2497" git -C "$HOME_REPO_2497" update-index --add --cacheinfo 100644 "$blob" "$relpath"
+    local tree; tree=$(GIT_INDEX_FILE="$IDX2497" git -C "$HOME_REPO_2497" write-tree)
+    local commit; commit=$(git -C "$HOME_REPO_2497" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$tree" -m "fixture: #2497 arm")
+    git -C "$HOME_REPO_2497" update-ref "$ref" "$commit"
+    rm -f "$IDX2497"
+  }
+  # mk2497ledger <session> <task> <er-artifact>: writes a complete 4-role ledger (planner/plan-review/
+  # executor genuinely complete; only execution-review's artifact_path varies per arm).
+  mk2497ledger() {
+    local sid="$1" task="$2" erArtifact="$3"
+    mk_sub "$sid" "${task}p1"; mk_sub "$sid" "${task}r1"
+    mk_sub "$sid" "${task}e1"; mk_sub "$sid" "${task}v1"
+    node "$LED" append --session "$sid" --task "$task" --role planner --agent "${task}p1" --artifact "$TMP/plan.md" >/dev/null
+    node "$LED" append --session "$sid" --task "$task" --role plan-review --agent "${task}r1" --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+    node "$LED" append --session "$sid" --task "$task" --role executor --agent "${task}e1" --artifact "branch $task" >/dev/null
+    node "$LED" append --session "$sid" --task "$task" --role execution-review --agent "${task}v1" --artifact "$erArtifact" >/dev/null
+  }
+
+  # ---- AC-1 GREEN: branch-only execution-review artifact resolvable ONLY at the task-EXACT ref (no
+  # dash suffix -- the PR #1488 shape) -> the FIXED check must resolve it (exit 0).
+  T2497A="2497exactw$$"
+  REL2497A=".ai-workspace/reviews/2497-exact-fixture-$$.md"
+  REF2497A="refs/remotes/origin/${T2497A}"
+  mint2497 "$REF2497A" "$REL2497A" $'## Review\nDecision: PASS\n'
+  mk2497ledger "sess-2497a" "$T2497A" "$REL2497A"
+  OUT2497A=$(node "$LED" check --session "sess-2497a" --task "$T2497A" 2>&1); RC2497A=$?
+  { [ "$RC2497A" = "0" ]; } \
+    && ok "#2497 AC-1 GREEN: branch-only execution-review artifact resolvable ONLY at task-EXACT refs/remotes/origin/<T> (no dash suffix, the PR #1488 shape) -> check exits 0" \
+    || bad "#2497 AC-1 GREEN FAILED (rc=$RC2497A out=$OUT2497A)"
+  git -C "$HOME_REPO_2497" update-ref -d "$REF2497A" >/dev/null 2>&1
+
+  # ---- AC-2 dead control: identical ledger shape, blob minted NOWHERE (absent from disk, <T>, <T>-*,
+  # and origin/master) -> must still BLOCK (proves the fix did not fail-open).
+  T2497B="2497deadw$$"
+  REL2497B=".ai-workspace/reviews/2497-nowhere-fixture-$$.md"
+  mk2497ledger "sess-2497b" "$T2497B" "$REL2497B"
+  OUT2497B=$(node "$LED" check --session "sess-2497b" --task "$T2497B" 2>&1); RC2497B=$?
+  { [ "$RC2497B" = "2" ] && echo "$OUT2497B" | command grep -qi "execution-review" && echo "$OUT2497B" | command grep -qi "not found"; } \
+    && ok "#2497 AC-2 dead control: artifact present NOWHERE (disk, <T>, <T>-*, origin/master) -> check exits 2 naming execution-review + not found" \
+    || bad "#2497 AC-2 dead control FAILED (rc=$RC2497B out=$OUT2497B)"
+
+  # ---- AC-3 W3 preserved on the fallback: blob at the task-EXACT ref, but its ONLY decision line is a
+  # flush-left `Decision: NEEDS-WORK` (not in CHECK_LANE_AFFIRMATIVE) -> must still BLOCK naming the W3
+  # refusal (the new candidate reuses the SAME content bar as every existing candidate -- no weaker path).
+  T2497C="2497w3w$$"
+  REL2497C=".ai-workspace/reviews/2497-w3-fixture-$$.md"
+  REF2497C="refs/remotes/origin/${T2497C}"
+  mint2497 "$REF2497C" "$REL2497C" $'## Review\nDecision: NEEDS-WORK\n'
+  mk2497ledger "sess-2497c" "$T2497C" "$REL2497C"
+  OUT2497C=$(node "$LED" check --session "sess-2497c" --task "$T2497C" 2>&1); RC2497C=$?
+  { [ "$RC2497C" = "2" ] && echo "$OUT2497C" | command grep -qi "lacks a flush-left affirmative Decision"; } \
+    && ok "#2497 AC-3 W3 preserved: branch-only blob at the task-EXACT ref whose only decision line is 'Decision: NEEDS-WORK' -> check still exits 2 naming the W3 refusal" \
+    || bad "#2497 AC-3 W3 preserved FAILED (rc=$RC2497C out=$OUT2497C)"
+  git -C "$HOME_REPO_2497" update-ref -d "$REF2497C" >/dev/null 2>&1
+
+  # ---- AC-4 boundedness hold-out: a fully VALID `Decision: PASS` blob minted at refs/remotes/origin/<T>9
+  # (a SIBLING task's exact-named branch -- task token + one trailing non-dash char) must NEVER satisfy a
+  # check for task <T>. Pins "EXACT literal + dash-glob, never a bare `<task>*` glob": a naive over-widened
+  # implementation using a bare `<task>*` glob WOULD match this sibling and wrongly resolve; the literal
+  # exact-ref implementation matches ONLY the ref of that exact name and never does.
+  T2497D="2497boundw$$"
+  REL2497D=".ai-workspace/reviews/2497-bound-fixture-$$.md"
+  REF2497D_SIBLING="refs/remotes/origin/${T2497D}9"
+  mint2497 "$REF2497D_SIBLING" "$REL2497D" $'## Review\nDecision: PASS\n'
+  mk2497ledger "sess-2497d" "$T2497D" "$REL2497D"
+  OUT2497D=$(node "$LED" check --session "sess-2497d" --task "$T2497D" 2>&1); RC2497D=$?
+  { [ "$RC2497D" = "2" ] && echo "$OUT2497D" | command grep -qi "execution-review"; } \
+    && ok "#2497 AC-4 boundedness hold-out: a VALID PASS blob minted ONLY at the sibling ref refs/remotes/origin/<T>9 -> check for task <T> still exits 2 (no bare <task>* overmatch)" \
+    || bad "#2497 AC-4 boundedness hold-out FAILED (rc=$RC2497D out=$OUT2497D)"
+  git -C "$HOME_REPO_2497" update-ref -d "$REF2497D_SIBLING" >/dev/null 2>&1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2174 — cmdInherit's precondition-1 (PARENT-LEG RELATION) gains a PARENT-KEYED, bounded trusted-ref
+# fallback, reusing the shipped #2088/#2462 resolveArtifactAtRef()/candidateTaskRefs() mechanism, so a
+# STALE on-disk copy of the parent's plan (the last-merged primary-clone file, per the #897/#2023
+# ~/-rooted stable-path doctrine) no longer shadows the fresher branch copy plan-review actually
+# reviewed while the parent task's branch is still unmerged (the #2169 blocker this plan targets).
+# Delta-based property (fails on unpatched master, passes here) manually verified during
+# implementation against a checked-out copy of master's hooks/3role-ledger.mjs — see the PR body for
+# that one-off red/green proof; this section carries the permanent GREEN + adversarial-REJECT
+# assertions that run against the CURRENT (fixed) script every time this file runs.
+#
+# Hermetic helper-copy pattern (identical to the #2462 AC-1 drift-proof arm / #2088 AC-5/AC-11 fixtures
+# above): copy $LED into a throwaway fixture repo's hooks/ subdir so aiBrainToplevel() (which resolves
+# from the RUNNING script's own selfDir(), never cwd) points at the fixture repo, not the real ai-brain
+# repo — no real repo ref/branch state is ever touched. HOME is overridden per-invocation (never
+# `export`ed — scoped inline per command, so it can never leak into any other git/node invocation in
+# this script) so the `~/`-rooted disk arm resolves INSIDE the fixture, never the real operator $HOME.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+AC2174_HOME="$(mktemp -d)"
+# Canonicalize (macOS: $TMPDIR/mktemp lands under /var/..., a symlink to /private/var/...) so this
+# fixture's HOME override (used by the `~/`-rooted disk arm below) textually PREFIX-MATCHES
+# aiBrainToplevel()'s realpath'd toplevel (selfDir() -> fs.realpathSync()) -- repoRelativeCandidate()'s
+# `abs.startsWith(repoDir + '/')` string match would otherwise silently miss on this platform even
+# though both sides name the identical directory.
+AC2174_HOME="$(cd "$AC2174_HOME" && pwd -P)"
+( cd "$AC2174_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+mkdir -p "$AC2174_HOME/hooks" "$AC2174_HOME/.ai-workspace/plans"
+cp "$LED" "$AC2174_HOME/hooks/3role-ledger.mjs"
+LED_2174="$AC2174_HOME/hooks/3role-ledger.mjs"
+S2174="sess-2174-w$$"
+
+# The ~/-rooted disk copy: EXISTS, carries a plan marker, names NO leg — shared by every AC-1/AC-2 arm
+# below (each arm's parent planner row points at this SAME stale file; only each arm's REF content
+# differs). This reproduces the #2169 shape exactly: a real, plan-marker-bearing file that shadows the
+# fresher branch copy because it happens to already exist on disk.
+REL2174P=".ai-workspace/plans/2174-smoke-parent.md"
+printf '## ELI5\nparent plan (stale disk copy)\n### Binary AC\n- AC1\n' > "$AC2174_HOME/$REL2174P"
+REL2174P_BARE=".ai-workspace/plans/2174-smoke-parent-bare.md"   # AC-3 only — never written to disk.
+
+LEGNAMING='## ELI5\nparent plan (fresh branch copy)\n### Binary AC\n- AC1\n\nLegs: %s\n'
+NONNAMING='## ELI5\nparent plan (fresh branch copy, still missing the leg)\n### Binary AC\n- AC1\n'
+
+# mk2174ref <ref-key> <remote|head> <relpath> <content>: commits CONTENT at RELPATH as
+# refs/remotes/origin/<ref-key>-fixture (kind=remote) or refs/heads/<ref-key>-fixture (kind=head) in
+# $AC2174_HOME, via an ISOLATED scratch index (GIT_INDEX_FILE, never touching the fixture repo's real
+# working-tree/index/HEAD) — byte-identical technique to the #2462 AC-1 drift-proof arm above.
+mk2174ref() {
+  local key="$1" kind="$2" relpath="$3" content="$4"
+  local blob; blob=$(printf '%s' "$content" | git -C "$AC2174_HOME" hash-object -w --stdin)
+  local idx="$TMP/2174-scratch-$key.index"
+  rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git -C "$AC2174_HOME" update-index --add --cacheinfo 100644 "$blob" "$relpath"
+  local tree; tree=$(GIT_INDEX_FILE="$idx" git -C "$AC2174_HOME" write-tree)
+  local commit; commit=$(git -C "$AC2174_HOME" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$tree" -m "fixture: #2174 $key")
+  rm -f "$idx"
+  if [ "$kind" = remote ]; then
+    git -C "$AC2174_HOME" update-ref "refs/remotes/origin/${key}-fixture" "$commit"
+  else
+    git -C "$AC2174_HOME" update-ref "refs/heads/${key}-fixture" "$commit"
+  fi
+}
+
+# ---- AC-1 GREEN (the #2169 shape): parent-keyed ref exists + names the leg -> inherit-plan-review exits 0 --
+P2174_1="2174p1w$$"; L2174_1="2174l1w$$"
+mk2174ref "$P2174_1" remote "$REL2174P" "$(printf "$LEGNAMING" "$L2174_1")"
+mk_sub "$S2174" "2174p1a"; mk_sub "$S2174" "2174p1r"
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_1" --role planner --agent 2174p1a --artifact "~/$REL2174P" >/dev/null
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_1" --role plan-review --agent 2174p1r --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+OUT=$(HOME="$AC2174_HOME" node "$LED_2174" inherit-plan-review --session "$S2174" --task "$L2174_1" --parent "$P2174_1" 2>&1); RC=$?
+LEGFILE_1="$THREE_ROLE_LEDGER_DIR/$S2174/$L2174_1.jsonl"
+{ [ "$RC" = "0" ] && [ -f "$LEGFILE_1" ] && command grep -q '"role":"planner"' "$LEGFILE_1" \
+    && command grep -q '"role":"plan-review"' "$LEGFILE_1" && command grep -q "inherited_from" "$LEGFILE_1"; } \
+  && ok "#2174 AC-1: stale ~/-rooted disk copy (exists, plan marker, no leg) + parent-keyed refs/remotes/origin/<parent>-fixture blob (names the leg) -> inherit-plan-review exits 0, both rows land in the leg ledger (the #2169 shape)" \
+  || bad "#2174 AC-1 FAILED (rc=$RC out=$OUT legfile=$([ -f "$LEGFILE_1" ] && cat "$LEGFILE_1" || echo MISSING))"
+
+# ---- AC-2(a) adversarial: leg-KEYED ref (never parent-keyed) must NOT satisfy the fallback ------------------
+P2174_2A="2174p2aw$$"; L2174_2A="2174l2aw$$"
+mk2174ref "$L2174_2A" remote "$REL2174P" "$(printf "$LEGNAMING" "$L2174_2A")"   # ref keyed to the LEG id, not the parent
+mk_sub "$S2174" "2174p2aa"; mk_sub "$S2174" "2174p2ar"
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2A" --role planner --agent 2174p2aa --artifact "~/$REL2174P" >/dev/null
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2A" --role plan-review --agent 2174p2ar --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+OUT=$(HOME="$AC2174_HOME" node "$LED_2174" inherit-plan-review --session "$S2174" --task "$L2174_2A" --parent "$P2174_2A" 2>&1); RC=$?
+{ [ "$RC" = "3" ] && echo "$OUT" | command grep -qi "does not name leg task"; } \
+  && ok "#2174 AC-2(a): leg-naming blob exists ONLY at a ref keyed to the LEG id (refs/remotes/origin/<leg>-fixture) -> refused (candidate set is parent-keyed, not leg-keyed), exit 3" \
+  || bad "#2174 AC-2(a) FAILED (rc=$RC out=$OUT)"
+
+# ---- AC-2(b) adversarial: local-only refs/heads/<parent>-* (never mirrored to refs/remotes/origin/) --------
+P2174_2B="2174p2bw$$"; L2174_2B="2174l2bw$$"
+mk2174ref "$P2174_2B" head "$REL2174P" "$(printf "$LEGNAMING" "$L2174_2B")"   # refs/heads/ only -- never refs/remotes/origin/
+mk_sub "$S2174" "2174p2ba"; mk_sub "$S2174" "2174p2br"
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2B" --role planner --agent 2174p2ba --artifact "~/$REL2174P" >/dev/null
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2B" --role plan-review --agent 2174p2br --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+OUT=$(HOME="$AC2174_HOME" node "$LED_2174" inherit-plan-review --session "$S2174" --task "$L2174_2B" --parent "$P2174_2B" 2>&1); RC=$?
+{ [ "$RC" = "3" ] && echo "$OUT" | command grep -qi "does not name leg task"; } \
+  && ok "#2174 AC-2(b): leg-naming blob exists ONLY at a local refs/heads/<parent>-fixture (never mirrored under refs/remotes/origin/) -> refused (namespace-bound), exit 3" \
+  || bad "#2174 AC-2(b) FAILED (rc=$RC out=$OUT)"
+
+# ---- AC-2(c) adversarial: parent-keyed ref blob EXISTS with a plan marker but does NOT name the leg ---------
+P2174_2C="2174p2cw$$"; L2174_2C="2174l2cw$$"
+mk2174ref "$P2174_2C" remote "$REL2174P" "$NONNAMING"   # plan marker present, leg token absent
+mk_sub "$S2174" "2174p2ca"; mk_sub "$S2174" "2174p2cr"
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2C" --role planner --agent 2174p2ca --artifact "~/$REL2174P" >/dev/null
+HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_2C" --role plan-review --agent 2174p2cr --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+OUT=$(HOME="$AC2174_HOME" node "$LED_2174" inherit-plan-review --session "$S2174" --task "$L2174_2C" --parent "$P2174_2C" 2>&1); RC=$?
+{ [ "$RC" = "3" ] && echo "$OUT" | command grep -qi "does not name leg task"; } \
+  && ok "#2174 AC-2(c): parent-keyed ref blob EXISTS (plan marker present) but does NOT name the leg (disk copy doesn't either) -> refused (content tested AT THE REF, not mere existence-at-ref), exit 3" \
+  || bad "#2174 AC-2(c) FAILED (rc=$RC out=$OUT)"
+
+# ---- AC-3: bare-relative shape, this gate only -- disk resolution MISSES (no CLAUDE_PROJECT_DIR / cwd hit /
+#      HOME hit), parent-ref blob names the leg -> inherit-plan-review exits 0 -------------------------------
+P2174_3="2174p3w$$"; L2174_3="2174l3w$$"
+mk2174ref "$P2174_3" remote "$REL2174P_BARE" "$(printf "$LEGNAMING" "$L2174_3")"
+BARE_LEDGER_HOLD_2174="$TMP/2174-bare-cwd"; mkdir -p "$BARE_LEDGER_HOLD_2174"
+mk_sub "$S2174" "2174p3a"; mk_sub "$S2174" "2174p3r"
+( cd "$BARE_LEDGER_HOLD_2174" && env -u CLAUDE_PROJECT_DIR HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_3" --role planner --agent 2174p3a --artifact "$REL2174P_BARE" >/dev/null )
+( cd "$BARE_LEDGER_HOLD_2174" && env -u CLAUDE_PROJECT_DIR HOME="$AC2174_HOME" node "$LED_2174" append --session "$S2174" --task "$P2174_3" --role plan-review --agent 2174p3r --artifact "$TMP/rev.md" --verdict PASS >/dev/null )
+OUT=$( cd "$BARE_LEDGER_HOLD_2174" && env -u CLAUDE_PROJECT_DIR HOME="$AC2174_HOME" node "$LED_2174" inherit-plan-review --session "$S2174" --task "$L2174_3" --parent "$P2174_3" 2>&1 ); RC=$?
+LEGFILE_3="$THREE_ROLE_LEDGER_DIR/$S2174/$L2174_3.jsonl"
+{ [ "$RC" = "0" ] && [ -f "$LEGFILE_3" ] && command grep -q "inherited_from" "$LEGFILE_3"; } \
+  && ok "#2174 AC-3: bare-relative artifact_path, disk resolution MISSES (no CLAUDE_PROJECT_DIR / cwd hit / HOME hit) -> parent-ref blob resolves and names the leg -> inherit-plan-review exits 0 (the #1868-family bare-relative shape, fixed inside THIS gate only)" \
+  || bad "#2174 AC-3 FAILED (rc=$RC out=$OUT legfile=$([ -f "$LEGFILE_3" ] && cat "$LEGFILE_3" || echo MISSING))"
+
+rm -rf "$AC2174_HOME" "$BARE_LEDGER_HOLD_2174"
+
+# #2496 — wire the sibling-token resolver's own hermetic red/green oracle into THIS file's exit code (the
+# AC-4 named regression guard). This file is already CI-referenced (three-role-smoke-ci.yml derives its
+# smoke list from `sync-three-role-plugin.mjs --list`, which names this file) — folding the new oracle's
+# exit code in here exercises it under that SAME CI reference with zero workflow edit.
+if bash "$DIR/3role-ledger-sibling-resolve-smoke-test.sh"; then
+  ok "hooks/3role-ledger-sibling-resolve-smoke-test.sh (the #2496 sibling-resolve oracle) exited 0"
+else
+  bad "hooks/3role-ledger-sibling-resolve-smoke-test.sh (the #2496 sibling-resolve oracle) FAILED — see its own PASS/FAIL lines above"
+fi
+
+# =====================================================================================================
+# #2169 slice 5 — AC-34 delivery-receipt guard (design decision 4, .ai-workspace/plans/
+# 2026-08-25-2075-phase3-recut.md). Closes the #2115 misattribution class at the ledger APPEND edge: the
+# AGENT-tool spawn edge (hooks/three-role-spawn-ledger.sh) stamps a `dispatch_nonce` field onto a row when
+# a spawn prompt carries a DEDICATED "DISPATCH-NONCE:<token>" line; a verdict-carrying append onto a
+# dispatch_nonce-STAMPED row is then refused unless the caller echoes the matching token via --receipt
+# (never --run — that name collided with Phase 2's AC-13). The stamped VALUE is a one-way hash, never the
+# plaintext (S5-AC6 harvest ban). A legacy (unstamped) row is completely unaffected (S5-AC4, the
+# load-bearing counterfactual). Dedicated session (sess-2169s5) so agent ids/task ids never collide with
+# any earlier section's fixtures.
+# =====================================================================================================
+S5SID="sess-2169s5"
+S5HOOK="$ROOT/hooks/three-role-spawn-ledger.sh"
+
+# helper: run the spawn-ledger hook with a JSON payload, same convention as
+# hooks/three-role-spawn-ledger-smoke-test.sh's own run(). Sets S5RC, S5CAP.
+s5_run_hook() {
+  local payload="$1"
+  S5CAP=$(printf '%s' "$payload" \
+    | env THREE_ROLE_LEDGER_DIR="$THREE_ROLE_LEDGER_DIR" THREE_ROLE_PROJECTS_ROOT="$THREE_ROLE_PROJECTS_ROOT" \
+        KANBAN_SYNC_DRYRUN=1 KANBAN_AUTOSYNC_OFF_FILE="$TMP/none-kanban-s5" bash "$S5HOOK" 2>&1); S5RC=$?
+}
+
+# ---- #2169 S5-AC1 (AC-34, mint + never-terminal): the spawn edge, driven with a fixture prompt whose
+#      DEDICATED DISPATCH-NONCE:<token> line sits alone on its own line, stamps a dispatch_nonce field
+#      onto the row (before: 0 occurrences of "dispatch_nonce" anywhere in the ledger) -- AND that stamp
+#      alone (no agentId/artifact/verdict) is still NOT counted a completed role by check (the stamp is
+#      never terminal evidence), even with the OTHER three required roles genuinely complete (isolates the
+#      stamp guard from an unrelated "missing role" problem, mirroring S4-AC2's pending precedent).
+S5T_AC1="2169s5-ac1"
+P_S5AC1='{"session_id":"'"$S5SID"'","tool_input":{"prompt":"3ROLE_TASK:'"$S5T_AC1"' ROLE:executor\nDISPATCH-NONCE:s5ac1-raw-token\n\nImplement the slice."}}'
+s5_run_hook "$P_S5AC1"
+S5T_AC1_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S5SID/$S5T_AC1.jsonl"
+S5T_AC1_ROW=$(command grep '"role":"executor"' "$S5T_AC1_LEDFILE" 2>/dev/null)
+mk_sub "$S5SID" "${S5T_AC1}-p1"; mk_sub "$S5SID" "${S5T_AC1}-pr1"
+node "$LED" append --session "$S5SID" --task "$S5T_AC1" --role planner --agent "${S5T_AC1}-p1" --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session "$S5SID" --task "$S5T_AC1" --role plan-review --agent "${S5T_AC1}-pr1" --artifact "$TMP/rev.md" --verdict PASS >/dev/null
+node "$LED" append --session "$S5SID" --task "$S5T_AC1" --role execution-review --oracle "$TMP/oracle.txt" >/dev/null
+OUT=$(node "$LED" check --session "$S5SID" --task "$S5T_AC1" 2>&1); RC=$?
+{ [ "$S5RC" = "0" ] && echo "$S5T_AC1_ROW" | command grep -q '"dispatch_nonce":"' && [ "$RC" = "2" ]; } \
+  && ok "#2169 S5-AC1 (AC-34 mint + never-terminal): the spawn edge, driven with a fixture whose prompt carries a DEDICATED DISPATCH-NONCE:<token> line, stamps a dispatch_nonce field onto the row (before: 0 occurrences of dispatch_nonce anywhere in the ledger) -- AND the OTHER three required roles genuinely complete still leaves check BLOCKed (rc=2): a stamp alone is never terminal evidence" \
+  || bad "#2169 S5-AC1 FAILED (hookrc=$S5RC row=$S5T_AC1_ROW checkrc=$RC checkout=$OUT)"
+
+# ---- #2169 S5-AC5 (AC-34 mint discipline): a spawn prompt that merely MENTIONS "DISPATCH-NONCE:" inside
+#      running prose (mid-line, not a dedicated line) does NOT mint a stamp -- reproduces the closed
+#      branch's real regex bug (matched the word "line" inside a sentence, carried pitfall #5) as a
+#      red-then-green arm: a naive un-anchored match would mint dispatch_nonce="line" here; this fixture
+#      asserts the row carries NO dispatch_nonce field at all.
+S5T_AC5="2169s5-ac5"
+P_S5AC5='{"session_id":"'"$S5SID"'","tool_input":{"prompt":"3ROLE_TASK:'"$S5T_AC5"' ROLE:executor\nNote that the DISPATCH-NONCE: line in the brief carries the delivery token.\n\nImplement the slice."}}'
+s5_run_hook "$P_S5AC5"
+S5T_AC5_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S5SID/$S5T_AC5.jsonl"
+S5T_AC5_ROW=$(command grep '"role":"executor"' "$S5T_AC5_LEDFILE" 2>/dev/null)
+{ [ "$S5RC" = "0" ] && [ -n "$S5T_AC5_ROW" ] && ! echo "$S5T_AC5_ROW" | command grep -q '"dispatch_nonce"'; } \
+  && ok "#2169 S5-AC5 (AC-34 mint discipline): a prompt merely MENTIONING DISPATCH-NONCE: mid-sentence (not a dedicated line) does NOT mint a stamp -- the row is still written (role recorded) but carries NO dispatch_nonce field, reproducing + closing the closed-branch regex bug (matched the word \"line\") as a red-then-green arm" \
+  || bad "#2169 S5-AC5 FAILED (hookrc=$S5RC row=$S5T_AC5_ROW)"
+
+# ---- #2169 S5-AC2 / S5-AC3 / S5-AC7 arm-1 (AC-34 refusal + allow + remedy honesty): a stamped row
+#      (minted via the CLI --dispatch-nonce flag, the same field the spawn edge above writes) receives a
+#      verdict-carrying append WITHOUT --receipt first -- REFUSED (rc!=0, named delivery-receipt guard +
+#      --receipt token in the message), row byte-unchanged (before: such an append succeeded
+#      unconditionally). THEN the SAME append is retried WITH the matching --receipt -- the refusal's own
+#      advertised remedy, executed verbatim against the EXACT SAME refusing row -- and SUCCEEDS, proving
+#      the remedy genuinely unblocks the row it was printed for.
+S5T_AC2="2169s5-ac2"
+S5AC2_TOKEN="s5ac2-raw-token-999"
+node "$LED" append --session "$S5SID" --task "$S5T_AC2" --role executor --dispatch-nonce "$S5AC2_TOKEN" >/dev/null
+S5T_AC2_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S5SID/$S5T_AC2.jsonl"
+S5T_AC2_ROW_BEFORE=$(command grep '"role":"executor"' "$S5T_AC2_LEDFILE")
+OUT=$(node "$LED" append --session "$S5SID" --task "$S5T_AC2" --role executor --verdict PASS --artifact "PR #s5ac2" 2>&1); RC=$?
+S5T_AC2_ROW_AFTER=$(command grep '"role":"executor"' "$S5T_AC2_LEDFILE")
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "delivery-receipt guard" && echo "$OUT" | command grep -q -- "--receipt" && [ "$S5T_AC2_ROW_BEFORE" = "$S5T_AC2_ROW_AFTER" ]; } \
+  && ok "#2169 S5-AC2 (AC-34 refusal arm): a proof-less verdict-carrying append onto a dispatch_nonce-STAMPED row without --receipt is REFUSED (rc!=0, named delivery-receipt guard, --receipt token named in the message), row byte-unchanged -- before: such an append succeeded unconditionally" \
+  || bad "#2169 S5-AC2 FAILED (rc=$RC out=$OUT before=$S5T_AC2_ROW_BEFORE after=$S5T_AC2_ROW_AFTER)"
+OUT=$(node "$LED" append --session "$S5SID" --task "$S5T_AC2" --role executor --verdict PASS --artifact "PR #s5ac2" --receipt "$S5AC2_TOKEN" 2>&1); RC=$?
+S5T_AC2_ROW_FINAL=$(command grep '"role":"executor"' "$S5T_AC2_LEDFILE")
+{ [ "$RC" = "0" ] && echo "$S5T_AC2_ROW_FINAL" | command grep -q '"verdict":"PASS"'; } \
+  && ok "#2169 S5-AC3 + S5-AC7 arm-1 (AC-34 allow arm + remedy honesty): retrying the EXACT SAME refused append from S5-AC2, now WITH the matching --receipt token (the refusal's own advertised remedy, executed verbatim against the refusing row), SUCCEEDS -- verdict PASS recorded" \
+  || bad "#2169 S5-AC3 / S5-AC7 arm-1 FAILED (rc=$RC out=$OUT row=$S5T_AC2_ROW_FINAL)"
+
+# ---- #2169 S5-AC6 / S5-AC7 arm-2 (AC-34 harvest ban + remedy honesty): an echo constructed SOLELY from
+#      the value STORED on the row (harvested straight off the ledger file -- never seen on a genuine
+#      DISPATCH-NONCE: line -- and echoed back as --receipt) is REFUSED: no value PRINTED on a row proves
+#      a caller's identity, and the stored dispatch_nonce is a ONE-WAY HASH, so hashing an already-hashed
+#      value never reproduces it. Retrying with the GENUINE raw token (never harvested from the row) then
+#      SUCCEEDS -- the remedy for THIS refusal arm too.
+S5T_AC6="2169s5-ac6"
+S5AC6_TOKEN="s5ac6-raw-token-777"
+node "$LED" append --session "$S5SID" --task "$S5T_AC6" --role executor --dispatch-nonce "$S5AC6_TOKEN" >/dev/null
+S5T_AC6_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S5SID/$S5T_AC6.jsonl"
+S5T_AC6_STORED=$(node -e '
+  const fs = require("fs");
+  const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter((l) => l.trim());
+  for (const ln of lines) { const j = JSON.parse(ln); if (j.role === "executor") { process.stdout.write(j.dispatch_nonce || ""); break; } }
+' "$S5T_AC6_LEDFILE")
+S5T_AC6_ROW_BEFORE=$(command grep '"role":"executor"' "$S5T_AC6_LEDFILE")
+OUT=$(node "$LED" append --session "$S5SID" --task "$S5T_AC6" --role executor --verdict PASS --artifact "PR #s5ac6" --receipt "$S5T_AC6_STORED" 2>&1); RC=$?
+S5T_AC6_ROW_AFTER=$(command grep '"role":"executor"' "$S5T_AC6_LEDFILE")
+{ [ -n "$S5T_AC6_STORED" ] && [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "delivery-receipt guard" && [ "$S5T_AC6_ROW_BEFORE" = "$S5T_AC6_ROW_AFTER" ]; } \
+  && ok "#2169 S5-AC6 (AC-34 harvest ban): a --receipt constructed SOLELY from the value STORED on the row (harvested straight off the ledger file, never seen on a genuine DISPATCH-NONCE: line) is REFUSED -- the stored dispatch_nonce is a one-way hash, echoing it back can never re-derive itself, row byte-unchanged" \
+  || bad "#2169 S5-AC6 FAILED (stored=$S5T_AC6_STORED rc=$RC out=$OUT before=$S5T_AC6_ROW_BEFORE after=$S5T_AC6_ROW_AFTER)"
+OUT=$(node "$LED" append --session "$S5SID" --task "$S5T_AC6" --role executor --verdict PASS --artifact "PR #s5ac6" --receipt "$S5AC6_TOKEN" 2>&1); RC=$?
+S5T_AC6_ROW_FINAL=$(command grep '"role":"executor"' "$S5T_AC6_LEDFILE")
+{ [ "$RC" = "0" ] && echo "$S5T_AC6_ROW_FINAL" | command grep -q '"verdict":"PASS"'; } \
+  && ok "#2169 S5-AC7 arm-2 (AC-34 remedy honesty, harvest-ban refusal): retrying with the GENUINE raw token (never harvested off the row) SUCCEEDS -- the remedy for the harvest-ban refusal arm also actually works" \
+  || bad "#2169 S5-AC7 arm-2 FAILED (rc=$RC out=$OUT row=$S5T_AC6_ROW_FINAL)"
+
+# ---- #2169 S5-AC4 (PIN, load-bearing legacy counterfactual): a proof-less verdict append onto a
+#      LEGACY-shape row (agentId + model badge, NO dispatch_nonce stamp -- every row on disk today) still
+#      succeeds UNCHANGED -- no --receipt required, no refusal. Shipping a refusal that breaks this arm is
+#      a slice-FAIL regardless of every other AC in this slice.
+S5T_AC4="2169s5-ac4"
+mk_sub "$S5SID" "${S5T_AC4}-pr1"
+OUT=$(node "$LED" append --session "$S5SID" --task "$S5T_AC4" --role plan-review --agent "${S5T_AC4}-pr1" --model-version "claude-sonnet-5" --model-tier sonnet --artifact "$TMP/rev.md" --verdict PASS 2>&1); RC=$?
+S5T_AC4_LEDFILE="$THREE_ROLE_LEDGER_DIR/$S5SID/$S5T_AC4.jsonl"
+S5T_AC4_ROW=$(command grep '"role":"plan-review"' "$S5T_AC4_LEDFILE" 2>/dev/null)
+{ [ "$RC" = "0" ] && echo "$S5T_AC4_ROW" | command grep -q '"verdict":"PASS"' && ! echo "$S5T_AC4_ROW" | command grep -q '"dispatch_nonce"'; } \
+  && ok "#2169 S5-AC4 (PIN, load-bearing legacy counterfactual): a proof-less verdict append onto a LEGACY-shape row (agentId + model badge, no dispatch_nonce stamp) still succeeds UNCHANGED, no --receipt required -- shipping a refusal that breaks this arm would be a slice-FAIL regardless of every other AC" \
+  || bad "#2169 S5-AC4 FAILED (rc=$RC out=$OUT row=$S5T_AC4_ROW)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
