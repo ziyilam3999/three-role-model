@@ -74,6 +74,13 @@
 //     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
 //     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
 //     promotes a missing stamp to a BLOCK.
+//   check --session S --task T [--require-published-review]                    (2026-08-29, additive)
+//     execution-review-ONLY: skip the disk-artifact arm even with NO --merge-head (widens the same gate
+//     --merge-head already widens). Lets the complete-4-role-ledger proof resolve via the ALREADY
+//     default-on published origin/<task> ref arm (#2462) when the PR head cannot be resolved (a
+//     cross-repo / degraded-gh merge) — without accepting a merge-head-gated candidate, since no merge
+//     head is supplied. A disk-only execution-review artifact still fails under this flag (by design —
+//     "published" is the whole point). Absent, behavior is byte-identical to today.
 //   check --session S --task T [--merge-head <ref-or-sha>]                            (#2088, default-on #2462)
 //     Check-time-ONLY ref-scoped resolution arm — DEFAULT-ON as of #2462 (was opt-in-behind---merge-head
 //     under #2088; that gate was measured to leave master permanently unable to prove a branch-only role
@@ -1871,7 +1878,17 @@ function checkRole(role, e, session, opts, task) {
       return 'execution-review is NEVER inline-skippable (never grade your own homework) — it must resolve to a ' +
         'real reviewer agentId OR an oracle:<path> that exists with a PASS token; "ran it inline myself" is not allowed';
     }
-    if (e.oracle) {
+    // 2026-08-29 (R4, self-discovered during executor smoke-run — L1b): the oracle arm resolves a
+    // BARE DISK PATH with NO agentId requirement — the same "disk-only, self-authorable" shape
+    // --require-published-review exists to exclude (the plan's own ELI5: "A disk-only file still does
+    // NOT count"). It was already unconditional under --merge-head too (pre-existing #2480 scope,
+    // untouched here — L1a's oracle-via-merge-head allow stays byte-identical), but that was always
+    // reachable only via a DERIVABLE merge head; leg-3 being newly reachable with NO merge head at all
+    // (this task) would otherwise silently let a bare oracle file satisfy the stricter unbound mode too
+    // — reopening exactly the hole this flag closes. So: under requirePublishedReview, the oracle arm
+    // is INERT (falls through to the ordinary agentId + ref-arm path below, same as if e.oracle were
+    // unset) — an oracle row with no agentId then fails closed there, same shape as P2/P3.
+    if (e.oracle && !(opts && opts.requirePublishedReview)) {
       const op = resolveArtifact(stripOraclePrefix(e.oracle));
       if (!op) return 'execution-review oracle path "' + e.oracle + '" does not exist';
       if (!fileHas(op, VERDICT_RE)) return 'execution-review oracle "' + op + '" lacks a PASS/verdict token';
@@ -1897,7 +1914,11 @@ function checkRole(role, e, session, opts, task) {
     // origin/master) counts. Scope is EXECUTION-REVIEW ONLY (planner/plan-review keep disk-first
     // unconditionally — M5-control pins this). Absent a merge head this row stays BYTE-IDENTICAL to
     // pre-#2480: the disk arm is still consulted first (scope exclusion 5 / AC-2).
-    if (!(opts && opts.mergeHead)) {
+    // 2026-08-29 (additive): --require-published-review widens this SAME gate identically to a merge
+    // head — it also demands the ref-arm's PUBLISHED evidence instead of a disk-only artifact, but
+    // WITHOUT supplying a merge head, so the merge-head-gated candidate inside resolveArtifactAtRef
+    // stays inert (only the default-on task-bound-ref + origin/master candidates fire).
+    if (!(opts && (opts.mergeHead || opts.requirePublishedReview))) {
       const ap = resolveArtifact(e.artifact_path);
       if (ap) {
         if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
@@ -1921,6 +1942,15 @@ function checkRole(role, e, session, opts, task) {
     if (opts && opts.mergeHead) {
       return 'execution-review artifact_path "' + (e.artifact_path || '') + '" does not resolve at merge head ' +
         opts.mergeHead + ' — the on-disk review evidence is not bound to the PR being merged (#2050 AC-1)' +
+        worktreeDangleHint(e.artifact_path);
+    }
+    // 2026-08-29 (additive, R2): --require-published-review's own distinct fallthrough message — a
+    // DIFFERENT code path from the merge-head-bound one above, so it needs its OWN wording (and the
+    // hook's remedy-trigger grep must key on it too — see enforce-review-or-lfah.sh).
+    if (opts && opts.requirePublishedReview) {
+      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" is not published to an ' +
+        'origin/<task> ref (--require-published-review skips the disk-only arm; a disk-only artifact does ' +
+        'not count — publish the exec-review artifact to an ai-brain origin/<task> ref)' +
         worktreeDangleHint(e.artifact_path);
     }
     return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
@@ -3522,7 +3552,8 @@ function cmdCheck(o) {
   // candidate; the arm itself is DEFAULT-ON as of #2462 (task-bound refs + origin/master are consulted
   // regardless of whether this flag is present — see resolveArtifactAtRef()). Absent/empty just means the
   // merge-head candidate is skipped, not that the whole arm is skipped.
-  const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '' };
+  const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '',
+    requirePublishedReview: ('require-published-review' in o) };
   const problems = [];
   // #2496 — tracks ONLY the "missing X ledger line" problems the REQUIRED_ROLES loop below pushes (never
   // any other problem class: checkRole content failures, laneA/laneB, model-policy, tracked, kind,
