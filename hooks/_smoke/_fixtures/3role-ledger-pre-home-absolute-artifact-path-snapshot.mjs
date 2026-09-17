@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// bin/3role-ledger.mjs — role-LEDGER helper. Bundled in the plugin under bin/; hooks resolve it via
-// "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" (with a repo-relative ../bin fallback).
+// hooks/3role-ledger.mjs — #851 role-LEDGER helper (PR1, Phase 1+2).
 //
 // A tiny CLI that records WHICH 3-role roles actually ran for a task and verifies them against the
 // forgery-resistant signal the harness already produces: one transcript file per real subagent spawn
@@ -332,7 +331,7 @@
 //     names which writer stamped it, diagnostic only, never consulted by a gate.
 //
 // Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
-//   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger; empty is treated the same as unset)
+//   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger)
 //   THREE_ROLE_PROJECTS_ROOT (default ~/.claude/projects)
 //   THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE=1 (#2309) — documented operator escape for overlayAppend's clause 3
 //                            (the bound-but-verdict-less terminal-evidence guard, see its own comment block
@@ -458,20 +457,12 @@ function ledgerFile(session, task) {
 // $CLAUDE_CODE_SESSION_ID carry — measured in the plan's premise probe (36/36 real dirs match it).
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-// D2 — ARMED only when the ledger store resolves to its DEFAULT location — THREE_ROLE_LEDGER_DIR unset
-// OR empty, the SAME truthiness test the :422 store resolution's own `||` already uses (empty string is
-// falsy in JS, so `'' || default` already fell through to the default store pre-fix; this predicate now
-// agrees with that instead of asking the DIFFERENT question "is the key present in process.env", which an
-// empty-string assignment answers "yes" — session-id-reject-followups-cr1-drill-and-empty-ledger-dir-seam
-// F2: a caller that sets THREE_ROLE_LEDGER_DIR="" used to write into the REAL default store with the
-// guard silently DISARMED and no audit line — an unaudited disarm at the asset this guard protects, not a
-// redirect away from it.
-// No production caller sets that env var non-empty (measured) — a store deliberately redirected to a
-// scratch location is not the asset this guard protects, so the hundreds of synthetic-id smoke-fixture
-// appends (138 THREE_ROLE_LEDGER_DIR redirects measured) keep passing with zero fixture edits, and a
-// redirected caller never writes a bypass-audit line. Read ONCE, at module scope, same discipline as
-// LEDGER_DIR above.
-const SESSION_SHAPE_GUARD_ARMED = !process.env.THREE_ROLE_LEDGER_DIR;
+// D2 — ARMED only when the ledger store resolves to its DEFAULT location (THREE_ROLE_LEDGER_DIR unset).
+// No production caller sets that env var (measured) — a store deliberately redirected to a scratch
+// location is not the asset this guard protects, so the hundreds of synthetic-id smoke-fixture appends
+// (138 THREE_ROLE_LEDGER_DIR redirects measured) keep passing with zero fixture edits, and a redirected
+// caller never writes a bypass-audit line. Read ONCE, at module scope, same discipline as LEDGER_DIR above.
+const SESSION_SHAPE_GUARD_ARMED = !('THREE_ROLE_LEDGER_DIR' in process.env);
 
 // D6 — one audited kill-switch, same discipline as THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF below.
 function sessionShapeGuardOff() { return process.env.THREE_ROLE_LEDGER_SESSION_SHAPE_OFF === '1'; }
@@ -1560,15 +1551,7 @@ function isVacuousOracle(filePath) {
 // both the at-rest ledger AND that publish surface, when the resolved absolute path is under $HOME we store
 // the HOME-RELATIVE TILDE form `~/<rest>` — it carries NO username and resolveArtifact()'s `~/` arm expands
 // it from ANY cwd. A path genuinely OUTSIDE $HOME is stored absolute (no home to leak).
-// ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R1, write end) — `opts.
-// repoRelative` is an explicit OPT-IN, default OFF, so every OTHER normalizeArtifact() caller
-// (`--reviewed-plan`, `--transcript`) keeps today's byte-for-byte absolutizing behaviour (the plan's
-// explicit "untouched" scope — round-identity + never-inside-a-repo reasons respectively). Only the
-// `--artifact` store site passes `{ repoRelative: true }`, and only for non-execution-review roles (D1/D2/
-// D3 there are already untouched by construction — see the call site). See the branch below for the
-// mechanism.
-function normalizeArtifact(raw, opts) {
-  const repoRelative = !!(opts && opts.repoRelative);
+function normalizeArtifact(raw) {
   const v = String(raw == null ? '' : raw);
   if (v === '') return v;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v;   // URL scheme → not a filesystem path.
@@ -1595,42 +1578,6 @@ function normalizeArtifact(raw, opts) {
     return v;                                           // no slash → verbatim (PR #N, sha, "shipped").
   }
   abs = path.normalize(abs).replace(/\/+$/, '');
-
-  // R1 (repoRelative opt-in only) — `v` reached here through one of the two file-exists-verified relative
-  // branches above (never the `v.startsWith('/')` branch — an absolute/typed-absolute arg keeps today's
-  // behaviour byte-for-byte, the #1616 deferral stands). When `abs` lies under a checkout root git itself
-  // reports for THIS repo (the primary clone or ANY linked worktree of it — the SAME bounded set #1616's
-  // read end introduced via checkoutRootsFor), store the path REPO-ROOT-RELATIVE instead of collapsing it
-  // to `~/...` — durable across a worktree quarantine, cwd-independent for every worktree layout.
-  // Realpath-normalized on both sides (macOS mktemp symlink hazard, NR-3). Falls through to the existing
-  // tilde/absolute store below when `abs` is not inside any checkout of THIS repo (#1868 cross-repo cwd,
-  // untouched) or on any git spawn trouble (can't-tell -> today's behaviour, never a crash) — this is the
-  // #1199 D2 property, for every OTHER role, computed from git's root rather than stored verbatim.
-  //
-  // MOST-SPECIFIC (longest-prefix) root wins, never merely the FIRST one checkoutRootsFor happens to
-  // list: a NESTED worktree (`<primary>/.worktrees/<slug>` or `<primary>/.claude/worktrees/<slug>`) is
-  // itself a member of checkoutRootsFor(repoDir) whenever it's ALIVE (which it always is at append/write
-  // time — you can only write from a cwd that currently exists), but its path is ALSO a physical subtree
-  // of the primary's own path. Returning on the first (e.g. primary, listed first per git's documented
-  // ordering) match would silently store the WRONG, non-minimal tail (`.worktrees/<slug>/…` instead of
-  // the nested worktree's own repo-relative path) — caught live by this ticket's own AC-R1-0 WW/WN cells.
-  if (repoRelative && !v.startsWith('/')) {
-    const repoDir = repoToplevelFor(abs);
-    if (repoDir) {
-      const absReal = realpathNearest(abs);
-      let bestRel = null;
-      let bestLen = -1;
-      for (const root of checkoutRootsFor(repoDir)) {
-        const rootReal = realpathNearest(root).replace(/\/+$/, '') + '/';
-        if (absReal.startsWith(rootReal) && rootReal.length > bestLen) {
-          bestLen = rootReal.length;
-          bestRel = absReal.slice(rootReal.length);
-        }
-      }
-      if (bestRel !== null) return bestRel;
-    }
-  }
-
   const homePrefix = HOME.replace(/\/+$/, '') + path.sep;
   if (abs === HOME || abs.startsWith(homePrefix)) {     // R6: collapse $HOME prefix to `~` (no username).
     const rest = abs === HOME ? '' : abs.slice(homePrefix.length);
@@ -2271,107 +2218,14 @@ function repoToplevelFor(absPath) {
 // code must never violate — still honored) and the #2462 plan for the default-on decision; this block is
 // the mechanical half.
 
-// planner-home-absolute-artifact-path-blocks-merge-gate-at-ship — resolve the NEAREST EXISTING ancestor
-// directory's realpath, then reattach whatever tail we had to strip to get there. Unlike a flat
-// fs.realpathSync(p), this tolerates p naming a file that does not physically exist on THIS disk (the
-// exact shape of a role artifact committed only on a task branch, never checked out here) — it only needs
-// SOME ancestor (in practice, the checkout root itself, which always exists) to be real. On any total
-// failure (e.g. p is not under any real directory at all) falls back to p unchanged — can't-tell -> no
-// normalization, never a crash.
-function realpathNearest(p) {
-  let cur = p;
-  for (;;) {
-    try {
-      const real = fs.realpathSync(cur);
-      return real + p.slice(cur.length);
-    } catch (e) {
-      const parent = path.dirname(cur);
-      if (parent === cur) return p;   // hit the filesystem root without finding a real ancestor -> give up.
-      cur = parent;
-    }
-  }
-}
-
-// planner-home-absolute-artifact-path-blocks-merge-gate-at-ship — every checkout root git itself reports
-// for the SAME repository as repoDir: the main worktree AND every linked worktree (`git worktree list
-// --porcelain`, scoped to repoDir's own repo only — bounded, local, zero network, never a filesystem scan
-// or a name-pattern glob — NR-4). This is what lets a primary-clone-anchored (or any-other-checkout-
-// anchored) absolute/`~` artifact path resolve from whichever checkout `check` happens to run from. Falls
-// back to `[repoDir]` alone (today's narrower behavior) on any spawn trouble — can't-tell -> narrowest,
-// never a false-widen. Memoized per repoDir (git spawnSync is not free, and this is on the per-candidate
-// hot path).
-const _checkoutRootsCache = new Map();
-function checkoutRootsFor(repoDir) {
-  if (!repoDir) return [];
-  if (_checkoutRootsCache.has(repoDir)) return _checkoutRootsCache.get(repoDir);
-  let roots = [repoDir];
-  try {
-    const res = spawnSync('git', ['-C', repoDir, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' });
-    if (res.status === 0) {
-      const found = [];
-      for (const line of (res.stdout || '').split('\n')) {
-        const m = line.match(/^worktree\s+(.+)$/);
-        if (m) found.push(m[1].trim());
-      }
-      if (found.length) roots = found;
-    }
-  } catch (e) { /* fail-open: [repoDir] alone */ }
-  _checkoutRootsCache.set(repoDir, roots);
-  return roots;
-}
-
-// ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R2) — the PRIMARY root of
-// repoDir's repo family: git's documented ordering guarantees `git worktree list --porcelain` lists the
-// main worktree FIRST, and checkoutRootsFor() already parses that list — so the first entry IS the primary,
-// cwd-independent (the running helper's own repoDir may itself be a linked worktree; the family list is the
-// same regardless of which member queried it). Falls back to repoDir itself on any spawn trouble
-// (checkoutRootsFor's own can't-tell -> narrowest fallback already applies).
-function primaryRootFor(repoDir) {
-  const roots = checkoutRootsFor(repoDir);
-  return (roots && roots.length) ? roots[0] : repoDir;
-}
-
-// Strip a `<prefix><one-segment>/<tail>` shape from absReal when absReal starts with prefix; returns the
-// tail, or '' when absReal does not start with prefix OR there is no `/`-terminated one-segment component
-// after it (a bare `<prefix>` with nothing following, or `<prefix>` immediately followed by `/`, never
-// yields a candidate — R2's AC-R2-3 block arm: the strip maps a path, it never invents one).
-function stripOneSegmentPrefix(absReal, prefix) {
-  if (!absReal.startsWith(prefix)) return '';
-  const rest = absReal.slice(prefix.length);
-  const slashIdx = rest.indexOf('/');
-  return slashIdx > 0 ? rest.slice(slashIdx + 1) : '';
-}
-
 // #2023 dangle-class normalizer: derive a REPO-RELATIVE candidate path for a git `<ref>:<path>` lookup
-// inside repoDir. Strips a `.claude/worktrees/<slug>/` subtree prefix wherever it appears FIRST (a
-// worktree's git-tracked files use the SAME relative paths as the main repo, so the true repo-relative
-// tail is whatever follows that segment — this ordering is load-bearing: it pre-empts the nested-worktree
-// case below ever seeing a `.claude/worktrees/<slug>/…` path, so a P-anchored `~/…/.claude/worktrees/
-// <slug>/…` absolutized worktree path keeps resolving via THIS arm, never the checkout-root arm — named
-// risk rowc-reorder-regression-planrev-r1) and, failing that, strips an absolute/`~/`-expanded path's
-// prefix against ANY checkout root git reports for repoDir's own repository (planner-home-absolute-
-// artifact-path-blocks-merge-gate-at-ship — not only repoDir itself, so a path anchored at a DIFFERENT
-// checkout of the SAME repo still resolves) WHEN `widen` is true. Both sides are realpath-normalized
-// before comparison (via realpathNearest) so a symlinked root (macOS `/var` -> `/private/var`) can never
-// silently defeat the prefix match. Returns '' when the path cannot be made relative to ANY of repoDir's
-// own checkouts (e.g. it plainly points at a different repo) — the caller treats '' as "no candidate in
-// this repo", never as an error. The candidate root set stays bounded to THIS repo (checkoutRootsFor) — a
-// cross-repo path never resolves here, by construction.
-//
-// `widen` (default true) is a DELIBERATE per-call-site scope limit, not a general on/off knob: it is
-// FALSE only at call sites that resolve a raw `process.cwd()` against a CALLER-SUPPLIED --merge-head sha
-// with no independent task binding (resolveArtifactAtRef's merge-head candidate, rowIsAddedByPr,
-// resolveSessionScanForCheck) — there, widening the checkout-root set would let an artifact_path typed at
-// ANY sibling checkout of the SAME repo match ANY caller-passed sha, eroding the layout-independence
-// guarantee hooks/3role-ledger-execreview-artifact-shape-smoke-test.sh's D2 discriminator (AC-6
-// RED-first power) exists to prove — a real regression caught live by this ticket's own AC-6, not a
-// theoretical one. It stays TRUE (the fix) at the task/origin-ref-bound candidate inside
-// resolveArtifactAtRef (aiBrainToplevel()'s repoDir, checked only against refs/remotes/origin/<task>(-*)
-// and origin/master via candidateTaskRefs — task-scoped, not an arbitrary caller sha) — which is the ONLY
-// candidate the real incident (hand-run `check` from a worktree, helper=worktree) actually needed widened;
-// the probe table's "cwd=WT, helper=PRIMARY" cell already resolved pre-fix via this exact candidate,
-// confirming the narrower scope is sufficient, not merely convenient.
-function repoRelativeCandidate(rawPath, repoDir, widen) {
+// inside repoDir. Strips a `.claude/worktrees/<slug>/` subtree prefix wherever it appears (a worktree's
+// git-tracked files use the SAME relative paths as the main repo, so the true repo-relative tail is
+// whatever follows that segment) and, failing that, strips repoDir's OWN absolute prefix from an
+// absolute/`~/`-expanded path (the "a `~/…/<repo>/` root" case). Returns '' when the path cannot be made
+// relative to repoDir (e.g. it plainly points at a different repo) — the caller treats '' as "no candidate
+// in this repo", never as an error.
+function repoRelativeCandidate(rawPath, repoDir) {
   const p = String(rawPath == null ? '' : rawPath).trim();
   if (!p) return '';
   const wt = p.match(/(?:^|\/)\.claude\/worktrees\/[^/]+\/(.+)$/);
@@ -2380,49 +2234,8 @@ function repoRelativeCandidate(rawPath, repoDir, widen) {
   if (abs.startsWith('~/')) abs = path.join(HOME, abs.slice(2));
   if (path.isAbsolute(abs)) {
     if (!repoDir) return '';
-    if (widen === false) {
-      const root = repoDir.replace(/\/+$/, '') + '/';
-      return abs.startsWith(root) ? abs.slice(root.length) : '';
-    }
-    const absReal = realpathNearest(abs);
-
-    // ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R2) — fold round 2
-    // B1: bucket 1 (segment-strip, BEFORE the checkout-root loop below) — the NESTED `.worktrees/<slug>/`
-    // shape, anchored at the git-reported PRIMARY root's own absolute realpath (never a bare `.worktrees/`
-    // segment match — AC-R2-2(e)). This MUST run before the checkout-root loop: a `<primary>/.worktrees/
-    // <slug>/…` path lies UNDER the primary root P, so the loop below would otherwise match P first and
-    // return the WRONG non-repo-relative tail `.worktrees/<slug>/…` (a strip placed after the loop is dead
-    // code for this shape — plan-review round-1 measurement, NR-7). Reached only at this widen===true
-    // (task-bound) arm — see the `widen` doc above; NEVER at the widen===false merge-head arm, which
-    // already returned above.
-    const primary = primaryRootFor(repoDir);
-    if (primary) {
-      const primaryReal = realpathNearest(primary).replace(/\/+$/, '');
-      const nestedRel = stripOneSegmentPrefix(absReal, primaryReal + '/.worktrees/');
-      if (nestedRel) return nestedRel;
-    }
-
-    // Bucket 2 — the #1616 live-checkout-root loop, unchanged.
-    for (const root of checkoutRootsFor(repoDir)) {
-      const rootReal = realpathNearest(root).replace(/\/+$/, '') + '/';
-      if (absReal.startsWith(rootReal)) return absReal.slice(rootReal.length);
-    }
-
-    // Bucket 3 — AFTER the loop misses: the two SIBLING shapes only, which genuinely lie OUTSIDE P (so the
-    // loop above never claims them, alive or quarantined; a trailing-slash prefix test cannot confuse
-    // `<name>/` with `<name>-wt-…`/`<name>-wt/…`). Bounded to the primary's own name + parent — never a
-    // hard-coded `ai-brain` literal, never a directory scan or glob (NR-4).
-    if (primary) {
-      const primaryReal = realpathNearest(primary).replace(/\/+$/, '');
-      const parent = path.dirname(primaryReal);
-      const base = path.basename(primaryReal);
-      const dashRel = stripOneSegmentPrefix(absReal, parent + '/' + base + '-wt-');
-      if (dashRel) return dashRel;
-      const slashRel = stripOneSegmentPrefix(absReal, parent + '/' + base + '-wt/');
-      if (slashRel) return slashRel;
-    }
-
-    return '';
+    const root = repoDir.replace(/\/+$/, '') + '/';
+    return abs.startsWith(root) ? abs.slice(root.length) : '';
   }
   return p;   // already repo-relative.
 }
@@ -2495,7 +2308,7 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
   if (!rawPath) return null;
   if (mergeHead) {
     const cwdRepo = process.cwd();
-    const cwdRel = repoRelativeCandidate(rawPath, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound (see repoRelativeCandidate's `widen` doc).
+    const cwdRel = repoRelativeCandidate(rawPath, cwdRepo);
     if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
       return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
     }
@@ -2547,35 +2360,14 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
 // but-affirmative forms also now match -- `Decision: * PASS` (single star), unbalanced `Decision: **PASS`,
 // inner-spaced `Decision: ** PASS **` -- but the SAME decorations on a NEGATIVE value still reject, so no
 // negative verdict can ever satisfy W3 through this widening.
-//
-// review-seat-publish-verdict backstop (task plan-review-seat-leaves-verdict-uncommitted-in-worktree-
-// blocking-w3-gate, named-risk note backstop-regex-sourced-from-helper): the SubagentStop backstop hook
-// (hooks/review-verdict-published-backstop.sh) needs a VALUE-AGNOSTIC sibling of hasRefArmAffirmative below
-// -- "does this content carry a flush-left Decision:/verdict: line AT ALL" (a published FAIL still counts
-// as published; Constraint C1) -- and it must never hand-type its own copy of the line grammar (a second
-// regex that could silently drift from this one, exactly the class this backstop exists to prevent).
-// hasRefArmAffirmative and hasRefArmDecisionLine both build their RegExp from this ONE source string, so
-// they structurally cannot diverge.
-const DECISION_LINE_SOURCE =
-  '^(?:#{1,6}[ \\t]+)?\\*{0,2}(?:Decision|verdict)\\*{0,2}(?:\\s*\\([^()]*\\))?\\*{0,2}\\s*:\\s*\\*{0,2}\\s*\\*{0,2}([A-Za-z-]+)';
 function hasRefArmAffirmative(content) {
   const s = String(content == null ? '' : content);
-  const re = new RegExp(DECISION_LINE_SOURCE, 'gim');
+  const re = /^(?:#{1,6}[ \t]+)?\*{0,2}(?:Decision|verdict)\*{0,2}(?:\s*\([^()]*\))?\*{0,2}\s*:\s*\*{0,2}\s*\*{0,2}([A-Za-z-]+)/gim;
   let m;
   while ((m = re.exec(s)) !== null) {
     if (CHECK_LANE_AFFIRMATIVE.has(String(m[1]).toUpperCase())) return true;
   }
   return false;
-}
-// Value-agnostic sibling (see DECISION_LINE_SOURCE comment above): true iff content carries a flush-left
-// Decision:/verdict: line matching the SAME grammar, regardless of the captured value -- "the seat
-// published SOMETHING" vs "the seat published an AFFIRMATIVE something". Never consumed by
-// checkRole()/cmdCheck() (this plan's scope explicitly leaves `check`'s pass/fail semantics untouched) --
-// consumed only by cmdResolvePublishedVerdict below, which the backstop hook shells out to.
-function hasRefArmDecisionLine(content) {
-  const s = String(content == null ? '' : content);
-  const re = new RegExp(DECISION_LINE_SOURCE, 'gim');
-  return re.test(s);
 }
 
 // The #1544 perf-log tracked-check. Returns null when satisfied (out of jurisdiction, can't-tell, or
@@ -2765,7 +2557,7 @@ function rowIsAddedByPr(row, mergeHead) {
   try { verify = spawnSync('git', ['-C', cwdRepo, 'rev-parse', '--verify', '--quiet', masterRef], { encoding: 'utf8' }); }
   catch (e) { return false; }
   if (verify.error || verify.status !== 0) return false;      // unreadable/unresolvable origin/master -> unprovable.
-  const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound.
+  const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo);
   if (!relPath) return false;                                  // can't map artifact_path into the merge-head's own repo.
   if (!refHasBlob(cwdRepo, mergeHead, relPath)) return false;   // must be present at the merge head itself.
   if (refHasBlob(cwdRepo, masterRef, relPath)) return false;    // must NOT already be present on origin/master.
@@ -2905,7 +2697,7 @@ function resolveSessionScanForCheck(session, task, checkOpts) {
   for (const cand of sessionScanCandidates(session, task)) {
     const row = siblingQualifies(cand.file, session, task, checkOpts);
     if (!row) continue;
-    const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound.
+    const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo);
     if (!relPath) continue;
     const content = readBlobAtRef(cwdRepo, mergeHead, relPath);
     if (content === null) continue;
@@ -3438,19 +3230,9 @@ function cmdAppend(o) {
     // normalizeArtifact()'s cwd-absolutizing branches — gated by the SAME kill-switch as D1 (#2309-style
     // switch discipline: one env var makes the whole feature inert, never a half-applied state where D1
     // rejects but D2 still absolutizes, or D1 is off but D2 still stores verbatim).
-    //
-    // ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R1): the THIRD leg —
-    // execution-review with the D1/D2 kill-switch ON (execReviewShapeOff) — is D3, "restores pre-fix
-    // behaviour in FULL, including normalizeArtifact()'s absolutizing store" (the switch's own contract),
-    // so it deliberately calls normalizeArtifact() WITHOUT `{ repoRelative: true }` — untouched by R1. Only
-    // the remaining case (every role OTHER than execution-review) opts into the new repo-relative store.
-    if (role === 'execution-review' && !execReviewShapeOff) {
-      fields.artifact_path = execReviewRawArtifact;
-    } else if (role === 'execution-review' && execReviewShapeOff) {
-      fields.artifact_path = normalizeArtifact(o.artifact);   // D3 legacy path — byte-for-byte untouched.
-    } else {
-      fields.artifact_path = normalizeArtifact(o.artifact, { repoRelative: true });   // #1199 Part B + R1.
-    }
+    fields.artifact_path = (role === 'execution-review' && !execReviewShapeOff)
+      ? execReviewRawArtifact
+      : normalizeArtifact(o.artifact);   // #1199 Part B: cwd-independent + home-tilde.
   }
   // review-round-counter-per-plan — the plan-review round's PLAN identity (never the reviewer's own
   // artifact — that stays `--artifact`/artifact_path). normalizeArtifact() applies the same cwd-independent
@@ -3572,8 +3354,7 @@ function cmdAppend(o) {
     if (rawArtifactArg && /(^|\/)\.claude\/worktrees\//.test(rawArtifactArg)) {
       console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
         'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
-        'stable, git-tracked repo-relative path the artifact lands at after merge+FF, OR complete the task ' +
-        'before quarantine.');
+        'stable primary-clone path the artifact lands at after merge+FF, OR complete the task before quarantine.');
     } else if (rawArtifactArg && (rawArtifactArg === '~' || rawArtifactArg.startsWith('~/') || rawArtifactArg.startsWith('/'))) {
       console.error('WARN (3role-ledger #2462 AC-6): --artifact "' + rawArtifactArg + '" cites an ephemeral or ' +
         'anchored location (a home/tilde-anchored or otherwise machine-local absolute path, or a temp/scratch ' +
@@ -4139,7 +3920,7 @@ function cmdCheck(o) {
     const scanAbsent = resolveSessionScanForCheck(session, task, absentScanOpts);
     if (scanAbsent) { printSessionScanResolveAllow(task, scanAbsent); process.exit(0); }
     console.log('BLOCK: no role-ledger found for task ' + sanitize(task) + ' in this session (' + file +
-      '). Append a ledger line per role: node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" append --session <sid> --task <id> --role <role> ...');
+      '). Append a ledger line per role: node hooks/3role-ledger.mjs append --session <sid> --task <id> --role <role> ...');
     process.exit(2);
   }
   const byRole = {};
@@ -4696,82 +4477,6 @@ function cmdResolveArtifactsForTask(o) {
       console.log(JSON.stringify({ session, role, ref: rawRef, resolved: false, via: 'not-found' }));
     }
   }
-  process.exit(0);
-}
-
-// review-seat-publish-verdict backstop primitive (task plan-review-seat-leaves-verdict-uncommitted-in-
-// worktree-blocking-w3-gate) — resolve-published-verdict --session S --task T --role R [--merge-head H]:
-// finds the LAST ledger row for (session, task, role) and resolves its artifact_path/oracle-ref via the
-// REF ARM ONLY (resolveArtifactAtRef — task-bound refs + origin/master, + merge-head if given) — NOT the
-// disk-first arm resolve-artifacts-for-task above uses (Constraint C2: a disk-only PASS is not "published"
-// — that is exactly the lane-1-shaped defect this whole ticket exists to close). Prints ONE line to stdout:
-//   row:<0|1> ref-hit:<0|1> ref:<ref-or-none> decision-line:<0|1> affirmative:<0|1> artifact:<encoded-or-none>
-// row=0           — no ledger row exists for this (session,task,role) at all.
-// ref-hit=0       — a row exists but its artifact_path/oracle does not resolve at ANY candidate ref
-//                   (whether or not it exists on disk — disk is not consulted here).
-// decision-line=1 — the ref-resolved content carries a flush-left Decision:/verdict: line, ANY value
-//                   (hasRefArmDecisionLine — the value-agnostic sibling of hasRefArmAffirmative, built
-//                   from the SAME DECISION_LINE_SOURCE — Constraint C1).
-// affirmative=1   — informational only: that line's value is ALSO in CHECK_LANE_AFFIRMATIVE. The backstop
-//                   hook does not gate on this field (C1 — a published FAIL is still published); it is
-//                   printed for operator visibility / smoke assertions only.
-// artifact         — the row's raw artifact_path/oracle string, encodeURIComponent'd (so a path can never
-//                     break the single-line whitespace-delimited output) — lets a caller build a repair
-//                     recipe naming the REAL path without re-reading the ledger file itself.
-// Not a pass/fail gate itself (mirrors resolve-artifacts-for-task's contract; does not change
-// checkRole()/cmdCheck() pass/fail semantics) — exit 0 whenever the ledger file for (session,task) is
-// readable, exit 1 when it is not (lets the caller fail open on a missing ledger, same shape as
-// resolve-artifacts-for-task's NO-LEDGER exit 1).
-function cmdResolvePublishedVerdict(o) {
-  const session = o.session, task = o.task, role = o.role;
-  if (!session || !task || !role) {
-    console.log('resolve-published-verdict: --session, --task, and --role are all required');
-    process.exit(2);
-  }
-  const mergeHead = o['merge-head'] || '';
-  const file = ledgerFile(session, task);
-  let lines = [];
-  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
-  catch (e) {
-    console.log('row:0 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:none');
-    process.exit(1);
-  }
-  let last = null;
-  for (const ln of lines) {
-    let row; try { row = JSON.parse(ln); } catch (e) { continue; }
-    if (row && row.role === role) last = row;   // LAST matching row wins, same semantics as cmdCheck's byRole
-  }
-  if (!last) {
-    console.log('row:0 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:none');
-    process.exit(0);
-  }
-  // A row carrying skip_reason (classifySkip) self-declares "no artifact to publish" — checkRole() already
-  // judges whether the reason is SPECIFIC enough at `check` time (its own message covers that); this
-  // primitive stays out of that judgment and simply reports it as satisfied so the backstop hook does not
-  // fire on a legitimately-skipped review.
-  if (classifySkip(last).skip) {
-    console.log('row:1 ref-hit:1 ref:inline-skip decision-line:1 affirmative:1 artifact:none');
-    process.exit(0);
-  }
-  const rawRef = (role === 'execution-review' && last.oracle) ? stripOraclePrefix(last.oracle) : last.artifact_path;
-  const encRef = rawRef ? encodeURIComponent(String(rawRef)) : 'none';
-  if (!rawRef || !String(rawRef).trim()) {
-    console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
-    process.exit(0);
-  }
-  const hit = resolveArtifactAtRef(rawRef, mergeHead, task);
-  if (!hit) {
-    console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
-    process.exit(0);
-  }
-  const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
-  if (content === null) {
-    console.log('row:1 ref-hit:1 ref:' + hit.ref + ' decision-line:0 affirmative:0 artifact:' + encRef);
-    process.exit(0);
-  }
-  const decisionLine = hasRefArmDecisionLine(content) ? 1 : 0;
-  const affirmative = hasRefArmAffirmative(content) ? 1 : 0;
-  console.log('row:1 ref-hit:1 ref:' + hit.ref + ' decision-line:' + decisionLine + ' affirmative:' + affirmative + ' artifact:' + encRef);
   process.exit(0);
 }
 
@@ -6941,7 +6646,6 @@ try {
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
-  else if (cmd === 'resolve-published-verdict') cmdResolvePublishedVerdict(opts);
   else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
@@ -6958,11 +6662,10 @@ try {
   else if (cmd === 'clear-seat-pin') cmdClearSeatPin(opts);
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
-      '[--session S --task T --role R [--merge-head R] (resolve-published-verdict, review-seat-publish-verdict backstop primitive) — prints row: ref-hit: ref: decision-line: affirmative:] ' +
       '[--merge-head R (check, widens the DEFAULT-ON ref-scoped resolution arm, #2088/#2462)] ' +
       '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
       '[--enforce-artifact-role-kind (check, #1532)] ' +

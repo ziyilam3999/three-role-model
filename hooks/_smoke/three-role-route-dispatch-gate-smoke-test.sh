@@ -37,13 +37,13 @@ LOG="$TMP/bypass.log"
 # machine's real environment happens to resolve to (normally normal/default, since this smoke never sets
 # HOME). CC_MODE_FILE is an isolated scratch path per pin -- this smoke NEVER reads or writes the real
 # ~/.config/cc-mode.json. NO_PIN is deliberately never created -> resolves to mode=normal via source=default
-# (the AC-11a arm). SB_PIN pins speed-boost (the AC-11c arm).
+# (the AC-11a arm). SB_PIN pins boost (the AC-11c arm).
 LED="$ROOT/bin/3role-ledger.mjs"
 CONS_PIN="$TMP/cons-pin.json"
 CC_MODE_FILE="$CONS_PIN" node "$LED" set-mode --mode conservative --reason smoke >/dev/null 2>&1
 NO_PIN="$TMP/no-pin-never-created.json"
 SB_PIN="$TMP/sb-pin.json"
-CC_MODE_FILE="$SB_PIN" node "$LED" set-mode --mode speed-boost --reason smoke >/dev/null 2>&1
+CC_MODE_FILE="$SB_PIN" node "$LED" set-mode --mode boost --reason smoke >/dev/null 2>&1
 
 # Fixture A — BOTH plan-review and executor declared subprocess-openrouter (real #1947 shape). Drives AC-3/4
 # (the two declared seats each have their OWN session:task:role signature -> distinct markers, no
@@ -221,7 +221,7 @@ echo "== SECTION 3: #2105 D3 mode-awareness backstop — AC 11(a)/(b)/(c) =="
 # ---- AC-11(a): mode=normal (default, NO_PIN never created -> source=default) -- the SAME subprocess-declared
 #      plan-review payload that blocks under conservative (AC-3) now stays COMPLETELY SILENT on its FIRST
 #      issue: outside conservative mode the Agent-tool spawn of this seat IS the sanctioned primary (D3's own
-#      dispatch helpers refuse the subprocess route themselves in normal/speed-boost), so nudging it here
+#      dispatch helpers refuse the subprocess route themselves in normal/boost), so nudging it here
 #      would just train every routine normal-mode spawn to carry the bypass token. Distinct session id so no
 #      STATE_DIR marker collision with AC-3's own signature. ----
 P11A='{"session_id":"ac11a","tool_input":{"prompt":"3ROLE_TASK:9601 ROLE:plan-review\nreview the plan"}}'
@@ -243,13 +243,13 @@ run "$P11B" CC_MODE_FILE="$CONS_PIN"
   && ok "AC-11b: mode=conservative re-issue -> exit 0 silent (block-once still holds under the mode gate)" \
   || bad "AC-11b conservative re-issue should exit 0 silent (rc=$RC out=$CAP)"
 
-# ---- AC-11(c): mode=speed-boost (a SECOND non-conservative mode, not just "not pinned") -> also silent,
+# ---- AC-11(c): mode=boost (a SECOND non-conservative mode, not just "not pinned") -> also silent,
 #      proving the gate keys on "== conservative", not merely "!= normal" / "no pin present". ----
 P11C='{"session_id":"ac11c","tool_input":{"prompt":"3ROLE_TASK:9603 ROLE:executor\nimplement the plan"}}'
 run "$P11C" CC_MODE_FILE="$SB_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
-  && ok "AC-11c: mode=speed-boost -> exit 0 silent (gate keys on ==conservative, not merely !=normal)" \
-  || bad "AC-11c speed-boost mode should stay silent (rc=$RC out=$CAP)"
+  && ok "AC-11c: mode=boost -> exit 0 silent (gate keys on ==conservative, not merely !=normal)" \
+  || bad "AC-11c boost mode should stay silent (rc=$RC out=$CAP)"
 
 # ---- AC-11(d): a crashed/unreadable mode resolver still fails OPEN (silent), matching the hook's own
 #      documented convention -- point CC_MODE_FILE at a directory (not a file) so resolve-mode's fs.readFileSync

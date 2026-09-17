@@ -1,12 +1,25 @@
 {
-  "_composition_contract": "#2105 — this file is one of TWO disjoint lane-policy tables (the other is #1939's config/lane-modes.json). LANE axis: the two doormen (this ticket's hooks/mode-pin-lane-gate.sh and #1939's hooks/lane-ceiling-gate.sh, when it lands) are INDEPENDENT CONJUNCT PreToolUse gates registered at the same two edges — each refuses on its own predicate, so the effective ceiling any spawn actually experiences is min(pin-ceiling, computed-ceiling) BY CONSTRUCTION: a second gate can only refuse MORE, never permit more (tighten-only). PROVIDER axis: the AUTHORIZATION verdict (openrouter_dispatch=permitted|forbidden) is a pure function of (this table, the operator pin at ~/.config/cc-mode.json) ALONE — a computed LANE reading from #1939's decision-maker (e.g. .ai-workspace/status/lane-mode.json) is NEVER consulted for the provider axis and cannot move it by one byte (AC 16); this stays true unchanged by #2189. #2189 D2/D3 add a SEPARATE, DOWNSTREAM, ONE-WAY veto sitting AFTER this table+pin already resolves permitted: a RECORDED OpenRouter credits reading (~/.claude/lane-mode-status/openrouter-reading.json, written only by the scheduled record-openrouter job — the decision path itself never makes a live network call) can SUBTRACT that permission per-dispatch (refuse on an absent/stale/malformed/exhausted reading) but can never GRANT it — a fresh, healthy reading never substitutes for or overrides this table+pin's own verdict; it can only narrow what the verdict already allowed. This file never gains a T/nudge-target column — that lives exclusively in #1939's own config/lane-modes.json table. Canonical mode ids are the operator's own words (conservative, normal, speed-boost); #1939/#2035's spelling token-conservative is accepted as an input ALIAS for conservative (see aliases below) so the human vocabulary boundary between the two subsystems never forces a rename on either side. lane_ceiling values are #2035 SS1's C column verbatim (2/3/6) — a committed check (scripts/check-mode-policy-lane-ceiling-parity.mjs) cross-checks these three numbers against that same upstream design doc so the two disjoint tracked tables cannot silently drift apart (AC 17(a)).",
+  "_composition_contract": "#2105/redesign-lane-mode-caps-work-shiptail-pools-enforced (2026-08-29) — this file is one of TWO disjoint lane-policy tables (the other is #1939's config/lane-modes.json, which stays single-ceiling — see the plan's Lockstep §(a) for why the two now legitimately encode DIFFERENT semantics). TWO-POOL LANE axis (v2): each mode carries lanes.{work_base, opportunist, work_ceiling, ship_tail_ceiling} — work_ceiling MUST equal work_base+opportunist (mechanically checked by scripts/check-mode-policy-lane-ceiling-parity.mjs against the plan's Target-state table, the new parity authority). The two doormen (hooks/lane-ceiling-gate.sh and hooks/mode-pin-lane-gate.sh) are INDEPENDENT CONJUNCT PreToolUse gates registered at the same start edges — each refuses on its own predicate over the SAME shared pool-aware membership math (hooks/sole_lane_math.py live_pool_members), so the effective per-pool ceiling any spawn actually experiences is min(pin-ceiling, computed-ceiling) BY CONSTRUCTION (tighten-only). WORK pool roles = planner|plan-review|executor|execution-review; SHIP-TAIL pool role = ship-tail; research is never a lane. Within the WORK pool, work_ceiling is a HARD cap (repeats on re-issue); the work_base->work_ceiling band is a block-once ADVISORY (the opportunist judgment surface); ship_tail_ceiling is a HARD cap with no advisory band. PROVIDER axis: openrouter_dispatch (permitted|forbidden) and the NEW local_dispatch axis (permitted|forbidden, mirroring openrouter_dispatch — authorizes the conservative-mode local-LLM offload option, forbidden everywhere else in v1) are pure functions of (this table, the operator pin at ~/.config/cc-mode.json) ALONE. #2189 D2/D3's downstream OpenRouter-credits ONE-WAY veto (can only SUBTRACT permission, never grant it) is unchanged by this redesign. Canonical mode ids are the operator's own words: conservative, normal, boost (renamed from speed-boost — speed-boost is now an ALIAS, never operator-selectable via set-mode, #2189 D6 'aliases may describe, never unlock'); #1939/#2035's spelling token-conservative remains an input ALIAS for conservative. This file never gains a T/nudge-target column — that lives exclusively in #1939's own config/lane-modes.json table, which keeps its own speed-boost vocabulary (resolved via scripts/lane-mode/lib/pin-to-lane-band.mjs's reverse-alias bridge, zero edits needed there). lane_ceiling (the pre-v2 single-number field) is REMOVED — no dual encoding to drift.",
   "default_mode": "normal",
   "modes": {
-    "conservative": { "lane_ceiling": 2, "openrouter_dispatch": "permitted" },
-    "normal": { "lane_ceiling": 3, "openrouter_dispatch": "forbidden" },
-    "speed-boost": { "lane_ceiling": 6, "openrouter_dispatch": "forbidden" }
+    "conservative": {
+      "lanes": { "work_base": 2, "opportunist": 1, "work_ceiling": 3, "ship_tail_ceiling": 2 },
+      "openrouter_dispatch": "permitted",
+      "local_dispatch": "permitted"
+    },
+    "normal": {
+      "lanes": { "work_base": 2, "opportunist": 1, "work_ceiling": 3, "ship_tail_ceiling": 2 },
+      "openrouter_dispatch": "forbidden",
+      "local_dispatch": "forbidden"
+    },
+    "boost": {
+      "lanes": { "work_base": 5, "opportunist": 0, "work_ceiling": 5, "ship_tail_ceiling": 3 },
+      "openrouter_dispatch": "forbidden",
+      "local_dispatch": "forbidden"
+    }
   },
   "aliases": {
-    "token-conservative": "conservative"
+    "token-conservative": "conservative",
+    "speed-boost": "boost"
   }
 }
