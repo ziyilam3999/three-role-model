@@ -13,6 +13,8 @@ bad() { echo "FAIL: $1"; fail=1; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export THREE_ROLE_LEDGER_DIR="$TMP/ledger"
 export THREE_ROLE_PROJECTS_ROOT="$TMP/projects"
+export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
+export RULE12_LOG="$TMP/rule12.log"  # D4: never write the operator's real audit log during a suite run.
 SID="sess-ledger"; TASK="700"
 LEDFILE="$THREE_ROLE_LEDGER_DIR/$SID/$TASK.jsonl"
 
@@ -3254,8 +3256,12 @@ p1_gate "$P1_FIX/routes.json" "p1-ac33" "t1"
   && ok "#2169 S3-AC11 (PIN, AC-33 re-scoped): the settled split holds -- check-lane (Lane B) counts PASS-WITH-FIXES as affirmative (NO NEGATIVE-VERDICT problem for plan-review) AND gate-plan-review's strict AFFIRMATIVE_VERDICTS still refuses it (rc=$PGRC, class=negative-verdict) -- no behavior change, fixture pins the master-shipped split" \
   || bad "#2169 S3-AC11 FAILED (check_out=$PCOUT gate_rc=$PGRC gate_out=$PGOUT)"
 
-# All S3 fixtures above ran; unset the redirected audit log so it never leaks into any later section.
-unset RULE12_LOG
+# All S3 fixtures above ran; RESTORE the file-level pin (line 16's $TMP/rule12.log) so it never
+# leaks into any later section -- D4(b) (#1493): the previous `unset RULE12_LOG` here dropped the
+# pin ENTIRELY instead of restoring it, so every section below this point (most of the file, incl.
+# fixtures on task ids "1936ac*"/"uf-c04") ran UNPINNED and landed in the operator's real
+# ~/.claude/.rule-12-overrides.log (measured 4,286 rows in 30 days, 3,981 on 2026-09-11 alone).
+export RULE12_LOG="$TMP/rule12.log"
 
 
 # =====================================================================================================
@@ -3646,13 +3652,17 @@ for RROLE_2 in execution-review plan-review; do
     && ok "1936 AC-2($RROLE_2) leg2: artifact-only re-point laundering -> STILL blocks" \
     || bad "1936 AC-2($RROLE_2) leg2 failed (rc=$RC out=$OUT)"
 
-  # (leg iv-a) BOTH attribution-free appends LAND (exit 0 each -- write path unchanged, the scope pin) and
-  #            check STILL blocks afterwards (the B4 verdict-overlay laundering, killed at the READ side).
+  # (leg iv-a) verdict-fail-loud (3role-ledger-review-append-should-require-verdict-fail-loud): the bare
+  #            artifact-only re-point (R1) onto RA2's still verdict-less shield row now REFUSES (rc!=0,
+  #            naming --verdict) instead of landing -- this was a #1936 scope pin ("write path unchanged"),
+  #            not a standing contract. The bare verdict append (R2, no --artifact -> the new guard's
+  #            --artifact precondition never triggers) still LANDS, and check STILL blocks afterwards (the
+  #            B4 verdict-overlay laundering, killed at the READ side -- clause 3, untouched by this guard).
   node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --artifact "$TMP/rev.md" >"$TMP/1936-ac2-iva1-${RROLE_2}.out" 2>&1; R1=$?
   node "$LED" append --session "$S1936" --task "$T2" --role "$RROLE_2" --verdict PASS >"$TMP/1936-ac2-iva2-${RROLE_2}.out" 2>&1; R2=$?
   OUT=$(node "$LED" check --session "$S1936" --task "$T2" 2>&1); RC=$?
-  { [ "$R1" = "0" ] && [ "$R2" = "0" ] && [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
-    && ok "1936 AC-2($RROLE_2) leg(iv-a): both attribution-free appends land (exit0/exit0, write path unchanged) yet check STILL blocks" \
+  { [ "$R1" != "0" ] && command grep -q -- "--verdict" "$TMP/1936-ac2-iva1-${RROLE_2}.out" && [ "$R2" = "0" ] && [ "$RC" != "0" ] && echo "$OUT" | command grep -qi "NEGATIVE-VERDICT"; } \
+    && ok "1936 AC-2($RROLE_2) leg(iv-a): bare artifact-only re-point now REFUSES (verdict-fail-loud, names --verdict; R1!=0), the bare verdict append still lands (R2=0), and check STILL blocks afterwards" \
     || bad "1936 AC-2($RROLE_2) leg(iv-a) failed (r1=$R1 r2=$R2 rc=$RC out=$OUT)"
 
   # (leg iv-b) raw-JSONL hand-written twin, on a FRESH task: FAIL round complete, then a DIRECTLY-appended
@@ -4005,10 +4015,14 @@ AFTER9E=$(cat "$F9E")
   || bad "#2309 AC-9⁗(e) FAILED (rc=$RC9E before=$BEFORE9E after=$AFTER9E)"
 
 # ---- arm (g): artifact_path seed (no closedAt -- still OPEN), then (a)'s attack -----------------------
+# verdict-fail-loud: the second seed line now names --agent explicitly (the orchestrator-repoint shape) --
+# a bare artifact-only re-point onto this still verdict-less row would now REFUSE, so re-seeding this way
+# binds the SAME row (identical final state: agentId=ac9g-p1, artifact_path set, no verdict, no closedAt)
+# without relying on the now-refused bare form.
 T9G="zzc3g"
 mk_sub "$S9" "ac9g-p1"
 node "$LED" append --session "$S9" --task "$T9G" --role plan-review --agent "ac9g-p1" >/dev/null
-node "$LED" append --session "$S9" --task "$T9G" --role plan-review --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session "$S9" --task "$T9G" --role plan-review --agent "ac9g-p1" --artifact "$TMP/rev.md" >/dev/null
 F9G="$THREE_ROLE_LEDGER_DIR/$S9/$T9G.jsonl"
 BEFORE9G=$(cat "$F9G")
 node "$LED" append --session "$S9" --task "$T9G" --role plan-review --verdict PASS --closed-at "2026-01-01T00:00:00Z" >/dev/null 2>&1; RC9G=$?
@@ -4067,15 +4081,19 @@ node "$LED" append --session "$S9" --task "$T9DC" --role plan-review --artifact 
   && ok "#2467 AC-9⁗(d″): backslash-continued one-command self-append (diary proves it across \\\\\\n) -> rc=0" \
   || bad "#2467 AC-9⁗(d″) append FAILED (rc=$RC9DC out=$(cat "$TMP/2467-ac9dc.out"))"
 
-# ---- arm (i): honest TWO-command twin (self-append --artifact, then self-append --verdict) ------------
+# ---- arm (i): honest TWO-command twin (self-append --verdict, then self-append --artifact) --------------
+# verdict-fail-loud: order flipped from the original (artifact, then verdict) -- a bare artifact-only
+# self-append would now REFUSE onto a still verdict-less row (see leg-iv-a above), so the honest self-append
+# shape does --verdict FIRST; the artifact-only re-point then lands (RC9I2) because the row already carries
+# the verdict (carve-out iv-a). The diary / clause-3 proof for ac9i-p1 is unaffected by this ordering.
 T9I="zzc3i"
 mk_tagged "$S9" "ac9i-p1" "$T9I" "plan-review"
 mk_diary "$S9" "ac9i-p1" "$T9I" "plan-review" "PASS"
 node "$LED" append --session "$S9" --task "$T9I" --role plan-review --agent "ac9i-p1" >/dev/null
-node "$LED" append --session "$S9" --task "$T9I" --role plan-review --artifact "$TMP/rev.md" >"$TMP/2309-ac9i-1.out" 2>&1; RC9I1=$?
-node "$LED" append --session "$S9" --task "$T9I" --role plan-review --verdict PASS >"$TMP/2309-ac9i-2.out" 2>&1; RC9I2=$?
+node "$LED" append --session "$S9" --task "$T9I" --role plan-review --verdict PASS >"$TMP/2309-ac9i-1.out" 2>&1; RC9I1=$?
+node "$LED" append --session "$S9" --task "$T9I" --role plan-review --artifact "$TMP/rev.md" >"$TMP/2309-ac9i-2.out" 2>&1; RC9I2=$?
 { [ "$RC9I1" = "0" ] && [ "$RC9I2" = "0" ]; } \
-  && ok "#2309 AC-9⁗(i): honest two-command twin (artifact, then verdict) -> BOTH rc=0" \
+  && ok "#2309 AC-9⁗(i): honest two-command twin (verdict, then artifact re-point onto the now-verdict-carrying row) -> BOTH rc=0" \
   || bad "#2309 AC-9⁗(i) FAILED (rc1=$RC9I1 rc2=$RC9I2 out1=$(cat "$TMP/2309-ac9i-1.out") out2=$(cat "$TMP/2309-ac9i-2.out"))"
 
 # ---- arm (f1′): forged no-`--agent` verdict onto a DEAD bare row -> DIVERTED to a new UNBOUND row ------
@@ -4678,5 +4696,182 @@ S5T_AC4_ROW=$(command grep '"role":"plan-review"' "$S5T_AC4_LEDFILE" 2>/dev/null
 { [ "$RC" = "0" ] && echo "$S5T_AC4_ROW" | command grep -q '"verdict":"PASS"' && ! echo "$S5T_AC4_ROW" | command grep -q '"dispatch_nonce"'; } \
   && ok "#2169 S5-AC4 (PIN, load-bearing legacy counterfactual): a proof-less verdict append onto a LEGACY-shape row (agentId + model badge, no dispatch_nonce stamp) still succeeds UNCHANGED, no --receipt required -- shipping a refusal that breaks this arm would be a slice-FAIL regardless of every other AC" \
   || bad "#2169 S5-AC4 FAILED (rc=$RC out=$OUT row=$S5T_AC4_ROW)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# verdict-fail-loud (3role-ledger-review-append-should-require-verdict-fail-loud): a REVIEW role's own
+# outcome write must carry --verdict (or a sanctioned --skip-reason/--oracle) or fail loud, instead of
+# silently landing a verdict-empty row. New arms mirror the plan's Binary AC (AC-1..AC-8) against THIS
+# (fixed) binary -- the both-ends BASE-vs-FIXED comparison lives in the plan's own AC recipe, run
+# separately against `git show origin/master:hooks/3role-ledger.mjs`.
+SVFL="sess-vfl"
+VFL_DIR="$THREE_ROLE_LEDGER_DIR/$SVFL"
+
+# AC-1: bare (no --agent) artifact-only plan-review self-append onto a first write -> REFUSE, names
+# --verdict, ledger file for the task absent (byte-untouched -- never even created).
+OUT=$(node "$LED" append --session "$SVFL" --task vfl-ac1 --role plan-review --artifact "$TMP/rev.md" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$VFL_DIR/vfl-ac1.jsonl" ]; } \
+  && ok "verdict-fail-loud AC-1: bare artifact-only plan-review self-append (first write) -> REFUSE, names --verdict, file absent" \
+  || bad "verdict-fail-loud AC-1 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$VFL_DIR/vfl-ac1.jsonl" ] && echo yes || echo no))"
+
+# AC-2: --decision is not a ledger verdict field -> REFUSE, names BOTH --decision and --verdict, file absent.
+OUT=$(node "$LED" append --session "$SVFL" --task vfl-ac2 --role plan-review --artifact "$TMP/rev.md" --decision PASS 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--decision" && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$VFL_DIR/vfl-ac2.jsonl" ]; } \
+  && ok "verdict-fail-loud AC-2: --decision PASS on a review-role append -> REFUSE, names --decision AND --verdict, file absent" \
+  || bad "verdict-fail-loud AC-2 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$VFL_DIR/vfl-ac2.jsonl" ] && echo yes || echo no))"
+
+# AC-3: a valueless --verdict counts as missing -> REFUSE, names --verdict, file absent.
+OUT=$(node "$LED" append --session "$SVFL" --task vfl-ac3 --role plan-review --verdict --artifact "$TMP/rev.md" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$VFL_DIR/vfl-ac3.jsonl" ]; } \
+  && ok "verdict-fail-loud AC-3: valueless --verdict counts as missing -> REFUSE, names --verdict, file absent" \
+  || bad "verdict-fail-loud AC-3 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$VFL_DIR/vfl-ac3.jsonl" ] && echo yes || echo no))"
+
+# AC-4/AC-5: a real --verdict PASS append still lands, for BOTH review roles.
+for VFLROLE in plan-review execution-review; do
+  T="vfl-ac4-$VFLROLE"
+  OUT=$(node "$LED" append --session "$SVFL" --task "$T" --role "$VFLROLE" --artifact "$TMP/rev.md" --verdict PASS 2>&1); RC=$?
+  ROW=$(command grep '"verdict":"PASS"' "$VFL_DIR/$T.jsonl" 2>/dev/null)
+  { [ "$RC" = "0" ] && [ -n "$ROW" ]; } \
+    && ok "verdict-fail-loud AC-4/5 ($VFLROLE): --verdict PASS --artifact -> lands, row carries verdict:PASS" \
+    || bad "verdict-fail-loud AC-4/5 ($VFLROLE) FAILED (rc=$RC out=$OUT row=$ROW)"
+done
+
+# AC-6: no-regression control -- executor / planner artifact-only appends are untouched (not review roles).
+node "$LED" append --session "$SVFL" --task vfl-ac6 --role executor --artifact "PR #vfl-ac6" >/dev/null 2>&1; RC6E=$?
+node "$LED" append --session "$SVFL" --task vfl-ac6 --role planner --artifact "$TMP/rev.md" >/dev/null 2>&1; RC6P=$?
+{ [ "$RC6E" = "0" ] && [ "$RC6P" = "0" ]; } \
+  && ok "verdict-fail-loud AC-6: executor/planner artifact-only appends (not review roles) -> unaffected, both land" \
+  || bad "verdict-fail-loud AC-6 FAILED (rc-executor=$RC6E rc-planner=$RC6P)"
+
+# AC-7: the subprocess-openrouter reviewer's verdict-less --artifact self-append onto its own pre-stamped
+# row (tools/openrouter-role-dispatch.sh:539's shape) -- the load-bearing sanctioned-writer carve-out.
+node "$LED" append --session "$SVFL" --task vfl-ac7 --role plan-review --dispatch subprocess-openrouter \
+  --run-kind bound --run-source dispatch-helper --run-id N1 --dispatch-nonce N1 --pending >/dev/null 2>&1
+OUT=$(node "$LED" append --session "$SVFL" --task vfl-ac7 --role plan-review --artifact "$TMP/rev.md" 2>&1); RC=$?
+ROW=$(command grep '"dispatch":"subprocess-openrouter"' "$VFL_DIR/vfl-ac7.jsonl" 2>/dev/null)
+{ [ "$RC" = "0" ] && [ -n "$ROW" ] && echo "$ROW" | command grep -q "artifact_path"; } \
+  && ok "verdict-fail-loud AC-7: subprocess-openrouter reviewer verdict-less self-append onto its pre-stamped row -> lands, keeps dispatch marker + gains artifact_path" \
+  || bad "verdict-fail-loud AC-7 FAILED (rc=$RC out=$OUT row=$ROW)"
+
+# AC-8: other sanctioned-writer controls -- all land.
+node "$LED" append --session "$SVFL" --task vfl-ac8f --role plan-review --agent vfl-ac8f-a1 --artifact "$TMP/rev.md" >/dev/null 2>&1; RC8F=$?
+node "$LED" append --session "$SVFL" --task vfl-ac8g --role plan-review --skip-reason "tightly coupled to live session state: mid-edit" >/dev/null 2>&1; RC8G=$?
+printf 'verdict: PASS\n' > "$TMP/oracle-vfl.txt"
+node "$LED" append --session "$SVFL" --task vfl-ac8h --role execution-review --oracle "$TMP/oracle-vfl.txt" >/dev/null 2>&1; RC8H=$?
+node "$LED" append --session "$SVFL" --task vfl-ac8i --role plan-review --artifact "$TMP/rev.md" --verdict PASS >/dev/null 2>&1
+node "$LED" append --session "$SVFL" --task vfl-ac8i --role plan-review --artifact "$TMP/rev.md" >/dev/null 2>&1; RC8I=$?
+{ [ "$RC8F" = "0" ] && [ "$RC8G" = "0" ] && [ "$RC8H" = "0" ] && [ "$RC8I" = "0" ]; } \
+  && ok "verdict-fail-loud AC-8: --agent re-point / --skip-reason / --oracle / artifact-only re-point onto an already-verdict-carrying row -> all land" \
+  || bad "verdict-fail-loud AC-8 FAILED (agent=$RC8F skip-reason=$RC8G oracle=$RC8H repoint=$RC8I)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# unknown-flag (3role-ledger-append-should-reject-unknown-flags): append refuses ANY flag not on the
+# closed 25-name allowlist, for every RECORDABLE_ROLES role -- BLOCK (rc!=0), nothing written, naming
+# every offender + the full allowlist. New arms mirror the plan's Binary AC (AC-1..AC-6, AC-8) against
+# THIS (fixed) binary -- the both-ends BASE-vs-FIXED comparison lives in the plan's own AC recipe, run
+# separately against `git show origin/master:hooks/3role-ledger.mjs`. Inserted strictly after the blank
+# line following the verdict-fail-loud AC-8 arm above, so that section's :4681-4745 range stays
+# byte-identical (AC-5(c)).
+SUF="sess-uf"
+UF_DIR="$THREE_ROLE_LEDGER_DIR/$SUF"
+UF_PLAN="$TMP/uf-plan.md"
+printf '## ELI5\nx\n### Binary AC\n- a\n' > "$UF_PLAN"
+
+# AC-1 (hold-out reject): a flag name MINTED AT RUN TIME (can never be in any allowlist by construction)
+# -> REFUSE, stderr carries the stable token unknown-flag + the literal offending --flag, ledger file for
+# the task absent (never even created).
+UF_HELDOUT="heldout-$$-$RANDOM"
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac1 --role planner --agent uf-a1 --artifact "$UF_PLAN" --"$UF_HELDOUT" X 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q "unknown-flag" && echo "$OUT" | command grep -q -- "--$UF_HELDOUT" && [ ! -f "$UF_DIR/uf-ac1.jsonl" ]; } \
+  && ok "unknown-flag AC-1: a run-time-minted hold-out flag -> REFUSE, stderr carries unknown-flag + --$UF_HELDOUT, file absent" \
+  || bad "unknown-flag AC-1 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac1.jsonl" ] && echo yes || echo no))"
+
+# AC-4 (allowlist printed in full): the SAME AC-1 refusal's stderr must enumerate all 25 known names,
+# each with a leading --, in particular --verdict and --closed-at.
+UF_ALLOWLIST="session task role agent artifact reviewed-plan skip-reason oracle verdict cairn dispatch transcript nonce dispatch-nonce receipt pending run-kind run-id run-source self-authored effort model-version model-tier closed-at sense-reroute"
+UF_AC4_MISSING=""
+for UFNAME in $UF_ALLOWLIST; do
+  echo "$OUT" | command grep -q -- "--$UFNAME" || UF_AC4_MISSING="$UF_AC4_MISSING $UFNAME"
+done
+[ -z "$UF_AC4_MISSING" ] \
+  && ok "unknown-flag AC-4: the block message enumerates all 25/25 known flags (each with --), incl. --verdict and --closed-at" \
+  || bad "unknown-flag AC-4 FAILED (missing from stderr:$UF_AC4_MISSING)"
+
+# AC-2 (the incident shape, non-review roles): a typo'd/wrong flag on a role OTHER than plan-review /
+# execution-review -> REFUSE, names the offender, file absent. #1555's own guard only ever covered review
+# roles; this is the class that guard could not close.
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac2a --role executor --agent uf-e1 --artifact "PR #uf1" --decsion PASS 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--decsion" && [ ! -f "$UF_DIR/uf-ac2a.jsonl" ]; } \
+  && ok "unknown-flag AC-2a: --decsion (typo) on an executor append -> REFUSE, names --decsion, file absent" \
+  || bad "unknown-flag AC-2a FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac2a.jsonl" ] && echo yes || echo no))"
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac2b --role planner --agent uf-p1 --artifact "$UF_PLAN" --decision PASS 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--decision" && [ ! -f "$UF_DIR/uf-ac2b.jsonl" ]; } \
+  && ok "unknown-flag AC-2b: --decision on a planner append (non-review role) -> REFUSE, names --decision, file absent" \
+  || bad "unknown-flag AC-2b FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac2b.jsonl" ] && echo yes || echo no))"
+
+# AC-3 (all offenders named, valued AND bare): multiple unrecognized flags on one call are ALL named on
+# the single refusal, file absent.
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac3 --role executor --agent uf-e1 --artifact "PR #uf1" --bogus-a 1 --bogus-b 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--bogus-a" && echo "$OUT" | command grep -q -- "--bogus-b" && [ ! -f "$UF_DIR/uf-ac3.jsonl" ]; } \
+  && ok "unknown-flag AC-3: multiple offenders (valued --bogus-a 1 + bare --bogus-b) -> REFUSE, BOTH named, file absent" \
+  || bad "unknown-flag AC-3 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac3.jsonl" ] && echo yes || echo no))"
+
+# AC-5(a) (write-nothing on an EXISTING row): an unknown-flag retry against an already-written row never
+# touches the file -- byte-unchanged.
+node "$LED" append --session "$SUF" --task uf-ac5 --role planner --agent uf-p1 --artifact "$UF_PLAN" >/dev/null 2>&1
+UF_AC5_FILE="$UF_DIR/uf-ac5.jsonl"
+UF_AC5_SNAP="$TMP/uf-ac5-snap.jsonl"
+cp "$UF_AC5_FILE" "$UF_AC5_SNAP"
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac5 --role planner --agent uf-p1 --artifact "$UF_PLAN" --nope 1 2>&1); RC=$?
+{ [ "$RC" != "0" ] && cmp -s "$UF_AC5_SNAP" "$UF_AC5_FILE"; } \
+  && ok "unknown-flag AC-5a: an unknown-flag retry against an ALREADY-WRITTEN row -> REFUSE, row byte-unchanged" \
+  || bad "unknown-flag AC-5a FAILED (rc=$RC out=$OUT)"
+
+# AC-5(b) (#1555 preserved with zero edits to its own section above): its three refusals still fire,
+# assertions unchanged -- the new general check runs FIRST for --decision, but still names --verdict via
+# the C1(iii) full-allowlist enumeration, so #1555's observable contract survives.
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac5b --role plan-review --artifact "$UF_PLAN" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$UF_DIR/uf-ac5b.jsonl" ]; } \
+  && ok "unknown-flag AC-5b(i): #1555 bare review-role artifact-only self-append still REFUSEs, names --verdict" \
+  || bad "unknown-flag AC-5b(i) FAILED (rc=$RC out=$OUT)"
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac5c --role plan-review --artifact "$UF_PLAN" --decision PASS 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--decision" && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$UF_DIR/uf-ac5c.jsonl" ]; } \
+  && ok "unknown-flag AC-5b(ii): #1555 --decision on a review role still REFUSEs, names BOTH --decision and --verdict" \
+  || bad "unknown-flag AC-5b(ii) FAILED (rc=$RC out=$OUT)"
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac5d --role plan-review --verdict --artifact "$UF_PLAN" 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | command grep -q -- "--verdict" && [ ! -f "$UF_DIR/uf-ac5d.jsonl" ]; } \
+  && ok "unknown-flag AC-5b(iii): #1555 valueless --verdict still REFUSEs, names --verdict" \
+  || bad "unknown-flag AC-5b(iii) FAILED (rc=$RC out=$OUT)"
+
+# AC-6 (every sanctioned shape still lands, rc=0, file present): one call per caller shape, together
+# covering all 22 optional flags across the caller shapes the plan's survey enumerated.
+printf 'verdict: PASS\n' > "$TMP/uf-oracle.txt"
+printf '{"type":"assistant","message":{"model":"claude-sonnet-4-5"}}\n' > "$TMP/uf-t.jsonl"
+UF_OK=1
+node "$LED" append --session "$SUF" --task uf-c01 --role planner --agent uf-p1 --artifact "$UF_PLAN" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c02 --role executor --artifact "PR #uf-c02" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c03 --role plan-review --artifact "$UF_PLAN" --verdict PASS >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c04 --role execution-review --verdict FAIL --artifact "$UF_PLAN" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c05 --role plan-review --skip-reason "tightly coupled to live session state: mid-edit" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c06 --role execution-review --oracle "$TMP/uf-oracle.txt" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c07 --role plan-review --agent uf-r1 --reviewed-plan "$UF_PLAN" --artifact "$UF_PLAN" --verdict PASS >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c08 --role planner --cairn "cairn: searched x -> 2 hits" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id N1 --dispatch-nonce N1 --pending >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --artifact "$UF_PLAN" --verdict PASS --receipt N1 >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c11 --role executor --dispatch subprocess-openrouter --transcript "$TMP/uf-t.jsonl" --nonce N2 --artifact "PR #uf-c11" >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c16 --role planner --agent uf-p2 --artifact "$UF_PLAN" --dispatch-nonce TOK1 --reviewed-plan "$UF_PLAN" --sense-reroute --effort xhigh --model-tier fable --model-version claude-fable-5-1 >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --artifact "PR #uf-c12" --effort high --model-version claude-sonnet-4-5 --model-tier sonnet --sense-reroute >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --closed-at 2026-09-04T00:00:00.000Z --self-authored --effort high --sense-reroute >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c14 --role executor --agent uf-e2 --closed-at 2026-09-04T00:00:00.000Z --self-authored false --pending false >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c15 --role research --artifact "$UF_PLAN" >/dev/null 2>&1 || UF_OK=0
+[ "$UF_OK" = "1" ] \
+  && ok "unknown-flag AC-6: every sanctioned caller shape (all 22 optional flags across 16 calls) still lands rc=0" \
+  || bad "unknown-flag AC-6 FAILED (one or more sanctioned shapes returned non-zero)"
+
+# AC-8 (coexistence with #2189): a repeated --artifact AND an unrecognized flag on the SAME call -- either
+# refusal may speak first, but nothing is ever written.
+OUT=$(node "$LED" append --session "$SUF" --task uf-ac8 --role planner --agent uf-p1 --artifact "$UF_PLAN" --artifact "$UF_PLAN" --nope 1 2>&1); RC=$?
+{ [ "$RC" != "0" ] && [ ! -f "$UF_DIR/uf-ac8.jsonl" ]; } \
+  && ok "unknown-flag AC-8: coexists with #2189's duplicate-flag refusal -- REFUSE, file absent" \
+  || bad "unknown-flag AC-8 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac8.jsonl" ] && echo yes || echo no))"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
