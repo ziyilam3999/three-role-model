@@ -87,6 +87,20 @@ case "$TRANSCRIPT" in
 esac
 [ -f "$TRANSCRIPT" ] || exit 0
 
+# F10 (live-pool-members-undercounts-long-running-lanes) -- derive the ORCHESTRATOR session from the
+# transcript path's own segment, in PREFERENCE to trusting the payload's session_id (mirrors the exact
+# defense hooks/lane-heartbeat.sh:96-115 already documents/applies for its own model-refresh trigger). Both
+# the closedAt stamp and the marker unlink below key on SESSION -- if it is ever a subagent-local session
+# rather than the true orchestrator session, the stamp lands in the wrong ledger dir and the unlink targets
+# the wrong marker dir. Falls back to the already-parsed payload SESSION when the path carries no such
+# segment (matches the payload shape this hook has always seen in practice).
+DERIVED_SESSION="$(printf '%s' "$TRANSCRIPT" | node -e '
+let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{
+  const m=s.match(/\/([^\/]+)\/subagents\/agent-[^\/]+\.jsonl$/);
+  process.stdout.write((m && /^[A-Za-z0-9._-]+$/.test(m[1])) ? m[1] : "");
+})' 2>/dev/null)"
+[ -n "$DERIVED_SESSION" ] && SESSION="$DERIVED_SESSION"
+
 # agentId: PREFER the payload's agent_id; fall back to the filename .../subagents/agent-<id>.jsonl
 if [ -n "$PAYLOAD_AGENTID" ]; then
   AGENTID="$PAYLOAD_AGENTID"
@@ -186,4 +200,35 @@ CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # base-url that changed since spawn gets its stamp refreshed at its own authoritative close edge. Same
 # fail-open semantics as the spawn edge (see three-role-spawn-ledger.sh) -- a no-op for an ordinary session.
 node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG --closed-at "$CLOSED_AT" --sense-reroute >/dev/null 2>&1
+
+# Redesign (2026-08-29, work/ship-tail pool split) — spawn-intent MARKER LIFECYCLE: unlink the marker
+# hooks/lane-ceiling-gate.sh wrote at this role's spawn PERMIT, now that the role has genuinely stopped.
+# Best-effort, never blocks: a missing marker (never written -- e.g. the ceiling gate was killed-switched at
+# spawn time) is a silent no-op; the TTL backstop (LANE_INTENT_TTL_MS) covers any marker this unlink misses.
+#
+# F4 (live-pool-members-undercounts-long-running-lanes) -- ROLE-MATCHED unlink, with a WILDCARD for the
+# `role: "-"` TaskUpdate-origin marker class. The eager unlink used to fire on ANY same-task SubagentStop
+# with NO role/agent match at all, so a same-task research/ship-tail close could delete a still-running
+# WORK lane's real marker early. A strict role match alone would overshoot the other way: a TaskUpdate-
+# origin marker is ALWAYS written with `"role": "-"` (lane-ceiling-gate.sh never parses ROLE: on that edge),
+# so under a strict match no stopping role would ever equal "-" and that whole marker class would leak to
+# TTL instead of being cleared as it is today. The wildcard preserves today's clearing for THAT class while
+# fixing the same-task cross-role deletion for every real-role marker.
+LANE_INTENT_DIR_RESOLVED="${LANE_INTENT_DIR:-$HOME/.claude/.lane-intents}"
+SID_SAFE="$(printf '%s' "$SESSION" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>process.stdout.write(s.replace(/[^0-9A-Za-z._-]/g,"")))' 2>/dev/null)"
+TASK_SAFE="$(printf '%s' "$TASKID" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>process.stdout.write(s.replace(/[^0-9A-Za-z._-]/g,"")))' 2>/dev/null)"
+if [ -n "$SID_SAFE" ] && [ -n "$TASK_SAFE" ]; then
+  MARKER_PATH="$LANE_INTENT_DIR_RESOLVED/$SID_SAFE/$TASK_SAFE.json"
+  MARKER_ROLE="$(node -e '
+    const fs=require("fs");
+    try {
+      const o=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+      process.stdout.write((o && typeof o.role==="string") ? o.role : "");
+    } catch (e) { process.stdout.write("__ABSENT__"); }
+  ' "$MARKER_PATH" 2>/dev/null)"
+  if [ "$MARKER_ROLE" != "__ABSENT__" ] && { [ -z "$MARKER_ROLE" ] || [ "$MARKER_ROLE" = "-" ] || [ "$MARKER_ROLE" = "$ROLE" ]; }; then
+    rm -f "$MARKER_PATH" 2>/dev/null
+  fi
+fi
+
 exit 0

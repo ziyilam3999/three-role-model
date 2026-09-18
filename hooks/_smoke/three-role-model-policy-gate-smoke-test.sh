@@ -12,6 +12,24 @@
 # to the CURRENT hook AND, for the two REGRESSION-CATCH rows, to a snapshot of the PRE-FIX hook fetched from
 # origin/master — proving the leak this ticket exists to close ACTUALLY existed on HEAD (RED-on-HEAD-first;
 # a smoke whose red arm can pass via an unrelated fail-open path is vacuous — #1502's exact defect class).
+#
+# NOTE (3role-ledger-accepts-attribution-url-fragment-as-session-creating-stray-dirs, #1610, #NR-2, carried
+# forward by #2502): every `session_id` payload below is a CANONICAL 8-4-4-4-12 lowercase-hex value now that
+# hooks/3role-ledger.mjs's enforceSessionShape() rejects a non-canonical --session unconditionally at the top
+# of resolve-effective-tier — this gate always forwards session_id straight through to
+# `resolve-effective-tier --session ...`. A bare short literal (e.g. "l4", "ac9") used to make
+# resolve-effective-tier fail-open with an EMPTY tier (BLOCK on stderr, nothing on stdout), which this gate
+# reads as EFFECTIVE=unknown and false-blocks even the on-policy/allow arms this smoke is asserting.
+# #1610 applied this exact remedy to its two sibling smokes (hooks/lane-intent-refresh-smoke-test.sh,
+# hooks/three-role-effort-mechanism-smoke-test.sh) but missed this third consumer — that omission is #2502's
+# root cause. Per NR-2's own prescribed remedy ("redirect the store or use a canonical session in that
+# harness — never the kill-switch"), every id below is an OBVIOUSLY-SYNTHETIC, zero-heavy, injectively-remapped
+# UUID (`ac0000NN-0000-4000-8000-0000000000NN`, mirroring #1610's own `ac900000-…`/`ac100000-…` family) that
+# still corresponds to no real session/transcript on any host — only the SHAPE changed, never the store
+# location and never the guard's own escape hatch (this file sets and reads neither the ledger's store-
+# redirect env var nor its session-shape guard's kill-switch env var — NR-2 forbids both), and the remap
+# preserves every block-once signature relationship the smoke tests (the two intentional duplicates —
+# the L1/L2/L3 legacy `l1` id and the AC-INDEP `ac1513indep` id — stay duplicates under the remap).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
@@ -422,7 +440,7 @@ echo "== SECTION 2: GATE arms (PreToolUse(Agent) payloads through the hook) — 
 
 # ---- AC-8: REGRESSION — the measured leak. planner, NO model, general-purpose, FABLE_TX.
 #      HEAD (pre-fix): exits 0 silent (the bug). Post-fix: exits 2, names fable + the session source. ----
-P8='{"session_id":"ac8","tool_input":{"prompt":"3ROLE_TASK:9101 ROLE:planner\nPlan it.","subagent_type":"general-purpose"},"transcript_path":"'"$FABLE_TX"'"}'
+P8='{"session_id":"ac000001-0000-4000-8000-000000000001","tool_input":{"prompt":"3ROLE_TASK:9101 ROLE:planner\nPlan it.","subagent_type":"general-purpose"},"transcript_path":"'"$FABLE_TX"'"}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$P8"
   { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
@@ -435,7 +453,7 @@ run "$P8"
   || bad "AC-8 post-fix should block and name fable+session (rc=$RC out=$CAP)"
 
 # ---- AC-9: GREEN majority path — robust tail, no false block, DEFAULT tail bytes (no override). ----
-P9='{"session_id":"ac9","tool_input":{"prompt":"3ROLE_TASK:9102 ROLE:planner\nPlan it.","subagent_type":"general-purpose"},"transcript_path":"'"$REALISTIC_OPUS_TX"'"}'
+P9='{"session_id":"ac000002-0000-4000-8000-000000000002","tool_input":{"prompt":"3ROLE_TASK:9102 ROLE:planner\nPlan it.","subagent_type":"general-purpose"},"transcript_path":"'"$REALISTIC_OPUS_TX"'"}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$P9"; rc9h=$RC
 else
@@ -447,7 +465,7 @@ run "$P9"; rc9p=$RC
   || bad "AC-9 should never false-block (rc_head=$rc9h rc_postfix=$rc9p)"
 
 # ---- AC-10: GREEN explicit — an explicit model:sonnet under a Fable-session transcript is NOT false-blocked. ----
-P10='{"session_id":"ac10","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9103 ROLE:executor\nGo."},"transcript_path":"'"$FABLE_TX"'"}'
+P10='{"session_id":"ac000003-0000-4000-8000-000000000003","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9103 ROLE:executor\nGo."},"transcript_path":"'"$FABLE_TX"'"}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$P10"; rc10h=$RC
 else
@@ -462,7 +480,7 @@ run "$P10"; rc10p=$RC
 #      HEAD: exits 0 silent (the DANGEROUS direction — old hardcoded opus == opus policy). Post-fix: exits 2
 #      via the named `unknown` branch; stderr asks for an explicit model: and does NOT silently claim opus
 #      was assumed (no "inherited"/"the session model, Opus" language — the exact phrasing the bug used). ----
-P11='{"session_id":"ac11","tool_input":{"prompt":"3ROLE_TASK:9104 ROLE:plan-review\nReview it."},"transcript_path":"'"$EMPTY_TX"'"}'
+P11='{"session_id":"ac000004-0000-4000-8000-000000000004","tool_input":{"prompt":"3ROLE_TASK:9104 ROLE:plan-review\nReview it."},"transcript_path":"'"$EMPTY_TX"'"}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$P11"
   { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
@@ -477,7 +495,7 @@ run "$P11"
 
 # ---- AC-12: FAIL-CLOSED cheap-seat can't-determine (consistency arm — HEAD already exits 2, for a
 #      different reason: hardcoded opus != sonnet policy). Post-fix exits 2 via the NEW unknown branch. ----
-P12='{"session_id":"ac12","tool_input":{"prompt":"3ROLE_TASK:9105 ROLE:executor\nImplement."},"transcript_path":"'"$EMPTY_TX"'"}'
+P12='{"session_id":"ac000005-0000-4000-8000-000000000005","tool_input":{"prompt":"3ROLE_TASK:9105 ROLE:executor\nImplement."},"transcript_path":"'"$EMPTY_TX"'"}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$P12"
   { [ "$RC" = "2" ]; } \
@@ -491,7 +509,7 @@ run "$P12"
 
 # ---- AC-13: agent-def does NOT rescue a badge-less cheap seat. executor, no model, subagent_type cc-executor
 #      (frontmatter sonnet), OPUS_TX. Effective resolves to the SESSION tier (opus) != sonnet -> BLOCK. ----
-P13='{"session_id":"ac13","tool_input":{"prompt":"3ROLE_TASK:9106 ROLE:executor\nImplement.","subagent_type":"cc-executor"},"transcript_path":"'"$OPUS_TX"'"}'
+P13='{"session_id":"ac000006-0000-4000-8000-000000000006","tool_input":{"prompt":"3ROLE_TASK:9106 ROLE:executor\nImplement.","subagent_type":"cc-executor"},"transcript_path":"'"$OPUS_TX"'"}'
 run "$P13"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "opus"; } \
   && ok "AC-13: cc-executor frontmatter=sonnet under an opus-session transcript -> exit 2 (frontmatter does not rescue)" \
@@ -499,11 +517,11 @@ run "$P13"
 
 # ---- AC-14: escapes preserved (kill-switch, inline bypass, untagged) — each on a FRESH, otherwise-positive
 #      signature (non-vacuity: proves the escape suppressed a REAL block, not an already-silent path). ----
-P14a='{"session_id":"ac14a","tool_input":{"prompt":"3ROLE_TASK:9107 ROLE:planner\nPlan it."},"transcript_path":"'"$FABLE_TX"'"}'
+P14a='{"session_id":"ac000007-0000-4000-8000-000000000007","tool_input":{"prompt":"3ROLE_TASK:9107 ROLE:planner\nPlan it."},"transcript_path":"'"$FABLE_TX"'"}'
 runh "$HOOK" "$P14a" CC_ROLE_MODEL_GATE_OFF=1; rc14a=$RC
-P14b='{"session_id":"ac14b","tool_input":{"prompt":"3ROLE_TASK:9108 ROLE:planner [model-policy-ok]\nPlan it."},"transcript_path":"'"$FABLE_TX"'"}'
+P14b='{"session_id":"ac000008-0000-4000-8000-000000000008","tool_input":{"prompt":"3ROLE_TASK:9108 ROLE:planner [model-policy-ok]\nPlan it."},"transcript_path":"'"$FABLE_TX"'"}'
 run "$P14b"; rc14b=$RC
-P14c='{"session_id":"ac14c","tool_input":{"prompt":"General research, no tags at all."},"transcript_path":"'"$FABLE_TX"'"}'
+P14c='{"session_id":"ac000009-0000-4000-8000-000000000009","tool_input":{"prompt":"General research, no tags at all."},"transcript_path":"'"$FABLE_TX"'"}'
 run "$P14c"; rc14c=$RC
 { [ "$rc14a" = "0" ] && [ "$rc14b" = "0" ] && [ "$rc14c" = "0" ]; } \
   && ok "AC-14: kill-switch / inline bypass / untagged spawn all -> exit 0 on an otherwise-positive FABLE_TX payload" \
@@ -519,7 +537,7 @@ run "$P8"
 echo "== SECTION 3: legacy explicit-model / escape-mechanics regression coverage (unaffected by #1494) =="
 
 # ---- L1. executor + model:opus (violates sonnet policy), FRESH sig -> exit 2 + names role + expected tier. ----
-PL1='{"session_id":"l1","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9201 ROLE:executor\nImplement."}}'
+PL1='{"session_id":"ac00000a-0000-4000-8000-00000000000a","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9201 ROLE:executor\nImplement."}}'
 run "$PL1"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "ROLE:executor" && echo "$CAP" | grep -q "sonnet"; } \
   && ok "L1: executor model:opus (fresh) -> exit 2, names role + sonnet policy" \
@@ -530,43 +548,43 @@ run "$PL1"
 { [ "$RC" = "0" ]; } && ok "L2: same signature again -> exit 0 (block-once, not wedged)" || bad "L2 second identical spawn should fall through (rc=$RC out=$CAP)"
 
 # ---- L3. DIFFERENT signature (different taskId, same session) AFTER L1's marker exists -> exit 2 again. ----
-PL3='{"session_id":"l1","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9202 ROLE:executor\nDifferent task, same violation."}}'
+PL3='{"session_id":"ac00000a-0000-4000-8000-00000000000a","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9202 ROLE:executor\nDifferent task, same violation."}}'
 run "$PL3"
 { [ "$RC" = "2" ]; } && ok "L3: DIFFERENT taskId offense after first fire -> STILL exit 2 (blocks again)" || bad "L3 different signature must still block (rc=$RC out=$CAP)"
 
 # ---- L4. executor + model:sonnet (matches policy) -> exit 0 silent. ----
-PL4='{"session_id":"l4","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9203 ROLE:executor\nGo."}}'
+PL4='{"session_id":"ac00000b-0000-4000-8000-00000000000b","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9203 ROLE:executor\nGo."}}'
 run "$PL4"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L4: executor model:sonnet (match) -> exit 0 silent" || bad "L4 matching model should be silent allow (rc=$RC out=$CAP)"
 
 # ---- L5. planner + model:sonnet -> explicit WRONG tier on an opus seat -> exit 2. ----
-PL5='{"session_id":"l5","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9204 ROLE:planner\nPlan it, wrong tier."}}'
+PL5='{"session_id":"ac00000c-0000-4000-8000-00000000000c","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:9204 ROLE:planner\nPlan it, wrong tier."}}'
 run "$PL5"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "opus"; } && ok "L5: planner model:sonnet (explicit wrong on opus seat) -> exit 2" || bad "L5 explicit wrong tier should block (rc=$RC out=$CAP)"
 
 # ---- L6. non-tagged spawn (no 3ROLE_TASK, no ROLE) -> exit 0 silent (the norm). ----
-run '{"session_id":"l6","tool_input":{"prompt":"Do some general research. No tags."}}'
+run '{"session_id":"ac00000d-0000-4000-8000-00000000000d","tool_input":{"prompt":"Do some general research. No tags."}}'
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L6: non-tagged spawn -> exit 0 silent" || bad "L6 untagged spawn should be silent allow (rc=$RC out=$CAP)"
 
 # ---- L7. role-only, no task tag -> exit 0 silent. L7b. task-only, no role tag -> exit 0 silent. ----
-run '{"session_id":"l7","tool_input":{"model":"opus","prompt":"ROLE:executor\nNo task tag here."}}'
+run '{"session_id":"ac00000e-0000-4000-8000-00000000000e","tool_input":{"model":"opus","prompt":"ROLE:executor\nNo task tag here."}}'
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L7: role-only (no task tag) -> exit 0 silent" || bad "L7 role-only should be silent allow (rc=$RC out=$CAP)"
-run '{"session_id":"l7b","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9205\nSome work, no role tag."}}'
+run '{"session_id":"ac00000f-0000-4000-8000-00000000000f","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9205\nSome work, no role tag."}}'
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L7b: task-only (no role tag) -> exit 0 silent" || bad "L7b task-only should be silent allow (rc=$RC out=$CAP)"
 
 # ---- L8. kill-switches on an OTHERWISE-POSITIVE explicit-model payload -> exit 0. ----
-PL8a='{"session_id":"l8a","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9206 ROLE:executor\nviolation."}}'
+PL8a='{"session_id":"ac000010-0000-4000-8000-000000000010","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9206 ROLE:executor\nviolation."}}'
 run "$PL8a" CC_ROLE_MODEL_GATE_OFF=1; rcl8a=$RC
-PL8b='{"session_id":"l8b","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9207 ROLE:executor\nviolation."}}'
+PL8b='{"session_id":"ac000011-0000-4000-8000-000000000011","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9207 ROLE:executor\nviolation."}}'
 run "$PL8b" THREE_ROLE_INSTRUMENT_OFF=1; rcl8b=$RC
-PL8c='{"session_id":"l8c","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9208 ROLE:executor\nviolation."}}'
+PL8c='{"session_id":"ac000012-0000-4000-8000-000000000012","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9208 ROLE:executor\nviolation."}}'
 run "$PL8c" SHIP_PIPELINE=1; rcl8c=$RC
 { [ "$rcl8a" = "0" ] && [ "$rcl8b" = "0" ] && [ "$rcl8c" = "0" ]; } \
   && ok "L8: kill-switches on POSITIVE explicit-model payload -> exit 0" \
   || bad "L8 kill-switches should suppress a real block (rc_a=$rcl8a rc_b=$rcl8b rc_c=$rcl8c)"
 
 # ---- L9. bypass-form coverage (#749): role tag in the description field + model in tool_input.model. ----
-PL9='{"session_id":"l9","tool_input":{"model":"opus","description":"3ROLE_TASK:9209 ROLE:executor","prompt":"Implementation work, tags in description."}}'
+PL9='{"session_id":"ac000013-0000-4000-8000-000000000013","tool_input":{"model":"opus","description":"3ROLE_TASK:9209 ROLE:executor","prompt":"Implementation work, tags in description."}}'
 run "$PL9"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "ROLE:executor"; } \
   && ok "L9: tags in description field -> still detected -> exit 2" \
@@ -574,17 +592,17 @@ run "$PL9"
 
 # ---- L10. malformed / empty payload -> exit 0 (fail-open). ----
 run 'not json {{{'; rcl10a=$RC
-run '{"session_id":"l10"}'; rcl10b=$RC
+run '{"session_id":"ac000014-0000-4000-8000-000000000014"}'; rcl10b=$RC
 { [ "$rcl10a" = "0" ] && [ "$rcl10b" = "0" ]; } && ok "L10: malformed / empty payload -> exit 0 (fail-open)" || bad "L10 malformed should fail-open exit 0 (rcl10a=$rcl10a rcl10b=$rcl10b)"
 
 # ---- L11. NO-CONFIG fail-safe: CC_ROLES_ENV=/nonexistent -> policy resolves to opus for every role -> an
 #      executor+model:opus spawn effective=opus == opus -> exit 0 (no false-block when config is absent). ----
-PL11='{"session_id":"l11","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9210 ROLE:executor\nno config."}}'
+PL11='{"session_id":"ac000015-0000-4000-8000-000000000015","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9210 ROLE:executor\nno config."}}'
 run "$PL11" CC_ROLES_ENV=/nonexistent
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "L11: no-config executor+opus -> exit 0 (fail-safe opus, no false-block)" || bad "L11 no-config should fail-safe to opus (rc=$RC out=$CAP)"
 
 # ---- L12. FABLE config: executor=fable, spawn model:opus -> exit 2 with the (corrected) Fable cap-budget note. ----
-PL12='{"session_id":"l12","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9211 ROLE:executor\nfable policy."}}'
+PL12='{"session_id":"ac000016-0000-4000-8000-000000000016","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9211 ROLE:executor\nfable policy."}}'
 run "$PL12" CC_ROLES_ENV="$CFGF"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "Fable" && echo "$CAP" | grep -q "50% of the weekly limit"; } \
   && ok "L12: fable-executor config + model:opus -> exit 2 + corrected Fable cap-budget note (50% of the weekly limit)" \
@@ -607,14 +625,14 @@ CC_ROLE_PLAN_REVIEW_MODEL=opus
 EOF
 
 # ---- M1 (AC-6a, ALLOW): planner=fable policy + spawn model:fable -> exit 0 (the new seat can spawn at all). ----
-PM1='{"session_id":"m1","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9301 ROLE:planner\nPlan it."}}'
+PM1='{"session_id":"ac000017-0000-4000-8000-000000000017","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9301 ROLE:planner\nPlan it."}}'
 run "$PM1" CC_ROLES_ENV="$CFGF3"
 { [ "$RC" = "0" ]; } \
   && ok "M1 (#1569 AC-6a): planner=fable policy + model:fable -> exit 0 (new seat ALLOWED)" \
   || bad "M1 fable planner seat should be allowed to spawn (rc=$RC out=$CAP)"
 
 # ---- M2 (AC-6a, ALLOW): execution-review=fable policy + spawn model:fable -> exit 0. ----
-PM2='{"session_id":"m2","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9302 ROLE:execution-review\nReview it."}}'
+PM2='{"session_id":"ac000018-0000-4000-8000-000000000018","tool_input":{"model":"fable","prompt":"3ROLE_TASK:9302 ROLE:execution-review\nReview it."}}'
 run "$PM2" CC_ROLES_ENV="$CFGF3"
 { [ "$RC" = "0" ]; } \
   && ok "M2 (#1569 AC-6a): execution-review=fable policy + model:fable -> exit 0 (new seat ALLOWED)" \
@@ -624,7 +642,7 @@ run "$PM2" CC_ROLES_ENV="$CFGF3"
 #      exit 2, naming the seat + instructing model:fable. Without this, M1 could "pass" merely because the
 #      gate is inert for fable policies -- this proves the gate is still discriminating on a fable SEAT
 #      (L12 already covers this shape on the EXECUTOR seat; this is the same control on a NEW #1569 seat). ----
-PM3='{"session_id":"m3","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9303 ROLE:planner\nPlan it, wrong tier."}}'
+PM3='{"session_id":"ac000019-0000-4000-8000-000000000019","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9303 ROLE:planner\nPlan it, wrong tier."}}'
 run "$PM3" CC_ROLES_ENV="$CFGF3"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "ROLE:planner" && echo "$CAP" | grep -qi "fable"; } \
   && ok "M3 (#1569 AC-6b): planner=fable policy + model:opus -> exit 2, names role + fable (non-vacuous BLOCK control)" \
@@ -632,7 +650,7 @@ run "$PM3" CC_ROLES_ENV="$CFGF3"
 
 # ---- M4 (AC-6c, UNCHANGED seat): plan-review stays opus in this SAME fixture -> model:opus -> exit 0 silent.
 #      Proves the fable rollout on two seats does not disturb the untouched plan-review seat's policy. ----
-PM4='{"session_id":"m4","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9304 ROLE:plan-review\nReview it."}}'
+PM4='{"session_id":"ac00001a-0000-4000-8000-00000000001a","tool_input":{"model":"opus","prompt":"3ROLE_TASK:9304 ROLE:plan-review\nReview it."}}'
 run "$PM4" CC_ROLES_ENV="$CFGF3"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "M4 (#1569 AC-6c): plan-review=opus (unchanged) + model:opus -> exit 0 silent" \
@@ -646,7 +664,7 @@ echo "== SECTION 5: #1513 subagent_type/effort-inert advisory sub-leg =="
 #      cc-planner.md PRESENT (AGENTS_FULL). RED proof: the pinned pre-fix snapshot (same one AC-8/AC-11 use —
 #      it has NO subagent_type-aware logic at all) exits 0 silent on this identical payload; the CURRENT hook
 #      exits 2 naming the inert-effort condition + the fix. ----
-PRED='{"session_id":"ac1513red","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PRED='{"session_id":"ac00001b-0000-4000-8000-00000000001b","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 if [ "$HEAD_AVAILABLE" = "1" ]; then
   run_head "$PRED" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
   { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
@@ -659,14 +677,14 @@ runh "$HOOK" "$PRED" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
   || bad "AC-RED post-fix should block and name the inert-effort condition (rc=$RC out=$CAP)"
 
 # ---- AC-RED-CLAUDE (per-disjunct fixture): subagent_type:claude (not hardcoded to "general-purpose"). ----
-PREDC='{"session_id":"ac1513redclaude","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"claude"}}'
+PREDC='{"session_id":"ac00001c-0000-4000-8000-00000000001c","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"claude"}}'
 runh "$HOOK" "$PREDC" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-planner"; } \
   && ok "AC-RED-CLAUDE: subagent_type:claude (not general-purpose) + cc-planner.md present -> exit 2 (not hardcoded to one string)" \
   || bad "AC-RED-CLAUDE should also fire on subagent_type:claude (rc=$RC out=$CAP)"
 
 # ---- AC-POS (positive control — right robot stays clean): subagent_type:cc-planner, cc-planner.md present -> exit 0, no marker. ----
-PPOS='{"session_id":"ac1513pos","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"cc-planner"}}'
+PPOS='{"session_id":"ac00001d-0000-4000-8000-00000000001d","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"cc-planner"}}'
 runh "$HOOK" "$PPOS" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-POS: subagent_type:cc-planner (the right robot) -> exit 0 clean, no inert-effort marker" \
@@ -674,14 +692,14 @@ runh "$HOOK" "$PPOS" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 
 # ---- AC-NEG (sanctioned fallback — def absent must NOT fire): general-purpose, DEFAULT AGENTS_FIX (which
 #      lacks cc-planner.md) -> exit 0, no marker. This is the case the fix must never false-block. ----
-PNEG='{"session_id":"ac1513neg","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PNEG='{"session_id":"ac00001e-0000-4000-8000-00000000001e","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 run "$PNEG"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-NEG: cc-planner.md absent (sanctioned fallback) -> exit 0, never false-blocked" \
   || bad "AC-NEG should never fire when the dedicated def is genuinely absent (rc=$RC out=$CAP)"
 
 # ---- AC-NEG-DANGLING (broken install reads as absent): cc-planner.md is a symlink to a missing target. ----
-PDANG='{"session_id":"ac1513dangling","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PDANG='{"session_id":"ac00001f-0000-4000-8000-00000000001f","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PDANG" CC_ROLE_AGENTS_DIR="$AGENTS_DANGLING"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-NEG-DANGLING: dangling symlink at cc-planner.md -> reads as ABSENT -> exit 0, never false-blocked" \
@@ -689,7 +707,7 @@ runh "$HOOK" "$PDANG" CC_ROLE_AGENTS_DIR="$AGENTS_DANGLING"
 
 # ---- AC-EXECUTOR-TIER (non-opus seat, effort still asserted independent of tier): executor, model:sonnet
 #      (matches the sonnet policy), subagent_type:general-purpose, AGENTS_FIX (has cc-executor.md) -> exit 2. ----
-PTIER='{"session_id":"ac1513tier","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513 ROLE:executor\nGo.","subagent_type":"general-purpose"}}'
+PTIER='{"session_id":"ac000020-0000-4000-8000-000000000020","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513 ROLE:executor\nGo.","subagent_type":"general-purpose"}}'
 run "$PTIER"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-executor"; } \
   && ok "AC-EXECUTOR-TIER: tier-satisfied non-opus (sonnet) seat still fires the effort advisory" \
@@ -697,7 +715,7 @@ run "$PTIER"
 
 # ---- AC-RESEARCH (research never gated): ROLE:research resolves ROLE=- and fail-opens before the new logic
 #      even runs (belt-and-suspenders — the ROLE regex never matches "research"). ----
-PRESEARCH='{"session_id":"ac1513research","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:research\nLook it up.","subagent_type":"general-purpose"}}'
+PRESEARCH='{"session_id":"ac000021-0000-4000-8000-000000000021","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:research\nLook it up.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PRESEARCH" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-RESEARCH: ROLE:research -> exit 0, never gated by the effort leg" \
@@ -708,12 +726,12 @@ runh "$HOOK" "$PRESEARCH" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 #      (model:opus on the sonnet seat) -> fires the TIER advisory, writes $SIG.notified. (2) SAME
 #      session/taskId/role, tier-SATISFIED (model:sonnet) but subagent_type wrong + cc-executor.md present ->
 #      MUST still exit 2 via the effort advisory (NOT suppressed by the tier marker from step 1). ----
-PINDEP1='{"session_id":"ac1513indep","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement."}}'
+PINDEP1='{"session_id":"ac000022-0000-4000-8000-000000000022","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement."}}'
 run "$PINDEP1"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "WRONG model tier"; } \
   && ok "AC-INDEP step 1: tier-mismatch fires the TIER advisory + writes its marker" \
   || bad "AC-INDEP step 1 should fire the tier advisory (rc=$RC out=$CAP)"
-PINDEP2='{"session_id":"ac1513indep","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement.","subagent_type":"general-purpose"}}'
+PINDEP2='{"session_id":"ac000022-0000-4000-8000-000000000022","tool_input":{"model":"sonnet","prompt":"3ROLE_TASK:1513indep ROLE:executor\nImplement.","subagent_type":"general-purpose"}}'
 run "$PINDEP2"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "inert" && echo "$CAP" | grep -q "subagent_type: cc-executor"; } \
   && ok "AC-INDEP step 2: SAME session/taskId/role, tier now satisfied -> effort advisory STILL fires (independent marker, not cannibalized)" \
@@ -721,7 +739,7 @@ run "$PINDEP2"
 
 # ---- AC-ONCE (block-once, self-clearing — proves advisory not wall): issue a FRESH effort-condition payload
 #      twice against the persistent shared STATE_DIR -> first exit 2, second exit 0. ----
-PONCE='{"session_id":"ac1513once","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513once ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PONCE='{"session_id":"ac000023-0000-4000-8000-000000000023","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513once ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PONCE" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_once1=$RC
 runh "$HOOK" "$PONCE" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_once2=$RC
 { [ "$rc_once1" = "2" ] && [ "$rc_once2" = "0" ]; } \
@@ -729,20 +747,20 @@ runh "$HOOK" "$PONCE" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_once2=$RC
   || bad "AC-ONCE should block-once and self-clear (rc1=$rc_once1 rc2=$rc_once2)"
 
 # ---- AC-EMPTY (boundary — empty subagent_type fail-opens; Design nuance E): def present, subagent_type:"" -> exit 0. ----
-PEMPTY='{"session_id":"ac1513empty","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":""}}'
+PEMPTY='{"session_id":"ac000024-0000-4000-8000-000000000024","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":""}}'
 runh "$HOOK" "$PEMPTY" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-EMPTY: subagent_type:\"\" (malformed/edge payload) -> exit 0, fail-open" \
   || bad "AC-EMPTY should fail-open on an empty subagent_type (rc=$RC out=$CAP)"
 
 # ---- AC-KILL (kill-switches honored) — each on a FRESH, otherwise-positive effort-condition payload. ----
-PKILLA='{"session_id":"ac1513killa","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PKILLA='{"session_id":"ac000025-0000-4000-8000-000000000025","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PKILLA" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" CC_ROLE_MODEL_GATE_OFF=1; rc_killa=$RC
-PKILLB='{"session_id":"ac1513killb","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PKILLB='{"session_id":"ac000026-0000-4000-8000-000000000026","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PKILLB" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" THREE_ROLE_INSTRUMENT_OFF=1; rc_killb=$RC
-PKILLC='{"session_id":"ac1513killc","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
+PKILLC='{"session_id":"ac000027-0000-4000-8000-000000000027","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PKILLC" CC_ROLE_AGENTS_DIR="$AGENTS_FULL" SHIP_PIPELINE=1; rc_killc=$RC
-PKILLD='{"session_id":"ac1513killd","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner [model-policy-ok]\nPlan it.","subagent_type":"general-purpose"}}'
+PKILLD='{"session_id":"ac000028-0000-4000-8000-000000000028","tool_input":{"model":"opus","prompt":"3ROLE_TASK:1513 ROLE:planner [model-policy-ok]\nPlan it.","subagent_type":"general-purpose"}}'
 runh "$HOOK" "$PKILLD" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_killd=$RC
 { [ "$rc_killa" = "0" ] && [ "$rc_killb" = "0" ] && [ "$rc_killc" = "0" ] && [ "$rc_killd" = "0" ]; } \
   && ok "AC-KILL: kill-switches (CC_ROLE_MODEL_GATE_OFF / THREE_ROLE_INSTRUMENT_OFF / SHIP_PIPELINE) + inline bypass all -> exit 0 on an otherwise-positive effort-condition payload" \

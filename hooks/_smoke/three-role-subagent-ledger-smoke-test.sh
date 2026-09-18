@@ -14,6 +14,8 @@ bad() { echo "FAIL: $1"; fail=1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 LEDGERDIR="$TMP/ledger"; PROJROOT="$TMP/projects"
+export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
+export RULE12_LOG="$TMP/rule12.log"  # D4: never write the operator's real audit log during a suite run.
 
 # Build a subagent transcript fixture under <PROJROOT>/<slug>/<session>/subagents/agent-<id>.jsonl whose FIRST
 # type:user message has the given brief.  mk_transcript <session> <agentId> <brief>
