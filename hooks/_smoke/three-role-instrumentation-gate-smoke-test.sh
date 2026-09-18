@@ -25,6 +25,8 @@ PROJ="$TMP/proj"; mkdir -p "$PROJ"
 # a "no config resolves" default so every pre-existing call is unaffected; the MDL*/W* arms that WANT
 # model-policy/version enforcement explicitly override CC_ROLES_ENV per call (env CC_ROLES_ENV=<fixture> ...).
 export CC_ROLES_ENV="$TMP/no-such-cc-roles.env"
+export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
+export RULE12_LOG="$TMP/rule12.log"  # D4: never write the operator's real audit log during a suite run.
 
 # ---- perf-log card fixtures ----
 # A card WITH an entry citing task #847 (a per-round entry naming the run).
