@@ -27,7 +27,8 @@ LEDFILE="$THREE_ROLE_LEDGER_DIR/$SID/$TASK.jsonl"
 # ---- #2075 AC-23(b) baseline fixture (committed, no git dependency, no network) -----------------
 # AC-23(b) below diffs the NEW binary's check() output against the OLD (pre-#2075) binary's output
 # on an identical fixture -- proving #2075 is byte-identical on a legacy ledger except for its one
-# new PROVENANCE-LEGACY note. Same class of problem, same fix pattern, as the established
+# new PROVENANCE-LEGACY note (and, as of #1528, the new always-on EFFORT-PROVENANCE note -- both
+# stripped from the comparison the same way). Same class of problem, same fix pattern, as the established
 # hooks/_fixtures/3role-ledger-pre1580-overlay.mjs / -pre1947-ma2-overlay.mjs (#1833 Bundle 1A / #1947
 # M-A-2): the original cut acquired the pre-fix binary via `git show origin/master:...` piped into an
 # artifact (the #1833-class shape-i defect) -- MEASURED to fail two ways (#2094): (1) CI runs a
@@ -2829,14 +2830,19 @@ NEW_OUT="$PCOUT"; NEW_RC="$PCRC"
 if [ -s "$AC23B_FIXTURE" ]; then
   OLD_OUT=$(THREE_ROLE_LEDGER_DIR="$P1_FIX/ledger" THREE_ROLE_PROJECTS_ROOT="$P1_FIX/projects" CC_ROUTES_JSON="$P1_FIX/routes.json" \
     node "$OLD_LED" check --session "p1-ac23b" --task "t1" 2>&1); OLD_RC=$?
-  NEW_OUT_STRIPPED=$(echo "$NEW_OUT" | grep -v '^PROVENANCE-LEGACY:')
+  # #1528 D4: the LIVE binary also now prints an unconditional EFFORT-PROVENANCE: line on this SAME
+  # roles-satisfied path (additive, sibling of PROVENANCE-LEGACY: above) -- strip it too, same discipline,
+  # so this AC keeps proving "byte-identical except the DOCUMENTED additive advisories", not a tautology
+  # that happens to also swallow a real regression in either line.
+  NEW_OUT_STRIPPED=$(echo "$NEW_OUT" | grep -v '^PROVENANCE-LEGACY:' | grep -v '^EFFORT-PROVENANCE:')
   # Non-decay guard (same convention as this file's other pinned-baseline ACs, e.g. #1833 AC3 / #1947
   # M-A-2): the pinned snapshot must NOT be byte-identical to the live ledger, else a future careless
   # "regenerate the snapshot from HEAD" collapses this into a fixed-vs-fixed tautology with zero power.
   cmp -s "$OLD_LED" "$LED" && bad "#2075 AC-23(b) non-decay guard: pinned pre-#2075 snapshot is byte-identical to the LIVE ledger -- the comparison has decayed into a tautology (re-pin hooks/_fixtures/3role-ledger-pre2075-snapshot.mjs from the real pre-#2075 commit)"
   { [ "$NEW_RC" = "0" ] && [ "$NEW_RC" = "$OLD_RC" ] && [ "$NEW_OUT_STRIPPED" = "$OLD_OUT" ] \
-    && echo "$NEW_OUT" | grep -q '^PROVENANCE-LEGACY: planner, plan-review, executor, execution-review'; } \
-    && ok "#2075 AC-23(b): check() on an all-legacy ledger is byte-identical to the pre-#2075 (pinned snapshot) binary's output, except the new PROVENANCE-LEGACY: note naming all four roles" \
+    && echo "$NEW_OUT" | grep -q '^PROVENANCE-LEGACY: planner, plan-review, executor, execution-review' \
+    && echo "$NEW_OUT" | grep -Eq '^EFFORT-PROVENANCE: informative=0/4 '; } \
+    && ok "#2075 AC-23(b): check() on an all-legacy ledger is byte-identical to the pre-#2075 (pinned snapshot) binary's output, except the new PROVENANCE-LEGACY: note naming all four roles and (#1528) the new EFFORT-PROVENANCE: advisory (informative=0/4 on this all-legacy, effort-less fixture)" \
     || bad "#2075 AC-23(b) regression (new_rc=$NEW_RC old_rc=$OLD_RC new=[$NEW_OUT] old=[$OLD_OUT])"
 else
   bad "#2075 AC-23(b): FIXTURE MISSING at $AC23B_FIXTURE -- this fixture is committed and must always be present (it replaced a git-object acquisition; its absence means this AC cannot prove the byte-identical-except-PROVENANCE-LEGACY claim at all)"
@@ -4811,15 +4817,16 @@ OUT=$(node "$LED" append --session "$SUF" --task uf-ac1 --role planner --agent u
   && ok "unknown-flag AC-1: a run-time-minted hold-out flag -> REFUSE, stderr carries unknown-flag + --$UF_HELDOUT, file absent" \
   || bad "unknown-flag AC-1 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac1.jsonl" ] && echo yes || echo no))"
 
-# AC-4 (allowlist printed in full): the SAME AC-1 refusal's stderr must enumerate all 25 known names,
-# each with a leading --, in particular --verdict and --closed-at.
-UF_ALLOWLIST="session task role agent artifact reviewed-plan skip-reason oracle verdict cairn dispatch transcript nonce dispatch-nonce receipt pending run-kind run-id run-source self-authored effort model-version model-tier closed-at sense-reroute"
+# AC-4 (allowlist printed in full): the SAME AC-1 refusal's stderr must enumerate all 26 known names,
+# each with a leading --, in particular --verdict and --closed-at. (#1528: effort-source joins the
+# allowlist, 25 -> 26.)
+UF_ALLOWLIST="session task role agent artifact reviewed-plan skip-reason oracle verdict cairn dispatch transcript nonce dispatch-nonce receipt pending run-kind run-id run-source self-authored effort effort-source model-version model-tier closed-at sense-reroute"
 UF_AC4_MISSING=""
 for UFNAME in $UF_ALLOWLIST; do
   echo "$OUT" | command grep -q -- "--$UFNAME" || UF_AC4_MISSING="$UF_AC4_MISSING $UFNAME"
 done
 [ -z "$UF_AC4_MISSING" ] \
-  && ok "unknown-flag AC-4: the block message enumerates all 25/25 known flags (each with --), incl. --verdict and --closed-at" \
+  && ok "unknown-flag AC-4: the block message enumerates all 26/26 known flags (each with --), incl. --verdict and --closed-at" \
   || bad "unknown-flag AC-4 FAILED (missing from stderr:$UF_AC4_MISSING)"
 
 # AC-2 (the incident shape, non-review roles): a typo'd/wrong flag on a role OTHER than plan-review /
@@ -4869,7 +4876,8 @@ OUT=$(node "$LED" append --session "$SUF" --task uf-ac5d --role plan-review --ve
   || bad "unknown-flag AC-5b(iii) FAILED (rc=$RC out=$OUT)"
 
 # AC-6 (every sanctioned shape still lands, rc=0, file present): one call per caller shape, together
-# covering all 22 optional flags across the caller shapes the plan's survey enumerated.
+# covering all 23 optional flags across the caller shapes the plan's survey enumerated. (#1528: uf-c16
+# below now also exercises --effort-source, the 23rd optional flag.)
 printf 'verdict: PASS\n' > "$TMP/uf-oracle.txt"
 printf '{"type":"assistant","message":{"model":"claude-sonnet-4-5"}}\n' > "$TMP/uf-t.jsonl"
 UF_OK=1
@@ -4884,13 +4892,13 @@ node "$LED" append --session "$SUF" --task uf-c08 --role planner --cairn "cairn:
 node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id N1 --dispatch-nonce N1 --pending >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --artifact "$UF_PLAN" --verdict PASS --receipt N1 >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c11 --role executor --dispatch subprocess-openrouter --transcript "$TMP/uf-t.jsonl" --nonce N2 --artifact "PR #uf-c11" >/dev/null 2>&1 || UF_OK=0
-node "$LED" append --session "$SUF" --task uf-c16 --role planner --agent uf-p2 --artifact "$UF_PLAN" --dispatch-nonce TOK1 --reviewed-plan "$UF_PLAN" --sense-reroute --effort xhigh --model-tier fable --model-version claude-fable-5-1 >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c16 --role planner --agent uf-p2 --artifact "$UF_PLAN" --dispatch-nonce TOK1 --reviewed-plan "$UF_PLAN" --sense-reroute --effort xhigh --effort-source assigned --model-tier fable --model-version claude-fable-5-1 >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --artifact "PR #uf-c12" --effort high --model-version claude-sonnet-4-5 --model-tier sonnet --sense-reroute >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --closed-at 2026-09-04T00:00:00.000Z --self-authored --effort high --sense-reroute >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c14 --role executor --agent uf-e2 --closed-at 2026-09-04T00:00:00.000Z --self-authored false --pending false >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c15 --role research --artifact "$UF_PLAN" >/dev/null 2>&1 || UF_OK=0
 [ "$UF_OK" = "1" ] \
-  && ok "unknown-flag AC-6: every sanctioned caller shape (all 22 optional flags across 16 calls) still lands rc=0" \
+  && ok "unknown-flag AC-6: every sanctioned caller shape (all 23 optional flags across 16 calls) still lands rc=0" \
   || bad "unknown-flag AC-6 FAILED (one or more sanctioned shapes returned non-zero)"
 
 # AC-8 (coexistence with #2189): a repeated --artifact AND an unrecognized flag on the SAME call -- either
@@ -4899,5 +4907,59 @@ OUT=$(node "$LED" append --session "$SUF" --task uf-ac8 --role planner --agent u
 { [ "$RC" != "0" ] && [ ! -f "$UF_DIR/uf-ac8.jsonl" ]; } \
   && ok "unknown-flag AC-8: coexists with #2189's duplicate-flag refusal -- REFUSE, file absent" \
   || bad "unknown-flag AC-8 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$UF_DIR/uf-ac8.jsonl" ] && echo yes || echo no))"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1528 -- effort_source provenance `append` contract (plan D2 C1-C6). New session so it never shares a
+# task with the unknown-flag block above.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+ESUF="sess-1528-es"
+ES_DIR="$THREE_ROLE_LEDGER_DIR/$ESUF"
+
+# AC-C1: a bad --effort-source value -> exit 2, stderr carries the stable token + the literal bad value,
+# ledger file does NOT exist afterwards.
+OUT=$(node "$LED" append --session "$ESUF" --task c1 --role executor --agent es-a1 --effort medium --effort-source bogus 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | command grep -q "BLOCK (3role-ledger effort-source)" && echo "$OUT" | command grep -q "bogus" && [ ! -f "$ES_DIR/c1.jsonl" ]; } \
+  && ok "#1528 AC-C1: --effort-source bogus -> BLOCK (3role-ledger effort-source), names bogus, file absent" \
+  || bad "#1528 AC-C1 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$ES_DIR/c1.jsonl" ] && echo yes || echo no))"
+
+# AC-C2: --effort-source with NO --effort on the same call -> exit 2, same token, file does NOT exist.
+OUT=$(node "$LED" append --session "$ESUF" --task c2 --role executor --agent es-a2 --effort-source observed 2>&1); RC=$?
+{ [ "$RC" = "2" ] && echo "$OUT" | command grep -q "BLOCK (3role-ledger effort-source)" && [ ! -f "$ES_DIR/c2.jsonl" ]; } \
+  && ok "#1528 AC-C2: --effort-source observed with no --effort -> BLOCK (3role-ledger effort-source), file absent" \
+  || bad "#1528 AC-C2 FAILED (rc=$RC out=$OUT file-exists=$([ -f "$ES_DIR/c2.jsonl" ] && echo yes || echo no))"
+
+# AC-C3 (persist): an --effort/--effort-source observed row, then a second append carrying ONLY --artifact
+# -> the row still carries BOTH effort:medium and effort_source:observed (own-key overlay persistence).
+node "$LED" append --session "$ESUF" --task c3 --role executor --agent es-a3 --effort medium --effort-source observed >/dev/null 2>&1
+node "$LED" append --session "$ESUF" --task c3 --role executor --agent es-a3 --artifact "PR #1" >/dev/null 2>&1
+F_C3="$ES_DIR/c3.jsonl"
+{ command grep -q '"effort":"medium"' "$F_C3" && command grep -q '"effort_source":"observed"' "$F_C3"; } \
+  && ok "#1528 AC-C3: an --artifact-only close-out never clobbers a prior effort/effort_source" \
+  || bad "#1528 AC-C3 FAILED (got: $(cat "$F_C3" 2>/dev/null))"
+
+# AC-C4 (unknown provenance never inherits): after an observed row, --effort with NO --effort-source ->
+# the new effort value lands but effort_source is GONE (count 0), never inheriting the prior "observed" tag.
+node "$LED" append --session "$ESUF" --task c4 --role executor --agent es-a4 --effort medium --effort-source observed >/dev/null 2>&1
+node "$LED" append --session "$ESUF" --task c4 --role executor --agent es-a4 --effort high >/dev/null 2>&1
+F_C4="$ES_DIR/c4.jsonl"
+EC4=$(command grep -c 'effort_source' "$F_C4" 2>/dev/null)
+{ command grep -q '"effort":"high"' "$F_C4" && [ "$EC4" = "0" ]; } \
+  && ok "#1528 AC-C4: --effort high with no source after an observed row -> effort:high, effort_source count 0 (no false inherit)" \
+  || bad "#1528 AC-C4 FAILED (effort_source-count=$EC4 got: $(cat "$F_C4" 2>/dev/null))"
+
+# AC-C5 (skip clears): after an observed row, --skip-reason clears BOTH effort and effort_source.
+node "$LED" append --session "$ESUF" --task c5 --role executor --agent es-a5 --effort medium --effort-source observed >/dev/null 2>&1
+node "$LED" append --session "$ESUF" --task c5 --role executor --agent es-a5 --skip-reason test >/dev/null 2>&1
+F_C5="$ES_DIR/c5.jsonl"
+{ ! command grep -q '"effort"' "$F_C5" && ! command grep -q 'effort_source' "$F_C5"; } \
+  && ok "#1528 AC-C5: --skip-reason after an observed row clears both effort and effort_source" \
+  || bad "#1528 AC-C5 FAILED (got: $(cat "$F_C5" 2>/dev/null))"
+
+# AC-C6 (allowlist self-audit): the unknown-flag block message enumerates --effort-source (already proven by
+# unknown-flag AC-4 above, 26/26); the source array carries the flag name itself, inside APPEND_KNOWN_FLAGS.
+ALW_CT=$(command grep -c "'effort-source'" "$LED")
+[ "$ALW_CT" -ge 1 ] \
+  && ok "#1528 AC-C6: hooks/3role-ledger.mjs's APPEND_KNOWN_FLAGS carries 'effort-source' (count=$ALW_CT)" \
+  || bad "#1528 AC-C6 FAILED (grep count=$ALW_CT)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
