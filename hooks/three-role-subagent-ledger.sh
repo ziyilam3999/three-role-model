@@ -188,7 +188,12 @@ SELF_FLAG=""
 # leaves whatever the spawn-time ASSIGNED stamp (or a prior line) already carries untouched -- never a blank
 # clobber. When present, this OBSERVED value OVERWRITES the ASSIGNED one (observed wins at close).
 EFFORT_FLAG=""
-[ -n "$PAYLOAD_EFFORT" ] && EFFORT_FLAG="--effort $PAYLOAD_EFFORT"
+# #1528 W2 -- --effort-source observed rides the SAME conditional as --effort immediately below: this is
+# the CLOSE-time stamp, so a value only ever gets attributed when the payload really carried a measured
+# effort.level. An absent payload omits BOTH flags together (never --effort-source alone, which would hit
+# cmdAppend's C2 guard), so the spawn-time `assigned` tag on the row survives untouched -- exactly the
+# honest answer when close observed nothing.
+[ -n "$PAYLOAD_EFFORT" ] && EFFORT_FLAG="--effort $PAYLOAD_EFFORT --effort-source observed"
 # #1516 -- the EXPLICIT close-stamp. This hook is the ONLY writer that fires exclusively at close (a real
 # SubagentStop, gated above on "must resolve to a real /subagents/agent-*.jsonl transcript"), so it is the
 # ONE place a close-stamp can be trustworthy -- never inferred from agentId (which is also present at

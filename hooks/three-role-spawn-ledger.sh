@@ -221,7 +221,13 @@ read -r ATIER AEFFORT AVERSION < <(node "$HELPER" resolve-role-model --role "$RO
 ASSIGNED_FLAGS=""
 [ "$ATIER" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-tier $ATIER"
 [ "$AVERSION" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --model-version $AVERSION"
-[ "$AEFFORT" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --effort $AEFFORT"
+#1528 W1 — --effort-source assigned rides the SAME conditional as --effort above (deliberately, named-risk
+# note 1528-w1-effort-source-must-be-conditional): this is the SPAWN-time stamp, so its value is always the
+# ASSIGNED policy default, never an observed one. Gating it on the identical `[ "$AEFFORT" != "-" ]` test
+# means an unresolvable role effort (AEFFORT stays "-") omits BOTH flags together — never --effort-source
+# alone, which would hit cmdAppend's C2 guard (requires --effort on the same call) and regress the whole
+# spawn badge to a hard block instead of today's degraded-but-safe {role}-only line.
+[ "$AEFFORT" != "-" ] && ASSIGNED_FLAGS="$ASSIGNED_FLAGS --effort $AEFFORT --effort-source assigned"
 # review-round-counter-per-plan (plan Intent #2, spawn edge) — the plan-review round's PLAN identity,
 # resolved above (statSync-gated against this spawn's own cwd) ONLY for a plan-review spawn. "-" means
 # unresolved (no match, or the matched path did not exist) — omit the flag entirely rather than stamp a

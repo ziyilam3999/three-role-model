@@ -16,6 +16,7 @@
 //   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
 //                                        [--verdict V] [--self-authored]
 //                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
+//                                        [--effort-source assigned|observed]                     (#1528)
 //                                        [--closed-at ISO]                                       (#1516)
 //                                        [--dispatch-nonce TOK] [--receipt TOK]        (#2169 slice 5, AC-34)
 //                                        [--reviewed-plan P]              (review-round-counter-per-plan)
@@ -55,6 +56,18 @@
 //     auto-capture path above, unchanged). Every OTHER append (self-record, close-out --artifact) passes NONE
 //     of the three, so overlayAppend's per-key "provided" discipline (#855) PRESERVES whatever a role's real
 //     line already carries — an orchestrator's --artifact-only close-out can never clobber a role's effort.
+//     #1528 — `--effort-source assigned|observed` is the PROVENANCE tag for whichever value `--effort`
+//     carries on THIS append: the spawn-time hook stamps `assigned` (the policy default it just resolved),
+//     the close-time hook stamps `observed` (the harness's real per-run SubagentStop value) ONLY when it
+//     actually received one. The two numbers land in the SAME `effort` box; without this tag a row equal to
+//     policy is indistinguishable from a row nobody ever measured — both are evidentially VOID. The ONE
+//     downstream rule: a row is effort-INFORMATIVE iff `effort_source === "observed"`; `assigned` and an
+//     absent key (every pre-#1528 row, or any `--effort` written without a source) are both void. Fail-safe
+//     by construction: `--effort-source` REQUIRES `--effort` on the SAME call (a provenance claim with no
+//     value to attribute is refused), and an `--effort` call that OMITS `--effort-source` DELETES any prior
+//     tag on that row rather than let it survive attached to a new, unattributed value — provenance can
+//     never be inherited across a value change. `check` reports how many of the four required roles are
+//     effort-informative via its `EFFORT-PROVENANCE:` advisory line.
 //     #2169 slice 5 (design decision 4, AC-34 delivery-receipt guard) — --dispatch-nonce/--receipt.
 //     --dispatch-nonce TOK is the MINTING flag: the spawn edge (three-role-spawn-ledger.sh today; the
 //     subprocess dispatch helper too, slice 6) passes the raw token it saw on a genuine
@@ -3210,7 +3223,17 @@ function overlayAppend(session, task, role, fields) {
   // "artifact at close" exactly like agentId/artifact_path do (#855 overlay-merge).
   if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
   if ('modelTier' in fields) entry.modelTier = fields.modelTier;
-  if ('effort' in fields) entry.effort = fields.effort;
+  if ('effort' in fields) {
+    entry.effort = fields.effort;
+    // #1528 D2 C3 — `effort_source` is WRITER-STAMPED PROVENANCE for THIS `effort` value, not an
+    // independent overlay key: it can only ever describe whatever the SAME call just set `entry.effort`
+    // to, so it moves in lockstep with `effort` rather than persisting on its own. A call that supplies
+    // `--effort-source` stamps it; a call that supplies `--effort` WITHOUT `--effort-source` (every
+    // pre-#1528 caller) DELETES any prior tag — fail-SAFE: a value that changes hands with unknown
+    // provenance can never inherit a stale `observed` from an earlier writer's row.
+    if ('effort_source' in fields) entry.effort_source = fields.effort_source;
+    else delete entry.effort_source;
+  }
   // review-round-counter-per-plan — `reviewed_plan`, an ordinary own-key overlay (same discipline as every
   // field above): the plan-review round's PLAN identity, resolved from the DISPATCH context by the caller
   // (spawn edge / dispatch helper / reconciler), never derived here. An unprovided key persists whatever the
@@ -3325,7 +3348,7 @@ function overlayAppend(session, task, role, fields) {
   }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
-    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.closedAt; delete entry.reroute;
+    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.effort_source; delete entry.closedAt; delete entry.reroute;
     delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
     // #2169 slice 5 — dispatch_nonce joins the clear-list for the SAME reason as dispatch/transcript_path/
     // nonce just above: it is provenance OF a real dispatch, and a skip is a declaration that no (or no
@@ -3376,18 +3399,18 @@ function overlayAppend(session, task, role, fields) {
 }
 
 // 3role-ledger-append-should-reject-unknown-flags — the COMPLETE, closed allowlist of every flag name
-// cmdAppend actually consumes: the 3 required flags checked at the top of cmdAppend below, plus the 22
+// cmdAppend actually consumes: the 3 required flags checked at the top of cmdAppend below, plus the 23
 // optional flags each read via `'<flag>' in o` in the body that follows (:3069-3157 as of this comment —
 // keep this array and those consumers in LOCKSTEP: a future `if ('new' in o)` consumer added without also
 // adding 'new' here makes that consumer silently DEAD the instant its own smoke runs — fail-closed, loud,
-// not a silent miss). A name listed here with no live consumer is inert but harmless. 25 names total.
+// not a silent miss). A name listed here with no live consumer is inert but harmless. 26 names total.
 const APPEND_KNOWN_FLAGS = [
   // required (checked immediately below)
   'session', 'task', 'role',
   // optional — every flag a sanctioned writer passes today (see the plan's caller-evidence survey)
   'agent', 'artifact', 'reviewed-plan', 'skip-reason', 'oracle', 'verdict', 'cairn', 'dispatch',
   'transcript', 'nonce', 'dispatch-nonce', 'receipt', 'pending', 'run-kind', 'run-id', 'run-source',
-  'self-authored', 'effort', 'model-version', 'model-tier', 'closed-at', 'sense-reroute',
+  'self-authored', 'effort', 'effort-source', 'model-version', 'model-tier', 'closed-at', 'sense-reroute',
 ];
 
 function cmdAppend(o) {
@@ -3409,6 +3432,25 @@ function cmdAppend(o) {
       console.error('BLOCK (3role-ledger unknown-flag): append refuses unrecognized flag(s) ' +
         unknown.map((k) => '--' + k).join(', ') + ' — nothing written. Known flags: ' +
         APPEND_KNOWN_FLAGS.map((k) => '--' + k).join(', ') + '.');
+      process.exit(2);
+    }
+  }
+  // #1528 D2 C1/C2 — EFFORT-SOURCE fail-closed guard. Runs BEFORE any ledger file read/write, same
+  // discipline as the unknown-flag refusal immediately above. C1: the value must be exactly "assigned" or
+  // "observed" — anything else, including a bare valueless flag (parseArgs yields ''), is refused, naming
+  // the bad value. C2: `--effort-source` REQUIRES `--effort` on the SAME call — a provenance claim with no
+  // value to attribute is meaningless. Both refuse with the SAME stable stderr token so either failure mode
+  // is one grep.
+  if ('effort-source' in o) {
+    const rawEffortSource = o['effort-source'];
+    if (rawEffortSource !== 'assigned' && rawEffortSource !== 'observed') {
+      console.error('BLOCK (3role-ledger effort-source): --effort-source "' + rawEffortSource +
+        '" is not one of the two legal values (assigned, observed) — nothing written.');
+      process.exit(2);
+    }
+    if (!('effort' in o)) {
+      console.error('BLOCK (3role-ledger effort-source): --effort-source requires --effort on the SAME ' +
+        'call (a provenance claim with no value to attribute is meaningless) — nothing written.');
       process.exit(2);
     }
   }
@@ -3535,6 +3577,11 @@ function cmdAppend(o) {
   // when both are present on the SAME call — normally they never co-occur (see the file-header comment).
   // --effort has NO auto-capture counterpart any more (removed below), so this is its ONLY source.
   if ('effort' in o) fields.effort = o.effort;
+  // #1528 D2 — provenance tag for the effort value THIS call carries. Reaching here means the C1/C2 guard
+  // above already validated the value (exactly "assigned"/"observed") and confirmed --effort was also
+  // provided on this same call; overlayAppend's own-key discipline (see its `effort` block) does the
+  // lockstep set-or-delete.
+  if ('effort-source' in o) fields.effort_source = o['effort-source'];
   if ('model-version' in o) fields.modelVersion = o['model-version'];
   if ('model-tier' in o) fields.modelTier = o['model-tier'];
   // #1516 — explicit close-stamp flag. ONLY three-role-subagent-ledger.sh (SubagentStop) passes this; every
@@ -4621,6 +4668,31 @@ function cmdCheck(o) {
       ' this is a VISIBILITY note, not a verdict invalidation. The two causes are a habitual Agent-tool bypass OR' +
       " a sanctioned D3 fallback — disambiguate by reading .ai-workspace/status/1947-seat-mix-live-smoke.md's" +
       ' OR-DISPATCH-FALLBACK / OR-SEAT-SMOKE receipt lines (task-keyed via their task= field).');
+  }
+  // #1528 D4 — EFFORT-PROVENANCE advisory. Prints UNCONDITIONALLY on the roles-satisfied path (unlike every
+  // advisory above, which only prints when it has something to flag) — even at 4/4 informative — so its
+  // absence from stdout can never be mistaken for "no rows to report" (AC-R7). Sibling of PROVENANCE:/
+  // ROUTE-BYPASS:, pure output, exit code UNCHANGED. Computed over the SAME merged byRole[role]
+  // last-row-per-role every other advisory above already uses. Downstream rule (D1): a row is
+  // effort-INFORMATIVE iff `effort_source === "observed"` — "assigned" and absent (unattributed, whether or
+  // not `effort` itself is present) are both evidentially void, so a conveyance statistic computed over void
+  // rows is visibly wrong here rather than silently wrong.
+  {
+    let observedCount = 0, assignedCount = 0, unattributedCount = 0;
+    const perRoleLabel = {};
+    for (const role of REQUIRED_ROLES) {
+      const e = byRole[role];
+      const src = e && e.effort_source;
+      let label;
+      if (src === 'observed') { label = 'observed'; observedCount++; }
+      else if (src === 'assigned') { label = 'assigned'; assignedCount++; }
+      else { label = 'unattributed'; unattributedCount++; }
+      perRoleLabel[role] = label;
+    }
+    console.log('EFFORT-PROVENANCE: informative=' + observedCount + '/' + REQUIRED_ROLES.length +
+      ' observed=' + observedCount + ' assigned=' + assignedCount + ' unattributed=' + unattributedCount +
+      ' (planner=' + perRoleLabel.planner + ', plan-review=' + perRoleLabel['plan-review'] +
+      ', executor=' + perRoleLabel.executor + ', execution-review=' + perRoleLabel['execution-review'] + ')');
   }
   console.log('OK: role-ledger complete for task ' + sanitize(task) +
     ' (planner, plan-review, executor, execution-review all resolved)');
