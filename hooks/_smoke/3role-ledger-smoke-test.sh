@@ -4962,4 +4962,295 @@ ALW_CT=$(command grep -c "'effort-source'" "$LED")
   && ok "#1528 AC-C6: hooks/3role-ledger.mjs's APPEND_KNOWN_FLAGS carries 'effort-source' (count=$ALW_CT)" \
   || bad "#1528 AC-C6 FAILED (grep count=$ALW_CT)"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1709 W1/W2 — AC-2 (four counters, never pre-summed), AC-3 (ledger rows untouched, fail-open on every
+# bad shape), AC-4 (backfill: per agent, idempotent, never writes the ledger), AC-10 (banner). AC-1/AC-1b
+# (end-to-end through the real SubagentStop hook) live in three-role-subagent-ledger-smoke-test.sh (§4 of
+# the plan). No call into the offline rollup script's directory and no host transcript reference below (F4).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+U_SID="sess-1709"; U_TASK="1709u"
+U_LEDFILE="$THREE_ROLE_LEDGER_DIR/$U_SID/$U_TASK.jsonl"
+U_USAGEDIR="${THREE_ROLE_LEDGER_DIR}-usage"
+
+# Write a subagent transcript at the standard fixture path (mirrors mk_sub's own path convention) whose
+# CONTENT is supplied verbatim (already-JSON lines, one per array entry) -- write_usage_transcript
+# <session> <agentId> <nodeArrayLiteralOfLines>
+write_usage_transcript() {
+  local s="$1" aid="$2"
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$s/subagents"
+  cat > "$THREE_ROLE_PROJECTS_ROOT/proj/$s/subagents/agent-$aid.jsonl"
+}
+
+# The AC-1-shaped fixture body (tagged brief + msg_A x3 + msg_B x1 + msg_S x1), reused by several arms below.
+u_ac1_body() {
+  local aid="$1"
+  AID="$aid" node -e '
+    const aid = process.env.AID;
+    const usageA = (out) => ({ input_tokens: 2, output_tokens: out, cache_read_input_tokens: 1000,
+      cache_creation_input_tokens: 40, cache_creation: { ephemeral_5m_input_tokens: 40, ephemeral_1h_input_tokens: 0 } });
+    const rec = (model, id, usage, ctype) => JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid,
+      message: { model, id, usage, content: [{ type: ctype || "text", text: "x" }] } });
+    const lines = [
+      JSON.stringify({ isSidechain: true, agentId: aid, sessionId: "x", type: "user", message: { role: "user", content: "3ROLE_TASK:1709u ROLE:executor" } }),
+      rec("claude-sonnet-5", "msg_A", usageA(5), "thinking"),
+      rec("claude-sonnet-5", "msg_A", usageA(5), "tool_use"),
+      rec("claude-sonnet-5", "msg_A", usageA(300), "text"),
+      rec("claude-opus-5-5", "msg_B", { input_tokens: 2, output_tokens: 50, cache_read_input_tokens: 2000, cache_creation_input_tokens: 0 }, "text"),
+      rec("<synthetic>", "msg_S", { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, "text"),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+  '
+}
+
+# ---- #1709 AC-2: four counters, never pre-summed. ----
+u_ac1_body u2a | write_usage_transcript sU2 u2a
+node "$LED" append --session sU2 --task 1709u --role executor --agent u2a --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+AC2_RESULT=$(node -e '
+  const fs = require("fs");
+  const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const NAMED = new Set(["api_calls", "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens"]);
+  const bad = [];
+  function walk(o, p) {
+    if (!o || typeof o !== "object") return;
+    for (const [k, v] of Object.entries(o)) {
+      if (/total|sum/i.test(k)) bad.push(p + k);
+      if (/tokens$/.test(k) && !NAMED.has(k)) bad.push(p + k);
+      if (v && typeof v === "object") walk(v, p + k + ".");
+    }
+  }
+  walk(rec.usage, "usage.");
+  const models = Object.values(rec.usage.by_model || {});
+  const sevenKeys = models.every((m) => NAMED.size === Object.keys(m).length && Object.keys(m).every((k) => NAMED.has(k)));
+  console.log(bad.length === 0 && sevenKeys ? "OK" : ("FAIL:" + bad.join(",") + " sevenKeys=" + sevenKeys));
+' "$U_USAGEDIR/u2a.json")
+{ [ "$AC2_RESULT" = "OK" ]; } \
+  && ok "#1709 AC-2: every by_model entry carries exactly the seven named counter keys, no total/sum key anywhere in usage" \
+  || bad "#1709 AC-2 FAILED (result=$AC2_RESULT)"
+
+# ---- #1709 AC-3(a): spawn-time append, then close -> ledger row carries NO usage key; usage file exists. ----
+node "$LED" append --session sU3a --task 1709u --role executor --agent u3a --effort xhigh --effort-source assigned --model-tier sonnet >/dev/null 2>&1
+u_ac1_body u3a | write_usage_transcript sU3a u3a
+node "$LED" append --session sU3a --task 1709u --role executor --agent u3a --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+F_U3A="$THREE_ROLE_LEDGER_DIR/sU3a/1709u.jsonl"
+{ [ -f "$U_USAGEDIR/u3a.json" ] && ! command grep -q '"usage"' "$F_U3A" && command grep -q '"effort":"xhigh"' "$F_U3A" && command grep -q '"closedAt"' "$F_U3A"; } \
+  && ok "#1709 AC-3(a): spawn-time fields survive, ledger row carries no usage key, usage file exists" \
+  || bad "#1709 AC-3(a) FAILED"
+
+# ---- #1709 AC-3(b): transcript ABSENT at close -> row gains closedAt, no usage file. ----
+node "$LED" append --session sU3b --task 1709u --role executor --agent u3b-noexist --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+F_U3B="$THREE_ROLE_LEDGER_DIR/sU3b/1709u.jsonl"
+{ command grep -q '"closedAt"' "$F_U3B" && [ ! -f "$U_USAGEDIR/u3b-noexist.json" ]; } \
+  && ok "#1709 AC-3(b): no transcript on disk -> closedAt written, no usage file" \
+  || bad "#1709 AC-3(b) FAILED"
+
+# ---- #1709 AC-3(c): transcript with ONLY the brief (no assistant record) -> no usage file. ----
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({isSidechain:true,agentId:"u3c",sessionId:"x",type:"user",message:{role:"user",content:"3ROLE_TASK:1709u ROLE:executor"}}))')" | write_usage_transcript sU3c u3c
+node "$LED" append --session sU3c --task 1709u --role executor --agent u3c --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+{ [ ! -f "$U_USAGEDIR/u3c.json" ]; } \
+  && ok "#1709 AC-3(c): brief-only transcript (no assistant record) -> no usage file" \
+  || bad "#1709 AC-3(c) FAILED"
+
+# ---- #1709 AC-3(d) F2: three malformed arms -- closedAt row still written, rc=0 in every case. ----
+# (i) a truncated trailing line -> ignored, stamp reflects the complete records only (api_calls still 2).
+(u_ac1_body u3d1; printf '{"type":"assistant","agentId":"u3d1","message":{"model":"claude-sonnet-5"') | write_usage_transcript sU3d1 u3d1
+OUT_D1=$(node "$LED" append --session sU3d1 --task 1709u --role executor --agent u3d1 --closed-at 2026-01-01T00:00:00.000Z 2>&1); RC_D1=$?
+API_D1=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).usage.api_calls)' "$U_USAGEDIR/u3d1.json" 2>/dev/null)
+{ [ "$RC_D1" = "0" ] && [ "$API_D1" = "2" ] && command grep -q '"closedAt"' "$THREE_ROLE_LEDGER_DIR/sU3d1/1709u.jsonl"; } \
+  && ok "#1709 AC-3(d)(i): truncated trailing line ignored -> stamp reflects the complete records (api_calls=2), closedAt written, rc=0" \
+  || bad "#1709 AC-3(d)(i) FAILED (rc=$RC_D1 api=$API_D1 out=$OUT_D1)"
+# (ii) usage missing its cache_creation sub-object -> ephemeral 5m/1h == 0, the four core counters intact.
+AID="u3d2" node -e '
+  const aid = process.env.AID;
+  const lines = [
+    JSON.stringify({ isSidechain: true, agentId: aid, sessionId: "x", type: "user", message: { role: "user", content: "3ROLE_TASK:1709u ROLE:executor" } }),
+    JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid, message: { model: "claude-sonnet-5", id: "msg_D2",
+      usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, content: [{ type: "text", text: "x" }] } }),
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
+' | write_usage_transcript sU3d2 u3d2
+node "$LED" append --session sU3d2 --task 1709u --role executor --agent u3d2 --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+D2_RESULT=$(node -e '
+  const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).usage.by_model["claude-sonnet-5"];
+  const ok = m.cache_creation_5m_input_tokens === 0 && m.cache_creation_1h_input_tokens === 0 &&
+    m.input_tokens === 1 && m.output_tokens === 2 && m.cache_read_input_tokens === 3 && m.cache_creation_input_tokens === 4;
+  console.log(ok ? "OK" : ("FAIL:" + JSON.stringify(m)));
+' "$U_USAGEDIR/u3d2.json")
+{ [ "$D2_RESULT" = "OK" ]; } \
+  && ok "#1709 AC-3(d)(ii): missing cache_creation sub-object -> ephemeral 5m/1h=0, four core counters intact" \
+  || bad "#1709 AC-3(d)(ii) FAILED (result=$D2_RESULT)"
+# (iii) a non-numeric counter -> ABORTS the whole stamp (no usage file at all -- never partial/coerced).
+AID="u3d3" node -e '
+  const aid = process.env.AID;
+  const lines = [
+    JSON.stringify({ isSidechain: true, agentId: aid, sessionId: "x", type: "user", message: { role: "user", content: "3ROLE_TASK:1709u ROLE:executor" } }),
+    JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid, message: { model: "claude-sonnet-5", id: "msg_D3",
+      usage: { input_tokens: "not-a-number", output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, content: [{ type: "text", text: "x" }] } }),
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
+' | write_usage_transcript sU3d3 u3d3
+OUT_D3=$(node "$LED" append --session sU3d3 --task 1709u --role executor --agent u3d3 --closed-at 2026-01-01T00:00:00.000Z 2>&1); RC_D3=$?
+{ [ "$RC_D3" = "0" ] && [ ! -f "$U_USAGEDIR/u3d3.json" ] && command grep -q '"closedAt"' "$THREE_ROLE_LEDGER_DIR/sU3d3/1709u.jsonl"; } \
+  && ok "#1709 AC-3(d)(iii): non-numeric counter -> aborts the stamp (no usage file, never coerced), closedAt still written, rc=0" \
+  || bad "#1709 AC-3(d)(iii) FAILED (rc=$RC_D3 out=$OUT_D3)"
+
+# ---- #1709 AC-3(e) F3: re-close overwrites (superset); a close with the transcript gone leaves the record alone. ----
+u_ac1_body u3e1 | write_usage_transcript sU3e1 u3e1
+node "$LED" append --session sU3e1 --task 1709u --role executor --agent u3e1 --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>&1
+FIRST_API=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).usage.api_calls)' "$U_USAGEDIR/u3e1.json")
+# grow the transcript with one more usage-bearing record, then close again.
+AID="u3e1" node -e '
+  const aid = process.env.AID;
+  process.stdout.write(JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid, message: { model: "claude-sonnet-5", id: "msg_MORE",
+    usage: { input_tokens: 9, output_tokens: 9, cache_read_input_tokens: 9, cache_creation_input_tokens: 0 }, content: [{ type: "text", text: "more" }] } }) + "\n");
+' >> "$THREE_ROLE_PROJECTS_ROOT/proj/sU3e1/subagents/agent-u3e1.jsonl"
+node "$LED" append --session sU3e1 --task 1709u --role executor --agent u3e1 --closed-at 2026-01-01T00:01:00.000Z >/dev/null 2>&1
+SECOND_API=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).usage.api_calls)' "$U_USAGEDIR/u3e1.json")
+{ [ "$FIRST_API" = "2" ] && [ "$SECOND_API" = "3" ]; } \
+  && ok "#1709 AC-3(e)(re-close): a later close OVERWRITES with the grown transcript's superset (api_calls 2 -> 3)" \
+  || bad "#1709 AC-3(e)(re-close) FAILED (first=$FIRST_API second=$SECOND_API)"
+# a close with the transcript already gone must leave an EXISTING usage file byte-identical (absent != delete).
+SNAP_U3E1="$TMP/u3e1-snap.json"; cp "$U_USAGEDIR/u3e1.json" "$SNAP_U3E1"
+mv "$THREE_ROLE_PROJECTS_ROOT/proj/sU3e1/subagents/agent-u3e1.jsonl" "$THREE_ROLE_PROJECTS_ROOT/proj/sU3e1/subagents/agent-u3e1.jsonl.moved-away"
+node "$LED" append --session sU3e1 --task 1709u --role executor --agent u3e1 --closed-at 2026-01-01T00:02:00.000Z >/dev/null 2>&1
+{ cmp -s "$SNAP_U3E1" "$U_USAGEDIR/u3e1.json"; } \
+  && ok "#1709 AC-3(e)(gone transcript): a close with the transcript removed leaves the usage file byte-identical (absent is not delete)" \
+  || bad "#1709 AC-3(e)(gone transcript) FAILED"
+
+# ---- #1709 AC-4: usage-backfill -- per agent, idempotent, never writes the ledger. ----
+# Fixture: TWO session dirs, in a PRIVATE ledger dir (this smoke file's shared $THREE_ROLE_LEDGER_DIR
+# accumulates hundreds of rows from every earlier AC above -- an unscoped usage-backfill against THAT store
+# would tally the whole file's fixtures, not just this one, so AC-4 gets its own isolated store instead).
+# s1/1493.jsonl is a MULTI-ROUND same-role file: a closed plan-review NEEDS-WORK row FIRST (agentId R1),
+# then a closed plan-review PASS row (agentId R1b) -- both transcripts on disk, no usage files. s2 carries
+# R2 (transcript on disk, usage file ALREADY present with sentinel api_calls:999) and R3 (agentId, NO
+# transcript).
+BF_LED="$TMP/bf-ledger"; BF_USAGE="${BF_LED}-usage"
+bf_led() { THREE_ROLE_LEDGER_DIR="$BF_LED" THREE_ROLE_USAGE_DIR="$BF_USAGE" THREE_ROLE_PROJECTS_ROOT="$THREE_ROLE_PROJECTS_ROOT" node "$LED" "$@"; }
+# Spawn-tagged (so a genuinely-new round is admitted by the terminal-evidence guard) AND usage-bearing (so
+# backfill has something real to stamp) -- mk_tagged() alone gives the FIRST but not the second.
+# mk_tagged_usage <session> <agentId> <task> <role>
+mk_tagged_usage() {
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  T3="$3" R4="$4" AID="$2" node -e '
+    const aid = process.env.AID;
+    const lines = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "3ROLE_TASK:" + process.env.T3 + " ROLE:" + process.env.R4 + " -- do the work" } }),
+      JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid, message: { model: "claude-sonnet-5", id: "msg_" + aid,
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 }, content: [{ type: "text", text: "x" }] } }),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+  ' > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+mk_tagged_usage s1 R1 1493 plan-review; mk_tagged_usage s1 R1b 1493 plan-review; mk_tagged_usage s2 R2 1493 plan-review
+# R3 deliberately gets NO transcript file at all (the "no_transcript=1" candidate).
+# Write the ledger ROWS directly (bypassing cmdAppend/the close-time capture path entirely) -- these model
+# HISTORICAL rows closed before #1709 shipped: closedAt already present, no usage file, transcript may or
+# may not still be on disk. Using cmdAppend's own --closed-at here would immediately auto-stamp usage at
+# append time (the W1 capture this same file already proved above), defeating the point of a BACKFILL
+# fixture -- backfill exists precisely for rows the close-time path never touched.
+write_ledger_row() { # <ledgerDir> <session> <task> <jsonRow(no trailing newline)>
+  mkdir -p "$1/$2"
+  printf '%s\n' "$4" >> "$1/$2/$3.jsonl"
+}
+write_ledger_row "$BF_LED" s1 1493 '{"role":"plan-review","session_id":"s1","ts":"2026-01-01T00:00:00.000Z","agentId":"R1","verdict":"NEEDS-WORK","closedAt":"2026-01-01T00:00:00.000Z"}'
+write_ledger_row "$BF_LED" s1 1493 '{"role":"plan-review","session_id":"s1","ts":"2026-01-02T00:00:00.000Z","agentId":"R1b","verdict":"PASS","closedAt":"2026-01-02T00:00:00.000Z"}'
+write_ledger_row "$BF_LED" s2 1493 '{"role":"plan-review","session_id":"s2","ts":"2026-01-01T00:00:00.000Z","agentId":"R2","verdict":"PASS","closedAt":"2026-01-01T00:00:00.000Z"}'
+write_ledger_row "$BF_LED" s2 1494 '{"role":"executor","session_id":"s2","ts":"2026-01-01T00:00:00.000Z","agentId":"R3","artifact_path":"PR #x","closedAt":"2026-01-01T00:00:00.000Z"}'
+# R2 already has a usage file (sentinel, api_calls:999) -- backfill must never rewrite an already-stamped agent.
+mkdir -p "$BF_USAGE"
+printf '{"agentId":"R2","usage":{"source":"transcript","captured_at":"2026-01-01T00:00:00.000Z","api_calls":999,"by_model":{}}}' > "$BF_USAGE/R2.json"
+# snapshot sha256 + mtime of EVERY ledger file before backfill.
+BF_SNAP="$TMP/bf-snapshot.json"
+node -e '
+  const fs = require("fs"), path = require("path"), crypto = require("crypto");
+  const dir = process.argv[1];
+  const out = {};
+  for (const sess of fs.readdirSync(dir)) {
+    const sdir = path.join(dir, sess);
+    if (!fs.statSync(sdir).isDirectory()) continue;
+    for (const fn of fs.readdirSync(sdir)) {
+      if (!fn.endsWith(".jsonl")) continue;
+      const f = path.join(sdir, fn);
+      const buf = fs.readFileSync(f);
+      out[sess + "/" + fn] = { sha256: crypto.createHash("sha256").update(buf).digest("hex"), mtimeMs: fs.statSync(f).mtimeMs };
+    }
+  }
+  fs.writeFileSync(process.argv[2], JSON.stringify(out));
+' "$BF_LED" "$BF_SNAP"
+# dry-run: tallies, writes nothing.
+DRY_OUT=$(bf_led usage-backfill --dry-run 2>&1); DRY_RC=$?
+{ [ "$DRY_RC" = "0" ] && echo "$DRY_OUT" | command grep -qE 'would_stamp=2 already=1 no_transcript=1'; } \
+  && ok "#1709 AC-4: usage-backfill --dry-run reports would_stamp=2 already=1 no_transcript=1, exit 0" \
+  || bad "#1709 AC-4 dry-run FAILED (rc=$DRY_RC out=$DRY_OUT)"
+DRY_SNAP="$TMP/bf-after-dry.json"
+node -e '
+  const fs = require("fs"), path = require("path"), crypto = require("crypto");
+  const dir = process.argv[1]; const out = {};
+  for (const sess of fs.readdirSync(dir)) {
+    const sdir = path.join(dir, sess); if (!fs.statSync(sdir).isDirectory()) continue;
+    for (const fn of fs.readdirSync(sdir)) { if (!fn.endsWith(".jsonl")) continue; const f = path.join(sdir, fn);
+      out[sess+"/"+fn] = { sha256: crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex"), mtimeMs: fs.statSync(f).mtimeMs }; }
+  }
+  fs.writeFileSync(process.argv[2], JSON.stringify(out));
+' "$BF_LED" "$DRY_SNAP"
+DRY_UNCHANGED=$(node -e '
+  const before = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+  const after = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+  const keys = Object.keys(before);
+  const same = keys.length === Object.keys(after).length && keys.every((k) => after[k] && after[k].sha256 === before[k].sha256 && after[k].mtimeMs === before[k].mtimeMs);
+  console.log(same ? "OK" : "FAIL");
+' "$BF_SNAP" "$DRY_SNAP")
+{ [ ! -f "$BF_USAGE/R1.json" ] && [ ! -f "$BF_USAGE/R1b.json" ] && [ "$DRY_UNCHANGED" = "OK" ]; } \
+  && ok "#1709 AC-4: --dry-run writes NOTHING (no usage files, every ledger file sha256+mtime unchanged)" \
+  || bad "#1709 AC-4 dry-run wrote something (unchanged=$DRY_UNCHANGED)"
+# real run: stamps R1/R1b, R2 untouched (sentinel survives), R3 never touched; every ledger file's sha256
+# AND mtime unchanged; NEEDS-WORK row is still FIRST (row order preserved).
+REAL_OUT=$(bf_led usage-backfill 2>&1); REAL_RC=$?
+R2_API=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).usage.api_calls)' "$BF_USAGE/R2.json")
+ORDER_OK=$(node -e '
+  const lines = require("fs").readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  console.log(lines[0].verdict === "NEEDS-WORK" && lines[1].verdict === "PASS" ? "OK" : "FAIL:" + JSON.stringify(lines.map((l) => l.verdict)));
+' "$BF_LED/s1/1493.jsonl")
+AFTER_SNAP="$TMP/bf-after-real.json"
+node -e '
+  const fs = require("fs"), path = require("path"), crypto = require("crypto");
+  const dir = process.argv[1]; const out = {};
+  for (const sess of fs.readdirSync(dir)) {
+    const sdir = path.join(dir, sess); if (!fs.statSync(sdir).isDirectory()) continue;
+    for (const fn of fs.readdirSync(sdir)) { if (!fn.endsWith(".jsonl")) continue; const f = path.join(sdir, fn);
+      out[sess+"/"+fn] = { sha256: crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex"), mtimeMs: fs.statSync(f).mtimeMs }; }
+  }
+  fs.writeFileSync(process.argv[2], JSON.stringify(out));
+' "$BF_LED" "$AFTER_SNAP"
+UNCHANGED=$(node -e '
+  const before = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+  const after = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+  const keys = Object.keys(before);
+  const same = keys.length === Object.keys(after).length && keys.every((k) => after[k] && after[k].sha256 === before[k].sha256 && after[k].mtimeMs === before[k].mtimeMs);
+  console.log(same ? "OK" : "FAIL");
+' "$BF_SNAP" "$AFTER_SNAP")
+{ [ "$REAL_RC" = "0" ] && [ -f "$BF_USAGE/R1.json" ] && [ -f "$BF_USAGE/R1b.json" ] && [ "$R2_API" = "999" ] && [ ! -f "$BF_USAGE/R3.json" ] && [ "$ORDER_OK" = "OK" ] && [ "$UNCHANGED" = "OK" ]; } \
+  && ok "#1709 AC-4: real backfill stamps R1/R1b, R2 sentinel untouched, R3 never touched, every ledger file sha256+mtime unchanged, NEEDS-WORK row still first" \
+  || bad "#1709 AC-4 real-run FAILED (rc=$REAL_RC r2api=$R2_API order=$ORDER_OK unchanged=$UNCHANGED)"
+# a second run leaves both stores byte-identical (idempotent).
+SECOND_OUT=$(bf_led usage-backfill 2>&1); SECOND_RC=$?
+{ [ "$SECOND_RC" = "0" ] && echo "$SECOND_OUT" | command grep -qE 'would_stamp=0'; } \
+  && ok "#1709 AC-4: a second real run is idempotent (would_stamp=0)" \
+  || bad "#1709 AC-4 second-run FAILED (rc=$SECOND_RC out=$SECOND_OUT)"
+# --session s3 stamps only s3's agents (a fresh isolated session added to the SAME private store).
+mk_sub s3 R4
+bf_led append --session s3 --task 1495 --role executor --agent R4 --artifact "PR #y" >/dev/null 2>&1
+S3_OUT=$(bf_led usage-backfill --session s3 --dry-run 2>&1)
+{ echo "$S3_OUT" | command grep -qE 'would_stamp=1'; } \
+  && ok "#1709 AC-4: --session restricts the sweep to only that session's agents" \
+  || bad "#1709 AC-4 --session-filter FAILED (out=$S3_OUT)"
+
+# ---- #1709 AC-10: banner lists usage-backfill (the rollup subcommand lives in the offline reporting CLI, F6, not here). ----
+BANNER=$(node "$LED" 2>&1)
+{ echo "$BANNER" | command grep -q 'usage-backfill'; } \
+  && ok "#1709 AC-10: the no-args banner lists usage-backfill" \
+  || bad "#1709 AC-10 FAILED (banner missing usage-backfill)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
