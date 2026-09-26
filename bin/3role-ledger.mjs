@@ -6668,19 +6668,24 @@ function cmdListSeatPins(o) {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
-// #2105, redesigned 2026-08-29 (work/ship-tail pool split) — Mode switch SSOT: resolve-mode / set-mode. A
-// tiny operator posture pin (~/.config/cc-mode.json, machine-local, never tracked/synced) governs THREE axes
-// read from the tracked table below:
+// #2105, redesigned 2026-08-29 (work/ship-tail pool split); #2518 (2026-09-26) added a THIRD provider axis —
+// Mode switch SSOT: resolve-mode / set-mode. A tiny operator posture pin (~/.config/cc-mode.json,
+// machine-local, never tracked/synced) governs FOUR axes read from the tracked table below:
 //   - lanes.{work_base,opportunist,work_ceiling,ship_tail_ceiling}: the per-pool caps a NEW lane-start may
 //     not exceed (hooks/lane-ceiling-gate.sh, hooks/mode-pin-lane-gate.sh) — work_ceiling is a HARD cap, the
 //     work_base->work_ceiling band is a block-once opportunist advisory, ship_tail_ceiling is a HARD cap.
 //   - openrouter_dispatch: whether tools/openrouter-*-dispatch.sh may reach OpenRouter at all.
 //   - local_dispatch:      whether a seat may be dispatched to the local LLM (conservative-mode offload).
+//   - zai_dispatch (#2518): whether a seat may be dispatched to z.ai direct (hybrid-mode GLM offload) —
+//     `permitted` ONLY in the new `hybrid` mode; every other mode (incl. conservative) keeps it `forbidden`,
+//     so `hybrid` never re-opens OpenRouter or local and `conservative` never opens z.ai.
 // Fail-safe direction (D1): EVERY failure shape (absent/unreadable/unparseable pin, unknown mode value,
 // broken/absent tracked table) resolves to `normal` — the harm asymmetry is that an accidental non-Anthropic
 // dispatch violates the operator's directive AND a data-posture boundary, while 3 work / 2 ship-tail is the
 // operator's own declared normal-mode default. Garbage state can never resolve to boost and can never
-// resolve to openrouter_dispatch=permitted or local_dispatch=permitted.
+// resolve to openrouter_dispatch=permitted, local_dispatch=permitted, or zai_dispatch=permitted — a mode row
+// with no zai_dispatch key at all (every pre-#2518 fixture table) resolves the axis to forbidden too, never
+// undefined (#2518 AC-4 fail-closed arm).
 // Fixture seams (mirrors CC_ROUTES_JSON): CC_MODE_FILE (the pin) and CC_MODE_POLICY_JSON (the tracked table).
 // No smoke may ever omit both — the real ~/.config/cc-mode.json is NEVER read or written by any test arm.
 
@@ -6692,11 +6697,13 @@ const MODE_FALLBACK = Object.freeze({
   ship_tail_ceiling: 2,
   openrouter_dispatch: 'forbidden',
   local_dispatch: 'forbidden',
+  zai_dispatch: 'forbidden',
 });
 
-// Redesign (2026-08-29, work/ship-tail pool split) — builds the full v2 resolveMode() return shape for any
-// fallback arm. `ceiling` is the LEGACY field, kept equal to work_ceiling so an un-migrated reader degrades
-// to "work ceiling governs" instead of failing open on a missing key (never a garbage/permitting value).
+// Redesign (2026-08-29, work/ship-tail pool split; #2518 added zai_dispatch) — builds the full v2
+// resolveMode() return shape for any fallback arm. `ceiling` is the LEGACY field, kept equal to work_ceiling
+// so an un-migrated reader degrades to "work ceiling governs" instead of failing open on a missing key
+// (never a garbage/permitting value).
 function fallbackResolved(source, reason) {
   return {
     mode: MODE_FALLBACK.mode,
@@ -6707,6 +6714,7 @@ function fallbackResolved(source, reason) {
     ceiling: MODE_FALLBACK.work_ceiling,
     openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch,
     local_dispatch: MODE_FALLBACK.local_dispatch,
+    zai_dispatch: MODE_FALLBACK.zai_dispatch,
     source, reason, set_at: '', task: '',
   };
 }
@@ -6802,6 +6810,7 @@ function resolveMode() {
                work_ceiling: lanes.work_ceiling, ship_tail_ceiling: lanes.ship_tail_ceiling,
                ceiling: lanes.work_ceiling,
                openrouter_dispatch: row.openrouter_dispatch, local_dispatch: row.local_dispatch,
+               zai_dispatch: row.zai_dispatch === 'permitted' ? 'permitted' : 'forbidden',
                source: 'default', reason: '', set_at: '', task: '' };
     }
     return fallbackResolved('invalid-pin-fallback', 'unreadable-pin');
@@ -6826,18 +6835,23 @@ function resolveMode() {
   // #2189 AC-4(e1)/D6 — ALIASES MAY DESCRIBE, NEVER UNLOCK. A pin whose `mode` field is an ALIAS
   // spelling (never producible by set-mode any more, per AC-4(e2) — but a hand-edited or legacy pin
   // file can still carry one, e.g. #2035's token-conservative or the retired speed-boost) may still
-  // inform the READING axis (the mapped row's real lane numbers), but BOTH authorisation axes
-  // (openrouter_dispatch AND the redesign's local_dispatch) are clamped to 'forbidden' regardless of the
-  // row's own values: the operator never selected the literal canonical mode, so the road never opens on
-  // an alias click.
+  // inform the READING axis (the mapped row's real lane numbers), but ALL THREE authorisation axes
+  // (openrouter_dispatch, local_dispatch, AND #2518's zai_dispatch) are clamped to 'forbidden' regardless
+  // of the row's own values: the operator never selected the literal canonical mode, so the road never
+  // opens on an alias click (#2518 AC-4 hold-one-out clamp: an alias pointing AT hybrid must never unlock
+  // zai_dispatch, even though pinning canonical hybrid does).
   const dispatchAxis = viaAlias ? 'forbidden' : row.openrouter_dispatch;
   const localAxis = viaAlias ? 'forbidden' : row.local_dispatch;
+  // Fail-closed on a missing/garbage zai_dispatch key (#2518 AC-4): only a LITERAL 'permitted' value on a
+  // non-alias resolution ever unlocks it — anything else (absent key, any other string, alias clamp) is
+  // 'forbidden', never 'undefined'.
+  const zaiAxis = (!viaAlias && row.zai_dispatch === 'permitted') ? 'permitted' : 'forbidden';
   const reasonText = String(pin.reason == null ? '' : pin.reason);
   return { mode: resolved,
            work_base: lanes.work_base, opportunist: lanes.opportunist,
            work_ceiling: lanes.work_ceiling, ship_tail_ceiling: lanes.ship_tail_ceiling,
            ceiling: lanes.work_ceiling,
-           openrouter_dispatch: dispatchAxis, local_dispatch: localAxis,
+           openrouter_dispatch: dispatchAxis, local_dispatch: localAxis, zai_dispatch: zaiAxis,
            source: 'pin', reason: viaAlias ? (reasonText ? reasonText + ' [alias-non-authorizing]' : 'alias-non-authorizing') : reasonText,
            set_at: String(pin.set_at == null ? '' : pin.set_at), task: String(pin.task == null ? '' : pin.task) };
 }
@@ -6856,6 +6870,7 @@ function cmdResolveMode(opts) {
   console.log('ceiling=' + r.ceiling);
   console.log('openrouter_dispatch=' + r.openrouter_dispatch);
   console.log('local_dispatch=' + r.local_dispatch);
+  console.log('zai_dispatch=' + r.zai_dispatch);
   console.log('source=' + r.source);
   console.log('reason=' + r.reason);
   // AC 20(b) (#2197) — `set_at=` is emitted ONLY on the source=pin arm, and only when the pin actually

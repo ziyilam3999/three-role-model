@@ -150,23 +150,35 @@ read -r SEAT_MODEL SEAT_DISPATCH < <(
     process.stdout.write(model.replace(/\s/g,"") + " " + dispatch.replace(/[^0-9A-Za-z._-]/g,"") + "\n");
   ' 2>/dev/null
 )
-# Only seats declared subprocess-openrouter are in scope. Every other seat (planner/execution-review/research,
-# or a seat whose row carries no dispatch field) and any SSOT-unresolvable case fail-opens silently.
-[ "$SEAT_DISPATCH" = "subprocess-openrouter" ] || exit 0
+# Any seat declared `subprocess-<provider>` is in scope (#2518 generalization of the #1989 openrouter-only
+# proxy — the ledger's own prefix test, isSubprocessDispatch). Every other seat (planner/execution-review/
+# research, or a seat whose row carries no dispatch field) and any SSOT-unresolvable case fail-opens silently.
+case "$SEAT_DISPATCH" in
+  subprocess-*) ;;
+  *) exit 0 ;;
+esac
+PROVIDER="${SEAT_DISPATCH#subprocess-}"
 
-# --- #2105 D3 backstop: mode-awareness ---------------------------------------------------------------------
-# In non-conservative mode the Agent-tool spawn of this seat IS the sanctioned primary (D3's own dispatch
-# helpers refuse the subprocess-openrouter path themselves outside conservative mode) — so this gate stays
-# COMPLETELY SILENT: no advisory, no marker write, no audit line. Firing on every sanctioned normal-mode
-# plan-review/executor spawn would train every spawn to carry the bypass token, deadening the gate for the
-# case it exists to catch. In conservative mode this hook's behavior is byte-identical to today (unchanged
-# below this point). Fail-open on any mode-resolution failure (a crashed resolver here is still advisory-
-# only, unlike the lane doorman/dispatch helpers, so the existing fail-open-on-any-parse-error convention
-# already covers it — MODE_VAL stays empty, which is != "conservative", so this ALSO fails open silently;
-# that is the correct direction for a hook whose whole job is "stay out of the way unless conservative").
+# --- #2105/#2518 D3 backstop: mode-awareness, keyed on THIS seat's OWN provider axis ------------------------
+# Generalizes the #1989 "== conservative" proxy (which stood in for openrouter_dispatch=permitted, the only
+# axis that existed then): the axis that matters is the resolved mode's <provider>_dispatch value for THIS
+# seat's declared provider, never a hardcoded mode name. When that axis is "permitted" the subprocess route
+# is live, so an Agent-tool spawn of this seat IS a real bypass — fire. When it is "forbidden" the dispatch
+# helper would refuse the subprocess route too, so the Agent-tool fallback is the sanctioned primary and
+# this gate stays COMPLETELY SILENT: no advisory, no marker write, no audit line (firing on every sanctioned
+# spawn would train every routine spawn to carry the bypass token, deadening the gate for the case it exists
+# to catch). Concretely: conservative + subprocess-openrouter still fires (openrouter_dispatch=permitted
+# there, unchanged from pre-#2518 behavior); hybrid + subprocess-zai now ALSO fires (zai_dispatch=permitted
+# in hybrid); hybrid + subprocess-openrouter and normal + subprocess-zai both stay silent (each axis is
+# forbidden under that mode) — hybrid never re-opens the OpenRouter door. Fail-open on any mode-resolution
+# failure or an unresolvable provider axis (a crashed resolver here is still advisory-only, unlike the lane
+# doorman/dispatch helpers, so the existing fail-open-on-any-parse-error convention already covers it —
+# AXIS_VAL stays empty, which is != "permitted", so this ALSO fails open silently; that is the correct
+# direction for a hook whose whole job is "stay out of the way unless the subprocess route is actually live").
 MODE_RESOLVE_OUT="$(node "$LEDGER_HELPER" resolve-mode 2>/dev/null)"
 MODE_VAL="$(printf '%s\n' "$MODE_RESOLVE_OUT" | command grep -m1 '^mode=' | cut -d= -f2)"
-[ "$MODE_VAL" = "conservative" ] || exit 0
+AXIS_VAL="$(printf '%s\n' "$MODE_RESOLVE_OUT" | command grep -m1 "^${PROVIDER}_dispatch=" | cut -d= -f2)"
+[ "$AXIS_VAL" = "permitted" ] || exit 0
 
 # --- per-signature block-once marker ---
 mkdir -p "$STATE_DIR" 2>/dev/null
@@ -179,16 +191,16 @@ MARKER="$STATE_DIR/$SIG.notified"
 
 cat >&2 <<EOF
 <system-reminder>
-THREE-ROLE ROUTE-DISPATCH GATE (three-role-route-dispatch-gate hook, #1989): the seat ROLE:${ROLE} for
-3ROLE_TASK:${TASKID} is declared dispatch=subprocess-openrouter (model ${SEAT_MODEL}) in the routes SSOT
-(config/cc-routes.json), so its PRIMARY dispatch path is the subprocess helper, NOT an in-session Agent-tool
-spawn:
+THREE-ROLE ROUTE-DISPATCH GATE (three-role-route-dispatch-gate hook, #1989/#2518): the seat ROLE:${ROLE} for
+3ROLE_TASK:${TASKID} is declared dispatch=${SEAT_DISPATCH} (model ${SEAT_MODEL}, provider ${PROVIDER}) in the
+routes SSOT (config/cc-routes.json), and mode=${MODE_VAL} resolves ${PROVIDER}_dispatch=permitted, so its
+PRIMARY dispatch path is the subprocess helper, NOT an in-session Agent-tool spawn:
     bash tools/openrouter-role-dispatch.sh --role ${ROLE} --brief <brief-path> --task ${TASKID}
 (A provider endpoint binds once at \`claude\` launch -- #1685/#1917 -- so an Agent-tool call cannot reach this
 seat's declared non-Anthropic model; only the fresh-OS-process subprocess can, and \`agent_tool_fallback\`
 made an accidental Agent-tool spawn silently gate-clean before this gate existed.) The Agent-tool spawn of
 this seat is the FALLBACK path, sanctioned ONLY for: (a) a D3 bounded fallback after a failed/timed-out
-subprocess dispatch (helper exit 124 or nonzero, <=1 subprocess retry first); (b) the OpenRouter key file
+subprocess dispatch (helper exit 124 or nonzero, <=1 subprocess retry first); (b) the seat's key file
 absent / the route genuinely unavailable; or (c) explicit operator direction. If this spawn IS a sanctioned
 fallback, re-issue it carrying the inline token [route-dispatch-fallback-ok] in the prompt (it is
 audit-logged as a deliberate bypass, never silent) and pass model:opus (plan-review) / model:sonnet (executor)
