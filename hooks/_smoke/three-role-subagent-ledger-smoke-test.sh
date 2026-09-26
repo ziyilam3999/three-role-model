@@ -14,6 +14,7 @@ bad() { echo "FAIL: $1"; fail=1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 LEDGERDIR="$TMP/ledger"; PROJROOT="$TMP/projects"
+USAGEDIR="${LEDGERDIR}-usage"   # #1709 W1 — the sibling usage store's default location (path.resolve(LEDGER_DIR)+'-usage').
 export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
 export RULE12_LOG="$TMP/rule12.log"  # D4: never write the operator's real audit log during a suite run.
 
@@ -250,5 +251,128 @@ TFE=$(mk_transcript sFOURe agFE "3ROLE_TASK:1495 ROLE:executor"$'\n'"Please revi
 run "$TFE" sFOURe agFE
 nex=$(ledger_count sFOURe 1495 executor agFE); npr=$(ledger_count sFOURe 1495 plan-review agFE)
 { [ "$npl" = "1" ] && [ "$nex" = "1" ] && [ "$npr" = "0" ]; } && ok "[control] S-FOUR-UNCHANGED: the four roles unregressed by widening the alternation" || bad "[control] S-FOUR-UNCHANGED broken (npl=$npl nex=$nex npr=$npr)"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #1709 W1/B1 — AC-1 (capture at close, end-to-end through the REAL hook) + AC-1b (fork boundary). No
+# call into the offline rollup script's directory and no host transcript reference here (F4 — this file is plugin-synced;
+# its oracle is the plugin's own ubuntu `validate` job).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Build a tagged subagent transcript that ALSO carries usage-bearing assistant records: msg_A x3 blocks
+# (model claude-sonnet-5, same message.id, output_tokens 5/5/300 -- last-writer-wins), msg_B x1 (model
+# claude-opus-5-5), msg_S x1 (model <synthetic>, excluded). mk_transcript_usage <session> <agentId> <brief>
+mk_transcript_usage() {
+  local s="$1" aid="$2" brief="$3"
+  local d="$PROJROOT/proj/$s/subagents"; mkdir -p "$d"
+  BRIEF_ENV="$brief" AID="$aid" S="$s" node -e '
+    const fs = require("fs");
+    const aid = process.env.AID, s = process.env.S;
+    const usageA = (out) => ({ input_tokens: 2, output_tokens: out, cache_read_input_tokens: 1000,
+      cache_creation_input_tokens: 40, cache_creation: { ephemeral_5m_input_tokens: 40, ephemeral_1h_input_tokens: 0 } });
+    const rec = (model, id, usage, ctype) => JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid,
+      message: { model, id, usage, content: [{ type: ctype || "text", text: "x" }] } });
+    const lines = [
+      JSON.stringify({ isSidechain: true, agentId: aid, sessionId: s, type: "user", message: { role: "user", content: process.env.BRIEF_ENV } }),
+      rec("claude-sonnet-5", "msg_A", usageA(5), "thinking"),
+      rec("claude-sonnet-5", "msg_A", usageA(5), "tool_use"),
+      rec("claude-sonnet-5", "msg_A", usageA(300), "text"),
+      rec("claude-opus-5-5", "msg_B", { input_tokens: 2, output_tokens: 50, cache_read_input_tokens: 2000, cache_creation_input_tokens: 0 }, "text"),
+      rec("<synthetic>", "msg_S", { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, "text"),
+    ];
+    fs.writeFileSync(process.argv[1], lines.join("\n") + "\n");
+  ' "$d/agent-$aid.jsonl"
+  printf '%s' "$d/agent-$aid.jsonl"
+}
+
+# Build a FORK CHILD transcript: parent-prefix (msg_P1, msg_P2, both NOT the child's own), a boundary record
+# holding a tool_use block whose id is <transcriptToolUseId>, then the child's own msg_C1 -- plus a sibling
+# agent-<id>.meta.json carrying isFork:true and toolUseId=<metaToolUseId> (B1's boundary rule keys on THIS
+# value; a deliberate mismatch against <transcriptToolUseId> models the "boundary unresolvable" arm).
+# mk_transcript_fork <session> <agentId> <brief> <transcriptToolUseId> <metaToolUseId>
+mk_transcript_fork() {
+  local s="$1" aid="$2" brief="$3" ttuid="$4" mtuid="$5"
+  local d="$PROJROOT/proj/$s/subagents"; mkdir -p "$d"
+  BRIEF_ENV="$brief" AID="$aid" S="$s" TTUID="$ttuid" node -e '
+    const fs = require("fs");
+    const aid = process.env.AID, s = process.env.S, ttuid = process.env.TTUID;
+    const usage = (cr, out) => ({ input_tokens: 1, output_tokens: out, cache_read_input_tokens: cr, cache_creation_input_tokens: 0 });
+    const rec = (model, id, u, content) => JSON.stringify({ type: "assistant", isSidechain: true, agentId: aid, message: { model, id, usage: u, content } });
+    const lines = [
+      JSON.stringify({ isSidechain: true, agentId: aid, sessionId: s, type: "user", message: { role: "user", content: process.env.BRIEF_ENV } }),
+      rec("claude-sonnet-5", "msg_P1", usage(5000, 1), [{ type: "text", text: "p1" }]),
+      rec("claude-sonnet-5", "msg_P2", usage(5000, 1), [{ type: "text", text: "p2" }]),
+      rec("claude-sonnet-5", "msg_BOUNDARY", usage(5000, 1), [{ type: "tool_use", id: ttuid, name: "Task" }]),
+      rec("claude-sonnet-5", "msg_C1", usage(1000, 30), [{ type: "text", text: "c1" }]),
+    ];
+    fs.writeFileSync(process.argv[1], lines.join("\n") + "\n");
+  ' "$d/agent-$aid.jsonl"
+  MTUID="$mtuid" node -e '
+    const fs = require("fs");
+    fs.writeFileSync(process.argv[1], JSON.stringify({ agentType: "fork", isFork: true, toolUseId: process.env.MTUID, parentAgentId: "parentXYZ" }));
+  ' "$d/agent-$aid.meta.json"
+  printf '%s' "$d/agent-$aid.jsonl"
+}
+
+# ---- #1709 AC-1: usage capture at close, end-to-end through the REAL hook. ----
+T1709A=$(mk_transcript_usage s1709a ag1709a "3ROLE_TASK:1709 ROLE:executor"$'\n'"Implement the feature.")
+run "$T1709A" s1709a ag1709a
+AC1_RESULT=$(node -e '
+  const fs = require("fs");
+  const [ , usageFile, ledgerFile ] = process.argv;
+  let rec;
+  try { rec = JSON.parse(fs.readFileSync(usageFile, "utf8")); } catch (e) { console.log("FAIL:no-usage-file"); process.exit(0); }
+  const u = rec.usage || {};
+  const sonnet = (u.by_model || {})["claude-sonnet-5"];
+  const expectSonnet = { api_calls: 1, input_tokens: 2, output_tokens: 300, cache_read_input_tokens: 1000, cache_creation_input_tokens: 40, cache_creation_5m_input_tokens: 40, cache_creation_1h_input_tokens: 0 };
+  const rows = fs.readFileSync(ledgerFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const row = rows.find((r) => r.role === "executor");
+  const checks = {
+    agentId: rec.agentId === "ag1709a",
+    source: u.source === "transcript",
+    apiCalls: u.api_calls === 2,
+    sonnet: JSON.stringify(sonnet) === JSON.stringify(expectSonnet),
+    opus: !!(u.by_model || {})["claude-opus-5-5"] && u.by_model["claude-opus-5-5"].output_tokens === 50,
+    noSynthetic: !(u.by_model || {})["<synthetic>"],
+    closedAt: !!(row && row.closedAt),
+    noUsageKey: !(row && ("usage" in row)),
+  };
+  const failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+  console.log(failed.length ? ("FAIL:" + failed.join(",")) : "OK");
+' "$USAGEDIR/ag1709a.json" "$LEDGERDIR/s1709a/1709.jsonl")
+{ [ "$RC" = "0" ] && [ "$AC1_RESULT" = "OK" ]; } \
+  && ok "#1709 AC-1: usage file matches the fixture exactly (2 api_calls, per-model counters, no synthetic, ledger row untouched)" \
+  || bad "#1709 AC-1 FAILED (rc=$RC result=$AC1_RESULT)"
+
+# ---- #1709 AC-1b (B1): fork boundary resolvable -> ONLY the child's own records are counted (a whole-file
+#      reader would see api_calls=3 / cache_read=11000 here; this fixture is RED against that by construction). ----
+T1709B=$(mk_transcript_fork s1709b ag1709b "3ROLE_TASK:1709 ROLE:executor"$'\n'"go" "toolu_F" "toolu_F")
+run "$T1709B" s1709b ag1709b
+AC1B_RESULT=$(node -e '
+  const fs = require("fs");
+  let rec;
+  try { rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { console.log("FAIL:no-usage-file"); process.exit(0); }
+  const u = rec.usage || {};
+  const m = (u.by_model || {})["claude-sonnet-5"];
+  const checks = {
+    apiCalls: u.api_calls === 1,
+    cacheRead: !!m && m.cache_read_input_tokens === 1000,
+    outputTokens: !!m && m.output_tokens === 30,
+  };
+  const failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+  console.log(failed.length ? ("FAIL:" + failed.join(",")) : "OK");
+' "$USAGEDIR/ag1709b.json")
+{ [ "$RC" = "0" ] && [ "$AC1B_RESULT" = "OK" ]; } \
+  && ok "#1709 AC-1b: fork boundary resolvable -> stamp equals the child's own records only (api_calls=1, cache_read=1000, output=30)" \
+  || bad "#1709 AC-1b FAILED (rc=$RC result=$AC1B_RESULT)"
+
+# ---- #1709 AC-1b second arm: isFork:true but no record carries the meta's toolUseId -> NO usage file,
+#      closedAt still written, hook exits 0. ----
+T1709C=$(mk_transcript_fork s1709c ag1709c "3ROLE_TASK:1709 ROLE:executor"$'\n'"go" "toolu_F" "toolu_MISSING")
+run "$T1709C" s1709c ag1709c
+LF1709C="$LEDGERDIR/s1709c/1709.jsonl"
+{ [ "$RC" = "0" ] && [ ! -f "$USAGEDIR/ag1709c.json" ] && [ -f "$LF1709C" ] && command grep -q '"closedAt"' "$LF1709C"; } \
+  && ok "#1709 AC-1b (no boundary): isFork:true with an unresolvable toolUseId -> no usage file, closedAt still written, hook exit 0" \
+  || bad "#1709 AC-1b no-boundary arm FAILED (rc=$RC)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

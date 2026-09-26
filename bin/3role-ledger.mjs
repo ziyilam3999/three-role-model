@@ -759,6 +759,176 @@ function transcriptModel(session, agentId) {
   return '';
 }
 
+// ── #1709 W1/W2 — PER-JOB TOKEN CAPTURE (sibling usage store, §2 of the plan) ────────────────────────────
+// The usage store is a FLAT directory of <agentId>.json files, a SIBLING of LEDGER_DIR (never inside a
+// session dir — cmdCheck's task-file glob at :2898-2903-equivalent reads every "*.jsonl" there, so a
+// sidecar in that tree would be misread as a task file, B3). Resolve via path.resolve() so a
+// THREE_ROLE_LEDGER_DIR carrying a trailing slash does not put "-usage" INSIDE the ledger tree
+// (plan-review round-2 note). THREE_ROLE_USAGE_DIR, when set, overrides the derived default outright — the
+// same isolation discipline the smokes already rely on for THREE_ROLE_LEDGER_DIR.
+function usageStoreDir() {
+  return process.env.THREE_ROLE_USAGE_DIR || (path.resolve(LEDGER_DIR) + '-usage');
+}
+function usageStoreFile(agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  return path.join(usageStoreDir(), aid + '.json');
+}
+
+// Locate a specific agent's own transcript / meta.json file (same glob as transcriptModel()/agentResolves()
+// — PROJECTS_ROOT/<slug>/<session>/subagents/agent-<agentId>.<ext>). Returns '' on no match (fail-open).
+function findAgentTranscriptFile(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    if (fileExists(f)) return f;
+  }
+  return '';
+}
+function findAgentMetaFile(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.meta.json');
+    if (fileExists(f)) return f;
+  }
+  return '';
+}
+
+// F2 fail-open counter readers. A CORE counter (the four named in §2.2) that is present-but-non-numeric
+// THROWS — the caller aborts the WHOLE stamp (never a partial/coerced record, plan §2.2/F2). A missing
+// `cache_creation` sub-object, or a non-numeric value inside it, degrades its two ephemeral sub-counters to
+// 0 rather than aborting (the softer AC-3(d) "four counters intact" arm).
+function readCoreCounter(v) {
+  const n = (v === undefined || v === null) ? 0 : Number(v);
+  if (!Number.isFinite(n)) throw new Error('#1709 usage capture: non-numeric usage counter');
+  return n;
+}
+function readEphemeralCounter(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Derive the §2.2 usage object from ONE agent's OWN transcript, applying the B1 fork-boundary rule and the
+// §1 message.id LAST-writer-wins dedupe rule. Returns null when there is nothing usage-bearing to stamp (no
+// assistant usage record at all, or every record is model "<synthetic>", or an isFork:true transcript whose
+// boundary record cannot be found — "can't tell" never becomes an over-count). THROWS on a malformed core
+// counter (F2) — the caller (captureUsageAtClose / cmdBackfill) never catches this itself, by design: it
+// propagates to whichever caller's own try/catch decides "no file written" (fail-open at the OUTER edge,
+// never a partial write from inside this function).
+function deriveUsageFromTranscript(transcriptPath, metaPath) {
+  const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n');
+
+  // B1 fork boundary: locate the record holding a tool_use content block whose id equals the meta's
+  // toolUseId. Only records AFTER that record are the fork child's own (§2.2's boundary rule, verified by
+  // plan-review against 6 real forks — the boundary is always one record past the last record shared with
+  // the parent). Keyed strictly on isFork:true, never on toolUseId presence alone (a non-fork meta also
+  // carries a toolUseId — measured; that must NOT trigger this rule).
+  let startIdx = 0;
+  if (metaPath) {
+    let meta = null;
+    try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (e) { meta = null; }
+    if (meta && meta.isFork === true) {
+      const toolUseId = meta.toolUseId;
+      let boundaryIdx = -1;
+      if (toolUseId) {
+        for (let i = 0; i < lines.length; i++) {
+          const s = lines[i].trim();
+          if (!s) continue;
+          let j; try { j = JSON.parse(s); } catch (e) { continue; }
+          const blocks = (j && j.message && Array.isArray(j.message.content)) ? j.message.content : [];
+          if (blocks.some((c) => c && c.type === 'tool_use' && c.id === toolUseId)) { boundaryIdx = i; break; }
+        }
+      }
+      if (boundaryIdx === -1) return null;   // isFork with no resolvable boundary -> can't tell -> no stamp.
+      startIdx = boundaryIdx + 1;
+    }
+  }
+
+  // message.id -> { model, usage }, LAST occurrence wins (a streamed reply repeats usage across several
+  // records sharing one message.id — the last block carries the final output_tokens, §1).
+  const byMessageId = new Map();
+  for (let i = startIdx; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s) continue;
+    let j;
+    try { j = JSON.parse(s); } catch (e) { continue; }   // truncated trailing line -> ignored (F2).
+    if (!j || j.type !== 'assistant' || !j.message) continue;
+    const msg = j.message;
+    if (typeof msg.model !== 'string' || !msg.model) continue;
+    if (typeof msg.id !== 'string' || !msg.id) continue;
+    if (!msg.usage || typeof msg.usage !== 'object') continue;
+    byMessageId.set(msg.id, { model: msg.model, usage: msg.usage });
+  }
+  if (byMessageId.size === 0) return null;   // no usage-bearing assistant record (AC-3(c)).
+
+  const byModel = {};
+  let apiCalls = 0;
+  for (const { model, usage } of byMessageId.values()) {
+    if (model === '<synthetic>') continue;   // harness-fabricated, never a real API call (§2.2).
+    const cc = (usage.cache_creation && typeof usage.cache_creation === 'object') ? usage.cache_creation : null;
+    const inputTokens = readCoreCounter(usage.input_tokens);
+    const outputTokens = readCoreCounter(usage.output_tokens);
+    const cacheReadTokens = readCoreCounter(usage.cache_read_input_tokens);
+    const cacheCreationTokens = readCoreCounter(usage.cache_creation_input_tokens);
+    const cache5m = readEphemeralCounter(cc ? cc.ephemeral_5m_input_tokens : 0);
+    const cache1h = readEphemeralCounter(cc ? cc.ephemeral_1h_input_tokens : 0);
+    if (!byModel[model]) {
+      byModel[model] = {
+        api_calls: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0, cache_creation_5m_input_tokens: 0, cache_creation_1h_input_tokens: 0,
+      };
+    }
+    const b = byModel[model];
+    b.api_calls += 1;
+    b.input_tokens += inputTokens;
+    b.output_tokens += outputTokens;
+    b.cache_read_input_tokens += cacheReadTokens;
+    b.cache_creation_input_tokens += cacheCreationTokens;
+    b.cache_creation_5m_input_tokens += cache5m;
+    b.cache_creation_1h_input_tokens += cache1h;
+    apiCalls += 1;
+  }
+  if (apiCalls === 0) return null;   // every record was <synthetic> -> nothing real to stamp.
+
+  return { source: 'transcript', captured_at: new Date().toISOString(), api_calls: apiCalls, by_model: byModel };
+}
+
+// Whole-file atomic write (tmp + rename, §2.7) — the ONLY writer of a usage-store file. Overwriting an
+// existing file is intentional: a later close's transcript is always a superset (F3), and backfill only
+// ever calls this when no file exists yet (B3's "agents already stamped are never rewritten").
+function writeUsageStoreFile(agentId, usage) {
+  const dir = usageStoreDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = usageStoreFile(agentId);
+  const tmp = file + '.tmp-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  fs.writeFileSync(tmp, JSON.stringify({ agentId: agentId, usage: usage }));
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+// W1 — close-time capture entry point. Called ONLY when the triggering append carries --closed-at (the
+// same signal #1465's centralized model capture already keys on) — never a new append flag (§3, the 26/26
+// pin stands). Fail-open throughout (F2): ANY failure in this path (no transcript, no usage-bearing record,
+// an unresolvable fork boundary, a malformed counter) must never change the append's exit code or touch the
+// ledger row already written — the sole caller (cmdAppend) wraps this in its OWN try/catch for exactly that
+// reason, so this function is deliberately NOT self-guarding against deriveUsageFromTranscript's throw.
+function captureUsageAtClose(session, agentId) {
+  if (!agentId) return;
+  const transcriptPath = findAgentTranscriptFile(session, agentId);
+  if (!transcriptPath) return;   // no transcript -> no stamp (mirrors transcriptModel()'s own contract).
+  const metaPath = findAgentMetaFile(session, agentId);
+  const usage = deriveUsageFromTranscript(transcriptPath, metaPath);
+  if (!usage) return;
+  writeUsageStoreFile(agentId, usage);
+}
+
 // ── #1512 RESUME-BOUNDARY DETECTOR ───────────────────────────────────────────────────────────────────────
 // A SendMessage resume discards a role's spawn-time model pin (measured: `.ai-workspace/research/
 // 2026-07-10-1512-resume-hook-edge-probe.md`) — the resumed subagent silently re-inherits the SESSION model,
@@ -3797,7 +3967,76 @@ function cmdAppend(o) {
     if (e instanceof GuardRejection) { console.error('BLOCK: ' + e.message); process.exit(2); }
     throw e;
   }
+  // #1709 W1 — usage capture is a SIBLING of this write, keyed on the SAME "this append carries
+  // --closed-at" signal #1465's centralized model capture already uses (three-role-subagent-ledger.sh's
+  // close-time re-append is the only sanctioned caller). No new append flag (§3 — the 26/26 known-flag pin
+  // stands). Wrapped so ANY failure anywhere in the usage path (missing/unreadable/malformed transcript, no
+  // usage-bearing record, an unresolvable fork boundary, a non-numeric counter) never changes this append's
+  // rc or touches the ledger row already written above — fail-open, exactly like transcriptModel().
+  if ('closed-at' in o) {
+    try {
+      const explicitAgentForUsage = ('agent' in o && o.agent) ? o.agent : '';
+      const agentIdForUsage = explicitAgentForUsage || resolveAgent(session, task, role);
+      captureUsageAtClose(session, agentIdForUsage);
+    } catch (e) { /* fail-open — see comment above; the ledger row and rc are already committed */ }
+  }
   console.log('OK appended role=' + role + ' -> ' + file);
+  process.exit(0);
+}
+
+// #1709 W2 — usage-backfill [--session S] [--dry-run]. Offline, idempotent, PER AGENT (§2.3): walks every
+// ledger row (in --session S, or every session dir when omitted) that carries an agentId; for each DISTINCT
+// agentId with no usage-store record yet and a transcript still on disk, derives + writes the record; an
+// agentId already stamped is never rewritten; an agentId with no transcript is never touched. Dedup is by
+// agentId alone (never per (session, agentId)) so the SAME agent counted on rows in two different session
+// dirs is still only stamped once. **Never opens a ledger file for writing** — only fs.readFileSync ever
+// touches a ledger *.jsonl below; row order, `ts`, every other key and every ledger file's mtime are
+// untouched by construction (B3). `--dry-run` tallies without calling writeUsageStoreFile at all.
+function cmdBackfill(o) {
+  const sessionFilter = o.session ? sanitize(o.session) : '';
+  const dryRun = ('dry-run' in o);
+
+  let sessions = [];
+  try {
+    sessions = fs.readdirSync(LEDGER_DIR).filter((s) => {
+      try { return fs.statSync(path.join(LEDGER_DIR, s)).isDirectory(); } catch (e) { return false; }
+    });
+  } catch (e) { sessions = []; }
+  if (sessionFilter) sessions = sessions.filter((s) => s === sessionFilter);
+
+  let wouldStamp = 0, already = 0, noTranscript = 0;
+  const seenAgents = new Set();
+  for (const sess of sessions) {
+    const dir = path.join(LEDGER_DIR, sess);
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch (e) { continue; }
+    for (const fn of files) {
+      if (!fn.endsWith('.jsonl')) continue;
+      let lines = [];
+      try { lines = fs.readFileSync(path.join(dir, fn), 'utf8').split('\n').filter((l) => l.trim()); }
+      catch (e) { continue; }
+      for (const ln of lines) {
+        let row;
+        try { row = JSON.parse(ln); } catch (e) { continue; }
+        if (!row || !row.agentId) continue;
+        const agentId = String(row.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+        if (!agentId || seenAgents.has(agentId)) continue;
+        seenAgents.add(agentId);
+        if (fileExists(usageStoreFile(agentId))) { already++; continue; }
+        const transcriptPath = findAgentTranscriptFile(sess, agentId);
+        if (!transcriptPath) { noTranscript++; continue; }
+        wouldStamp++;
+        if (!dryRun) {
+          try {
+            const metaPath = findAgentMetaFile(sess, agentId);
+            const usage = deriveUsageFromTranscript(transcriptPath, metaPath);
+            if (usage) writeUsageStoreFile(agentId, usage);
+          } catch (e) { /* fail-open, per agent — never touches the ledger file, never aborts the sweep */ }
+        }
+      }
+    }
+  }
+  console.log('would_stamp=' + wouldStamp + ' already=' + already + ' no_transcript=' + noTranscript);
   process.exit(0);
 }
 
@@ -7072,8 +7311,9 @@ try {
   else if (cmd === 'set-seat-pin') cmdSetSeatPin(opts);
   else if (cmd === 'clear-seat-pin') cmdClearSeatPin(opts);
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
+  else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -7091,7 +7331,8 @@ try {
       '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
       '[--role R (--tier T | --slug S) --reason "..." [--task T] (set-seat-pin, #1918)] ' +
       '[--role R [--tier] [--slug] --reason "..." (clear-seat-pin, #1918)] ' +
-      '[[--json] (list-seat-pins, #1918)]');
+      '[[--json] (list-seat-pins, #1918)]' +
+      ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]');
     process.exit(2);
   }
 } catch (e) {
