@@ -44,6 +44,11 @@ CC_MODE_FILE="$CONS_PIN" node "$LED" set-mode --mode conservative --reason smoke
 NO_PIN="$TMP/no-pin-never-created.json"
 SB_PIN="$TMP/sb-pin.json"
 CC_MODE_FILE="$SB_PIN" node "$LED" set-mode --mode boost --reason smoke >/dev/null 2>&1
+# #2518 D3 generalization fixture — a `hybrid` pin (zai_dispatch=permitted, openrouter_dispatch=forbidden,
+# local_dispatch=forbidden). Reads the REAL config/cc-mode-policy.json (no CC_MODE_POLICY_JSON override, same
+# as the conservative/boost pins above), which now carries the `hybrid` mode this ticket added.
+HYB_PIN="$TMP/hyb-pin.json"
+CC_MODE_FILE="$HYB_PIN" node "$LED" set-mode --mode hybrid --reason smoke >/dev/null 2>&1
 
 # Fixture A — BOTH plan-review and executor declared subprocess-openrouter (real #1947 shape). Drives AC-3/4
 # (the two declared seats each have their OWN session:task:role signature -> distinct markers, no
@@ -62,6 +67,23 @@ cat > "$ROUTES_SUBPROC" <<'J'
                      "agent_tool_fallback": "opus", "task_class": "sustained-agentic", "data_sensitivity": "public" },
     "executor":    { "provider": "openrouter", "model": "z-ai/glm-5.2", "dispatch": "subprocess-openrouter",
                      "agent_tool_fallback": "sonnet", "task_class": "sustained-agentic", "data_sensitivity": "public" }
+  }
+}
+J
+
+# Fixture A-zai (#2518) — a seat declared subprocess-zai (real hybrid-mode shape: the executor dispatched to
+# z.ai direct). Same task_class/data_posture shape as Fixture A so resolve-route's C-2/C-3 guards clear.
+ROUTES_SUBPROC_ZAI="$TMP/routes-subproc-zai.json"
+cat > "$ROUTES_SUBPROC_ZAI" <<'J'
+{
+  "providers": {
+    "zai": { "auth": "env:ZAI_API_KEY", "endpoint": "https://api.z.ai/api/anthropic",
+             "data_posture": { "class": "no-training-default" } }
+  },
+  "task_classes": { "sustained-agentic": { "allowed_providers": ["anthropic", "zai"] } },
+  "seats": {
+    "executor": { "provider": "zai", "model": "glm-5.3-flash", "dispatch": "subprocess-zai",
+                  "agent_tool_fallback": "sonnet", "task_class": "sustained-agentic", "data_sensitivity": "public" }
   }
 }
 J
@@ -260,5 +282,47 @@ run "$P11D" CC_MODE_FILE="$TMP"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-11d: unreadable/crashed mode pin -> fails OPEN (silent), never mistaken for conservative" \
   || bad "AC-11d a broken mode resolution should fail open silent, not block (rc=$RC out=$CAP)"
+
+echo "== SECTION 4: #2518 D3 generalization — subprocess-zai under hybrid, per-provider axis isolation =="
+
+# ---- AC-12a: hybrid + subprocess-zai seat -> exit 2 on FIRST issue (zai_dispatch=permitted under hybrid is
+#      the live axis for this seat's own provider), naming subprocess-zai (not a hard-coded provider) and the
+#      helper path, no home-path leak; identical RE-ISSUE -> exit 0 silent (block-once, same as every other
+#      provider). ----
+P12A='{"session_id":"ac12a","tool_input":{"prompt":"3ROLE_TASK:9701 ROLE:executor\nimplement the plan"}}'
+runh "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "subprocess-zai" && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
+  && ok "AC-12a: hybrid + subprocess-zai seat -> exit 2 first issue, names subprocess-zai + helper, no home-path leak" \
+  || bad "AC-12a hybrid+zai should block first issue naming subprocess-zai + helper (rc=$RC out=$CAP)"
+runh "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-12a second issue: hybrid + subprocess-zai re-issue -> exit 0 silent (block-once, not wedged)" \
+  || bad "AC-12a second issue should exit 0 silent (rc=$RC out=$CAP)"
+
+# ---- AC-12b: hybrid + subprocess-openrouter seat -> silent on FIRST issue. Under hybrid,
+#      openrouter_dispatch=forbidden (hybrid opens ONLY the z.ai door), so an Agent-tool spawn of an
+#      OpenRouter-declared seat is the sanctioned fallback (the dispatch helper would refuse the subprocess
+#      route too) -- proves the axis isolation is per-PROVIDER, not "any subprocess-* seat under hybrid". ----
+P12B='{"session_id":"ac12b","tool_input":{"prompt":"3ROLE_TASK:9702 ROLE:plan-review\nreview the plan"}}'
+run "$P12B" CC_MODE_FILE="$HYB_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-12b: hybrid + subprocess-openrouter seat -> exit 0 silent (openrouter stays shut under hybrid)" \
+  || bad "AC-12b hybrid+openrouter should stay silent (rc=$RC out=$CAP)"
+
+# ---- AC-12c: normal + subprocess-zai seat -> silent on FIRST issue. Under normal, zai_dispatch=forbidden, so
+#      the same seat that blocks under hybrid (AC-12a) is silent here -- the axis, not the seat, decides. ----
+P12C='{"session_id":"ac12c","tool_input":{"prompt":"3ROLE_TASK:9703 ROLE:executor\nimplement the plan"}}'
+runh "$ROUTES_SUBPROC_ZAI" "$P12C" CC_MODE_FILE="$NO_PIN"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "AC-12c: normal + subprocess-zai seat -> exit 0 silent (zai stays shut outside hybrid)" \
+  || bad "AC-12c normal+zai should stay silent (rc=$RC out=$CAP)"
+
+# ---- AC-12d: conservative + subprocess-openrouter -> exit 2 (UNCHANGED regression check under the
+#      generalized per-provider code path -- re-derived independently of AC-11b's own session id/signature). ----
+P12D='{"session_id":"ac12d","tool_input":{"prompt":"3ROLE_TASK:9704 ROLE:plan-review\nreview the plan"}}'
+run "$P12D" CC_MODE_FILE="$CONS_PIN"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -q "subprocess-openrouter" && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
+  && ok "AC-12d: conservative + subprocess-openrouter -> exit 2 (unchanged), naming subprocess-openrouter under the generalized code path" \
+  || bad "AC-12d conservative+openrouter should still block first issue (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
