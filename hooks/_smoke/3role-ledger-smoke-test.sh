@@ -5764,6 +5764,39 @@ CHK18=$(node "$LED" check --session "$S" --task "$T" 2>&1)
   && ok "#2701 AC-18: in-flight reorder -- w2/w3 bind to their own row by run_id despite the re-touch (kills MU-17/MU-21)" \
   || bad "#2701 AC-18 FAILED (n=$N r1eq=$([ "$RAGA_18" = "$RAGA_18B" ] && echo Y || echo N) r2=$R2_18 grc=$GRC18 chk=$CHK18)"
 
+# ---- AC-20 (fix-cycle-1 B1 -- execution-review's exact launder reproduction, nr9/nr11's residual). A bare
+# FAIL self-append, a spawn stamp --agent agL, then a write carrying --run-id EQUAL to that row's own
+# agentId (agL) with NO --agent -- before this fix the raw-string identity comparison read "run_id agL" and
+# "agentId agL" as the SAME identity and merged, handing repair-crosswire a P2-satisfying cross-wired row
+# it could split and lift, after which agL's own later PASS flipped the gate ALLOW. The namespaced
+# comparison (an agentId and a run_id are never the same identity, only equal to another value from the
+# SAME field) makes the --run-id write open its OWN row instead, so repair-crosswire's P2 (row must carry
+# BOTH subprocess provenance AND an agentId) never finds anything to lift, and agL's later PASS is still
+# refused by clause 2 (same-agent flip) exactly as at base. Both-ends: this arm's assertion (final gate
+# stays BLOCK:negative-verdict) FAILS when this smoke file is run against the pre-fix head (rc 0, ALLOW) --
+# see AC-8's both-ends leg.
+S=cw20; T=t20
+node "$LED" append --session "$S" --task "$T" --role plan-review --verdict FAIL --artifact "$CW_ART/x20.md" >/dev/null 2>&1; W1RC20=$?
+mk_tagged "$S" agL "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agL --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1; W2RC20=$?
+GRC20A=$(cw_gate "$S" "$T")
+node "$LED" append --session "$S" --task "$T" --role plan-review --run-id agL --dispatch-nonce hh20 >/dev/null 2>"$TMP/cw.err"; W3RC20=$?
+N20=$(cw_prcount "$S" "$T")
+node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id agL >/dev/null 2>"$TMP/cw.err"; RCREPAIR20=$?
+# The same agent's PASS self-append, WITH a transcript diary proving it (a real reviewer's own self-append
+# is exactly what its transcript records) and a --closed-at (the shape a real completed review carries, and
+# what supersedesNegative's candidate side needs) -- the shape this launder actually needs to reach ALLOW at
+# base; without both, the write is refused for an unrelated reason at BOTH ends and the arm would not
+# discriminate base from head at all.
+mk_diary "$S" agL "$T" plan-review PASS
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agL --verdict PASS --artifact "$CW_ART/x20b.md" --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>"$TMP/cw.err"; W5RC20=$?
+GRC20=$(cw_gate "$S" "$T")
+{ [ "$W1RC20" = "0" ] && [ "$W2RC20" = "0" ] && [ "$GRC20A" = "2" ] && [ "$N20" = "2" ] \
+  && [ "$RCREPAIR20" != "0" ] && [ "$W5RC20" != "0" ] \
+  && [ "$GRC20" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-20 (fix-cycle-1 B1): run_id==agentId launder sequence refused end-to-end -- repair-crosswire finds no cross-wired row (rc=$RCREPAIR20), the agent's own PASS replay is still refused (rc=$W5RC20), final gate stays BLOCK:negative-verdict" \
+  || bad "#2701 AC-20 FAILED (w1=$W1RC20 w2=$W2RC20 grc20a=$GRC20A n20=$N20 w3=$W3RC20 repair=$RCREPAIR20 w5=$W5RC20 grc20=$GRC20 err=$(cat "$TMP/cw-gate.err"))"
+
 # AC-19(a)/(b) (the helper's own --dry-run rendering + the S9 in-flight-reorder shape through the real
 # stubbed helper) are covered in the DEDICATED hooks/openrouter-role-dispatch-smoke-test.sh, which already
 # builds the full isolated $HOME / CC_MODE_FILE / lane-mode-status / providers+task_classes routes fixture

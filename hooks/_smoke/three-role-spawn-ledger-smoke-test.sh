@@ -187,4 +187,26 @@ P19='{"session_id":"s1516f","hook_event_name":"PreToolUse","tool_input":{"prompt
 run "$P19"
 { [ "$RC" = "0" ] && [ -z "$(ls -A "$LEDGERDIR/s1516f" 2>/dev/null)" ]; } && ok "PreToolUse + untagged -> writes NOTHING" || bad "PreToolUse untagged should write nothing (rc=$RC out=$CAP)"
 
+# ===== #2701 AC-1b (fix-cycle-1 B3 -- D1's run-identity round boundary through the REAL hook, not just the
+#       ledger CLI). execution-review's B3 finding: this file never exercised the shape at all (0 "2701"
+#       references at review time). Same lifecycle as hooks/3role-ledger-smoke-test.sh's own #2701 AC-1 (a
+#       pending subprocess row, then an Agent-tool spawn stamp) but driven through THIS hook's real
+#       PostToolUse payload path (the M1h shape) instead of a direct `append` call -- proving the fix reaches
+#       the hook writer, not only the CLI. Base (pre-D1): 1 cross-wired row. Head: 2 rows. =====
+S2701="s2701ac1b"; T2701="2701"
+THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" \
+  node "$LED" append --session "$S2701" --task "$T2701" --role plan-review --dispatch subprocess-zai \
+    --run-kind bound --run-source dispatch-helper --run-id OR-NONCE-2701ac1b --dispatch-nonce OR-NONCE-2701ac1b \
+    --pending >/dev/null 2>&1
+P2701AC1B='{"session_id":"s2701ac1b","tool_input":{"prompt":"3ROLE_TASK:2701 ROLE:plan-review\nYou are the reviewer."},"tool_response":{"agentId":"agOPUS2701"}}'
+run "$P2701AC1B"
+N2701AC1B=$(ledger_count s2701ac1b 2701 plan-review)
+R1_2701AC1B=$(sed -n '1p' "$LEDGERDIR/s2701ac1b/2701.jsonl" 2>/dev/null)
+R2_2701AC1B=$(sed -n '2p' "$LEDGERDIR/s2701ac1b/2701.jsonl" 2>/dev/null)
+{ [ "$RC" = "0" ] && [ "$N2701AC1B" = "2" ] \
+  && echo "$R1_2701AC1B" | grep -q '"dispatch":"subprocess-zai"' && echo "$R1_2701AC1B" | grep -q 'dispatch_nonce' && ! echo "$R1_2701AC1B" | grep -q '"agentId"' \
+  && echo "$R2_2701AC1B" | grep -q '"agentId":"agOPUS2701"' && ! echo "$R2_2701AC1B" | grep -q 'dispatch_nonce' && ! echo "$R2_2701AC1B" | grep -q '"run_id"'; } \
+  && ok "#2701 AC-1b: D1 run-identity boundary through the REAL hook -- an Agent spawn stamp over a subprocess pending row opens a NEW row (base: 1 cross-wired row)" \
+  || bad "#2701 AC-1b FAILED (rc=$RC n=$N2701AC1B r1=$R1_2701AC1B r2=$R2_2701AC1B out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

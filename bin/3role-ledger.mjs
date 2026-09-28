@@ -3513,10 +3513,22 @@ function overlayAppend(session, task, role, fields) {
   // dispatch_nonce/nonce are receipts, never identities, so the legacy #1947/#1989/#2169-S5 compose shapes
   // (no run_id at all) are untouched. Second trigger (fold r1 finding 1, kept): the degraded {role}-only
   // Agent stamp (effort_source==='assigned', no agentId) arriving over a run_id-identified row.
-  const priorIdentity2701 = prior ? String(prior.agentId || prior.run_id || '') : '';
+  // #2701 fix-cycle-1 B1 — NAMESPACED comparison (execution-review FAIL, nr11's falsifier): the two
+  // identity fields live in DIFFERENT namespaces (an agentId is an Agent-tool run; a run_id is a
+  // subprocess dispatch), so comparing their raw string VALUES lets a write choose `--run-id <the row's
+  // own agentId>` and have it read as "the same identity" — silently merging a fresh subprocess claim onto
+  // an agent-bound row instead of opening a new round (the exact launder: `append --agent agL …` then
+  // `append --run-id agL --dispatch-nonce x` with no --agent, which used to compose onto agL's own row and
+  // hand `repair-crosswire` a P2-satisfying cross-wired shape it was never meant to see). Prefix each side
+  // with which field it came from before comparing, so an agentId "agL" and a run_id "agL" are NEVER the
+  // same identity, only ever equal to another value from the SAME field.
+  const priorIdentity2701 = prior
+    ? (prior.agentId ? ('agent:' + String(prior.agentId)) : (prior.run_id ? ('run:' + String(prior.run_id)) : ''))
+    : '';
   const isSkip2701 = ('skip_reason' in fields);
-  const incomingIdentity2701 = incomingAgentId ||
-    ((('run_id' in fields) && !isSkip2701) ? String(fields.run_id == null ? '' : fields.run_id) : '');
+  const incomingRunId2701 = (('run_id' in fields) && !isSkip2701) ? String(fields.run_id == null ? '' : fields.run_id) : '';
+  const incomingIdentity2701 = incomingAgentId ? ('agent:' + incomingAgentId) :
+    (incomingRunId2701 ? ('run:' + incomingRunId2701) : '');
   const identityBoundary2701 = !!(prior && priorIdentity2701 && incomingIdentity2701 && incomingIdentity2701 !== priorIdentity2701);
   const degradedStamp2701 = !!(prior && !incomingAgentId && !prior.agentId && prior.run_id &&
     fields.effort_source === 'assigned');
