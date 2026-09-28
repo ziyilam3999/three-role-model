@@ -47,19 +47,32 @@ run_routes() { CAP=$(printf '%s' "$1" | CC_ROUTES_JSON="$OR_ROUTES" THREE_ROLE_L
 run_routes_none() { CAP=$(printf '%s' "$1" | CC_ROUTES_JSON="$OR_ROUTES_NONE" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?; }
 # convenience: an Agent spawn payload with prompt $1, session $2
 agent() { printf '{"tool_name":"Agent","session_id":"%s","tool_input":{"prompt":"%s"}}' "$2" "$1"; }
-# #2051: a validly-bound subprocess-openrouter transcript (a `claude -p` one-shot's own transcript shape)
-# whose FIRST record (queue-operation/enqueue) carries `3ROLE_TASK:<task> ROLE:plan-review` + this dispatch's
-# nonce, and an assistant line serving the SSOT-declared model. Mirrors the node smoke's mk_g_or_transcript.
-mk_or_transcript() { # $1=path $2=task $3=nonce $4=served-model
+# #2051/#2700: a validly-bound subprocess-openrouter transcript (a `claude -p` one-shot's own transcript
+# shape) in the MEASURED shape (#2700 R3, all three #2694-plan transcripts): record 1 = queue-operation/
+# enqueue carrying `3ROLE_TASK:<task> ROLE:plan-review` + this dispatch's nonce at the TOP-LEVEL `content`
+# field, NO `cwd`; record 2 = queue-operation/dequeue, no `cwd`; record 3 = a `user` record — the FIRST
+# record that carries `cwd` (when $5 is given) — repeating the tag+nonce; record 4 = an `assistant` record
+# serving the SSOT-declared model, carrying the SAME `cwd`. A transcript with `cwd` on record 1 is NOT a
+# valid fixture (the harness never writes it, #2700 D1) — this builder never produces one. Mirrors the node
+# smoke's mk_or_transcript (kept identical by hand, #2051 "one evaluator, no mirror" discipline extended to
+# fixtures).
+mk_or_transcript() { # $1=path $2=task $3=nonce $4=served-model $5=dispatch-cwd (optional; omit for no cwd on any record)
   node -e '
     const fs = require("fs");
-    const [ , outPath, task, nonce, model ] = process.argv;
+    const [ , outPath, task, nonce, model, cwd ] = process.argv;
     const lines = [];
     lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
       sessionId: "or-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
-    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "or-fixture" }));
+    const userRec = { type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce } };
+    if (cwd) userRec.cwd = cwd;
+    lines.push(JSON.stringify(userRec));
+    const asstRec = { type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { model, content: [ { type: "text", text: "ok" } ] } };
+    if (cwd) asstRec.cwd = cwd;
+    lines.push(JSON.stringify(asstRec));
     fs.writeFileSync(outPath, lines.join("\n") + "\n");
-  ' "$1" "$2" "$3" "$4"
+  ' "$1" "$2" "$3" "$4" "${5:-}"
 }
 # #2051: append a plan-review row carrying the subprocess provenance fields under the fixture routes env.
 or_append() { # $1=session $2=task <append-args...>
@@ -489,5 +502,171 @@ run_routes_none "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not-finished"; } \
   && ok "#2051 AC-7 hermeticity: the green-arm row under fixture SSOT-SILENT routes -> BLOCK not-finished (the same row ALLOWs under the fixture subprocess routes via run_routes); CC_ROUTES_JSON is genuinely delivered + consulted, the green arm is hermetic" \
   || bad "#2051 AC-7 hermeticity discriminator FAILED: the green-arm row did NOT block not-finished under the SSOT-silent fixture routes (rc=$RC out=$CAP) — the green arm may be riding the shipped config, not the fixture"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2700 — vantage-first artifact resolution, Fixture F, through the REAL bash hook. The dispatch's own
+# recorded `cwd` (the FIRST transcript record that carries one — record 3, the first `user` record; never
+# record 1, the bound `enqueue` record) is consulted BEFORE the checker's own vantage; the FIRST candidate
+# that carries the nonce wins; a non-absolute recorded cwd contributes no candidate.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+F2700="$TMP/f2700"; mkdir -p "$F2700/wt/.ai-workspace/plans" "$F2700/primary" "$F2700/transcripts"
+or_append_from() { # $1=cwd $2=session $3=task <append-args...>
+  local CWDIR="$1" S="$2" T="$3"; shift 3
+  ( cd "$CWDIR" && CC_ROUTES_JSON="$OR_ROUTES" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" \
+    node "$LED" append --session "$S" --task "$T" --role plan-review "$@" >/dev/null 2>&1 )
+}
+run_or_vantage() { # $1=payload $2=primary-cwd
+  CAP=$(cd "$2" && printf '%s' "$1" | CC_ROUTES_JSON="$OR_ROUTES" CLAUDE_PROJECT_DIR="$2" \
+    THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$HOOK" 2>&1 >/dev/null); RC=$?
+}
+stored_artifact_path() { # $1=session $2=task
+  node -e '
+    const fs = require("fs");
+    let lines = [];
+    try { lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean); } catch (e) {}
+    let last = null;
+    for (const ln of lines) { try { const r = JSON.parse(ln); if (r.role === "plan-review" && r.artifact_path) last = r; } catch (e) {} }
+    process.stdout.write(last ? last.artifact_path : "");
+  ' "$LEDGERDIR/$1/$2.jsonl"
+}
+# a transcript whose FIRST record (enqueue) carries the tag but NOT the nonce -- record 3 (user) still
+# carries `cwd` + tag + nonce, and the artifact still carries the nonce (#2700 AC-3b).
+mk_or_transcript_unbound_enqueue() { # $1=path $2=task $3=nonce $4=served-model $5=dispatch-cwd
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce, model, cwd ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "or-fixture", content: "3ROLE_TASK:" + task + " ROLE:plan-review\n\nreview this plan" }));   // NO nonce here (M2 control)
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "or-fixture" }));
+    const userRec = { type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: "3ROLE_TASK:" + task + " ROLE:plan-review\nDISPATCH-NONCE:" + nonce } };
+    if (cwd) userRec.cwd = cwd;
+    lines.push(JSON.stringify(userRec));
+    const asstRec = { type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { model, content: [ { type: "text", text: "ok" } ] } };
+    if (cwd) asstRec.cwd = cwd;
+    lines.push(JSON.stringify(asstRec));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4" "${5:-}"
+}
+
+# ---- AC-1 (the bug): artifact present ONLY under the dispatch's recorded vantage (wt), absent under the
+#      checker's own primary vantage -> ALLOW. Base (pre-#2700) BLOCKs this exact row "not found". ----
+S="s-2700-ac1"; T="t-2700-ac1"
+mk_or_transcript "$F2700/transcripts/f-ac1.jsonl" "$T" "N-AC1-2700" "moonshotai/kimi-k3" "$F2700/wt"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac1.jsonl" \
+  --nonce "N-AC1-2700" --artifact ".ai-workspace/plans/p.md" --verdict PASS
+[ "$(stored_artifact_path "$S" "$T")" = ".ai-workspace/plans/p.md" ] \
+  && ok "#2700 fixture sanity (AC-1): stored artifact_path stayed relative" \
+  || bad "#2700 fixture trap (AC-1): stored artifact_path is not relative ('$(stored_artifact_path "$S" "$T")')"
+printf '## Review\nDISPATCH-NONCE:N-AC1-2700\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p.md"
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "#2700 AC-1: artifact present ONLY at the dispatch's recorded vantage (wt), absent at the checker's primary vantage -> ALLOW" \
+  || bad "#2700 AC-1 should ALLOW (rc=$RC out=$CAP)"
+
+# ---- AC-2a: truly missing everywhere -> BLOCK not found. ----
+S="s-2700-ac2a"; T="t-2700-ac2a"
+mk_or_transcript "$F2700/transcripts/f-ac2a.jsonl" "$T" "N-AC2A-2700" "moonshotai/kimi-k3" "$F2700/wt"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2a.jsonl" \
+  --nonce "N-AC2A-2700" --artifact ".ai-workspace/plans/p-ac2a.md" --verdict PASS
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "subprocess-unverified" && echo "$CAP" | grep -qi "not found"; } \
+  && ok "#2700 AC-2a: artifact missing at every candidate -> BLOCK not found" \
+  || bad "#2700 AC-2a should BLOCK not found (rc=$RC out=$CAP)"
+
+# ---- AC-2b: artifact present under wt WITHOUT the nonce, nothing at primary -> BLOCK names the nonce
+#      (never "not found" -- the vantage copy IS found, it just isn't bound to this dispatch). ----
+S="s-2700-ac2b"; T="t-2700-ac2b"
+mk_or_transcript "$F2700/transcripts/f-ac2b.jsonl" "$T" "N-AC2B-2700" "moonshotai/kimi-k3" "$F2700/wt"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2b.jsonl" \
+  --nonce "N-AC2B-2700" --artifact ".ai-workspace/plans/p-ac2b.md" --verdict PASS
+printf '## Review\nDISPATCH-NONCE:SOME-OTHER-NONCE\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac2b.md"
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "does not contain this dispatch's nonce"; } \
+  && ok "#2700 AC-2b: vantage copy exists but lacks this dispatch's nonce -> BLOCK names the nonce (not 'not found')" \
+  || bad "#2700 AC-2b should BLOCK naming the nonce (rc=$RC out=$CAP)"
+
+# ---- AC-2c: recorded cwd is an ABSENT directory -> vantage contributes no reachable candidate -> BLOCK
+#      not found (fail-closed, never fail-open on a missing/odd vantage). ----
+S="s-2700-ac2c"; T="t-2700-ac2c"
+mk_or_transcript "$F2700/transcripts/f-ac2c.jsonl" "$T" "N-AC2C-2700" "moonshotai/kimi-k3" "$F2700/gone-vantage-dir"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2c.jsonl" \
+  --nonce "N-AC2C-2700" --artifact ".ai-workspace/plans/p-ac2c.md" --verdict PASS
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+  && ok "#2700 AC-2c: recorded cwd is an absent directory -> BLOCK not found (fail-closed)" \
+  || bad "#2700 AC-2c should BLOCK not found (rc=$RC out=$CAP)"
+
+# ---- AC-2d: recorded cwd is non-absolute (bare-relative, then ~/-form) -> IGNORED, never joined against
+#      process.cwd()/HOME -- the real wt copy exists WITH the nonce, yet resolution still misses it because
+#      the vantage candidate is never added; today's chain (checker cwd = primary) has no copy either. ----
+S="s-2700-ac2d1"; T="t-2700-ac2d1"
+mk_or_transcript "$F2700/transcripts/f-ac2d1.jsonl" "$T" "N-AC2D1-2700" "moonshotai/kimi-k3" "wt"
+mkdir -p "$F2700/wt/.ai-workspace/plans"
+printf '## Review\nDISPATCH-NONCE:N-AC2D1-2700\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac2d1.md"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2d1.jsonl" \
+  --nonce "N-AC2D1-2700" --artifact ".ai-workspace/plans/p-ac2d1.md" --verdict PASS
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+  && ok "#2700 AC-2d (bare-relative recorded cwd 'wt'): ignored, never joined -> BLOCK not found" \
+  || bad "#2700 AC-2d (bare-relative) should BLOCK not found (rc=$RC out=$CAP)"
+
+S="s-2700-ac2d2"; T="t-2700-ac2d2"
+mk_or_transcript "$F2700/transcripts/f-ac2d2.jsonl" "$T" "N-AC2D2-2700" "moonshotai/kimi-k3" "~/wt"
+printf '## Review\nDISPATCH-NONCE:N-AC2D2-2700\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac2d2.md"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2d2.jsonl" \
+  --nonce "N-AC2D2-2700" --artifact ".ai-workspace/plans/p-ac2d2.md" --verdict PASS
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+  && ok "#2700 AC-2d (tilde-form recorded cwd '~/wt'): ignored, never joined -> BLOCK not found" \
+  || bad "#2700 AC-2d (tilde-form) should BLOCK not found (rc=$RC out=$CAP)"
+
+# ---- AC-3b: record 1 (the bound enqueue record) lacks the nonce, even though record 3 carries the cwd and
+#      the artifact carries the nonce -- a replayed/reused transcript must not bind (M2, unchanged). ----
+S="s-2700-ac3b"; T="t-2700-ac3b"
+mk_or_transcript_unbound_enqueue "$F2700/transcripts/f-ac3b.jsonl" "$T" "N-AC3B-2700" "moonshotai/kimi-k3" "$F2700/wt"
+printf '## Review\nDISPATCH-NONCE:N-AC3B-2700\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac3b.md"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac3b.jsonl" \
+  --nonce "N-AC3B-2700" --artifact ".ai-workspace/plans/p-ac3b.md" --verdict PASS
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "first record does"; } \
+  && ok "#2700 AC-3b: bound record (enqueue) lacks the nonce -> BLOCK, never reaches artifact resolution (M2)" \
+  || bad "#2700 AC-3b should BLOCK on the binding check (rc=$RC out=$CAP)"
+
+# ---- AC-4: a nonce-less copy appears at the PRIMARY vantage AFTER the row is appended (stored path stays
+#      relative) -- must NOT shadow the nonce-bound vantage copy. ----
+S="s-2700-ac4"; T="t-2700-ac4"
+mk_or_transcript "$F2700/transcripts/f-ac4.jsonl" "$T" "N-AC4-2700" "moonshotai/kimi-k3" "$F2700/wt"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac4.jsonl" \
+  --nonce "N-AC4-2700" --artifact ".ai-workspace/plans/p-ac4.md" --verdict PASS
+[ "$(stored_artifact_path "$S" "$T")" = ".ai-workspace/plans/p-ac4.md" ] \
+  && ok "#2700 fixture sanity (AC-4): stored artifact_path stayed relative" \
+  || bad "#2700 fixture trap (AC-4): stored artifact_path is not relative ('$(stored_artifact_path "$S" "$T")')"
+printf '## Review\nDISPATCH-NONCE:N-AC4-2700\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac4.md"
+mkdir -p "$F2700/primary/.ai-workspace/plans"
+printf '## Review\nDISPATCH-NONCE:SOME-OTHER-NONCE\nDecision: PASS\n' > "$F2700/primary/.ai-workspace/plans/p-ac4.md"
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "#2700 AC-4: a nonce-less primary copy created after append must not shadow the nonce-bound vantage copy -> ALLOW" \
+  || bad "#2700 AC-4 should ALLOW (rc=$RC out=$CAP)"
+
+# ---- AC-4b (monotone, PASS at both ends): roles swapped -- the VANTAGE copy lacks the nonce, the PRIMARY
+#      copy carries it. A "vantage-first, first-EXISTING-wins" implementation fails this (#1590 class); the
+#      nonce must choose among candidates regardless of which one is tried first. ----
+S="s-2700-ac4b"; T="t-2700-ac4b"
+mk_or_transcript "$F2700/transcripts/f-ac4b.jsonl" "$T" "N-AC4B-2700" "moonshotai/kimi-k3" "$F2700/wt"
+or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac4b.jsonl" \
+  --nonce "N-AC4B-2700" --artifact ".ai-workspace/plans/p-ac4b.md" --verdict PASS
+[ "$(stored_artifact_path "$S" "$T")" = ".ai-workspace/plans/p-ac4b.md" ] \
+  && ok "#2700 fixture sanity (AC-4b): stored artifact_path stayed relative" \
+  || bad "#2700 fixture trap (AC-4b): stored artifact_path is not relative ('$(stored_artifact_path "$S" "$T")')"
+printf '## Review\nDISPATCH-NONCE:SOME-OTHER-NONCE\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac4b.md"
+mkdir -p "$F2700/primary/.ai-workspace/plans"
+printf '## Review\nDISPATCH-NONCE:N-AC4B-2700\nDecision: PASS\n' > "$F2700/primary/.ai-workspace/plans/p-ac4b.md"
+run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "#2700 AC-4b: nonce-less VANTAGE copy + nonce-bearing PRIMARY copy -> the nonce still wins -> ALLOW (kills first-existing-wins, M5)" \
+  || bad "#2700 AC-4b should ALLOW (rc=$RC out=$CAP) -- a first-existing-wins implementation blocks this"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

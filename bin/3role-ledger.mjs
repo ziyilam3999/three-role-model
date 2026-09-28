@@ -1951,8 +1951,16 @@ function subprocessFirstRecordText(content) {
   return '';
 }
 
+// #2700 D1 — the dispatch's own vantage: the `cwd` recorded on the FIRST transcript record that carries
+// one. On the measured shape (R3) the bound record (record 1, `queue-operation`/`enqueue`) and record 2
+// (`queue-operation`/`dequeue`) carry no `cwd` at all — the first `user` record (record 3) is the first to
+// carry it. This is read from the SAME transcript that already passed the exists + tag&nonce binding checks
+// in checkSubprocessProvenance, and only consulted AFTER those checks (an unbound transcript never steers
+// resolution). Exposed as `dispatchCwd` (raw string as recorded — absolutizing/ignoring a non-absolute value
+// is the CALLER's job, per named risk 2700-pr1-relative-vantage-join: a non-absolute recorded cwd must be
+// ignored, never joined against process.cwd()/HOME).
 function subprocessTranscriptInfo(transcriptPath) {
-  const out = { exists: false, firstText: '', servedModel: '' };
+  const out = { exists: false, firstText: '', servedModel: '', dispatchCwd: '' };
   let p = String(transcriptPath == null ? '' : transcriptPath);
   // transcript_path is stored in portable home-tilde form by normalizeArtifact() (R6) — expand it back to
   // an absolute path before touching the filesystem; fs.* never expands `~` the way a shell does, so a
@@ -1966,14 +1974,57 @@ function subprocessTranscriptInfo(transcriptPath) {
     out.firstText = subprocessFirstRecordText(content);
     for (const ln of content.split('\n')) {
       if (!ln.trim()) continue;
-      try {
-        const rec = JSON.parse(ln);
+      let rec;
+      try { rec = JSON.parse(ln); } catch (e) { continue; }   // skip an unparsable line, keep scanning.
+      if (!out.servedModel) {
         const m = rec && rec.message && rec.message.model;
-        if (m) { out.servedModel = String(m); break; }   // first served model line wins (the dispatch's own turn).
-      } catch (e) { /* skip an unparsable line, keep scanning */ }
+        if (m) out.servedModel = String(m);   // first served model line wins (the dispatch's own turn).
+      }
+      if (!out.dispatchCwd) {
+        const c = rec && rec.cwd;
+        if (typeof c === 'string' && c) out.dispatchCwd = c;   // first record that carries a `cwd` wins.
+      }
+      if (out.servedModel && out.dispatchCwd) break;
     }
   } catch (e) { /* fail closed to the empty defaults above */ }
   return out;
+}
+
+// #2700 D2 — candidate list for a subprocess row's artifact_path: the dispatch's own vantage FIRST, then
+// today's chain, byte-for-byte. An absolute/`~/`-form artifact_path is unambiguous already (mirrors
+// resolveArtifact()) and never consults the vantage. For a relative path, the vantage candidate is added
+// ONLY when `dispatchCwd` is a genuinely ABSOLUTE recorded value — a missing, non-absolute (bare-relative or
+// `~/`-form) recorded cwd contributes NO candidate (2700-pr1-relative-vantage-join) and today's chain runs
+// exactly as it does at base.
+function artifactCandidatesWithVantage(p, dispatchCwd) {
+  const s = String(p == null ? '' : p);
+  if (!s) return [];
+  if (s.startsWith('/')) return [s];
+  if (s.startsWith('~/')) return [path.join(HOME, s.slice(2))];
+  const cands = [];
+  if (typeof dispatchCwd === 'string' && dispatchCwd.startsWith('/')) cands.push(path.join(dispatchCwd, s));
+  if (process.env.CLAUDE_PROJECT_DIR) cands.push(path.join(process.env.CLAUDE_PROJECT_DIR, s));
+  cands.push(path.join(process.cwd(), s));
+  cands.push(path.join(HOME, s));
+  cands.push(s);
+  return cands;
+}
+
+// #2700 D2 — the nonce chooses among the candidates, not mere existence: the FIRST candidate that both
+// EXISTS and carries `nonce` wins (`winner`); a same-named copy that only exists is the WEAKER signal and
+// must never erase a nonce-bound copy in EITHER direction (#1590 class) — it is only reported (`existing`,
+// the first EXISTING candidate, for the "does not contain nonce" message) when no candidate carries the
+// nonce. Both empty means "not found" on every candidate.
+function resolveArtifactVantage(p, dispatchCwd, nonce) {
+  const cands = artifactCandidatesWithVantage(p, dispatchCwd);
+  let existing = '';
+  const n = String(nonce == null ? '' : nonce);
+  for (const c of cands) {
+    if (!fileExists(c)) continue;
+    if (!existing) existing = c;
+    if (n && fileHas(c, new RegExp(escapeRegExp(n)))) return { winner: c, existing: existing };
+  }
+  return { winner: '', existing: existing };
 }
 
 // M2 — the transcript's FIRST record must carry BOTH the exact spawn tag and this dispatch's nonce. A bare
@@ -2047,13 +2098,16 @@ function checkSubprocessProvenance(role, e, session, task) {
     return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
       (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
   }
-  const ap = resolveArtifact(e.artifact_path || '');
-  if (ap) {
-    if (!e.nonce || !fileHas(ap, new RegExp(escapeRegExp(e.nonce)))) {
-      return role + ' dispatch=' + e.dispatch + ' artifact "' + ap + '" does not contain this dispatch\'s ' +
-        'nonce "' + (e.nonce || '<missing>') + '" (M2 — binds artifact to this exact run)';
-    }
-  } else if (role !== 'executor') {
+  // #2700 D2 — vantage-first, nonce-choice resolution: try the dispatch's own recorded cwd BEFORE today's
+  // chain; the FIRST candidate that carries the nonce wins. `ap` below is that winner (or '' if none did).
+  const vantageResolved = resolveArtifactVantage(e.artifact_path || '', info.dispatchCwd, e.nonce);
+  const ap = vantageResolved.winner;
+  if (!ap && vantageResolved.existing) {
+    // a candidate exists (vantage or today's chain) but none carried this dispatch's nonce — block, naming
+    // the first EXISTING candidate (never silently prefer a nonce-less copy over a nonce-bound one, #1590).
+    return role + ' dispatch=' + e.dispatch + ' artifact "' + vantageResolved.existing + '" does not contain ' +
+      'this dispatch\'s nonce "' + (e.nonce || '<missing>') + '" (M2 — binds artifact to this exact run)';
+  } else if (!ap && role !== 'executor') {
     // executor's artifact is legitimately a PR URL/commit/branch string, never required to resolve on disk
     // (mirrors the ordinary arm's own role-shaped exemption below); every other role needs a real disk path.
     return role + ' dispatch=' + e.dispatch + ' artifact_path "' + (e.artifact_path || '') + '" not found' +
