@@ -1516,6 +1516,78 @@ function priorAgentTranscriptProves(prior, task, role, verdict) {
   return empty;
 }
 
+// #2701 D4 P5 — fail-closed on ANY ledger-CLI append mention the command-position parser cannot read
+// plainly. Scans the RAW (pre-stripQuotedAndHeredocBodies) text of every Bash tool_use command in the
+// LIFTED agent's own transcript (resolved from row.agentId + row.session_id, exactly as
+// priorAgentTranscriptProves resolves it above — never from a caller claim) for a literal mention of the
+// ledger CLI's append subcommand (recognized by its literal file name — nr11 residual: an aliased/globbed/
+// copied invocation is invisible here, out of scope; D1's one-identity-per-write refusal is the primary
+// protection going forward). For each raw mention: the STRIPPED text must place it at command position
+// with a literal --task and a literal --role for THIS (task, role) — a $V/"$T"-style value, a quoted or
+// heredoc-fed invocation, or a bash -c wrapper all strip to something that no longer matches, exactly the
+// nr9 laundering shapes — or the mention is UNRECOGNIZED and P5 fails. When --verdict is present at that
+// position it must likewise bind to a literal token or the mention is UNRECOGNIZED. A RECOGNIZED mention
+// whose literal verdict equals the ROW'S OWN verdict proves the agent executed a self-append of exactly
+// that verdict — P5 fails (lifting this agentId would let that verdict supersede its own earlier flip,
+// the exact shape 1a clause 2 already refuses live). A transcript with no mention at all, or every mention
+// recognized with no verdict or a verdict DIFFERENT from the row's own, passes P5.
+function priorAgentTranscriptP5(row, task, role) {
+  const pass = { ok: true, path: '' };
+  if (!row || !row.agentId) return pass;
+  const aid = String(row.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return pass;
+  const sess = sanitize(row.session_id || '');
+  if (!sess) return pass;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return pass; }
+  const taskRe = new RegExp('--task[= ]["\']?' + escapeRegExp(String(task)) + '(["\'\\s]|$)');
+  const roleRe = new RegExp('--role[= ]["\']?' + escapeRegExp(String(role)) + '(["\'\\s]|$)');
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    for (const ln of content.split('\n')) {
+      if (!ln.trim()) continue;
+      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+      const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+      if (!isAsst) continue;
+      const c = j.message && j.message.content;
+      if (!Array.isArray(c)) continue;
+      for (const blk of c) {
+        if (!blk || blk.type !== 'tool_use') continue;
+        if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+        const cmd = String((blk.input && blk.input.command) || '');
+        if (!/3role-ledger\.mjs['"]?\s+append\b/.test(cmd)) continue; // no raw mention -> this command is fine
+        const stripped = stripQuotedAndHeredocBodies(cmd);
+        const segs = stripped.split(/&&|\|\||;|\||\n/);
+        let matchedSeg = null;
+        for (const seg of segs) {
+          const t = seg.trim();
+          if (/3role-ledger\.mjs/.test(t) && /\bappend\b/.test(t)) { matchedSeg = t; break; }
+        }
+        if (!matchedSeg || !taskRe.test(matchedSeg) || !roleRe.test(matchedSeg)) {
+          return { ok: false, path: f, reason: 'an unrecognized ledger-append mention (the raw text mentions ' +
+            '3role-ledger.mjs append, but the command-position parse could not place a literal --task/--role ' +
+            'for this task/role — a quoted, heredoc-fed, bash -c, or $VAR-style invocation)' };
+        }
+        if (/--verdict\b/.test(matchedSeg)) {
+          const vm = matchedSeg.match(/--verdict[= ]([A-Za-z0-9_-]+)/);
+          if (!vm) {
+            return { ok: false, path: f, reason: 'an unrecognized ledger-append mention (--verdict is present ' +
+              'but does not bind to a literal token at command position)' };
+          }
+          if (row.verdict && vm[1] === String(row.verdict)) {
+            return { ok: false, path: f, reason: 'a recognized executed self-append of this row\'s own verdict "' +
+              row.verdict + '" at command position' };
+          }
+        }
+      }
+    }
+    return pass; // this agent's transcript file was found and fully scanned
+  }
+  return pass;
+}
+
 // #1575 §1b — the gate's universal verdict screen vocabulary, ONE allowlist shared by the gate (via
 // `gate-plan-review`) and `cmdInherit`'s parent-verdict precondition ("the gate's own allowlist, one
 // vocabulary, not two"). ALLOWLIST, never a denylist (D3): membership admits, everything else — BLOCK,
@@ -1888,6 +1960,19 @@ function escapeRegExp(s) { return String(s == null ? '' : s).replace(/[.*+?^${}(
 // further edits (AC-3's provider-agnosticism proof) — the class boundary is "not an Agent-tool spawn",
 // never a specific vendor name.
 function isSubprocessDispatch(v) { return typeof v === 'string' && v.indexOf('subprocess-') === 0; }
+
+// #2701 D2/D4 — a row "carries subprocess provenance" when ANY of its own nonce-derived fields say so,
+// independent of whether that provenance verifies: a run_id shaped OR-NONCE-* (the helper's own mint,
+// :645), a dispatch_nonce (the pre-launch stamp), or a dispatch value matching isSubprocessDispatch above
+// (before the #1947 clear-list erases it). Used by D2 (reconcile-spawns must never infer an identity onto
+// such a row, verified or not) and D4's P2 (the repair's cross-wire precondition).
+function rowHasSubprocessProvenance2701(row) {
+  if (!row) return false;
+  if (typeof row.run_id === 'string' && row.run_id.indexOf('OR-NONCE-') === 0) return true;
+  if (row.dispatch_nonce) return true;
+  if (isSubprocessDispatch(row.dispatch)) return true;
+  return false;
+}
 
 // Fresh SSOT read: is this role's SEAT declared a subprocess (non-Agent-tool) dispatch right now? Returns
 // {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
@@ -3244,6 +3329,23 @@ function overlayAppend(session, task, role, fields) {
       if (j && j.agentId === bindAgentId) { prior = j; priorIdx = i; break; }
     }
   }
+  // #2701 D1 fold r2 finding 1(i) — NONCE-KEYED TARGET SELECTION, the twin of the agentId binding just
+  // above. A write carrying --run-id R (and NOT a --skip-reason — a skip is identity-less, fold r3 finding
+  // 2, and must never be nonce-pinned) binds to the same-role row that ALREADY carries run_id R, wherever
+  // it sits — this is what lets the dispatch helper's post-exit write (:1255-1257) and its rendered
+  // self-append instruction (:536) find their OWN row even when a sanctioned same-agent re-touch has since
+  // moved it off the tail (S9/AC-18). A miss (no row carries this run_id — the genuinely-new-identity case)
+  // falls through to the ordinary "last same-role row" selection, and D1's identity-boundary rule above
+  // decides whether that's a merge or a new round.
+  const pinRunId2701 = (!bindAgentId && !('skip_reason' in fields) && ('run_id' in fields))
+    ? String(fields.run_id == null ? '' : fields.run_id) : '';
+  if (priorIdx === -1 && pinRunId2701) {
+    for (let i = priorSameRoleLines.length - 1; i >= 0; i--) {
+      let j;
+      try { j = JSON.parse(priorSameRoleLines[i]); } catch (e) { continue; }
+      if (j && j.run_id === pinRunId2701) { prior = j; priorIdx = i; break; }
+    }
+  }
   if (priorIdx === -1 && priorSameRoleLines.length) {
     priorIdx = priorSameRoleLines.length - 1;
     try { prior = JSON.parse(priorSameRoleLines[priorIdx]); } catch (e) { prior = null; }
@@ -3403,8 +3505,34 @@ function overlayAppend(session, task, role, fields) {
   // row's stale agentId/artifact_path/verdict — it starts a genuinely fresh row, carrying only what THIS
   // write provides, with the old E1 row retained verbatim as history (same "no deletion" mechanic as
   // divertNewRound3 and the ordinary distinct-agent round boundary below).
-  const isNewRound = divertNewRound3 || divertRouteChange ||
-    !!(prior && prior.agentId && incomingAgentId && incomingAgentId !== prior.agentId);
+  // #2701 D1 — RUN-IDENTITY round boundary. A row's identity is its agentId if present, else its run_id
+  // (the doc comment above: "run_id is the run's own identity — agentId for E1, nonce for E2, absent for
+  // a bare marker"). A write's identity is its agentId if provided, else its run_id (a --skip-reason write
+  // is identity-less even when it carries --run-id — fold r3 finding 2 — because a skip is an ASSERTION,
+  // never a new round). When both sides carry an identity and they differ, this write opens a NEW row —
+  // dispatch_nonce/nonce are receipts, never identities, so the legacy #1947/#1989/#2169-S5 compose shapes
+  // (no run_id at all) are untouched. Second trigger (fold r1 finding 1, kept): the degraded {role}-only
+  // Agent stamp (effort_source==='assigned', no agentId) arriving over a run_id-identified row.
+  // #2701 fix-cycle-1 B1 — NAMESPACED comparison (execution-review FAIL, nr11's falsifier): the two
+  // identity fields live in DIFFERENT namespaces (an agentId is an Agent-tool run; a run_id is a
+  // subprocess dispatch), so comparing their raw string VALUES lets a write choose `--run-id <the row's
+  // own agentId>` and have it read as "the same identity" — silently merging a fresh subprocess claim onto
+  // an agent-bound row instead of opening a new round (the exact launder: `append --agent agL …` then
+  // `append --run-id agL --dispatch-nonce x` with no --agent, which used to compose onto agL's own row and
+  // hand `repair-crosswire` a P2-satisfying cross-wired shape it was never meant to see). Prefix each side
+  // with which field it came from before comparing, so an agentId "agL" and a run_id "agL" are NEVER the
+  // same identity, only ever equal to another value from the SAME field.
+  const priorIdentity2701 = prior
+    ? (prior.agentId ? ('agent:' + String(prior.agentId)) : (prior.run_id ? ('run:' + String(prior.run_id)) : ''))
+    : '';
+  const isSkip2701 = ('skip_reason' in fields);
+  const incomingRunId2701 = (('run_id' in fields) && !isSkip2701) ? String(fields.run_id == null ? '' : fields.run_id) : '';
+  const incomingIdentity2701 = incomingAgentId ? ('agent:' + incomingAgentId) :
+    (incomingRunId2701 ? ('run:' + incomingRunId2701) : '');
+  const identityBoundary2701 = !!(prior && priorIdentity2701 && incomingIdentity2701 && incomingIdentity2701 !== priorIdentity2701);
+  const degradedStamp2701 = !!(prior && !incomingAgentId && !prior.agentId && prior.run_id &&
+    fields.effort_source === 'assigned');
+  const isNewRound = divertNewRound3 || divertRouteChange || identityBoundary2701 || degradedStamp2701;
   for (const ln of olderRoundLines) kept.push(ln);
   if (isNewRound) kept.push(JSON.stringify(prior));
   // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
@@ -3899,19 +4027,42 @@ function cmdAppend(o) {
   // SL-8/SL-9 concurrent cross-wire incident). REFUSE outright (non-zero exit, ledger file untouched —
   // this block only ever READS the file) rather than guess; the remedy is a plain, actionable retry with
   // --agent naming the specific target row.
+  // #2701 D1 — ONE IDENTITY PER WRITE. A write naming BOTH --agent and --run-id is refused outright: no
+  // sanctioned writer ever does it, and it is the exact write that mints a self-cross-wired row (nr9).
+  if (('agent' in o) && ('run-id' in o)) {
+    console.error('BLOCK (3role-ledger one-identity #2701): a write may name only ONE run identity — ' +
+      '--agent and --run-id together are refused; nothing written.');
+    process.exit(2);
+  }
   {
-    const hasAgent = ('agent' in o);
+    // #2701 fold r2 finding 1 / fold r3 finding 1 — Fix A EXEMPTS a --run-id-pinned write (except a
+    // --skip-reason write, which D1 treats as identity-less and never nonce-pins) exactly like an --agent
+    // write: once D1 gives each dispatch round its own row, the helper's post-exit write and its rendered
+    // self-append instruction must not collide with Fix A's ambiguity refusal just because an OLDER
+    // artifact-less same-role row (a stranded pending dispatch, an Agent dead round, or D4's lifted agent
+    // row) exists. The ONLY row left OUT of the live-candidate count is a `pending` row that a NEWER
+    // same-role row with a DIFFERENT identity has since superseded (a stranded dispatch) — fold r3 undid
+    // the dead-round exclusion (it reopened the concurrent-lane cross-wire Fix A exists to stop: two live
+    // agent rows, one bare self-append, must still be refused with exit 2 — AC-17's stopped-lane clause).
+    const hasAgent = ('agent' in o) || (('run-id' in o) && !('skip-reason' in o));
     if (!hasAgent) {
       const artifactLessRows = [];
+      const all2701 = [];
       try {
         const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
         for (const ln of raw) {
           try {
             const j = JSON.parse(ln);
-            if (j && j.role === role && !j.artifact_path) artifactLessRows.push(j);
+            if (j && j.role === role) all2701.push(j);
           } catch (e) { /* skip unparsable line */ }
         }
       } catch (e) { /* no ledger file yet -> artifactLessRows stays [] */ }
+      const id2701 = (r) => String((r && (r.agentId || r.run_id)) || '');
+      all2701.forEach((j, i) => {
+        if (j.artifact_path) return;
+        if (j.pending && all2701.slice(i + 1).some((k) => id2701(k) && id2701(k) !== id2701(j))) return; // superseded pending only
+        artifactLessRows.push(j);
+      });
       if (artifactLessRows.length > 1) {
         const ids = artifactLessRows.map((r) => (r.agentId || '(no agentId)')).join(', ');
         console.error('BLOCK (3role-ledger fix-A ambiguity, ledger-concurrent-append-agent-disambiguation): ' +
@@ -4255,6 +4406,25 @@ function evaluatePlanReviewGate(session, task) {
       return { allow: false, class: 'junk-line', detail: file + ' (unparseable line ' + (i + 1) + ' follows the last plan-review line)' };
     }
   }
+  // #2701 D3 — LATEST-ROUND pre-screen, additive and monotonic: it can only ever turn an ALLOW into a
+  // BLOCK, never the reverse. The bottom LINE is not always the latest ROUND (a sanctioned same-identity
+  // re-touch re-emits an older row at the file's tail — the M2 reorder), so the gate must judge by the
+  // role's full history's effective verdict, exactly as `check` Lane B already does (one evaluator, no
+  // mirror — #2051 discipline). Runs AFTER the trailing-junk rule, BEFORE the universal verdict screen
+  // below, so an in-flight verdict-less last row still falls through to that screen's own no-verdict class
+  // (AC-4d), and a single PASS or an honest FAIL-then-PASS by a distinct, newer round still ALLOWs.
+  {
+    const parsedLines2701 = rawLines.filter((_, i) => parsedOk[i]);
+    const eff2701 = effectiveVerdictRow(verdictRows(rowsForRole(parsedLines2701, 'plan-review')), 'plan-review', session, task);
+    if (eff2701 && !CHECK_LANE_AFFIRMATIVE.has(String(eff2701.verdict))) {
+      return {
+        allow: false, class: 'negative-verdict',
+        detail: file + ' (verdict=' + eff2701.verdict + ', agentId=' + (eff2701.agentId || '<none>') +
+          ', run_id=' + (eff2701.run_id || '<none>') + ') — the review did not pass; a newer or ' +
+          'unsuperseded negative round governs'
+      };
+    }
+  }
   const e = lastEntry;
   // Universal verdict screen (an ALLOWLIST in the code, never a denylist — D3): runs FIRST, on EVERY arm,
   // regardless of any other field on the line.
@@ -4359,9 +4529,12 @@ function parseClosedAtMs(v) {
 
 // Every row for ONE role, in ledger PARSE ORDER (file top-to-bottom) — the role's FULL history, never just
 // the byRole-selected (last-parse-wins) row. Unparseable lines are silently skipped (mirrors the byRole
-// build loop's own `catch (e) { /* skip */ }`). File order is chronological within a role by construction
-// (overlayAppend always retains an older round's row, verbatim, ahead of the new/merged row it writes —
-// see the plan's Context section and the round-3/round-4 reviewers' independent fixture proofs).
+// build loop's own `catch (e) { /* skip */ }`). #2701 D3: file order is NOT reliably chronological — a
+// sanctioned same-round re-touch (an agentId- or run_id-bound write) re-emits its target row at the file's
+// TAIL regardless of when that round actually happened, so "latest round governs" only holds in the BLOCK
+// direction (effectiveVerdictRow's negative-supersession branch, gated by supersedesNegative's own
+// distinct+newer-closedAt test) — the affirmative branch is unconditional newest-BY-FILE-ORDER-wins, same
+// as before this ticket.
 function rowsForRole(lines, role) {
   const out = [];
   for (const ln of lines) {
@@ -4388,11 +4561,24 @@ function verdictRows(rows) {
 // construction) — this is what lets AC-14's raw hand-written shapes and the real #1821 fixture (whose bare
 // shield row is never itself the negative — the negative is the FAIL row, which always carries both fields
 // in the corpus) resolve correctly without a separate code path.
-function supersedesNegative(candidate, negative) {
-  if (!candidate || !candidate.agentId) return false;
+// #2701 D3 (fold r1 finding 2) — WIDENED to let a verified, agentId-less subprocess round supersede a
+// negative exactly as a fresh Agent-tool reviewer can, so a z.ai PASS after any FAIL is not blocked
+// forever once D1 gives each dispatch its own row. An agentId-less candidate supersedes only when its
+// subprocess provenance is VERIFIED (checkSubprocessProvenance === '', the #2051 one-evaluator), its
+// run_id differs from the negative row's identity (agentId or run_id), and its closedAt is strictly
+// newer — an unverified subprocess PASS never supersedes (fail-closed, AC-4f).
+function supersedesNegative(candidate, negative, role, session, task) {
+  if (!candidate) return false;
   const candMs = parseClosedAtMs(candidate.closedAt);
   if (candMs === null) return false;
-  const distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
+  let distinct;
+  if (candidate.agentId) {
+    distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
+  } else {
+    if (!role || checkSubprocessProvenance(role, candidate, session, task) !== '') return false;
+    const negId2701 = String(negative.agentId || negative.run_id || '');
+    distinct = !!candidate.run_id && String(candidate.run_id) !== negId2701;
+  }
   if (!distinct) return false;
   const negMs = parseClosedAtMs(negative.closedAt);
   const newer = (negMs === null) ? true : (candMs > negMs);
@@ -4404,12 +4590,12 @@ function supersedesNegative(candidate, negative) {
 // wins); it supersedes a currently-effective NEGATIVE verdict only per supersedesNegative() above — otherwise
 // the row is read PAST and the negative stays effective. Returns null when the role carries NO
 // verdict-bearing row at all (Lane B stays SILENT — today's honest fail-open residual, pinned by AC-7(c)).
-function effectiveVerdictRow(vrows) {
+function effectiveVerdictRow(vrows, role, session, task) {
   let eff = null;
   for (const row of vrows) {
     if (!eff) { eff = row; continue; }
     if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) { eff = row; continue; }   // affirmative -> unconditional newest-wins
-    if (supersedesNegative(row, eff)) eff = row;                            // negative -> gated supersession
+    if (supersedesNegative(row, eff, role, session, task)) eff = row;       // negative -> gated supersession
     // else: read PAST this row, keep the negative effective.
   }
   return eff;
@@ -4418,10 +4604,10 @@ function effectiveVerdictRow(vrows) {
 // Lane B — outcome MONOTONICITY, for ONE review-pair role (execution-review OR plan-review — the shield is
 // role-symmetric, round-2 review N1). Returns null (silent) when the role carries no verdict anywhere in its
 // history, or its effective verdict is check-lane affirmative; else a `NEGATIVE-VERDICT:` problem string.
-function laneBProblem(role, lines) {
+function laneBProblem(role, lines, session, task) {
   const vrows = verdictRows(rowsForRole(lines, role));
   if (!vrows.length) return null;                        // no verdict on ANY row of the role -> silent (AC-7(c)).
-  const eff = effectiveVerdictRow(vrows);
+  const eff = effectiveVerdictRow(vrows, role, session, task);
   if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) return null;
   return 'NEGATIVE-VERDICT: role ' + role + ' — effective recorded verdict is "' + eff.verdict + '" (agentId ' +
     (eff.agentId || '<none>') + ', ' + (eff.closedAt ? 'closedAt ' + eff.closedAt : 'no closedAt') +
@@ -4558,7 +4744,7 @@ function cmdCheck(o) {
   // (no opt-in flag) for both review-pair roles / both subject-review pairs. Each lane is independently
   // silent on any missing/unparseable/absent input (fail-open by design -- see each function's doc comment).
   for (const role of ['execution-review', 'plan-review']) {
-    const laneB = laneBProblem(role, lines);
+    const laneB = laneBProblem(role, lines, session, task);
     if (laneB) problems.push(laneB);
   }
   {
@@ -5324,6 +5510,134 @@ function deriveLaterRecordFacts(file, role) {
   return result;
 }
 
+// #2701 D4 — repair-crosswire: the ONE sanctioned repair for a row an earlier writer cross-wired (an
+// Agent-tool spawn stamp merged onto a subprocess dispatch's own row instead of opening a new one — the
+// exact defect D1 now prevents going forward). Fail-closed predicate P1-P5 (exit 3, writes nothing, names
+// the failing term); idempotent (a row this tool already repaired, or one that was never cross-wired,
+// exits 0 with "nothing to repair" and touches nothing); a wet run backs the file up first (a sibling
+// `.repair-backup/` directory, never a `*.jsonl` glob target) and rewrites atomically (tmp + rename).
+// `--dry-run` prints the same BEFORE/AFTER and writes nothing (byte-identity is an AC).
+function cmdRepairCrosswire(o) {
+  const session = o.session, task = o.task, role = o.role, runId = o['run-id'];
+  if (!session || !task || !role || !runId) {
+    console.error('repair-crosswire: --session, --task, --role, --run-id are required');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-crosswire', 2);
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-crosswire P1): no ledger file exists for task ' + sanitize(task) +
+      ' — no row could carry run_id ' + runId + '. Nothing written.');
+    process.exit(3);
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+
+  // P1 — exactly one row of role R whose run_id equals --run-id.
+  const matchIdx = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const j = parsed[i];
+    if (j && j.role === role && j.run_id === runId) matchIdx.push(i);
+  }
+  if (matchIdx.length !== 1) {
+    console.error('BLOCK (3role-ledger repair-crosswire P1): ' + matchIdx.length + ' row(s) of role ' + role +
+      ' carry run_id ' + runId + ' (need exactly one) — nothing written.');
+    process.exit(3);
+  }
+  const idx = matchIdx[0];
+  const row = parsed[idx];
+
+  // P2 — the row carries subprocess provenance AND an agentId (it is cross-wired — the invariant is
+  // violated). IDEMPOTENT carve-out: a row this SAME tool already repaired (no agentId, but its own
+  // repair_ticket marker is present) is the honest no-op outcome of a re-run naming the same run_id, not a
+  // refusal — the row genuinely has nothing left to fix. Anything else failing P2 (a row that was never
+  // cross-wired at all — missing an agentId with no repair marker, or an agentId with no subprocess
+  // provenance) is a REFUSAL: the operator named a real run_id whose row does not match the precondition
+  // this tool exists to fix.
+  if (!row.agentId && row.repair_ticket === '2701') {
+    console.log('OK repair-crosswire: nothing to repair (row ' + idx + ' was already repaired by this tool).');
+    process.exit(0);
+  }
+  if (!row.agentId || !rowHasSubprocessProvenance2701(row)) {
+    console.error('BLOCK (3role-ledger repair-crosswire P2): row ' + idx + ' does not carry both subprocess ' +
+      'provenance and an agentId (it was never cross-wired) — nothing written.');
+    process.exit(3);
+  }
+
+  // P3 — a real spawn of this seat exists to own the new row (the row's agentId is tag-bound).
+  if (!agentBoundToTag(session, row.agentId, task, role)) {
+    console.error('BLOCK (3role-ledger repair-crosswire P3): no spawn transcript tag-bound to 3ROLE_TASK:' +
+      sanitize(task) + ' ROLE:' + sanitize(role) + ' was found for agentId ' + row.agentId + ' — nothing written.');
+    process.exit(3);
+  }
+
+  // P4 — no OTHER row of role R already carries that agentId.
+  for (let i = 0; i < parsed.length; i++) {
+    if (i === idx) continue;
+    const j = parsed[i];
+    if (j && j.role === role && j.agentId === row.agentId) {
+      console.error('BLOCK (3role-ledger repair-crosswire P4): another row (line ' + (i + 1) + ') of role ' +
+        role + ' already carries agentId ' + row.agentId + ' — nothing written.');
+      process.exit(3);
+    }
+  }
+
+  // P5 — fail-closed on any ledger-append mention in the lifted agent's own transcript that the
+  // command-position parser cannot read plainly (see priorAgentTranscriptP5's own comment).
+  const p5 = priorAgentTranscriptP5(row, task, role);
+  if (!p5.ok) {
+    console.error('BLOCK (3role-ledger repair-crosswire P5): the lifted agent\'s own transcript' +
+      (p5.path ? ' (' + p5.path + ')' : '') + ' shows ' + p5.reason + ' — lifting agentId ' + row.agentId +
+      ' could let that agent\'s own verdict supersede its own earlier flip. Nothing written.');
+    process.exit(3);
+  }
+
+  const dryRun = ('dry-run' in o);
+  const LIFTED_FIELDS_2701 = ['agentId', 'modelVersion', 'modelTier', 'effort', 'effort_source', 'self_authored', 'closedAt'];
+  const before = JSON.parse(JSON.stringify(row));
+
+  const subprocessRow = JSON.parse(JSON.stringify(row));
+  const agentRow = { role: row.role, session_id: row.session_id, ts: new Date().toISOString(), run_kind: 'bound',
+    run_source: 'repair-crosswire', repaired_from_run_id: runId };
+  for (const k of LIFTED_FIELDS_2701) {
+    if (k in subprocessRow) { agentRow[k] = subprocessRow[k]; delete subprocessRow[k]; }
+  }
+  subprocessRow.repair_ticket = '2701';
+  subprocessRow.repair_at = new Date().toISOString();
+  subprocessRow.repair_moved_agent = before.agentId;
+
+  console.error('AUDIT: repair-crosswire — session=' + sanitize(session) + ' task=' + sanitize(task) +
+    ' role=' + sanitize(role) + ' run_id=' + runId + (dryRun ? ' (dry-run)' : ''));
+  console.error('BEFORE: ' + JSON.stringify(before));
+  console.error('AFTER (subprocess row): ' + JSON.stringify(subprocessRow));
+  console.error('AFTER (new agent row): ' + JSON.stringify(agentRow));
+
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-crosswire: would rewrite row ' + idx + ' and append a new bound row for ' +
+      'agentId ' + before.agentId + '. Nothing written.');
+    console.log('BEFORE: ' + JSON.stringify(before));
+    console.log('AFTER (subprocess row): ' + JSON.stringify(subprocessRow));
+    console.log('AFTER (new agent row): ' + JSON.stringify(agentRow));
+    process.exit(0);
+  }
+
+  const backupDir = path.join(path.dirname(file), '.repair-backup');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, sanitize(task) + '.jsonl.' + new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.copyFileSync(file, backupFile);
+
+  const newLines = rawLines.slice();
+  newLines[idx] = JSON.stringify(subprocessRow);
+  newLines.push(JSON.stringify(agentRow));
+  const tmp = file + '.tmp-repair-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, newLines.join('\n') + '\n');
+  fs.renameSync(tmp, file);
+
+  console.log('OK repair-crosswire: repaired row ' + idx + ' for agentId ' + before.agentId + '; backup at ' + backupFile);
+  process.exit(0);
+}
+
 // #1229 / #1851: reconcile-spawns --session S — see the file-header doc block near the top of this file
 // (the "reconcile-spawns" subcommand entry) for the full design rationale, including the #1851 incremental
 // rewrite (D1 hoist / D2 bounded read / D3 per-file checkpoint / D4 correctness / D5 wall-clock budget / D6
@@ -5480,6 +5794,12 @@ function cmdReconcileSpawns(o) {
       // agentId is passed explicitly to deriveLaterRecordFacts below, so no blind search ever runs for it
       // (AC-10's ordinary-Anthropic-row backfill keeps working unchanged).
       if (computeVerifiedKindForProtection(role, prior, sess, task) === 'E2') continue;
+      // #2701 D2 — widen the containment: a row carrying subprocess provenance and NO agentId must never
+      // have an identity INFERRED onto it by this sweep, verified or not. An E3 inference is a blind,
+      // newest-mtime transcript search — claiming a nonce-identified row with it is exactly the write-side
+      // cross-wire this ticket exists to stop, and the honest outcome is that this sweep writes NOTHING for
+      // the group (the spawn hook and SubagentStop are the real E1 writers for it).
+      if (prior && !prior.agentId && rowHasSubprocessProvenance2701(prior)) continue;
 
       // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
       // call at all (idempotency -- a bare re-append would still refresh `ts` and break byte-identity).
@@ -7345,6 +7665,7 @@ try {
   else if (cmd === 'heartbeat') cmdHeartbeat(opts);
   else if (cmd === 'refresh-models') cmdRefreshModels(opts);
   else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
+  else if (cmd === 'repair-crosswire') cmdRepairCrosswire(opts);
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
@@ -7367,7 +7688,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -7386,7 +7707,8 @@ try {
       '[--role R (--tier T | --slug S) --reason "..." [--task T] (set-seat-pin, #1918)] ' +
       '[--role R [--tier] [--slug] --reason "..." (clear-seat-pin, #1918)] ' +
       '[[--json] (list-seat-pins, #1918)]' +
-      ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]');
+      ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]' +
+      ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]');
     process.exit(2);
   }
 } catch (e) {

@@ -436,14 +436,37 @@ run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 { [ "$RC" = "2" ]; } && ok "AC-9(c) last-match: stale ALLOW-shaped first, authoritative BLOCK-shaped last -> BLOCK (kills first-match)" || bad "AC-9(c) first case should block (rc=$RC out=$CAP)"
 
 S="s-ac9c2"; T="9c2-task"
-mk_bound "$S" "ag9c2" "$T" "plan-review"
+mk_bound "$S" "ag9c3" "$T" "plan-review"
 LEDFILE9C2="$LEDGERDIR/$S/$T.jsonl"; mkdir -p "$(dirname "$LEDFILE9C2")"
 {
   printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c2","verdict":"BLOCK","closedAt":"2026-07-11T00:00:00.000Z"}\n' "$S"
-  printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c2","verdict":"PASS","closedAt":"2026-07-11T00:00:01.000Z"}\n' "$S"
+  printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c3","verdict":"PASS","closedAt":"2026-07-11T00:00:01.000Z"}\n' "$S"
 } > "$LEDFILE9C2"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC-9(c) converse: stale BLOCK-shaped first, authoritative ALLOW-shaped+bound last -> ALLOW (kills last-line-only-if-it-blocks)" || bad "AC-9(c) converse case should allow (rc=$RC out=$CAP)"
+# #2701 D3: a SAME-agent flip (ag9c2 BLOCK -> ag9c2 PASS) is now correctly BLOCKED by supersedesNegative's
+# distinct-agent test -- re-fixtured with a DISTINCT, newer, bound agent (ag9c3) so this arm keeps its
+# original last-match purpose (a stale BLOCK-shaped row must not out-rank an authoritative later ALLOW).
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC-9(c) converse: stale BLOCK-shaped first, authoritative ALLOW-shaped+bound last by a DISTINCT newer agent -> ALLOW (kills last-line-only-if-it-blocks; #2701 D3 blocks a same-agent flip)" || bad "AC-9(c) converse case should allow (rc=$RC out=$CAP)"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2701 AC-4 (fix-cycle-1 B3; D3's M2 reorder, THROUGH THE REAL BASH GATE) -- execution-review's B3 finding:
+# hooks/3role-ledger-smoke-test.sh's own #2701 AC-4 proves this at the ledger-CLI level, but the plan also
+# names "one arm of the same shape ... through three-role-transition-gate.sh" and this file (unlike
+# 3role-ledger-smoke-test.sh's cw_agent_round) never carried it. [agA PASS 01:00, agB FAIL 02:00], then a
+# same-agent re-touch of the OLDER row (an artifact re-point, no verdict change -- the sanctioned repair the
+# cross-wire memory itself prescribes) moves agA's PASS to the file's tail. Base (pre-D3): the gate reads the
+# last LINE -> ALLOW. Head: D3's latest-round pre-screen reads the last ROUND -> BLOCK, naming agB.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+S="s2701-ac4"; T="2701ac4"
+mk_bound "$S" "ag2701A" "$T" "plan-review"
+appendL --session "$S" --task "$T" --role plan-review --agent ag2701A --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-01-01T01:00:00.000Z"
+mk_bound "$S" "ag2701B" "$T" "plan-review"
+appendL --session "$S" --task "$T" --role plan-review --agent ag2701B --artifact "$TMP/rev.md" --verdict FAIL --closed-at "2026-01-01T02:00:00.000Z"
+appendL --session "$S" --task "$T" --role plan-review --agent ag2701A --artifact "$TMP/rev.md"
+run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "did not pass" && echo "$CAP" | grep -q "ag2701B"; } \
+  && ok "#2701 AC-4: D3 latest-round pre-screen through the REAL bash gate -- an M2 same-agent re-touch reorder must not resurrect an older PASS over a newer FAIL (base: ALLOW)" \
+  || bad "#2701 AC-4 FAILED (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #2051 AC-7 — end-to-end through the REAL bash hook. The gate's third arm (subprocess-openrouter provenance

@@ -5298,4 +5298,509 @@ BANNER=$(node "$LED" 2>&1)
   && ok "#1709 AC-10: the no-args banner lists usage-backfill" \
   || bad "#1709 AC-10 FAILED (banner missing usage-backfill)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2701 — an Agent-tool spawn stamp must never claim a delivered subprocess row; the plan-review gate must
+# read the latest ROUND, not the last LINE. D1 (run-identity round boundary + nonce-keyed target selection
+# + one-identity-per-write), D2 (reconcile-spawns E3 containment), D3 (latest-round gate pre-screen +
+# widened supersession), D4 (repair-crosswire). Fixture macros mirror the plan's own Binary-AC conventions.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+CW_ART="$TMP/cw-art"; CW_TX="$TMP/cw-tx"; mkdir -p "$CW_ART" "$CW_TX"
+CW_ROUTES="$TMP/cw-routes.json"
+cat > "$CW_ROUTES" <<'CWROUTES'
+{ "seats": { "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai", "routed_since": "2025-01-01T00:00:00Z", "agent_tool_fallback": "opus" } } }
+CWROUTES
+export CC_ROUTES_JSON="$CW_ROUTES"
+
+cw_mk_or_tx() { # <path> <nonce> <task>
+  node -e '
+    const fs = require("fs");
+    const [ , p, n, t ] = process.argv;
+    const L = [];
+    L.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "cwtx", content: "3ROLE_TASK:" + t + " ROLE:plan-review\nDISPATCH-NONCE:" + n + "\n\nreview" }));
+    L.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "cwtx" }));
+    L.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: "3ROLE_TASK:" + t + " ROLE:plan-review\nDISPATCH-NONCE:" + n } }));
+    L.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { model: "glm-5.3", content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(p, L.join("\n") + "\n");
+  ' "$1" "$2" "$3"
+}
+cw_w1() { node "$LED" append --session "$1" --task "$2" --role plan-review --dispatch subprocess-zai --run-kind bound --run-source dispatch-helper --run-id "$3" --dispatch-nonce "$3" --pending >/dev/null 2>"$TMP/cw.err"; }
+cw_w2() { printf '\n## Review\nDISPATCH-NONCE:%s\nDecision: %s\n' "$3" "$4" >> "$5"; node "$LED" append --session "$1" --task "$2" --role plan-review --artifact "$5" --run-id "$3" >/dev/null 2>"$TMP/cw.err"; }
+cw_w3() { cw_mk_or_tx "$CW_TX/$3.jsonl" "$3" "$2"; node "$LED" append --session "$1" --task "$2" --role plan-review --dispatch subprocess-zai --transcript "$CW_TX/$3.jsonl" --nonce "$3" --closed-at "$5" --receipt "$3" --run-id "$3" --verdict "$4" >/dev/null 2>"$TMP/cw.err"; }
+cw_sub_round() { cw_w1 "$1" "$2" "$3"; cw_w2 "$1" "$2" "$3" "$4" "$6"; cw_w3 "$1" "$2" "$3" "$4" "$5"; } # session task run_id verdict closedAt planfile
+cw_agent_round() { # session task agent verdict closedAt
+  mk_tagged "$1" "$3" "$2" plan-review
+  mk_diary "$1" "$3" "$2" plan-review "$4"
+  node "$LED" append --session "$1" --task "$2" --role plan-review --agent "$3" --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+  printf '## Review\nDecision: %s\n' "$4" > "$CW_ART/$3.md"
+  node "$LED" append --session "$1" --task "$2" --role plan-review --agent "$3" --artifact "$CW_ART/$3.md" --verdict "$4" --closed-at "$5" >/dev/null 2>"$TMP/cw.err"
+}
+cw_led() { echo "$THREE_ROLE_LEDGER_DIR/$1/$2.jsonl"; }
+cw_prcount() { grep -c '"role":"plan-review"' "$(cw_led "$1" "$2")" 2>/dev/null || echo 0; }
+cw_row() { sed -n "${3}p" "$(cw_led "$1" "$2")"; } # session task N(1-based)
+cw_gate() { node "$LED" gate-plan-review --session "$1" --task "$2" 2>"$TMP/cw-gate.err"; echo $?; }
+
+# ---- AC-1 (D1, direct append) --------------------------------------------------------------------------
+S=cw1; T=t1
+cw_w1 "$S" "$T" "OR-NONCE-r"
+mk_tagged "$S" agOPUS "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agOPUS --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>"$TMP/cw.err"; RC=$?
+N=$(cw_prcount "$S" "$T"); R1=$(cw_row "$S" "$T" 1); R2=$(cw_row "$S" "$T" 2)
+{ [ "$RC" = "0" ] && [ "$N" = "2" ] && echo "$R1" | grep -q '"dispatch":"subprocess-zai"' && echo "$R1" | grep -q 'dispatch_nonce' && ! echo "$R1" | grep -q '"agentId"' \
+  && echo "$R2" | grep -q '"agentId":"agOPUS"' && echo "$R2" | grep -q 'modelVersion' && ! echo "$R2" | grep -q '"verdict"' && ! echo "$R2" | grep -q 'dispatch_nonce' && ! echo "$R2" | grep -q '"run_id"'; } \
+  && ok "#2701 AC-1: D1 run-identity boundary -- Agent stamp over a subprocess pending row opens a NEW row (kills MU-1)" \
+  || bad "#2701 AC-1 FAILED (rc=$RC n=$N r1=$R1 r2=$R2)"
+
+# ---- AC-1c (erased-dispatch shape; kills MU-2) -----------------------------------------------------------
+S=cw1c; T=t1c
+mkdir -p "$(dirname "$(cw_led "$S" "$T")")"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h","run_id":"OR-NONCE-x","run_kind":"bound","verdict":"PASS","closedAt":"2026-01-01T00:00:00Z","artifact_path":"x.md"}\n' "$S" > "$(cw_led "$S" "$T")"
+R1BEFORE=$(cw_row "$S" "$T" 1)
+mk_tagged "$S" agOPUS "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agOPUS --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>"$TMP/cw.err"; RC=$?
+N=$(cw_prcount "$S" "$T"); R1AFTER=$(cw_row "$S" "$T" 1)
+{ [ "$RC" = "0" ] && [ "$N" = "2" ] && [ "$R1BEFORE" = "$R1AFTER" ]; } \
+  && ok "#2701 AC-1c: erased-dispatch row still opens a new row, row-1 byte-unchanged (kills MU-2)" \
+  || bad "#2701 AC-1c FAILED (rc=$RC n=$N before=$R1BEFORE after=$R1AFTER)"
+
+# ---- AC-1d (degraded stamp, no agentId) --------------------------------------------------------------
+S=cw1d; T=t1d
+cw_w1 "$S" "$T" "OR-NONCE-dg"
+node "$LED" append --session "$S" --task "$T" --role plan-review --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>"$TMP/cw.err"; RC=$?
+N=$(cw_prcount "$S" "$T"); R2=$(cw_row "$S" "$T" 2)
+mk_tagged "$S" agSTOP "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agSTOP --closed-at 2026-01-01T00:00:00Z --self-authored >/dev/null 2>"$TMP/cw.err"; RC2=$?
+N2=$(cw_prcount "$S" "$T"); R2B=$(cw_row "$S" "$T" 2)
+{ [ "$RC" = "0" ] && [ "$N" = "2" ] && echo "$R2" | grep -q '"effort_source":"assigned"' && ! echo "$R2" | grep -q '"agentId"' \
+  && [ "$RC2" = "0" ] && [ "$N2" = "2" ] && echo "$R2B" | grep -q '"agentId":"agSTOP"'; } \
+  && ok "#2701 AC-1d: degraded {role}-only Agent stamp over a run_id row is a new round (kills MU-4b)" \
+  || bad "#2701 AC-1d FAILED (rc=$RC n=$N r2=$R2 rc2=$RC2 n2=$N2 r2b=$R2B)"
+
+# ---- AC-2 (the honest FAIL lands onto its own row) -------------------------------------------------------
+S=cw2; T=t2
+cw_w1 "$S" "$T" "OR-NONCE-r2"
+mk_tagged "$S" agOPUS "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agOPUS --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+R1=$(cw_row "$S" "$T" 1)
+mk_diary "$S" agOPUS "$T" plan-review FAIL
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agOPUS --verdict FAIL --artifact "$CW_ART/rev2.md" --closed-at 2026-01-01T02:00:00Z >/dev/null 2>"$TMP/cw.err"; RC=$?
+R1AFTER=$(cw_row "$S" "$T" 1); R2=$(cw_row "$S" "$T" 2)
+{ [ "$RC" = "0" ] && echo "$R2" | grep -q '"verdict":"FAIL"' && [ "$R1" = "$R1AFTER" ]; } \
+  && ok "#2701 AC-2: honest FAIL lands on the agent's own (new) row, row-1 unchanged" \
+  || bad "#2701 AC-2 FAILED (rc=$RC r1=$R1 r1after=$R1AFTER r2=$R2)"
+
+# ---- AC-3 (gate on the cross-wire fixture) ----------------------------------------------------------------
+GRC=$(cw_gate "$S" "$T")
+{ [ "$GRC" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-3: gate BLOCK:negative-verdict on head after AC-2's honest FAIL" \
+  || bad "#2701 AC-3 FAILED (grc=$GRC err=$(cat "$TMP/cw-gate.err"))"
+
+# ---- AC-4 (D3, the M2 reorder) ---------------------------------------------------------------------------
+S=cw4; T=t4
+cw_agent_round "$S" "$T" agA PASS 2026-01-01T01:00:00Z
+cw_agent_round "$S" "$T" agB FAIL 2026-01-01T02:00:00Z
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agA --artifact "$CW_ART/agA-retouch.md" >/dev/null 2>&1
+GRC=$(cw_gate "$S" "$T")
+{ [ "$GRC" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err" && command grep -q 'agB' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-4: D3 latest-round pre-screen BLOCKs an M2 reorder that would otherwise ALLOW (kills MU-6/MU-7)" \
+  || bad "#2701 AC-4 FAILED (grc=$GRC err=$(cat "$TMP/cw-gate.err"))"
+
+# ---- AC-4b/4c/4d/4e controls -----------------------------------------------------------------------------
+S=cw4b; T=t4b
+cw_agent_round "$S" "$T" agE FAIL 2026-01-01T01:00:00Z
+cw_agent_round "$S" "$T" agF PASS 2026-01-01T02:00:00Z
+GRC=$(cw_gate "$S" "$T")
+[ "$GRC" = "0" ] && ok "#2701 AC-4b control: distinct newer PASS after FAIL -> ALLOW" || bad "#2701 AC-4b FAILED (grc=$GRC)"
+
+S=cw4c; T=t4c
+cw_agent_round "$S" "$T" agC PASS 2026-01-01T01:00:00Z
+GRC=$(cw_gate "$S" "$T")
+[ "$GRC" = "0" ] && ok "#2701 AC-4c control: single PASS -> ALLOW" || bad "#2701 AC-4c FAILED (grc=$GRC)"
+
+S=cw4d; T=t4d
+cw_agent_round "$S" "$T" agC PASS 2026-01-01T01:00:00Z
+mk_tagged "$S" agG "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agG >/dev/null 2>&1
+GRC=$(cw_gate "$S" "$T")
+{ [ "$GRC" = "2" ] && command grep -q 'no-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-4d control: an in-flight verdict-less last row still yields no-verdict" \
+  || bad "#2701 AC-4d FAILED (grc=$GRC err=$(cat "$TMP/cw-gate.err"))"
+
+S=cw4e; T=t4e
+cw_agent_round "$S" "$T" agA PASS 2026-01-01T01:00:00Z
+cw_agent_round "$S" "$T" agB FAIL 2026-01-01T02:00:00Z
+cw_agent_round "$S" "$T" agH PASS 2026-01-01T03:00:00Z
+GRC=$(cw_gate "$S" "$T")
+[ "$GRC" = "0" ] && ok "#2701 AC-4e control: a newer distinct PASS supersedes an older FAIL -> ALLOW" || bad "#2701 AC-4e FAILED (grc=$GRC)"
+
+# ---- AC-4f (verified vs unverified subprocess PASS supersession; kills MU-13b) ----------------------------
+S=cw4f; T=t4f
+mkdir -p "$(dirname "$(cw_led "$S" "$T")")"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","agentId":"agZ","dispatch":"subprocess-zai","verdict":"FAIL","closedAt":"2026-01-01T01:00:00Z"}\n' "$S" > "$(cw_led "$S" "$T")"
+cw_mk_or_tx "$CW_TX/OR-NONCE-nolineac4f.jsonl" "OR-NONCE-WRONGNONCE" "$T"
+printf '## Review\nDecision: PASS\n' > "$CW_ART/ac4f.md"
+node "$LED" append --session "$S" --task "$T" --role plan-review --dispatch subprocess-zai --transcript "$CW_TX/OR-NONCE-nolineac4f.jsonl" --nonce "OR-NONCE-ac4f" --closed-at 2026-01-01T02:00:00Z --receipt "OR-NONCE-ac4f" --run-id "OR-NONCE-ac4f" --verdict PASS --artifact "$CW_ART/ac4f.md" >/dev/null 2>&1
+GRC=$(cw_gate "$S" "$T")
+{ [ "$GRC" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-4f: an UNVERIFIED subprocess PASS (transcript nonce mismatch) never supersedes a FAIL (kills MU-13b)" \
+  || bad "#2701 AC-4f FAILED (grc=$GRC err=$(cat "$TMP/cw-gate.err"))"
+
+# ---- AC-5 (D2, reconcile-spawns never infers onto a subprocess row) ---------------------------------------
+S=cw5; T=t5
+cw_w1 "$S" "$T" "OR-NONCE-recon"
+mk_tagged "$S" agX "$T" plan-review
+RECRC=$(node "$LED" reconcile-spawns --session "$S" >/dev/null 2>"$TMP/cw.err"; echo $?)
+R1=$(cw_row "$S" "$T" 1); N=$(cw_prcount "$S" "$T")
+{ [ "$RECRC" = "0" ] && [ "$N" = "1" ] && ! echo "$R1" | grep -q '"agentId"'; } \
+  && ok "#2701 AC-5: reconcile-spawns never infers an agentId onto a subprocess-provenance row (kills MU-5)" \
+  || bad "#2701 AC-5 FAILED (recrc=$RECRC n=$N r1=$R1)"
+
+# ---- AC-6 (D4, repair-crosswire) ---------------------------------------------------------------------------
+S=cw6; T=t6
+mkdir -p "$(dirname "$(cw_led "$S" "$T")")" "$THREE_ROLE_PROJECTS_ROOT/proj/$S/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:plan-review -- do the work"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session %s --task %s --role plan-review --agent agOPUS --verdict FAIL --artifact rev2.md"}}]}}\n' "$T" "$S" "$T" > "$THREE_ROLE_PROJECTS_ROOT/proj/$S/subagents/agent-agOPUS.jsonl"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h1","run_id":"OR-NONCE-r6","run_kind":"bound","verdict":"PASS","closedAt":"2026-01-01T02:40:18Z","artifact_path":"rev.md","agentId":"agOPUS","modelVersion":"claude-opus-5-5","modelTier":"opus","effort":"xhigh","effort_source":"observed","self_authored":true,"run_source":"reconcile-spawns"}\n' "$S" > "$(cw_led "$S" "$T")"
+BSHA=$(shasum "$(cw_led "$S" "$T")")
+# 6a dry-run
+DRYOUT=$(node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id OR-NONCE-r6 --dry-run 2>&1); DRC=$?
+ASHA=$(shasum "$(cw_led "$S" "$T")")
+{ [ "$DRC" = "0" ] && echo "$DRYOUT" | grep -q 'BEFORE' && echo "$DRYOUT" | grep -q 'AFTER' && [ "$BSHA" = "$ASHA" ]; } \
+  && ok "#2701 AC-6a: repair-crosswire --dry-run prints BEFORE/AFTER, file byte-unchanged" \
+  || bad "#2701 AC-6a FAILED (drc=$DRC sha_eq=$([ "$BSHA" = "$ASHA" ] && echo Y || echo N))"
+# 6b wet
+WETOUT=$(node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id OR-NONCE-r6 2>&1); WRC=$?
+N=$(cw_prcount "$S" "$T"); R1=$(cw_row "$S" "$T" 1); R2=$(cw_row "$S" "$T" 2)
+BACKUP_OK=$(ls "$THREE_ROLE_LEDGER_DIR/$S/.repair-backup/" 2>/dev/null | wc -l | tr -d ' ')
+{ [ "$WRC" = "0" ] && [ "$N" = "2" ] \
+  && ! echo "$R1" | grep -qE '"(agentId|modelVersion|modelTier|effort|effort_source|self_authored|closedAt)"' \
+  && echo "$R1" | grep -q '"repair_ticket":"2701"' && echo "$R1" | grep -q '"repair_moved_agent":"agOPUS"' \
+  && echo "$R1" | grep -q '"verdict":"PASS"' && echo "$R1" | grep -q 'dispatch_nonce' && echo "$R1" | grep -q '"run_id":"OR-NONCE-r6"' && echo "$R1" | grep -q 'artifact_path' \
+  && echo "$R2" | grep -q '"agentId":"agOPUS"' && echo "$R2" | grep -q 'modelVersion' && echo "$R2" | grep -q '"effort_source":"observed"' && echo "$R2" | grep -q '"self_authored":true' \
+  && echo "$R2" | grep -q '"closedAt":"2026-01-01T02:40:18Z"' && echo "$R2" | grep -q '"run_source":"repair-crosswire"' && echo "$R2" | grep -q '"repaired_from_run_id":"OR-NONCE-r6"' \
+  && ! echo "$R2" | grep -qE '"(verdict|artifact_path)"' && [ "$BACKUP_OK" -ge 1 ] && echo "$WETOUT" | grep -q 'AUDIT: repair-crosswire'; } \
+  && ok "#2701 AC-6b: repair-crosswire wet run splits the row correctly (kills MU-9/MU-9b/MU-12/MU-15)" \
+  || bad "#2701 AC-6b FAILED (wrc=$WRC n=$N r1=$R1 r2=$R2 backup=$BACKUP_OK)"
+# 6c idempotent
+SHA1=$(shasum "$(cw_led "$S" "$T")")
+IDEMOUT=$(node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id OR-NONCE-r6 2>&1); IRC=$?
+SHA2=$(shasum "$(cw_led "$S" "$T")")
+{ [ "$IRC" = "0" ] && echo "$IDEMOUT" | grep -q 'nothing to repair' && [ "$SHA1" = "$SHA2" ]; } \
+  && ok "#2701 AC-6c: repair-crosswire is idempotent (kills MU-11)" \
+  || bad "#2701 AC-6c FAILED (irc=$IRC out=$IDEMOUT sha_eq=$([ "$SHA1" = "$SHA2" ] && echo Y || echo N))"
+# 6d(i) P1 no match
+node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id OR-NONCE-nomatch >/dev/null 2>"$TMP/cw.err"; RC6i=$?
+{ [ "$RC6i" = "3" ] && command grep -q 'P1' "$TMP/cw.err"; } \
+  && ok "#2701 AC-6d(i): repair-crosswire P1 refuses an unmatched run_id" \
+  || bad "#2701 AC-6d(i) FAILED (rc=$RC6i err=$(cat "$TMP/cw.err"))"
+# 6d(ii) P2 row never cross-wired
+S2=cw6ii; T2=t6ii
+mkdir -p "$(dirname "$(cw_led "$S2" "$T2")")"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h2","run_id":"OR-NONCE-noagent","run_kind":"bound","pending":true}\n' "$S2" > "$(cw_led "$S2" "$T2")"
+node "$LED" repair-crosswire --session "$S2" --task "$T2" --role plan-review --run-id OR-NONCE-noagent >/dev/null 2>"$TMP/cw.err"; RC6ii=$?
+{ [ "$RC6ii" = "3" ] && command grep -q 'P2' "$TMP/cw.err"; } \
+  && ok "#2701 AC-6d(ii): repair-crosswire P2 refuses a row that was never cross-wired" \
+  || bad "#2701 AC-6d(ii) FAILED (rc=$RC6ii err=$(cat "$TMP/cw.err"))"
+# 6d(iii) P3 no transcript
+S3=cw6iii; T3=t6iii
+mkdir -p "$(dirname "$(cw_led "$S3" "$T3")")"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h3","run_id":"OR-NONCE-notx","run_kind":"bound","verdict":"PASS","artifact_path":"x.md","agentId":"agNoTx"}\n' "$S3" > "$(cw_led "$S3" "$T3")"
+node "$LED" repair-crosswire --session "$S3" --task "$T3" --role plan-review --run-id OR-NONCE-notx >/dev/null 2>"$TMP/cw.err"; RC6iii=$?
+{ [ "$RC6iii" = "3" ] && command grep -q 'P3' "$TMP/cw.err"; } \
+  && ok "#2701 AC-6d(iii): repair-crosswire P3 refuses when the agentId's transcript is absent" \
+  || bad "#2701 AC-6d(iii) FAILED (rc=$RC6iii err=$(cat "$TMP/cw.err"))"
+# 6d(iv) P4 a second row already carries the agentId
+S4=cw6iv; T4=t6iv
+mkdir -p "$(dirname "$(cw_led "$S4" "$T4")")" "$THREE_ROLE_PROJECTS_ROOT/proj/$S4/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:plan-review -- do the work"}}\n' "$T4" > "$THREE_ROLE_PROJECTS_ROOT/proj/$S4/subagents/agent-agDup.jsonl"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h4","run_id":"OR-NONCE-dup","run_kind":"bound","verdict":"PASS","artifact_path":"x.md","agentId":"agDup"}\n{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:01Z","agentId":"agDup","verdict":"FAIL"}\n' "$S4" "$S4" > "$(cw_led "$S4" "$T4")"
+node "$LED" repair-crosswire --session "$S4" --task "$T4" --role plan-review --run-id OR-NONCE-dup >/dev/null 2>"$TMP/cw.err"; RC6iv=$?
+{ [ "$RC6iv" = "3" ] && command grep -q 'P4' "$TMP/cw.err"; } \
+  && ok "#2701 AC-6d(iv): repair-crosswire P4 refuses when another row already carries that agentId" \
+  || bad "#2701 AC-6d(iv) FAILED (rc=$RC6iv err=$(cat "$TMP/cw.err"))"
+# 6d(v) P5 -- own-verdict self-append proved; positive control (attempted a different verdict) passes
+S5=cw6v; T5=t6v
+mkdir -p "$(dirname "$(cw_led "$S5" "$T5")")" "$THREE_ROLE_PROJECTS_ROOT/proj/$S5/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:plan-review -- do the work"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session %s --task %s --role plan-review --agent agOPUS --verdict PASS --artifact rev2.md"}}]}}\n' "$T5" "$S5" "$T5" > "$THREE_ROLE_PROJECTS_ROOT/proj/$S5/subagents/agent-agOPUS.jsonl"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h5","run_id":"OR-NONCE-r5","run_kind":"bound","verdict":"PASS","artifact_path":"rev.md","agentId":"agOPUS"}\n' "$S5" > "$(cw_led "$S5" "$T5")"
+node "$LED" repair-crosswire --session "$S5" --task "$T5" --role plan-review --run-id OR-NONCE-r5 >/dev/null 2>"$TMP/cw.err"; RC6v=$?
+{ [ "$RC6v" = "3" ] && command grep -q 'P5' "$TMP/cw.err"; } \
+  && ok "#2701 AC-6d(v): repair-crosswire P5 refuses when the agent's own transcript proves its own verdict (kills MU-14)" \
+  || bad "#2701 AC-6d(v) FAILED (rc=$RC6v err=$(cat "$TMP/cw.err"))"
+S5b=cw6vb; T5b=t6vb
+mkdir -p "$(dirname "$(cw_led "$S5b" "$T5b")")" "$THREE_ROLE_PROJECTS_ROOT/proj/$S5b/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:plan-review -- do the work"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session %s --task %s --role plan-review --agent agOPUS2 --verdict FAIL --artifact rev2.md"}}]}}\n' "$T5b" "$S5b" "$T5b" > "$THREE_ROLE_PROJECTS_ROOT/proj/$S5b/subagents/agent-agOPUS2.jsonl"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h5","run_id":"OR-NONCE-r5b","run_kind":"bound","verdict":"PASS","artifact_path":"rev.md","agentId":"agOPUS2"}\n' "$S5b" > "$(cw_led "$S5b" "$T5b")"
+node "$LED" repair-crosswire --session "$S5b" --task "$T5b" --role plan-review --run-id OR-NONCE-r5b >/dev/null 2>"$TMP/cw.err"; RC6vb=$?
+{ [ "$RC6vb" = "0" ]; } \
+  && ok "#2701 AC-6d(v) positive control: agent's transcript proves a DIFFERENT verdict -> P5 passes, repair proceeds" \
+  || bad "#2701 AC-6d(v) positive control FAILED (rc=$RC6vb err=$(cat "$TMP/cw.err"))"
+# 6d(vi) nr9's exact three-write construction: one-identity refusal + P5's unrecognized-mention fail-closed
+S6=cw6vi; T6=t6vi
+mk_tagged "$S6" agA "$T6" plan-review
+node -e 'const fs=require("fs");const [,p,t]=process.argv;fs.appendFileSync(p,JSON.stringify({type:"assistant",message:{role:"assistant",content:[{type:"tool_use",name:"Bash",input:{command:"node hooks/3role-ledger.mjs append --session s --task "+t+" --role plan-review --verdict $V --artifact x.md"}}]}})+"\n")' "$THREE_ROLE_PROJECTS_ROOT/proj/$S6/subagents/agent-agA.jsonl" "$T6"
+node "$LED" append --session "$S6" --task "$T6" --role plan-review --verdict FAIL --artifact "$CW_ART/x6vi.md" >/dev/null 2>&1; W1RC=$?
+node "$LED" append --session "$S6" --task "$T6" --role plan-review --agent agA --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1; W2RC=$?
+N6VI=$(cw_prcount "$S6" "$T6")
+node "$LED" append --session "$S6" --task "$T6" --role plan-review --agent agA --run-id OR-NONCE-x6vi >/dev/null 2>"$TMP/cw.err"; W3RC=$?
+N6VIB=$(cw_prcount "$S6" "$T6"); R1_6VI=$(cw_row "$S6" "$T6" 1)
+{ [ "$W1RC" = "0" ] && [ "$W2RC" = "0" ] && [ "$N6VI" = "1" ] && echo "$R1_6VI" | grep -q '"verdict":"FAIL"' && echo "$R1_6VI" | grep -q '"agentId":"agA"' \
+  && [ "$W3RC" = "2" ] && command grep -q 'identity' "$TMP/cw.err" && [ "$N6VIB" = "1" ] && ! echo "$R1_6VI" | grep -q '"run_id"'; } \
+  && ok "#2701 AC-6d(vi): one-identity-per-write refusal (--agent + --run-id together) blocks nr9's minting write (kills MU-16/MU-20)" \
+  || bad "#2701 AC-6d(vi) FAILED (w1=$W1RC w2=$W2RC n=$N6VI row=$R1_6VI w3=$W3RC n2=$N6VIB)"
+# raw-row P5 residual, three diary shapes
+mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/s6via/subagents" "$THREE_ROLE_PROJECTS_ROOT/proj/s6vib/subagents" "$THREE_ROLE_PROJECTS_ROOT/proj/s6vic/subagents"
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:Tvia ROLE:plan-review -- do the work"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session s --task Tvia --role plan-review --verdict $V --artifact x.md"}}]}}\n' > "$THREE_ROLE_PROJECTS_ROOT/proj/s6via/subagents/agent-agA.jsonl"
+mkdir -p "$(dirname "$THREE_ROLE_LEDGER_DIR/s6via/Tvia.jsonl")"; printf '{"role":"plan-review","session_id":"s6via","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h","run_id":"OR-NONCE-x","run_kind":"bound","verdict":"FAIL","artifact_path":"x.md","agentId":"agA"}\n' > "$THREE_ROLE_LEDGER_DIR/s6via/Tvia.jsonl"
+node "$LED" repair-crosswire --session s6via --task Tvia --role plan-review --run-id OR-NONCE-x >/dev/null 2>"$TMP/cw.err"; RCVIA=$?
+printf "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"3ROLE_TASK:Tvib ROLE:plan-review -- do the work\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"bash -c 'node hooks/3role-ledger.mjs append --session s --task Tvib --role plan-review --verdict FAIL --artifact x.md'\"}}]}}\n" > "$THREE_ROLE_PROJECTS_ROOT/proj/s6vib/subagents/agent-agA.jsonl"
+mkdir -p "$(dirname "$THREE_ROLE_LEDGER_DIR/s6vib/Tvib.jsonl")"; printf '{"role":"plan-review","session_id":"s6vib","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h","run_id":"OR-NONCE-x","run_kind":"bound","verdict":"FAIL","artifact_path":"x.md","agentId":"agA"}\n' > "$THREE_ROLE_LEDGER_DIR/s6vib/Tvib.jsonl"
+node "$LED" repair-crosswire --session s6vib --task Tvib --role plan-review --run-id OR-NONCE-x >/dev/null 2>"$TMP/cw.err"; RCVIB=$?
+printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:Tvic ROLE:plan-review -- do the work"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"node hooks/3role-ledger.mjs append --session s --task \\"$T\\" --role plan-review --verdict FAIL --artifact x.md"}}]}}\n' > "$THREE_ROLE_PROJECTS_ROOT/proj/s6vic/subagents/agent-agA.jsonl"
+mkdir -p "$(dirname "$THREE_ROLE_LEDGER_DIR/s6vic/Tvic.jsonl")"; printf '{"role":"plan-review","session_id":"s6vic","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h","run_id":"OR-NONCE-x","run_kind":"bound","verdict":"FAIL","artifact_path":"x.md","agentId":"agA"}\n' > "$THREE_ROLE_LEDGER_DIR/s6vic/Tvic.jsonl"
+node "$LED" repair-crosswire --session s6vic --task Tvic --role plan-review --run-id OR-NONCE-x >/dev/null 2>"$TMP/cw.err"; RCVIC=$?
+{ [ "$RCVIA" = "3" ] && [ "$RCVIB" = "3" ] && [ "$RCVIC" = "3" ]; } \
+  && ok "#2701 AC-6d(vi) residual: \$V / bash -c / quoted-\$T diary shapes all fail P5 closed (exit 3)" \
+  || bad "#2701 AC-6d(vi) residual FAILED (via=$RCVIA vib=$RCVIB vic=$RCVIC)"
+# 6e post-repair readers
+GRC6E=$(cw_gate "$S" "$T")
+CHKOUT=$(node "$LED" check --session "$S" --task "$T" 2>&1)
+{ [ "$GRC6E" = "2" ] && command grep -q 'no-verdict' "$TMP/cw-gate.err" && ! echo "$CHKOUT" | grep -q 'NEGATIVE-VERDICT'; } \
+  && ok "#2701 AC-6e: post-repair, gate no-verdict, check clean" \
+  || bad "#2701 AC-6e FAILED (grc=$GRC6E err=$(cat "$TMP/cw-gate.err") chk=$CHKOUT)"
+mk_diary "$S" agOPUS "$T" plan-review FAIL
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agOPUS --verdict FAIL --artifact "$CW_ART/rev2-6e.md" --closed-at 2026-01-01T05:00:00Z >/dev/null 2>&1; RC6E2=$?
+GRC6E2=$(cw_gate "$S" "$T")
+{ [ "$RC6E2" = "0" ] && [ "$GRC6E2" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-6e: post-repair, the agent's proven FAIL replay lands and the gate BLOCKs negative-verdict" \
+  || bad "#2701 AC-6e replay FAILED (rc=$RC6E2 grc=$GRC6E2)"
+
+# ---- AC-7 (banner + APPEND_KNOWN_FLAGS byte-identity) ------------------------------------------------------
+BANNER=$(node "$LED" 2>&1)
+{ echo "$BANNER" | command grep -q 'repair-crosswire'; } \
+  && ok "#2701 AC-7: the no-args banner lists repair-crosswire" \
+  || bad "#2701 AC-7 FAILED (banner missing repair-crosswire)"
+
+# ---- AC-10 (S4, Agent-tool fallback after a FAILED dispatch; kills MU-18) -----------------------------------
+S=cw10; T=t10
+cw_w1 "$S" "$T" "OR-NONCE-e5"
+R1_10=$(cw_row "$S" "$T" 1)
+mk_tagged "$S" agFB "$T" plan-review; mk_diary "$S" agFB "$T" plan-review PASS
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agFB --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+N=$(cw_prcount "$S" "$T")
+printf '## Review\nDecision: PASS\n' > "$CW_ART/fb10.md"
+node "$LED" append --session "$S" --task "$T" --role plan-review --artifact "$CW_ART/fb10.md" --verdict PASS --closed-at 2026-01-01T01:00:00Z >/dev/null 2>"$TMP/cw.err"; BVRC=$?
+R1_10B=$(cw_row "$S" "$T" 1); R2_10=$(cw_row "$S" "$T" 2); N2=$(cw_prcount "$S" "$T")
+GRC10=$(cw_gate "$S" "$T")
+{ [ "$N" = "2" ] && [ "$R1_10" = "$R1_10B" ] && [ "$BVRC" = "0" ] && ! command grep -q 'fix-A ambiguity' "$TMP/cw.err" \
+  && [ "$N2" = "2" ] && echo "$R2_10" | grep -q '"verdict":"PASS"' && echo "$R2_10" | grep -q '"agentId":"agFB"' && [ "$GRC10" = "0" ]; } \
+  && ok "#2701 AC-10: seat-definition bare self-append lands its own row after a failed dispatch (kills MU-18)" \
+  || bad "#2701 AC-10 FAILED (n=$N r1eq=$([ "$R1_10" = "$R1_10B" ] && echo Y || echo N) bvrc=$BVRC n2=$N2 r2=$R2_10 grc10=$GRC10)"
+
+# ---- AC-11 (S6, z.ai PASS then z.ai FAIL in one plan file) --------------------------------------------------
+S=cw11; T=t11
+printf '## ELI5\nplan\n' > "$CW_ART/plan11.md"
+cw_sub_round "$S" "$T" "OR-NONCE-g1" PASS 2026-01-01T01:00:00Z "$CW_ART/plan11.md"
+R1_11=$(cw_row "$S" "$T" 1)
+cw_sub_round "$S" "$T" "OR-NONCE-g2" FAIL 2026-01-01T02:00:00Z "$CW_ART/plan11.md"
+N=$(cw_prcount "$S" "$T"); R1_11B=$(cw_row "$S" "$T" 1); R2_11=$(cw_row "$S" "$T" 2)
+GRC11=$(cw_gate "$S" "$T")
+{ [ "$N" = "2" ] && [ "$R1_11" = "$R1_11B" ] && echo "$R2_11" | grep -q '"run_id":"OR-NONCE-g2"' && echo "$R2_11" | grep -q '"verdict":"FAIL"' \
+  && ! echo "$R2_11" | grep -q '"pending"' && [ "$GRC11" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-11: z.ai PASS then z.ai FAIL in one plan file each get their own row (kills MU-4/MU-4d)" \
+  || bad "#2701 AC-11 FAILED (n=$N r1eq=$([ "$R1_11" = "$R1_11B" ] && echo Y || echo N) r2=$R2_11 grc=$GRC11)"
+
+# ---- AC-12 (S5, Agent PASS then z.ai FAIL) -------------------------------------------------------------------
+S=cw12; T=t12
+cw_agent_round "$S" "$T" agA PASS 2026-01-01T01:00:00Z
+R1_12=$(cw_row "$S" "$T" 1)
+printf '## ELI5\nplan\n' > "$CW_ART/plan12.md"
+cw_sub_round "$S" "$T" "OR-NONCE-f6" FAIL 2026-01-01T02:00:00Z "$CW_ART/plan12.md"
+N=$(cw_prcount "$S" "$T"); R1_12B=$(cw_row "$S" "$T" 1); R2_12=$(cw_row "$S" "$T" 2)
+GRC12=$(cw_gate "$S" "$T")
+{ [ "$N" = "2" ] && [ "$R1_12" = "$R1_12B" ] && ! echo "$R2_12" | grep -q '"agentId"' && [ "$GRC12" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-12: Agent PASS then z.ai FAIL each get their own row -> gate BLOCKs" \
+  || bad "#2701 AC-12 FAILED (n=$N r1eq=$([ "$R1_12" = "$R1_12B" ] && echo Y || echo N) r2=$R2_12 grc=$GRC12)"
+
+# ---- AC-13 (S1, z.ai FAIL then VERIFIED z.ai PASS; kills MU-13) ------------------------------------------------
+S=cw13; T=t13
+printf '## ELI5\nplan\n' > "$CW_ART/plan13.md"
+cw_sub_round "$S" "$T" "OR-NONCE-a1" FAIL 2026-01-01T01:00:00Z "$CW_ART/plan13.md"
+cw_sub_round "$S" "$T" "OR-NONCE-b2" PASS 2026-01-01T02:00:00Z "$CW_ART/plan13.md"
+N=$(cw_prcount "$S" "$T"); R2_13=$(cw_row "$S" "$T" 2)
+GRC13=$(cw_gate "$S" "$T")
+CHK13=$(node "$LED" check --session "$S" --task "$T" 2>&1)
+{ [ "$N" = "2" ] && echo "$R2_13" | grep -q '"verdict":"PASS"' && echo "$R2_13" | grep -q '"run_id":"OR-NONCE-b2"' && [ "$GRC13" = "0" ] && ! echo "$CHK13" | grep -q 'NEGATIVE-VERDICT'; } \
+  && ok "#2701 AC-13: a verified z.ai PASS supersedes an earlier z.ai FAIL -> ALLOW (kills MU-13)" \
+  || bad "#2701 AC-13 FAILED (n=$N r2=$R2_13 grc=$GRC13 chk=$CHK13)"
+
+# ---- AC-14 (S3, z.ai round after the D4-repaired shape) --------------------------------------------------------
+S=cw14; T=t14
+mkdir -p "$(dirname "$(cw_led "$S" "$T")")"
+printf '## Review\nDISPATCH-NONCE:OR-NONCE-r14\nDecision: PASS\n' > "$CW_ART/plan14.md"
+printf '{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h","run_id":"OR-NONCE-r14","run_kind":"bound","artifact_path":"%s","verdict":"PASS","repair_ticket":"2701"}\n{"role":"plan-review","session_id":"%s","ts":"2026-01-01T00:00:01Z","agentId":"agOPUS","modelVersion":"claude-opus-5-5","modelTier":"opus","effort":"xhigh","effort_source":"observed","self_authored":true,"closedAt":"2026-01-01T01:30:00Z","run_kind":"bound","run_source":"repair-crosswire","repaired_from_run_id":"OR-NONCE-r14"}\n' "$S" "$CW_ART/plan14.md" "$S" > "$(cw_led "$S" "$T")"
+mk_tagged "$S" agOPUS "$T" plan-review
+R2_14BEFORE=$(cw_row "$S" "$T" 2)
+cw_sub_round "$S" "$T" "OR-NONCE-d4" PASS 2026-01-01T03:00:00Z "$CW_ART/plan14.md"
+N=$(cw_prcount "$S" "$T"); R2_14=$(cw_row "$S" "$T" 2); R3_14=$(cw_row "$S" "$T" 3)
+GRC14=$(cw_gate "$S" "$T")
+{ [ "$N" = "3" ] && [ "$R2_14BEFORE" = "$R2_14" ] && ! command grep -q 'fix-A ambiguity' "$TMP/cw.err" \
+  && echo "$R3_14" | grep -q '"run_id":"OR-NONCE-d4"' && echo "$R3_14" | grep -q '"verdict":"PASS"' && echo "$R3_14" | grep -q 'artifact_path' && echo "$R3_14" | grep -q 'closedAt' && ! echo "$R3_14" | grep -q '"pending"' \
+  && [ "$GRC14" = "0" ]; } \
+  && ok "#2701 AC-14: a z.ai round after the D4-repaired shape lands on its own third row -> ALLOW" \
+  || bad "#2701 AC-14 FAILED (n=$N r2eq=$([ "$R2_14BEFORE" = "$R2_14" ] && echo Y || echo N) r3=$R3_14 grc=$GRC14)"
+
+# ---- AC-15(a) (S7, a failed dispatch retry; the pinned reclaim is REFUSED -- fold r3) ---------------------------
+S=cw15a; T=t15a
+cw_w1 "$S" "$T" "OR-NONCE-x1"
+R1_15A=$(cw_row "$S" "$T" 1)
+printf '## ELI5\nplan\n' > "$CW_ART/plan15a.md"
+cw_sub_round "$S" "$T" "OR-NONCE-x2" PASS 2026-01-01T02:00:00Z "$CW_ART/plan15a.md"
+N=$(cw_prcount "$S" "$T"); R1_15AB=$(cw_row "$S" "$T" 1); R2_15A=$(cw_row "$S" "$T" 2)
+GRC15A=$(cw_gate "$S" "$T")
+SHA_BEFORE_RECLAIM=$(shasum "$(cw_led "$S" "$T")")
+node "$LED" append --session "$S" --task "$T" --role plan-review --run-id OR-NONCE-x1 --skip-reason "stranded dispatch" >/dev/null 2>"$TMP/cw.err"; RECLAIMRC=$?
+SHA_AFTER_RECLAIM=$(shasum "$(cw_led "$S" "$T")")
+{ [ "$N" = "2" ] && [ "$R1_15A" = "$R1_15AB" ] && ! command grep -q 'fix-A ambiguity' "$TMP/cw.err" && echo "$R2_15A" | grep -q '"verdict":"PASS"' && [ "$GRC15A" = "0" ] \
+  && [ "$RECLAIMRC" != "0" ] && [ "$SHA_BEFORE_RECLAIM" = "$SHA_AFTER_RECLAIM" ]; } \
+  && ok "#2701 AC-15(a): a failed dispatch's retry lands on its own row; a pinned skip-reclaim is refused, file unchanged (kills MU-17 half)" \
+  || bad "#2701 AC-15(a) FAILED (n=$N r1eq=$([ "$R1_15A" = "$R1_15AB" ] && echo Y || echo N) r2=$R2_15A grc=$GRC15A reclaim=$RECLAIMRC sha_eq=$([ "$SHA_BEFORE_RECLAIM" = "$SHA_AFTER_RECLAIM" ] && echo Y || echo N))"
+
+# ---- AC-15(b) (S8, an Agent dead round then a z.ai round) --------------------------------------------------------
+S=cw15b; T=t15b
+mk_tagged "$S" agD "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agD --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agD --closed-at 2026-01-01T01:00:00Z --self-authored >/dev/null 2>&1
+R1_15B=$(cw_row "$S" "$T" 1)
+printf '## ELI5\nplan\n' > "$CW_ART/plan15b.md"
+cw_sub_round "$S" "$T" "OR-NONCE-y1" PASS 2026-01-01T02:00:00Z "$CW_ART/plan15b.md"
+N=$(cw_prcount "$S" "$T"); R1_15BB=$(cw_row "$S" "$T" 1); R2_15B=$(cw_row "$S" "$T" 2)
+GRC15B=$(cw_gate "$S" "$T")
+{ [ "$N" = "2" ] && [ "$R1_15B" = "$R1_15BB" ] && echo "$R2_15B" | grep -q '"verdict":"PASS"' && [ "$GRC15B" = "0" ]; } \
+  && ok "#2701 AC-15(b): an Agent dead round then a z.ai round each keep their own row -> ALLOW" \
+  || bad "#2701 AC-15(b) FAILED (n=$N r1eq=$([ "$R1_15B" = "$R1_15BB" ] && echo Y || echo N) r2=$R2_15B grc=$GRC15B)"
+
+# ---- AC-16 (the real 2694 ledger shape, on a SCRATCH copy of the fixture; fold r2 finding 2) ------------------------
+S=cw16; T=t16
+mkdir -p "$(dirname "$(cw_led "$S" "$T")")"
+printf '{"role":"executor","session_id":"%s","ts":"2026-01-01T00:00:00Z","dispatch_nonce":"h16","run_id":"OR-NONCE-700755b6b037b2fd","run_kind":"bound","pending":true}\n' "$S" > "$(cw_led "$S" "$T")"
+R1_16=$(cw_row "$S" "$T" 1)
+S16b="${S}b"; cp -r "$THREE_ROLE_LEDGER_DIR/$S" "$THREE_ROLE_LEDGER_DIR/$S16b" 2>/dev/null
+# (a) helper-shaped executor re-dispatch
+node "$LED" append --session "$S" --task "$T" --role executor --dispatch subprocess-zai --run-kind bound --run-source dispatch-helper --run-id OR-NONCE-exec2 --dispatch-nonce OR-NONCE-exec2 --pending >/dev/null 2>&1
+node "$LED" append --session "$S" --task "$T" --role executor --artifact "https://github.com/o/r/pull/9" --run-id OR-NONCE-exec2 --closed-at 2026-01-01T01:00:00Z >/dev/null 2>"$TMP/cw.err"; W2RC16A=$?
+NEXEC=$(grep -c '"role":"executor"' "$(cw_led "$S" "$T")")
+R1_16A=$(cw_row "$S" "$T" 1); R2_16A=$(cw_row "$S" "$T" 2)
+{ [ "$NEXEC" = "2" ] && [ "$R1_16" = "$R1_16A" ] && [ "$W2RC16A" = "0" ] && ! command grep -q 'fix-A ambiguity' "$TMP/cw.err" \
+  && echo "$R2_16A" | grep -q '"run_id":"OR-NONCE-exec2"' && echo "$R2_16A" | grep -q 'artifact_path' && ! echo "$R2_16A" | grep -q '"pending"'; } \
+  && ok "#2701 AC-16(a): helper-shaped executor re-dispatch lands its own row beside the stranded 2694-shape row" \
+  || bad "#2701 AC-16(a) FAILED (n=$NEXEC r1eq=$([ "$R1_16" = "$R1_16A" ] && echo Y || echo N) w2=$W2RC16A r2=$R2_16A)"
+# (b) Agent-tool executor fallback on a fresh copy of the same fixture
+mk_tagged "$S16b" agEX "$T" executor
+node "$LED" append --session "$S16b" --task "$T" --role executor --agent agEX --model-version claude-sonnet-4-5 --model-tier sonnet --effort high --effort-source assigned >/dev/null 2>&1
+node "$LED" append --session "$S16b" --task "$T" --role executor --artifact "https://github.com/o/r/pull/9" >/dev/null 2>"$TMP/cw.err"; SARC16B=$?
+NEXECB=$(grep -c '"role":"executor"' "$THREE_ROLE_LEDGER_DIR/$S16b/$T.jsonl")
+R1_16B=$(sed -n '1p' "$THREE_ROLE_LEDGER_DIR/$S16b/$T.jsonl"); R2_16B=$(sed -n '2p' "$THREE_ROLE_LEDGER_DIR/$S16b/$T.jsonl")
+{ [ "$NEXECB" = "2" ] && [ "$R1_16" = "$R1_16B" ] && [ "$SARC16B" = "0" ] && ! command grep -q 'fix-A ambiguity' "$TMP/cw.err" && echo "$R2_16B" | grep -q '"agentId":"agEX"' && echo "$R2_16B" | grep -q 'artifact_path'; } \
+  && ok "#2701 AC-16(b): Agent-tool executor fallback lands its own row beside the stranded row too (kills MU-18)" \
+  || bad "#2701 AC-16(b) FAILED (n=$NEXECB r1eq=$([ "$R1_16" = "$R1_16B" ] && echo Y || echo N) sarc=$SARC16B r2=$R2_16B)"
+# (c) reconcile-spawns on the copy leaves the stranded row's line string unchanged
+RECRC16=$(node "$LED" reconcile-spawns --session "$S16b" >/dev/null 2>"$TMP/cw.err"; echo $?)
+R1_16C=$(sed -n '1p' "$THREE_ROLE_LEDGER_DIR/$S16b/$T.jsonl")
+{ [ "$RECRC16" = "0" ] && [ "$R1_16" = "$R1_16C" ]; } \
+  && ok "#2701 AC-16(c): reconcile-spawns on the copy leaves the stranded row's line string unchanged (D2)" \
+  || bad "#2701 AC-16(c) FAILED (recrc=$RECRC16 r1eq=$([ "$R1_16" = "$R1_16C" ] && echo Y || echo N))"
+
+# ---- AC-17 (Fix A non-regression -- two live Agent rows still refuse; kills MU-19) -----------------------------
+S=cw17; T=t17
+mk_tagged "$S" agP "$T" plan-review; mk_tagged "$S" agQ "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agP --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agQ --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1
+SHA0=$(shasum "$(cw_led "$S" "$T")")
+node "$LED" append --session "$S" --task "$T" --role plan-review --artifact "$CW_ART/fbamb.md" --verdict PASS >/dev/null 2>"$TMP/cw.err"; RC17=$?
+SHA1=$(shasum "$(cw_led "$S" "$T")")
+{ [ "$RC17" = "2" ] && command grep -q 'fix-A ambiguity' "$TMP/cw.err" && [ "$SHA0" = "$SHA1" ]; } \
+  && ok "#2701 AC-17: two LIVE Agent rows -> a bare append still refuses (fix-A ambiguity), shasum unchanged (kills MU-19)" \
+  || bad "#2701 AC-17 FAILED (rc=$RC17 sha_eq=$([ "$SHA0" = "$SHA1" ] && echo Y || echo N))"
+# stopped-lane clause: agQ stops with no artifact; bare append still refuses (both seats -- kills the r3 dead-round-exclusion mutant)
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agQ --closed-at 2026-01-01T01:00:00Z --self-authored >/dev/null 2>&1
+SHA2=$(shasum "$(cw_led "$S" "$T")")
+node "$LED" append --session "$S" --task "$T" --role plan-review --artifact "$CW_ART/fbamb2.md" --verdict PASS >/dev/null 2>"$TMP/cw.err"; RC17B=$?
+SHA3=$(shasum "$(cw_led "$S" "$T")")
+{ [ "$RC17B" = "2" ] && command grep -q 'fix-A ambiguity' "$TMP/cw.err" && [ "$SHA2" = "$SHA3" ]; } \
+  && ok "#2701 AC-17 stopped-lane: agQ stopped (no artifact) still counts -- bare append still refuses, shasum unchanged" \
+  || bad "#2701 AC-17 stopped-lane FAILED (rc=$RC17B sha_eq=$([ "$SHA2" = "$SHA3" ] && echo Y || echo N))"
+# executor half of the stopped-lane clause
+S17E=cw17e; T17E=t17e
+mk_tagged "$S17E" agX "$T17E" executor; mk_tagged "$S17E" agY "$T17E" executor
+node "$LED" append --session "$S17E" --task "$T17E" --role executor --agent agX --model-version claude-sonnet-4-5 --model-tier sonnet --effort high --effort-source assigned >/dev/null 2>&1
+node "$LED" append --session "$S17E" --task "$T17E" --role executor --agent agY --model-version claude-sonnet-4-5 --model-tier sonnet --effort high --effort-source assigned >/dev/null 2>&1
+node "$LED" append --session "$S17E" --task "$T17E" --role executor --agent agY --closed-at 2026-01-01T01:00:00Z --self-authored >/dev/null 2>&1
+SHA4=$(shasum "$THREE_ROLE_LEDGER_DIR/$S17E/$T17E.jsonl")
+node "$LED" append --session "$S17E" --task "$T17E" --role executor --artifact "https://github.com/o/r/pull/77" >/dev/null 2>"$TMP/cw.err"; RC17E=$?
+SHA5=$(shasum "$THREE_ROLE_LEDGER_DIR/$S17E/$T17E.jsonl")
+{ [ "$RC17E" = "2" ] && command grep -q 'fix-A ambiguity' "$TMP/cw.err" && [ "$SHA4" = "$SHA5" ]; } \
+  && ok "#2701 AC-17 stopped-lane (executor): agY stopped, agX's bare self-append still refused, shasum unchanged" \
+  || bad "#2701 AC-17 stopped-lane executor FAILED (rc=$RC17E sha_eq=$([ "$SHA4" = "$SHA5" ] && echo Y || echo N))"
+
+# ---- AC-18 (S9, in-flight reorder; kills MU-17/MU-21) -----------------------------------------------------------
+# Row identity is tracked by CONTENT (agentId / run_id), not by line POSITION: a bindAgentId re-touch of an
+# existing row is a pre-existing, orthogonal behavior that re-serializes the touched row to the END of the
+# file (last-line-wins for simple non-cross-wire readers) -- so "row 1" before the retouch is "the agA row",
+# not "whatever occupies line 1", and that is what this arm actually needs to prove stays untouched by w2/w3.
+S=cw18; T=t18
+cw_agent_round "$S" "$T" agA PASS 2026-01-01T01:00:00Z
+cw_w1 "$S" "$T" "OR-NONCE-z2"
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agA --artifact "$CW_ART/agA18.md" >/dev/null 2>&1
+RAGA_18=$(command grep '"agentId":"agA"' "$(cw_led "$S" "$T")")
+printf '## ELI5\nplan\n' > "$CW_ART/plan18.md"
+cw_w2 "$S" "$T" "OR-NONCE-z2" FAIL "$CW_ART/plan18.md"
+cw_w3 "$S" "$T" "OR-NONCE-z2" FAIL 2026-01-01T02:00:00Z
+N=$(cw_prcount "$S" "$T"); RAGA_18B=$(command grep '"agentId":"agA"' "$(cw_led "$S" "$T")"); R2_18=$(command grep '"run_id":"OR-NONCE-z2"' "$(cw_led "$S" "$T")")
+GRC18=$(cw_gate "$S" "$T")
+CHK18=$(node "$LED" check --session "$S" --task "$T" 2>&1)
+{ [ "$N" = "2" ] && [ "$RAGA_18" = "$RAGA_18B" ] && echo "$R2_18" | grep -q '"verdict":"FAIL"' && echo "$R2_18" | grep -q 'artifact_path' && echo "$R2_18" | grep -q 'closedAt' && ! echo "$R2_18" | grep -q '"pending"' \
+  && [ "$GRC18" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err" && echo "$CHK18" | grep -q 'NEGATIVE-VERDICT'; } \
+  && ok "#2701 AC-18: in-flight reorder -- w2/w3 bind to their own row by run_id despite the re-touch (kills MU-17/MU-21)" \
+  || bad "#2701 AC-18 FAILED (n=$N r1eq=$([ "$RAGA_18" = "$RAGA_18B" ] && echo Y || echo N) r2=$R2_18 grc=$GRC18 chk=$CHK18)"
+
+# ---- AC-20 (fix-cycle-1 B1 -- execution-review's exact launder reproduction, nr9/nr11's residual). A bare
+# FAIL self-append, a spawn stamp --agent agL, then a write carrying --run-id EQUAL to that row's own
+# agentId (agL) with NO --agent -- before this fix the raw-string identity comparison read "run_id agL" and
+# "agentId agL" as the SAME identity and merged, handing repair-crosswire a P2-satisfying cross-wired row
+# it could split and lift, after which agL's own later PASS flipped the gate ALLOW. The namespaced
+# comparison (an agentId and a run_id are never the same identity, only equal to another value from the
+# SAME field) makes the --run-id write open its OWN row instead, so repair-crosswire's P2 (row must carry
+# BOTH subprocess provenance AND an agentId) never finds anything to lift, and agL's later PASS is still
+# refused by clause 2 (same-agent flip) exactly as at base. Both-ends: this arm's assertion (final gate
+# stays BLOCK:negative-verdict) FAILS when this smoke file is run against the pre-fix head (rc 0, ALLOW) --
+# see AC-8's both-ends leg.
+S=cw20; T=t20
+node "$LED" append --session "$S" --task "$T" --role plan-review --verdict FAIL --artifact "$CW_ART/x20.md" >/dev/null 2>&1; W1RC20=$?
+mk_tagged "$S" agL "$T" plan-review
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agL --model-version claude-opus-5-5 --model-tier opus --effort xhigh --effort-source assigned >/dev/null 2>&1; W2RC20=$?
+GRC20A=$(cw_gate "$S" "$T")
+node "$LED" append --session "$S" --task "$T" --role plan-review --run-id agL --dispatch-nonce hh20 >/dev/null 2>"$TMP/cw.err"; W3RC20=$?
+N20=$(cw_prcount "$S" "$T")
+node "$LED" repair-crosswire --session "$S" --task "$T" --role plan-review --run-id agL >/dev/null 2>"$TMP/cw.err"; RCREPAIR20=$?
+# The same agent's PASS self-append, WITH a transcript diary proving it (a real reviewer's own self-append
+# is exactly what its transcript records) and a --closed-at (the shape a real completed review carries, and
+# what supersedesNegative's candidate side needs) -- the shape this launder actually needs to reach ALLOW at
+# base; without both, the write is refused for an unrelated reason at BOTH ends and the arm would not
+# discriminate base from head at all.
+mk_diary "$S" agL "$T" plan-review PASS
+node "$LED" append --session "$S" --task "$T" --role plan-review --agent agL --verdict PASS --artifact "$CW_ART/x20b.md" --closed-at 2026-01-01T00:00:00.000Z >/dev/null 2>"$TMP/cw.err"; W5RC20=$?
+GRC20=$(cw_gate "$S" "$T")
+{ [ "$W1RC20" = "0" ] && [ "$W2RC20" = "0" ] && [ "$GRC20A" = "2" ] && [ "$N20" = "2" ] \
+  && [ "$RCREPAIR20" != "0" ] && [ "$W5RC20" != "0" ] \
+  && [ "$GRC20" = "2" ] && command grep -q 'negative-verdict' "$TMP/cw-gate.err"; } \
+  && ok "#2701 AC-20 (fix-cycle-1 B1): run_id==agentId launder sequence refused end-to-end -- repair-crosswire finds no cross-wired row (rc=$RCREPAIR20), the agent's own PASS replay is still refused (rc=$W5RC20), final gate stays BLOCK:negative-verdict" \
+  || bad "#2701 AC-20 FAILED (w1=$W1RC20 w2=$W2RC20 grc20a=$GRC20A n20=$N20 w3=$W3RC20 repair=$RCREPAIR20 w5=$W5RC20 grc20=$GRC20 err=$(cat "$TMP/cw-gate.err"))"
+
+# AC-19(a)/(b) (the helper's own --dry-run rendering + the S9 in-flight-reorder shape through the real
+# stubbed helper) are covered in the DEDICATED hooks/openrouter-role-dispatch-smoke-test.sh, which already
+# builds the full isolated $HOME / CC_MODE_FILE / lane-mode-status / providers+task_classes routes fixture
+# this needs -- duplicating that scaffolding here (this file has no such isolation) would either skip real
+# verification or corrupt this file's own ambient env; see that file's own #2701 arms instead.
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
