@@ -1111,7 +1111,7 @@ OUT=$(node "$LED" check --session "$RSID" --task 1495f 2>&1); RC=$?
 # which is exactly why those pre-existing ALLOW cases above are unaffected by this addition).
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 GITROOT="$(mktemp -d)"
-( cd "$GITROOT" && git init -q && git config user.email t@t.co && git config user.name t )
+( cd "$GITROOT" && git init -q && git config user.email t-fixture-id && git config user.name t )
 mkdir -p "$GITROOT/.ai-workspace/plans" "$GITROOT/.ai-workspace/reviews"
 
 # Frozen-#1515-shaped fixture bodies (synthetic content, real headings so PLAN_RE/VERDICT_RE resolve) — the
@@ -1218,7 +1218,7 @@ OUT=$(node "$LED" check --session "$TSID4" --task 1509ex2 --enforce-tracked-arti
 # block hermetic (never touches this smoke's own real running repo), exactly like #1509/#1537 above.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 AB_HERMETIC="$(mktemp -d)"
-( cd "$AB_HERMETIC" && git init -q && git config user.email t@t.co && git config user.name t )
+( cd "$AB_HERMETIC" && git init -q && git config user.email t-fixture-id && git config user.name t )
 mkdir -p "$AB_HERMETIC/hooks" "$AB_HERMETIC/.ai-workspace/plans" "$AB_HERMETIC/.ai-workspace/reviews" "$AB_HERMETIC/.ai-workspace/perf-logs"
 cp "$LED" "$AB_HERMETIC/hooks/3role-ledger.mjs"
 LED_AB="$AB_HERMETIC/hooks/3role-ledger.mjs"
@@ -1254,7 +1254,7 @@ OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-art
 # ai-brain) -> exit 0, NOT blocked. A naive `isGitTracked===false -> block` impl WOULD block this case
 # (isGitTracked alone is jurisdiction-blind); the ai-brain-toplevel jurisdiction key must fail-open here.
 OTHER_REPO_1544="$(mktemp -d)"
-( cd "$OTHER_REPO_1544" && git init -q && git config user.email t@t.co && git config user.name t )
+( cd "$OTHER_REPO_1544" && git init -q && git config user.email t-fixture-id && git config user.name t )
 PERF3A_1544="$OTHER_REPO_1544/perf.md"; printf 'card\n' > "$PERF3A_1544"
 OUT=$(node "$LED_AB" check --session "$TSID5" --task 1544j --enforce-tracked-artifacts --perf-log "$PERF3A_1544" 2>&1); RC=$?
 { [ "$RC" = "0" ] && ! echo "$OUT" | grep -q "TRACKED:"; } \
@@ -1653,17 +1653,26 @@ cat > "$OR_FIX/routes.json" <<'ORJSON'
   }
 }
 ORJSON
-mk_or_transcript() {   # $1=path $2=nonce $3=served-model $4=lead-with-ai-title(0|1)
+mk_or_transcript() {   # $1=path $2=nonce $3=served-model $4=lead-with-ai-title(0|1) $5=dispatch-cwd (optional, #2700)
   node -e '
     const fs = require("fs");
-    const [ , outPath, nonce, model, leadTitle ] = process.argv;
+    const [ , outPath, nonce, model, leadTitle, cwd ] = process.argv;
     const lines = [];
     if (leadTitle === "1") lines.push(JSON.stringify({ type: "ai-title", aiTitle: "smoke fixture title", sessionId: "or-fixture" }));
     lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
       sessionId: "or-fixture", content: "3ROLE_TASK:t ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
-    lines.push(JSON.stringify({ type: "assistant", message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    // #2700 R3 (measured shape): a dequeue record, then the first `user` record -- the FIRST record that
+    // carries `cwd` on the real corpus, never record 1 (the bound enqueue record).
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "or-fixture" }));
+    const userRec = { type: "user", timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "user", content: "3ROLE_TASK:t ROLE:plan-review\nDISPATCH-NONCE:" + nonce } };
+    if (cwd) userRec.cwd = cwd;
+    lines.push(JSON.stringify(userRec));
+    const asstRec = { type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { model, content: [ { type: "text", text: "ok" } ] } };
+    if (cwd) asstRec.cwd = cwd;
+    lines.push(JSON.stringify(asstRec));
     fs.writeFileSync(outPath, lines.join("\n") + "\n");
-  ' "$1" "$2" "$3" "$4"
+  ' "$1" "$2" "$3" "$4" "${5:-}"
 }
 
 # (a) forged-marker control: role=execution-review carries dispatch=subprocess-openrouter, but the SSOT seat
@@ -1741,6 +1750,42 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
   && ok "#1947 AC-11 regression(d): a leading ai-title bookkeeping record before the real enqueue record does not defeat the M2 tag+nonce binding -> still exits 0" \
   || bad "#1947 AC-11 regression(d) should still exit 0 with a leading ai-title record (rc=$RC out=$OUT)"
+
+# ── #2700 AC-5 — the completion gate's `check` (checkRole -> checkSubprocessProvenance, the SAME evaluator
+#    the transition gate's arm 3 consults) must resolve a plan-review artifact that lives ONLY under the
+#    dispatch's own recorded vantage (never the primary/local clone this checker itself runs from). The
+#    row is appended from INSIDE the vantage dir, BEFORE the artifact file exists there, so normalizeArtifact
+#    stores the RELATIVE form verbatim (the #2700 N4 fixture trap) -- this is what actually exercises the
+#    vantage arm rather than an absolute path that would resolve regardless of it.
+OR2700_WT="$TMP/or2700-wt"; mkdir -p "$OR2700_WT/.ai-workspace/plans"
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFix2700 --task t --role planner --skip-reason "fixture: not under test in #2700 AC-5" >/dev/null
+  node "$LED" append --session orFix2700 --task t --role executor --skip-reason "fixture: not under test in #2700 AC-5" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-2700.md"
+  node "$LED" append --session orFix2700 --task t --role execution-review --oracle "$OR_FIX/artifacts/er-2700.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fix2700.jsonl" "N-2700-VANTAGE" "moonshotai/kimi-k3" 0 "$OR2700_WT"
+  ( cd "$OR2700_WT" && node "$LED" append --session orFix2700 --task t --role plan-review --dispatch subprocess-openrouter \
+      --transcript "$OR_FIX/transcripts/fix2700.jsonl" --nonce "N-2700-VANTAGE" \
+      --artifact ".ai-workspace/plans/p2700.md" --verdict PASS >/dev/null )
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-2700-VANTAGE\n' > "$OR2700_WT/.ai-workspace/plans/p2700.md"
+)
+STORED_2700=$(node -e '
+  const fs = require("fs");
+  const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean);
+  let last = null;
+  for (const ln of lines) { try { const r = JSON.parse(ln); if (r.role === "plan-review" && r.artifact_path) last = r; } catch (e) {} }
+  process.stdout.write(last ? last.artifact_path : "");
+' "$OR_FIX/ledger/orFix2700/t.jsonl")
+[ "$STORED_2700" = ".ai-workspace/plans/p2700.md" ] \
+  && ok "#2700 AC-5 fixture sanity: stored artifact_path stayed relative ('$STORED_2700')" \
+  || bad "#2700 AC-5 fixture trap: stored artifact_path is not relative ('$STORED_2700')"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFix2700 --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK" && ! echo "$OUT" | grep -q "plan-review.*not found"; } \
+  && ok "#2700 AC-5: completion gate resolves a relative plan-review artifact_path from the dispatch's OWN recorded vantage (absent from the checker's own cwd) -> check exits 0, no 'plan-review ... not found' clause" \
+  || bad "#2700 AC-5 should exit 0 with no plan-review/not-found clause (rc=$RC out=$OUT)"
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "role=plan-review dispatch=subprocess-openrouter"; } \
+  && ok "#2700 AC-5: check's own stdout labels the passing vantage-resolved subprocess row 'role=plan-review dispatch=subprocess-openrouter' (the plan-review role IS reported satisfied)" \
+  || bad "#2700 AC-5 should print the dispatch=subprocess-openrouter label on the vantage-resolved success path (rc=$RC out=$OUT)"
 
 # (e) M-A monotonicity control (execution-review round-2 FAIL): a STALE, self-declared
 #     dispatch=subprocess-openrouter marker must NEVER outrank a harness-signed, RESOLVING agentId on the SAME
@@ -3728,7 +3773,7 @@ MH_SID="sess-2088-mh"
 
 # ---- AC-3: an unreviewed PR still BLOCKs -- a verdict:"PASS" FIELD alone buys nothing ---------------------
 AC3REPO="$(mktemp -d)"
-( cd "$AC3REPO" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC3REPO" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 AC3_SHA1=$(git -C "$AC3REPO" rev-parse HEAD)
 T_AC3="2088ac3"
 mk_sub "$MH_SID" ac3p1; mk_sub "$MH_SID" ac3r1; mk_sub "$MH_SID" ac3e1
@@ -3775,7 +3820,7 @@ IDENTICAL="no"; [ "$OUT_NEW" = "$OUT_OLD" ] && IDENTICAL="yes"
 
 # ---- AC-4: content at the ref outranks the verdict field (the #2261-direction arm) -------------------------
 AC4REPO="$(mktemp -d)"
-( cd "$AC4REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+( cd "$AC4REPO" && git init -q && git config user.email t-fixture-id && git config user.name t )
 mkdir -p "$AC4REPO/.ai-workspace/reviews"
 printf '## Review\nDecision: NEEDS-WORK\n' > "$AC4REPO/.ai-workspace/reviews/2088-smoke-ac4-execreview.md"
 ( cd "$AC4REPO" && git add .ai-workspace/reviews/2088-smoke-ac4-execreview.md && git commit -q -m "fixture: AC-4 needs-work" )
@@ -3808,7 +3853,7 @@ rm -rf "$AC4REPO"
 # ---- AC-5(a): candidate-set boundary -- artifact on a NON-task-bound, non-merge-head branch is never
 # consulted (uses candidate 1 only -- no aiBrainToplevel() dependency, no hermetic copy needed). ----------
 AC5REPO="$(mktemp -d)"
-( cd "$AC5REPO" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC5REPO" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 AC5_MERGEHEAD=$(git -C "$AC5REPO" rev-parse HEAD)
 git -C "$AC5REPO" checkout -q -b unrelated-branch
 mkdir -p "$AC5REPO/.ai-workspace/reviews"
@@ -3831,7 +3876,7 @@ rm -rf "$AC5REPO"
 # ---- AC-5(b): candidate-set boundary -- artifact on a LOCAL-ONLY <task>-* branch (refs/heads/, no
 # origin-tracking counterpart) is never consulted. Exercises candidate 2 -> hermetic helper-copy pattern. --
 AC5B_HOME="$(mktemp -d)"
-( cd "$AC5B_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC5B_HOME" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 AC5B_MERGEHEAD=$(git -C "$AC5B_HOME" rev-parse HEAD)
 AC5B_DEFAULT_BRANCH=$(git -C "$AC5B_HOME" branch --show-current)
 mkdir -p "$AC5B_HOME/hooks"
@@ -3874,7 +3919,7 @@ rm -rf "$AC5B_HOME" "$AC5B_ORIGIN"
 
 # ---- AC-6: worktree-dangle tail (the #2023 class) -----------------------------------------------------------
 AC6REPO="$(mktemp -d)"
-( cd "$AC6REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+( cd "$AC6REPO" && git init -q && git config user.email t-fixture-id && git config user.name t )
 mkdir -p "$AC6REPO/.ai-workspace/reviews"
 printf '## Review\nDecision: PASS\n' > "$AC6REPO/.ai-workspace/reviews/2088-smoke-ac6-execreview.md"
 ( cd "$AC6REPO" && git add .ai-workspace/reviews/2088-smoke-ac6-execreview.md && git commit -q -m "fixture: AC-6 worktree-dangle tail" )
@@ -3909,7 +3954,7 @@ rm -rf "$AC6REPO"
 # ---- AC-11(a): residual-pinning -- minted, PUSHED task-bound evidence IS accepted (documented, not fixed).
 # Exercises candidate 2 -> hermetic helper-copy pattern (aiBrainToplevel() must resolve to THIS fixture). --
 AC11A_HOME="$(mktemp -d)"
-( cd "$AC11A_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC11A_HOME" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 AC11A_UNRELATED_HEAD=$(git -C "$AC11A_HOME" rev-parse HEAD)
 AC11A_DEFAULT_BRANCH=$(git -C "$AC11A_HOME" branch --show-current)
 mkdir -p "$AC11A_HOME/hooks"
@@ -3944,7 +3989,7 @@ rm -rf "$AC11A_HOME" "$AC11A_ORIGIN"
 # ---- AC-11(b): residual-pinning -- LOCALLY-MINTED mirror variant (no push, no network, no remote). --------
 # Pins the r2 refutation: candidate 2 reads the local mirror, whose membership costs ONE local command.
 AC11B_HOME="$(mktemp -d)"
-( cd "$AC11B_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC11B_HOME" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 AC11B_UNRELATED_HEAD=$(git -C "$AC11B_HOME" rev-parse HEAD)
 AC11B_DEFAULT_BRANCH=$(git -C "$AC11B_HOME" branch --show-current)
 mkdir -p "$AC11B_HOME/hooks"
@@ -4262,7 +4307,7 @@ w3row2437() {
   local tag="$1" vline="$2"
   n2437w3=$((n2437w3+1)); local t="w2437-$n2437w3"
   local REPO; REPO="$(mktemp -d)"
-  ( cd "$REPO" && git init -q && git config user.email t@t.co && git config user.name t )
+  ( cd "$REPO" && git init -q && git config user.email t-fixture-id && git config user.name t )
   mkdir -p "$REPO/.ai-workspace/reviews"
   printf '## Review\n%s\n' "$vline" > "$REPO/.ai-workspace/reviews/2437-w3-$n2437w3.md"
   printf '## Review\nDecision: PASS\n' > "$REPO/.ai-workspace/reviews/2437-w3-er-$n2437w3.md"
@@ -4341,7 +4386,7 @@ else
   rm -f "$SCRATCH_INDEX_2462"
   GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" update-index --add --cacheinfo 100644 "$BLOB2462D" "$REL2462D"
   TREE2462D=$(GIT_INDEX_FILE="$SCRATCH_INDEX_2462" git -C "$HOME_REPO_2462" write-tree)
-  COMMIT2462D=$(git -C "$HOME_REPO_2462" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$TREE2462D" -m "fixture: #2462 AC-1 drift-proof arm (isolated, no working-tree/index/HEAD mutation)")
+  COMMIT2462D=$(git -C "$HOME_REPO_2462" -c user.email=fixture-test-id -c user.name=fixture commit-tree "$TREE2462D" -m "fixture: #2462 AC-1 drift-proof arm (isolated, no working-tree/index/HEAD mutation)")
   git -C "$HOME_REPO_2462" update-ref "$REF2462D" "$COMMIT2462D"
   rm -f "$SCRATCH_INDEX_2462"
 
@@ -4405,7 +4450,7 @@ else
     rm -f "$IDX2497"
     GIT_INDEX_FILE="$IDX2497" git -C "$HOME_REPO_2497" update-index --add --cacheinfo 100644 "$blob" "$relpath"
     local tree; tree=$(GIT_INDEX_FILE="$IDX2497" git -C "$HOME_REPO_2497" write-tree)
-    local commit; commit=$(git -C "$HOME_REPO_2497" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$tree" -m "fixture: #2497 arm")
+    local commit; commit=$(git -C "$HOME_REPO_2497" -c user.email=fixture-test-id -c user.name=fixture commit-tree "$tree" -m "fixture: #2497 arm")
     git -C "$HOME_REPO_2497" update-ref "$ref" "$commit"
     rm -f "$IDX2497"
   }
@@ -4500,7 +4545,7 @@ AC2174_HOME="$(mktemp -d)"
 # `abs.startsWith(repoDir + '/')` string match would otherwise silently miss on this platform even
 # though both sides name the identical directory.
 AC2174_HOME="$(cd "$AC2174_HOME" && pwd -P)"
-( cd "$AC2174_HOME" && git init -q && git config user.email t@t.co && git config user.name t && git commit -q --allow-empty -m seed )
+( cd "$AC2174_HOME" && git init -q && git config user.email t-fixture-id && git config user.name t && git commit -q --allow-empty -m seed )
 mkdir -p "$AC2174_HOME/hooks" "$AC2174_HOME/.ai-workspace/plans"
 cp "$LED" "$AC2174_HOME/hooks/3role-ledger.mjs"
 LED_2174="$AC2174_HOME/hooks/3role-ledger.mjs"
@@ -4528,7 +4573,7 @@ mk2174ref() {
   rm -f "$idx"
   GIT_INDEX_FILE="$idx" git -C "$AC2174_HOME" update-index --add --cacheinfo 100644 "$blob" "$relpath"
   local tree; tree=$(GIT_INDEX_FILE="$idx" git -C "$AC2174_HOME" write-tree)
-  local commit; commit=$(git -C "$AC2174_HOME" -c user.email=fixture@t.co -c user.name=fixture commit-tree "$tree" -m "fixture: #2174 $key")
+  local commit; commit=$(git -C "$AC2174_HOME" -c user.email=fixture-test-id -c user.name=fixture commit-tree "$tree" -m "fixture: #2174 $key")
   rm -f "$idx"
   if [ "$kind" = remote ]; then
     git -C "$AC2174_HOME" update-ref "refs/remotes/origin/${key}-fixture" "$commit"
