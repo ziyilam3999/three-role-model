@@ -436,14 +436,17 @@ run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 { [ "$RC" = "2" ]; } && ok "AC-9(c) last-match: stale ALLOW-shaped first, authoritative BLOCK-shaped last -> BLOCK (kills first-match)" || bad "AC-9(c) first case should block (rc=$RC out=$CAP)"
 
 S="s-ac9c2"; T="9c2-task"
-mk_bound "$S" "ag9c2" "$T" "plan-review"
+mk_bound "$S" "ag9c3" "$T" "plan-review"
 LEDFILE9C2="$LEDGERDIR/$S/$T.jsonl"; mkdir -p "$(dirname "$LEDFILE9C2")"
 {
   printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c2","verdict":"BLOCK","closedAt":"2026-07-11T00:00:00.000Z"}\n' "$S"
-  printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c2","verdict":"PASS","closedAt":"2026-07-11T00:00:01.000Z"}\n' "$S"
+  printf '{"role":"plan-review","session_id":"%s","agentId":"ag9c3","verdict":"PASS","closedAt":"2026-07-11T00:00:01.000Z"}\n' "$S"
 } > "$LEDFILE9C2"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC-9(c) converse: stale BLOCK-shaped first, authoritative ALLOW-shaped+bound last -> ALLOW (kills last-line-only-if-it-blocks)" || bad "AC-9(c) converse case should allow (rc=$RC out=$CAP)"
+# #2701 D3: a SAME-agent flip (ag9c2 BLOCK -> ag9c2 PASS) is now correctly BLOCKED by supersedesNegative's
+# distinct-agent test -- re-fixtured with a DISTINCT, newer, bound agent (ag9c3) so this arm keeps its
+# original last-match purpose (a stale BLOCK-shaped row must not out-rank an authoritative later ALLOW).
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "AC-9(c) converse: stale BLOCK-shaped first, authoritative ALLOW-shaped+bound last by a DISTINCT newer agent -> ALLOW (kills last-line-only-if-it-blocks; #2701 D3 blocks a same-agent flip)" || bad "AC-9(c) converse case should allow (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #2051 AC-7 — end-to-end through the REAL bash hook. The gate's third arm (subprocess-openrouter provenance
