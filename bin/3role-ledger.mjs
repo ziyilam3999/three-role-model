@@ -7294,8 +7294,9 @@ function cmdListSeatPins(o) {
 //     so `hybrid` never re-opens OpenRouter or local and `conservative` never opens z.ai.
 // Fail-safe direction (D1): EVERY failure shape (absent/unreadable/unparseable pin, unknown mode value,
 // broken/absent tracked table) resolves to `normal` — the harm asymmetry is that an accidental non-Anthropic
-// dispatch violates the operator's directive AND a data-posture boundary, while 3 work / 2 ship-tail is the
-// operator's own declared normal-mode default. Garbage state can never resolve to boost and can never
+// dispatch violates the operator's directive AND a data-posture boundary, while 4 work / 2 ship-tail is the
+// operator's own declared normal-mode default (#2824 — 3 quiet lanes + 1 block-once opportunist). Garbage
+// state can never resolve to boost and can never
 // resolve to openrouter_dispatch=permitted, local_dispatch=permitted, or zai_dispatch=permitted — a mode row
 // with no zai_dispatch key at all (every pre-#2518 fixture table) resolves the axis to forbidden too, never
 // undefined (#2518 AC-4 fail-closed arm).
@@ -7304,9 +7305,9 @@ function cmdListSeatPins(o) {
 
 const MODE_FALLBACK = Object.freeze({
   mode: 'normal',
-  work_base: 2,
+  work_base: 3,
   opportunist: 1,
-  work_ceiling: 3,
+  work_ceiling: 4,
   ship_tail_ceiling: 2,
   openrouter_dispatch: 'forbidden',
   local_dispatch: 'forbidden',
