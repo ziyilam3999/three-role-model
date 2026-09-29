@@ -9,7 +9,7 @@
       "zai_dispatch": "forbidden"
     },
     "normal": {
-      "lanes": { "work_base": 2, "opportunist": 1, "work_ceiling": 3, "ship_tail_ceiling": 2 },
+      "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
       "zai_dispatch": "forbidden"
@@ -21,7 +21,7 @@
       "zai_dispatch": "forbidden"
     },
     "hybrid": {
-      "lanes": { "work_base": 2, "opportunist": 1, "work_ceiling": 3, "ship_tail_ceiling": 2 },
+      "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
       "zai_dispatch": "permitted"
