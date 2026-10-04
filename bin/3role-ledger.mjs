@@ -16,6 +16,7 @@
 //   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
 //                                        [--verdict V] [--self-authored]
 //                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
+//                                        [--provider P]   (#2782 — SSOT-validated provider stamp)
 //                                        [--effort-source assigned|observed]                     (#1528)
 //                                        [--closed-at ISO]                                       (#1516)
 //                                        [--dispatch-nonce TOK] [--receipt TOK]        (#2169 slice 5, AC-34)
@@ -757,6 +758,32 @@ function transcriptModel(session, agentId) {
     if (last) return last;
   }
   return '';
+}
+
+// #2782 AC-8 — the same last-assistant-`message.model` read as transcriptModel() above, but against an
+// EXPLICIT transcript path (a subprocess dispatch row's own `transcript_path`, stored by the dispatch
+// helper — there is no agentId to glob for). Returns '' on a missing/unreadable file or when no assistant
+// model line exists (the caller treats '' as unreadable: the row's value is not known blind -> untouched).
+function transcriptModelFromPath(p) {
+  let f = String(p == null ? '' : p);
+  if (!f) return '';
+  // Rows store transcript paths in the ledger's PORTABLE home-tilde form (`~/...`, see the home-tilde
+  // store rule ~:1863) whenever the path sits under $HOME — the same shape the real subprocess rows
+  // carry. Expand before reading, exactly like every other read-side consumer (:1672, :2101, :2777);
+  // an absolute path (the dispatcher's own runtime resolution) passes through unchanged.
+  if (f.startsWith('~/')) f = path.join(HOME, f.slice(2));
+  let content;
+  try { content = fs.readFileSync(f, 'utf8'); } catch (e) { return ''; }
+  let last = '';
+  for (const ln of content.split('\n')) {
+    const s = ln.trim();
+    if (!s) continue;
+    let j; try { j = JSON.parse(s); } catch (e) { continue; }
+    if (j && j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+      last = j.message.model;
+    }
+  }
+  return last;
 }
 
 // ── #1709 W1/W2 — PER-JOB TOKEN CAPTURE (sibling usage store, §2 of the plan) ────────────────────────────
@@ -1974,6 +2001,32 @@ function rowHasSubprocessProvenance2701(row) {
   return false;
 }
 
+// #2782 intent 1 — decide whether THIS append call is subprocess-provenance, i.e. the row shape whose
+// model must never come from the blind resolveAgent() sibling search. TRUE when the call itself carries a
+// subprocess dispatch marker, a pre-launch dispatch nonce, or a --run-id shaped like the dispatch helper's
+// own mint (OR-NONCE-* — the same shape predicate rowHasSubprocessProvenance2701 uses, applied to the
+// INCOMING write so the gate holds even when the pending row this run-id will bind to is missing);
+// otherwise, when the call carries a plain --run-id, TRUE only when the same-role row already carrying
+// that run_id is itself a subprocess-provenance row (the #2701 D1 nonce-keyed binding, re-derived here
+// read-only). A call with an explicit --agent never reaches this predicate (cmdAppend gates on
+// !explicitAgent first) — an Agent-tool identity always keeps its own E1 capture.
+function appendBoundToSubprocess2782(session, task, role, fields) {
+  if (isSubprocessDispatch(fields.dispatch)) return true;
+  if (fields.dispatch_nonce) return true;
+  const rid = (fields.run_id == null) ? '' : String(fields.run_id);
+  if (!rid) return false;
+  if (rid.indexOf('OR-NONCE-') === 0) return true;
+  try {
+    const lines = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let j; try { j = JSON.parse(lines[i]); } catch (e) { continue; }
+      if (j && j.role === role && j.run_id === rid) return rowHasSubprocessProvenance2701(j);
+    }
+  } catch (e) { /* unreadable ledger -> nothing proves a subprocess binding */ }
+  return false;
+}
+
 // Fresh SSOT read: is this role's SEAT declared a subprocess (non-Agent-tool) dispatch right now? Returns
 // {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
 // of those cases must fall through to the ordinary agentId arm, never silently admit the weak arm.
@@ -2906,8 +2959,29 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
 // regex that could silently drift from this one, exactly the class this backstop exists to prevent).
 // hasRefArmAffirmative and hasRefArmDecisionLine both build their RegExp from this ONE source string, so
 // they structurally cannot diverge.
+// #2911 EOL anchor (mirrors the dispatcher's extract_reviewed_verdict() grammar -- kept in sync by hand):
+// the captured token counts ONLY when the next non-whitespace character after it is end-of-line (trailing
+// spaces before EOL allowed), one of ( [ - — – : ; , . (then the rest of the line is prose commentary), or
+// an asterisk run that is itself followed only by whitespace then EOL (a CLOSING bold, `PASS**`). A token
+// followed by a bare word (`verdict: pass the buck`, `Decision: PASS with fixes noted below`,
+// `**Decision: PASS** is what I would say`) is a prose sentence, not a verdict: hasRefArmAffirmative and
+// hasRefArmDecisionLine must both refuse it, so the W3 ref arm and the publish backstop cannot be
+// satisfied by prose. Decorated forms (`## **Decision (final)**: PASS`, `**Decision:** PASS`,
+// `### Decision: **APPROVE**`) keep matching.
+// #2911 r2 F1 (no backtracking, mirrors the dispatcher's declRe -- kept in sync by hand): the
+// `(?![A-Za-z-])` lookahead right after the capture forces the WHOLE word. Without it the engine could
+// give a hyphenated word back to an inner hyphen and treat that hyphen as the punctuation tail, so
+// `Decision: PASS-pending CI, see below` was affirmative via an invented `PASS`. A hyphen attached to
+// the word is part of the word (`PASS-W-FOLLOWUPS` at EOL still matches whole); a hyphen DETACHED by a
+// space is still a valid tail (`NEEDS-WORK - notes`).
+// #2911 r3 R2-F1 (mirrors the dispatcher's declRe -- kept in sync by hand): a closing EMPHASIS run
+// (asterisks or underscores) followed by a punctuation tail is now a VALID line (closing emphasis only
+// counted at end-of-line before), so `**Decision: FAIL** — two blockers remain` is value-driven instead
+// of invisible. A HYPHEN right after the closing run counts only when DETACHED (whitespace between run
+// and hyphen), so `**Verdict: APPROVE**-ish` cannot satisfy the W3 ref arm via a prefix through the
+// emphasis (the r2 whole-word rule re-asserted across the emphasis boundary).
 const DECISION_LINE_SOURCE =
-  '^(?:#{1,6}[ \\t]+)?\\*{0,2}(?:Decision|verdict)\\*{0,2}(?:\\s*\\([^()]*\\))?\\*{0,2}\\s*:\\s*\\*{0,2}\\s*\\*{0,2}([A-Za-z-]+)';
+  '^(?:#{1,6}[ \\t]+)?(?:\\*{0,2}|_{0,2})(?:Decision|verdict)(?:\\*{0,2}|_{0,2})(?:\\s*\\([^()]*\\))?(?:\\*{0,2}|_{0,2})\\s*:\\s*(?:\\*{0,2}|_{0,2})\\s*(?:\\*{0,2}|_{0,2})([A-Za-z-]+)(?![A-Za-z-])(?:[ \\t]*$|[ \\t]*[(\\[\\-—–:;,.]|(?:\\*+|_+)[ \\t]*(?:$|[(\\[—–:;,.]|[ \\t]\\-))';
 function hasRefArmAffirmative(content) {
   const s = String(content == null ? '' : content);
   const re = new RegExp(DECISION_LINE_SOURCE, 'gim');
@@ -3530,7 +3604,11 @@ function overlayAppend(session, task, role, fields) {
   const incomingIdentity2701 = incomingAgentId ? ('agent:' + incomingAgentId) :
     (incomingRunId2701 ? ('run:' + incomingRunId2701) : '');
   const identityBoundary2701 = !!(prior && priorIdentity2701 && incomingIdentity2701 && incomingIdentity2701 !== priorIdentity2701);
-  const degradedStamp2701 = !!(prior && !incomingAgentId && !prior.agentId && prior.run_id &&
+  // #2902: a write that names a run_id is a bound write (it either matches the prior row's own run_id, or
+  // identityBoundary2701 already forks it), never the bare Agent-tool stamp this arm exists to catch. The
+  // z.ai dispatcher's close append carries --run-id <nonce> AND --effort-source assigned (#2822); without
+  // this exclusion that close opened a new round and split every z.ai run into two rows.
+  const degradedStamp2701 = !!(prior && !incomingAgentId && !incomingRunId2701 && !prior.agentId && prior.run_id &&
     fields.effort_source === 'assigned');
   const isNewRound = divertNewRound3 || divertRouteChange || identityBoundary2701 || degradedStamp2701;
   for (const ln of olderRoundLines) kept.push(ln);
@@ -3575,6 +3653,10 @@ function overlayAppend(session, task, role, fields) {
   // "artifact at close" exactly like agentId/artifact_path do (#855 overlay-merge).
   if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
   if ('modelTier' in fields) entry.modelTier = fields.modelTier;
+  // #2782 — the served-provider stamp. Ordinary own-key overlay (same discipline as every field above):
+  // an unprovided key persists the prior line's value, so a close-only repoint composes with the
+  // dispatcher's model+provider stamp instead of erasing it.
+  if ('provider' in fields) entry.provider = fields.provider;
   if ('effort' in fields) {
     entry.effort = fields.effort;
     // #1528 D2 C3 — `effort_source` is WRITER-STAMPED PROVENANCE for THIS `effort` value, not an
@@ -3679,6 +3761,10 @@ function overlayAppend(session, task, role, fields) {
     })();
     if (agentSupersedes || oracleSupersedes) {
       delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+      // #2782 fix-1 (execution-review F1, #2823 fix-contract RULE) — provider is attribution OF the
+      // superseded dispatch's served-model stamp, and no agent append can re-set it (resolveModelFields
+      // copies only modelVersion/modelTier) — so the agent change clears it with the dispatch evidence.
+      delete entry.provider;
     }
   }
   // #2169 slice 4, AC-28d + #1590 carried pitfall — a GENUINE subprocess-openrouter evidence BUNDLE (every
@@ -3700,7 +3786,10 @@ function overlayAppend(session, task, role, fields) {
   }
   if ('skip_reason' in fields) {
     delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
-    delete entry.modelVersion; delete entry.modelTier; delete entry.effort; delete entry.effort_source; delete entry.closedAt; delete entry.reroute;
+    // #2782 fix-1 (execution-review F1, #2823 fix-contract RULE) — provider joins every clear that
+    // clears modelVersion/modelTier: a skip line must not leave a stale provider stamp beside an
+    // erased model.
+    delete entry.modelVersion; delete entry.modelTier; delete entry.provider; delete entry.effort; delete entry.effort_source; delete entry.closedAt; delete entry.reroute;
     delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
     // #2169 slice 5 — dispatch_nonce joins the clear-list for the SAME reason as dispatch/transcript_path/
     // nonce just above: it is provenance OF a real dispatch, and a skip is a declaration that no (or no
@@ -3763,6 +3852,7 @@ const APPEND_KNOWN_FLAGS = [
   'agent', 'artifact', 'reviewed-plan', 'skip-reason', 'oracle', 'verdict', 'cairn', 'dispatch',
   'transcript', 'nonce', 'dispatch-nonce', 'receipt', 'pending', 'run-kind', 'run-id', 'run-source',
   'self-authored', 'effort', 'effort-source', 'model-version', 'model-tier', 'closed-at', 'sense-reroute',
+  'provider',   // #2782 — the served-provider stamp (validated against the SSOT provider ids below).
 ];
 
 function cmdAppend(o) {
@@ -3803,6 +3893,23 @@ function cmdAppend(o) {
     if (!('effort' in o)) {
       console.error('BLOCK (3role-ledger effort-source): --effort-source requires --effort on the SAME ' +
         'call (a provenance claim with no value to attribute is meaningless) — nothing written.');
+      process.exit(2);
+    }
+  }
+  // #2782 AC-6 — PROVIDER fail-closed guard. Runs BEFORE any ledger file read/write, same discipline as
+  // the two guards immediately above. The value must be a member of the SSOT's CLOSED provider vocabulary
+  // (the keys of `providers` in config/cc-routes.json, read FRESH at call time — plan N5) — a typo'd or
+  // invented provider id must never land on a row the proving-run tally (#2580) will group by. When the
+  // SSOT itself is unreadable the closed vocabulary is unknown, so EVERY value is refused (fail-closed —
+  // never fail-open on a missing vocabulary). Refusal names the legal ids, writes nothing.
+  if ('provider' in o) {
+    const provVal = String(o.provider == null ? '' : o.provider);
+    const provIds = ssotProviderIds2782();
+    if (!provIds || !provIds.includes(provVal)) {
+      console.error('BLOCK (3role-ledger provider): --provider "' + provVal + '" is not one of the SSOT ' +
+        'provider ids (keys of `providers` in config/cc-routes.json, read at call time): ' +
+        (provIds && provIds.length ? provIds.join(', ') : 'the SSOT is unreadable, so no provider id can be validated') +
+        ' — nothing written.');
       process.exit(2);
     }
   }
@@ -3936,6 +4043,9 @@ function cmdAppend(o) {
   if ('effort-source' in o) fields.effort_source = o['effort-source'];
   if ('model-version' in o) fields.modelVersion = o['model-version'];
   if ('model-tier' in o) fields.modelTier = o['model-tier'];
+  // #2782 — the served-provider stamp. The VALUE was already validated fail-closed against the SSOT
+  // provider ids near the top of this handler; this is the ordinary own-key overlay onto the entry.
+  if ('provider' in o) fields.provider = o.provider;
   // #1516 — explicit close-stamp flag. ONLY three-role-subagent-ledger.sh (SubagentStop) passes this; every
   // other caller omits it, so overlayAppend's per-key "provided" discipline leaves an unstamped line alone.
   if ('closed-at' in o) fields.closedAt = o['closed-at'];
@@ -3953,11 +4063,23 @@ function cmdAppend(o) {
   // untouched until the role's own transcript actually completes — #1466 AC-8b, "observed wins").
   // #1481: this now calls the SHARED resolveModelFields() helper (extracted, not re-implemented) — the
   // exact same transcriptModel()->overlay-merge path cmdRefreshModels reuses for the in-flight backfill.
+  // #2782 intent 1 — SUBPROCESS-PROVENANCE GATE on that capture. An append that carries (or binds, via
+  // --run-id, to a row carrying) subprocess provenance — dispatch=subprocess-* — and that names NO --agent
+  // must never consult the blind resolveAgent() search inside resolveModelFields(): the newest-mtime winner
+  // that search returns is a SIBLING agent's transcript (the measured AC-1 leak: a z.ai subprocess row
+  // stamped with whichever Claude lane's agent transcript happened to be newest). On that row shape the
+  // search is skipped ENTIRELY — explicit --model-version/--model-tier set above are honored VERBATIM
+  // (never clobbered by an observed sibling), and no model is ever guessed. An EXPLICIT --agent keeps
+  // today's E1 observed-wins capture byte-identical (AC-3, and the mixed E1+E2 held-out case: the named
+  // agent's own transcript decides, row-level gate).
   {
     const explicitAgent = ('agent' in o && o.agent) ? o.agent : '';
-    const modelFields = resolveModelFields(session, task, role, explicitAgent);
-    if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
-    if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
+    const subProcGated2782 = !explicitAgent && appendBoundToSubprocess2782(session, task, role, fields);
+    if (!subProcGated2782) {
+      const modelFields = resolveModelFields(session, task, role, explicitAgent);
+      if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
+      if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
+    }
   }
   // #1640 S11 — the reroute-stamp RECORDER. Opt-in via --sense-reroute (only the spawn edge
   // three-role-spawn-ledger.sh and the SubagentStop edge three-role-subagent-ledger.sh pass it); reads ONLY
@@ -5140,6 +5262,30 @@ function cmdCheck(o) {
       if (j && j.role === role && isSubprocessDispatch(j.dispatch)) { stampSurvives = true; break; }
     }
     if (stampSurvives) continue;
+    // #2985 D9 -- a first-class Agent-tool route is NOT a bypass: when the plan-review row's reviewed_plan
+    // resolves (same resolver as the gate and the helper) to an effective agent-tool route for THIS task,
+    // print ROUTE-SIZE instead of ROUTE-BYPASS. Anything unresolvable keeps today's advisory.
+    {
+      const prRow = byRole['plan-review'];
+      if (prRow && typeof prRow.reviewed_plan === 'string' && prRow.reviewed_plan && decl.seat) {
+        // reviewed_plan is stored repo-relative (normalizeArtifact): resolve against the cwd first, then against
+        // the repo that holds THIS ledger helper (so a check run from another cwd still finds the plan).
+        let facts = resolvePlanFacts(prRow.reviewed_plan, o.task);
+        if (facts.unresolvable && !path.isAbsolute(prRow.reviewed_plan)) {
+          let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+          facts = resolvePlanFacts(path.join(selfDir, '..', prRow.reviewed_plan), o.task);
+        }
+        if (!facts.unresolvable) {
+          const eff = effectiveRouteFor(role, decl.seat, facts);
+          if (eff.effective_dispatch === 'agent-tool') {
+            console.log('ROUTE-SIZE: role=' + role + ' size=' + (facts.size || '-') +
+              (facts.data_class === 'operator-private' ? ' data-class=operator-private' : '') +
+              ' -> agent-tool ' + eff.effective_tier + ' (first-class)');
+            continue;
+          }
+        }
+      }
+    }
     const seatModel = (decl.seat && decl.seat.model) || '<unknown>';
     console.log('ROUTE-BYPASS: role=' + role + ' (seat model ' + seatModel + ', declared dispatch=subprocess-openrouter)' +
       " — no surviving subprocess dispatch stamp on this routed seat's ledger lines, so its work did not CLOSE" +
@@ -5635,6 +5781,210 @@ function cmdRepairCrosswire(o) {
   fs.renameSync(tmp, file);
 
   console.log('OK repair-crosswire: repaired row ' + idx + ' for agentId ' + before.agentId + '; backup at ' + backupFile);
+  process.exit(0);
+}
+
+// #2782 intent 3 / AC-8 — repair-subprocess-models: the ONE sanctioned repair for EXISTING wrong-or-empty
+// model stamps on subprocess-provenance rows. Rewrites modelVersion/modelTier/provider ONLY on rows that
+// (a) carry subprocess provenance (rowHasSubprocessProvenance2701 — the class whose existing value is known
+// blind: a subprocess row never had an honest transcript-model capture before #2782's gate), (b) carry NO
+// agentId (a cross-wired row is repair-crosswire's job, never this tool's), and (c) carry a transcript_path
+// that YIELDS a served model — the served id read from that transcript is the only truth this tool trusts.
+// An E1 (Agent-tool / Claude-seat) row is NEVER touched (its modelVersion was observed from its own
+// transcript, and plan (iii) pins it byte-identical). Non-goals by construction: no directory walk (only
+// the named task's own ledger file + the transcript each candidate row names — INPUT-BOUND: a bounded,
+// finite read set, no growth loop), no invention (a tier the SSOT cannot resolve and a provider the row's
+// own dispatch marker cannot name are simply never written), idempotent (a row already matching the
+// transcript truth is a no-op on re-run). --dry-run prints counts and writes nothing (byte-identity AC);
+// a wet run backs the file up FIRST (a `<task>.jsonl.bak-<iso>` sibling, N2) and rewrites atomically
+// (tmp + rename), never leaving a half-written ledger.
+function cmdRepairSubprocessModels(o) {
+  const session = o.session;
+  if (!session) {
+    console.error('repair-subprocess-models: --session is required (--task optional: bound to ONE task file)');
+    process.exit(2);
+  }
+  // #2782 AC-8/AC-8-live — the plan's invocation is `--session S [--dry-run]` (a SESSION-wide count over
+  // the orchestrator session's task files); --task narrows the run to ONE task file (an AC-8 fixture seam
+  // and a blast-radius bound an operator may want). INPUT-BOUND: the read set is exactly that one file, or
+  // the session's OWN drawer's *.jsonl files — a flat, finite listing, never a recursive walk, never a
+  // glob outside the session directory, so the repair cannot loop or grow with the store.
+  const task = ('task' in o) ? String(o.task == null ? '' : o.task) : '';
+  enforceSessionShape(session, task, 'repair-subprocess-models', 2);
+  const sessDir = path.join(LEDGER_DIR, sanitize(session));
+  let files;
+  if (task) {
+    files = [ledgerFile(session, task)];
+  } else {
+    let names = [];
+    try { names = fs.readdirSync(sessDir).filter((f) => f.endsWith('.jsonl')).sort(); } catch (e) { names = []; }
+    files = names.map((f) => path.join(sessDir, f));
+    if (!files.length) {
+      console.error('BLOCK (3role-ledger repair-subprocess-models P1): no ledger files exist for session ' +
+        sanitize(session) + ' — no row could carry a subprocess model stamp. Nothing written.');
+      process.exit(3);
+    }
+  }
+  const dryRun = ('dry-run' in o);
+  const provIds = ssotProviderIds2782() || [];
+  const jobs = [];      // { file, rawLines, repairs: [{ idx, row, changes }] } — files that NEED a rewrite
+  let unreadable = 0, untouched = 0;
+  for (const file of files) {
+    let raw;
+    try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+      if (task) {
+        console.error('BLOCK (3role-ledger repair-subprocess-models P1): no ledger file exists for task ' +
+          sanitize(task) + ' — no row could carry a subprocess model stamp. Nothing written.');
+        process.exit(3);
+      }
+      continue;   // session-wide: a file vanished between listing and read — skipped, never invented
+    }
+    const rawLines = raw.split('\n');
+    const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+    const repairs = [];   // { idx, row, changes }
+    for (let i = 0; i < parsed.length; i++) {
+      const row = parsed[i];
+      if (!row || row.role == null) continue;
+      if (!rowHasSubprocessProvenance2701(row) || row.agentId) { untouched++; continue; }
+      const tp = (row.transcript_path == null) ? '' : String(row.transcript_path);
+      if (!tp) { untouched++; continue; }   // no transcript named -> the value is not known blind -> untouched
+      const served = transcriptModelFromPath(tp);
+      if (!served) { unreadable++; continue; }   // transcript gone / carries no model line (held-out case 3)
+      const changes = {};
+      if (row.modelVersion !== served) changes.modelVersion = served;
+      const tier = modelIdToTier(served) || identifyModelViaSSOT(served);
+      if (tier && row.modelTier !== tier) changes.modelTier = tier;
+      const prov = isSubprocessDispatch(row.dispatch) ? row.dispatch.slice('subprocess-'.length) : '';
+      if (prov && provIds.includes(prov) && row.provider !== prov) changes.provider = prov;
+      if (Object.keys(changes).length) repairs.push({ idx: i, row, changes });
+      else untouched++;
+    }
+    if (repairs.length) jobs.push({ file, rawLines, repairs });
+  }
+  if (dryRun) {
+    console.log('DRY-RUN repair-subprocess-models: would-rewrite=' + jobs.reduce((a, j) => a + j.repairs.length, 0) +
+      ' rewritten=0' + ' unreadable=' + unreadable + ' untouched=' + untouched + ' — nothing written.');
+    process.exit(0);
+  }
+  if (!jobs.length) {
+    console.log('OK repair-subprocess-models: rewritten=0 unreadable=' + unreadable + ' untouched=' +
+      untouched + ' — nothing to rewrite.');
+    process.exit(0);
+  }
+  let n = 0;
+  for (const j of jobs) {
+    // N2 backup, per-file, BEFORE the rewrite: a `<task>.jsonl.bak-<iso>` sibling of the file itself.
+    const backupFile = path.join(path.dirname(j.file), path.basename(j.file) + '.bak-' +
+      new Date().toISOString().replace(/[:.]/g, '-'));
+    fs.copyFileSync(j.file, backupFile);
+    console.log('backup=' + backupFile);
+    const newLines = j.rawLines.slice();
+    for (const r of j.repairs) {
+      for (const [k, v] of Object.entries(r.changes)) r.row[k] = v;
+      newLines[r.idx] = JSON.stringify(r.row);
+      n++;
+    }
+    const tmp = j.file + '.tmp-repair-' + process.pid + '-' + Date.now();
+    fs.writeFileSync(tmp, newLines.join('\n'));
+    fs.renameSync(tmp, j.file);
+  }
+  console.log('OK repair-subprocess-models: rewritten=' + n + ' unreadable=' + unreadable +
+    ' untouched=' + untouched);
+  process.exit(0);
+}
+
+// #2902 — repair-split-run: merges the two halves of a z.ai dispatcher run that the pre-#2902 close append
+// split into an earlier pending/artifact row and a later closedAt row (same run_id). Fail-closed predicate
+// P1-P4 (exit 3, writes nothing); idempotent; dry-run prints BEFORE/AFTER and writes nothing; a wet run
+// backs up first and rewrites atomically. No lock exists, so a wet run re-reads the file right before the
+// rename and refuses if the bytes changed, and refuses while the task has an open pending row unless
+// --allow-pending is given.
+function cmdRepairSplitRun(o) {
+  const session = o.session, task = o.task, runId = o['run-id'];
+  if (!session || !task || !runId) {
+    console.error('repair-split-run: --session, --task, --run-id are required');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-split-run', 2);
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): no ledger file exists for task ' + sanitize(task) + '. Nothing written.');
+    process.exit(3);
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+  const matchIdx = [];
+  for (let i = 0; i < parsed.length; i++) { if (parsed[i] && parsed[i].run_id === runId) matchIdx.push(i); }
+  if (matchIdx.length === 1 && parsed[matchIdx[0]].repair_ticket === '2902') {
+    console.log('OK repair-split-run: nothing to repair (run ' + runId + ' was already repaired by this tool).');
+    process.exit(0);
+  }
+  if (matchIdx.length !== 2) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): ' + matchIdx.length + ' row(s) carry run_id ' + runId +
+      ' (need exactly two) — nothing written.');
+    process.exit(3);
+  }
+  const a = parsed[matchIdx[0]], b = parsed[matchIdx[1]];
+  if (a.role !== b.role || a.agentId || b.agentId || !/^OR-NONCE-/.test(String(runId))) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): the two rows must share a role, carry no agentId, and the run_id ' +
+      'must be a dispatcher nonce (OR-NONCE-*) — nothing written.');
+    process.exit(3);
+  }
+  if (!a.artifact_path || a.closedAt) {
+    console.error('BLOCK (3role-ledger repair-split-run P2): the earlier row must carry artifact_path and no closedAt — nothing written.');
+    process.exit(3);
+  }
+  if (!b.closedAt || b.artifact_path || !String(b.dispatch || '').startsWith('subprocess-')) {
+    console.error('BLOCK (3role-ledger repair-split-run P3): the later row must carry closedAt and subprocess dispatch, and no artifact_path — nothing written.');
+    process.exit(3);
+  }
+  if (a.session_id !== b.session_id) {
+    console.error('BLOCK (3role-ledger repair-split-run P4): the two rows disagree on session_id — nothing written.');
+    process.exit(3);
+  }
+  const dryRun = ('dry-run' in o);
+  const NEVER_2902 = ['run_kind', 'run_source', 'dispatch_nonce', 'artifact_path', 'agentId'];
+  const merged = { ...a };
+  for (const k of Object.keys(b)) { if (!NEVER_2902.includes(k)) merged[k] = b[k]; }
+  delete merged.pending;
+  merged.repair_ticket = '2902';
+  merged.repair_at = new Date().toISOString();
+  merged.repair_merged_from_line = matchIdx[1] + 1;
+  console.error('AUDIT: repair-split-run — session=' + sanitize(session) + ' task=' + sanitize(task) + ' run_id=' + runId + (dryRun ? ' (dry-run)' : ''));
+  console.log('BEFORE: ' + JSON.stringify(a));
+  console.log('BEFORE: ' + JSON.stringify(b));
+  console.log('AFTER: ' + JSON.stringify(merged));
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-split-run: would merge line ' + (matchIdx[1] + 1) + ' onto line ' + (matchIdx[0] + 1) + '. Nothing written.');
+    process.exit(0);
+  }
+  const openPending = parsed.some((j, i) => j && j.pending === true && i !== matchIdx[0]);
+  if (openPending && !('allow-pending' in o)) {
+    console.error('BLOCK (3role-ledger repair-split-run P5): task ' + sanitize(task) + ' has another pending row still open; ' +
+      'a concurrent close append could be lost (no lock). Re-run when quiesced, or pass --allow-pending. Nothing written.');
+    process.exit(3);
+  }
+  const backupDir = path.join(path.dirname(file), '.repair-backup');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, sanitize(task) + '.jsonl.' + new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.copyFileSync(file, backupFile);
+  const newLines = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    if (i === matchIdx[1]) continue;
+    newLines.push(i === matchIdx[0] ? JSON.stringify(merged) : rawLines[i]);
+  }
+  const tmp = file + '.tmp-repair-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, newLines.join('\n') + '\n');
+  let again = null;
+  try { again = fs.readFileSync(file, 'utf8'); } catch (e) { again = null; }
+  if (again !== raw) {
+    try { fs.unlinkSync(tmp); } catch (e) { /* best effort */ }
+    console.error('BLOCK (3role-ledger repair-split-run P6): the ledger changed while this repair was running — nothing written.');
+    process.exit(3);
+  }
+  fs.renameSync(tmp, file);
+  console.log('OK repair-split-run: merged line ' + (matchIdx[1] + 1) + ' onto line ' + (matchIdx[0] + 1) + '; backup at ' + backupFile);
   process.exit(0);
 }
 
@@ -6678,6 +7028,17 @@ function loadRoutesConfig() {
   return { ok: true, routes, error: '', configPath };
 }
 
+// #2782 AC-6 — the SSOT's CLOSED provider vocabulary (the keys of `providers` in config/cc-routes.json,
+// read FRESH at call time — plan N5). Returns null when the SSOT cannot be loaded: the caller fails
+// CLOSED on null (no provider id can be validated against a vocabulary that cannot be read).
+function ssotProviderIds2782() {
+  try {
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return null;
+    return Object.keys((rl.routes && rl.routes.providers) || {});
+  } catch (e) { return null; }
+}
+
 // Credential-hygiene lint (AC0.6, #1640 S1). Every `auth`/`*credential*`-class field on a provider row must be
 // an env:/keychain: indirection — no literal credential value, no "non-secret literal" escape (review B3 deleted
 // that escape; endpoint URLs are not credential-class and are covered by the smoke's separate count-based scans,
@@ -6909,7 +7270,164 @@ function resolveRoute(routes, seatKey) {
   return { ok: false, reason: sens.reason };
 }
 
-// resolve-route --seat <domain.seat> [--json]
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2985 — z.ai routing policy. ONE resolver (this block) answers three questions for every consumer (the
+// dispatch helper, the route-dispatch gate, `check`) so no caller keeps its own copy (the #2434
+// single-generator discipline):
+//   1. plan-size        — the planner's flush-left `size: S|M|L` line (D1). Missing / duplicated / indented /
+//                         lowercase / any other value is a fail-CLOSED refusal, never a default model.
+//   2. resolve-route --plan — the seat's EFFECTIVE route as a function of (SSOT seat row, plan facts) (D3).
+//                         Only a plan that is a real file under .ai-workspace/plans/, bound to the spawn's
+//                         task, with a valid label can ever yield `agent-tool`.
+//   3. zai-strikes      — how many times THIS round's z.ai plan-review dispatch has failed (D6), derived from
+//                         the dispatch helper's own receipt lines, never a hand-typed number.
+// INPUT-BOUND: a plan file larger than PLAN_MAX_BYTES is `unresolvable` (read is capped before parsing); the
+// receipt scan reads at most STRIKE_TAIL_BYTES from the END of the file (an undercount fails toward z.ai).
+const PLAN_MAX_BYTES = 1024 * 1024;
+const STRIKE_TAIL_BYTES = 4 * 1024 * 1024;
+const PLAN_DATA_CLASSES = ['public', 'operator-private'];
+
+function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Validate a --plan argument. Relative paths resolve against the process cwd (the hook's session cwd).
+// { ok:true, abs, text } | { ok:false, why }.
+function loadPlanFile(planArg, requirePlansDir) {
+  if (typeof planArg !== 'string' || !planArg) return { ok: false, why: 'no plan path' };
+  // A ledger row's reviewed_plan may be stored tilde-anchored (normalizeArtifact); expand it against HOME.
+  const abs = path.resolve(planArg.startsWith('~/') ? path.join(HOME, planArg.slice(2)) : planArg);
+  if (requirePlansDir && abs.split(path.sep).join('/').indexOf('.ai-workspace/plans/') < 0) {
+    return { ok: false, why: 'path is not under .ai-workspace/plans/' };
+  }
+  let st;
+  try { st = fs.statSync(abs); } catch (e) { return { ok: false, why: 'file does not exist' }; }
+  if (!st.isFile()) return { ok: false, why: 'not a regular file' };
+  if (st.size > PLAN_MAX_BYTES) return { ok: false, why: 'file larger than ' + PLAN_MAX_BYTES + ' bytes' };
+  let text;
+  try { text = fs.readFileSync(abs, 'utf8'); } catch (e) { return { ok: false, why: 'unreadable' }; }
+  return { ok: true, abs, text };
+}
+
+// The one flush-left `size:` line. { ok:true, size } | { ok:false, source, token }.
+function parsePlanSize(text) {
+  const hits = String(text).split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => /^size:/.test(l));
+  if (hits.length === 0) return { ok: false, source: 'missing', token: 'SIZE-LABEL-MISSING' };
+  if (hits.length > 1) return { ok: false, source: 'ambiguous', token: 'SIZE-LABEL-AMBIGUOUS' };
+  const m = hits[0].match(/^size: ([SML])[ \t]*$/);
+  if (!m) return { ok: false, source: 'invalid', token: 'SIZE-LABEL-INVALID' };
+  return { ok: true, size: m[1] };
+}
+
+// `data-class:` line. Absent = public; exactly one valid line = that value; anything else = 'invalid'.
+function parsePlanDataClass(text) {
+  const hits = String(text).split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => /^data-class:/.test(l));
+  if (hits.length === 0) return 'public';
+  if (hits.length > 1) return 'invalid';
+  const m = hits[0].match(/^data-class: ([a-z-]+)[ \t]*$/);
+  return (m && PLAN_DATA_CLASSES.includes(m[1])) ? m[1] : 'invalid';
+}
+
+// D4 task binding: basename `YYYY-MM-DD-<task>-...` OR a flush-left `Ticket: #<task>` line.
+function planBoundToTask(abs, text, task) {
+  if (!task || !/^[0-9A-Za-z._-]+$/.test(String(task))) return false;
+  const t = escapeRe(task);
+  if (new RegExp('^\\d{4}-\\d{2}-\\d{2}-' + t + '-').test(path.basename(abs))) return true;
+  return new RegExp('^Ticket: #' + t + '(?![0-9A-Za-z._-])', 'm').test(String(text));
+}
+
+// Plan facts for `seatKey`. { unresolvable:true, why } | { size, size_source, data_class, bound }.
+// With no `task` the binding step is skipped (callers that cannot know the task); every real consumer passes it.
+function resolvePlanFacts(planArg, task) {
+  const lp = loadPlanFile(planArg, true);
+  if (!lp.ok) return { unresolvable: true, why: lp.why };
+  const bound = task === undefined ? true : planBoundToTask(lp.abs, lp.text, task);
+  const sz = parsePlanSize(lp.text);
+  const dc = parsePlanDataClass(lp.text);
+  let size_source;
+  if (!bound) size_source = 'task-mismatch';
+  else size_source = sz.ok ? 'plan' : sz.source;
+  return { size: sz.ok ? sz.size : '', size_source, data_class: dc, bound, abs: lp.abs };
+}
+
+// D3/D4/D8: the effective route. Leaving the declared subprocess route needs ALL of: the seat declares an
+// agent_tool_fallback tier, the plan is bound to the task, and a first-class reason —
+//   executor    : (valid label AND (size L OR data-class operator-private))
+//   plan-review : data-class operator-private
+// Everything else (missing/ambiguous/invalid label, mismatch, invalid data-class) keeps the declared route; the
+// consumers refuse on size_source / data_class instead (fail closed, no path opened).
+function effectiveRouteFor(seatKey, seat, facts) {
+  const out = { effective_dispatch: seat.dispatch || '', effective_tier: '', effective_model: seat.model || '' };
+  const fb = seat.agent_tool_fallback;
+  if (!fb || !ROLE_MODELS.includes(fb) || !facts.bound) return out;
+  const privateData = facts.data_class === 'operator-private';
+  let leave = false;
+  if (seatKey === 'executor') leave = facts.size_source === 'plan' && (facts.size === 'L' || privateData);
+  else if (seatKey === 'plan-review') leave = privateData;
+  if (!leave) return out;
+  const cfg = loadRoleConfig().cfg || {};
+  out.effective_dispatch = 'agent-tool';
+  out.effective_tier = fb;
+  out.effective_model = cfg['CC_TIER_' + fb.toUpperCase() + '_VERSION'] || fb;
+  return out;
+}
+
+// plan-size --plan <path> : prints S|M|L, or a SIZE-* token with exit 2.
+function cmdPlanSize(opts) {
+  const lp = loadPlanFile(opts.plan, false);
+  if (!lp.ok) { console.log('SIZE-PLAN-UNRESOLVABLE: --plan ' + (typeof opts.plan === 'string' ? opts.plan : '<none>') + ' is unresolvable (' + lp.why + ')'); process.exit(2); }
+  const sz = parsePlanSize(lp.text);
+  if (!sz.ok) {
+    console.log(sz.token + ': ' + path.basename(lp.abs) + ' must carry exactly one flush-left `size: S`, `size: M` or `size: L` line (' + sz.source + ')');
+    process.exit(2);
+  }
+  console.log(sz.size);
+  process.exit(0);
+}
+
+// zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
+// consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
+// verdict in the SAME round. Scans from the END so the scan stops at the reset; lines without round= (legacy),
+// drill=1 lines and retry=attempted sub-attempt lines never count.
+function cmdZaiStrikes(opts) {
+  const task = opts.task, role = opts.role, round = opts.round;
+  if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
+  if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review (the only seat with a strike rule)'); process.exit(2); }
+  if (typeof round !== 'string' || !/^[0-9]{1,6}$/.test(round)) { console.error('zai-strikes: --round <n> is required (digits only)'); process.exit(2); }
+  let file = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  if (!file) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    file = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  }
+  let text = '';
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const len = Math.min(size, STRIKE_TAIL_BYTES);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      text = buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  } catch (e) { console.log('0'); process.exit(0); }
+  const lines = text.split('\n');
+  let n = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
+    const isSm = line.startsWith('OR-SEAT-SMOKE ');
+    if (!isFb && !isSm) continue;
+    const kv = {};
+    for (const tok of line.split(/\s+/)) { const eq = tok.indexOf('='); if (eq > 0 && !(tok.slice(0, eq) in kv)) kv[tok.slice(0, eq)] = tok.slice(eq + 1); }
+    if (kv.role !== role || kv.task !== task || kv.round !== round) continue;
+    if (kv.drill === '1') continue;
+    if (isSm) { if (kv.verdict && kv.verdict !== 'MISSING') break; continue; }
+    if ('retry' in kv && kv.retry === 'attempted') continue;
+    n++;
+  }
+  console.log(String(n));
+  process.exit(0);
+}
+
+// resolve-route --seat <domain.seat> [--json] [--plan <path> [--task <id>]]  (#2985: --plan adds plan-derived fields)
 function cmdResolveRoute(opts) {
   const seatKey = opts.seat;
   if (!seatKey) { console.log('BLOCK: resolve-route requires --seat <domain.seat>'); process.exit(2); }
@@ -6917,6 +7435,16 @@ function cmdResolveRoute(opts) {
   if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
   const result = resolveRoute(loaded.routes, seatKey);
   if (!result.ok) { process.stderr.write(result.reason + '\n'); process.exit(2); }
+  // #2985 D3/L8: --plan is VALIDATED, never silently ignored -- anything that is not an existing regular file
+  // under .ai-workspace/plans/ is unresolvable (exit 2).
+  let planFacts = null;
+  if ('plan' in opts) {
+    planFacts = resolvePlanFacts(opts.plan, opts.task);
+    if (planFacts.unresolvable) {
+      console.log('SIZE-PLAN-UNRESOLVABLE: --plan ' + (typeof opts.plan === 'string' ? opts.plan : '<none>') + ' is unresolvable (' + planFacts.why + ')');
+      process.exit(2);
+    }
+  }
   if (result.acceptance) {
     // #1880 intent 5 -- a route allowed only because of an acceptance must be observably different from one
     // that clears normally. Emitted on stderr at exit 0 (breaks no existing consumer -- stdout is unchanged
@@ -6928,9 +7456,17 @@ function cmdResolveRoute(opts) {
   if ('json' in opts) {
     const payload = Object.assign({ seat: seatKey }, result.seat);
     if (result.acceptance) payload.accepted_disclosure_applied = result.acceptance;
+    if (planFacts) {
+      Object.assign(payload, { size: planFacts.size, size_source: planFacts.size_source, data_class: planFacts.data_class },
+        effectiveRouteFor(seatKey, result.seat, planFacts));
+    }
     console.log(JSON.stringify(payload));
   } else {
     console.log(seatKey + ' -> ' + result.seat.provider + ' / ' + (result.seat.model || ''));
+    if (planFacts) {
+      const eff = effectiveRouteFor(seatKey, result.seat, planFacts);
+      console.log('size=' + (planFacts.size || '-') + ' size_source=' + planFacts.size_source + ' data_class=' + planFacts.data_class + ' effective_dispatch=' + eff.effective_dispatch);
+    }
   }
   process.exit(0);
 }
@@ -7667,6 +8203,8 @@ try {
   else if (cmd === 'refresh-models') cmdRefreshModels(opts);
   else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
   else if (cmd === 'repair-crosswire') cmdRepairCrosswire(opts);
+  else if (cmd === 'repair-subprocess-models') cmdRepairSubprocessModels(opts);
+  else if (cmd === 'repair-split-run') cmdRepairSplitRun(opts);
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
@@ -7678,6 +8216,8 @@ try {
   else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
+  else if (cmd === 'plan-size') cmdPlanSize(opts);
+  else if (cmd === 'zai-strikes') cmdZaiStrikes(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
   else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
@@ -7689,7 +8229,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|plan-size|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -7701,7 +8241,7 @@ try {
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
-      '[--seat S [--json] (resolve-route, #1640 M0)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
+      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--task T --role plan-review --round N (zai-strikes, #2985)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
       '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
       '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
@@ -7709,7 +8249,9 @@ try {
       '[--role R [--tier] [--slug] --reason "..." (clear-seat-pin, #1918)] ' +
       '[[--json] (list-seat-pins, #1918)]' +
       ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]' +
-      ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]');
+      ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]' +
+      ' [--session S [--task T] [--dry-run] (repair-subprocess-models, #2782 — rewrites modelVersion/modelTier/provider on subprocess-provenance rows ONLY, from each row\'s own transcript_path; backed up, idempotent, dry-run first)]' +
+      ' [--session S --task T --run-id ID [--dry-run] [--allow-pending] (repair-split-run, #2902 — merges a split dispatcher run, P1-P6 fail-closed, backed up, idempotent)]');
     process.exit(2);
   }
 } catch (e) {

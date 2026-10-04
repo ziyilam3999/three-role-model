@@ -4353,6 +4353,18 @@ fi
 w3row2437 accept '### Decision: **APPROVE**'
 w3row2437 reject '## Decision: **REJECT**'
 
+# #2911 r3 R2-F1 — NON-corpus hold-out probes (deliberately NOT TSV rows, like the AC-4 pair above): a
+# closing EMPHASIS run (asterisks or underscores) followed by a punctuation tail must now SATISFY the W3
+# ref arm when the value is affirmative — on the pre-r3 head these lines were invisible, so the accept
+# probes are RED there — and the line must stay value-driven when it is not. Hyphen detachment: a hyphen
+# right after the closing run counts only when detached, so 'APPROVE**-ish' cannot satisfy via a prefix.
+w3row2437 accept '**Decision: PASS** — see notes'
+w3row2437 accept '**Decision: PASS**.'
+w3row2437 accept '__Decision: PASS__ (queued)'
+w3row2437 reject '**Decision: FAIL** — two blockers remain'
+w3row2437 reject '**Decision: PASS** but only after fixes land'
+w3row2437 reject '**Verdict: APPROVE**-ish, see below'
+
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # #2462 AC-1 — drift-proof arm: the #2088 ref-scoped resolution arm is now DEFAULT-ON (no --merge-head
 # required to activate it — see resolveArtifactAtRef()'s doc comment). Proves the exact `:537` shape the
@@ -5803,4 +5815,578 @@ GRC20=$(cw_gate "$S" "$T")
 # this needs -- duplicating that scaffolding here (this file has no such isolation) would either skip real
 # verification or corrupt this file's own ambient env; see that file's own #2701 arms instead.
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2782 — z.ai ledger rows stamp the SERVED model + provider; a subprocess-provenance append never
+# inherits a sibling agent's model (intent 1), explicit stamps are honored verbatim (intent 1), --provider
+# is SSOT-validated fail-closed (AC-6), and repair-subprocess-models is bounded/dry-run-first/per-file
+# backed up (intent 3). Hermetic: per-case-group THREE_ROLE_LEDGER_DIR + a fixture routes SSOT (providers
+# zai/openrouter + the zai model_vocabulary) — never the real config, the real ledger, or a real transcript.
+# Helpers carry the _2782 suffix; synthetic ids are agent-2782-*, OR-NONCE-2782-*, run-id 2782n*.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+ZFIX2782="$TMP/2782-fixtures"
+mkdir -p "$ZFIX2782"
+printf 'stub artifact body 2782\n' > "$ZFIX2782/artifact.md"
+ZROUTES2782="$ZFIX2782/routes-2782.json"
+cat > "$ZROUTES2782" <<'ROUTES_2782_JSON'
+{
+  "providers": {
+    "openrouter": { "endpoint": "https://openrouter.ai/api", "auth": "env:OPENROUTER_API_KEY" },
+    "zai": { "endpoint": "https://api.z.ai/api/anthropic", "auth": "env:ZAI_API_KEY",
+      "model_vocabulary": { "glm-5.3": { "tier_equivalent": "opus" }, "glm-5.3-flash": { "tier_equivalent": "sonnet" } } }
+  },
+  "seats": {
+    "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai", "agent_tool_fallback": "opus", "data_sensitivity": "public" },
+    "executor": { "provider": "zai", "model": "glm-5.3-flash", "dispatch": "subprocess-zai", "agent_tool_fallback": "sonnet", "data_sensitivity": "public" }
+  },
+  "task_classes": { "sustained-agentic": { "allowed_providers": ["openrouter", "zai"] } }
+}
+ROUTES_2782_JSON
+
+mk_tagged_model_2782() {  # <session> <agentId> <task> <role> <model> — an Agent-tool transcript tagged for
+  # resolveAgent(), whose assistant line carries an observed model (the E1 "observed wins" capture shape).
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  printf '{"type":"user","message":{"role":"user","content":"3ROLE_TASK:%s ROLE:%s -- do the work"}}\n' "$3" "$4" \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+  printf '{"type":"assistant","message":{"model":"%s","content":[{"type":"text","text":"stub ok"}]}}\n' "$5" \
+    >> "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+mk_model_file_2782() {  # <path> <model> — a bare subprocess transcript: one assistant model line.
+  mkdir -p "$(dirname "$1")"
+  printf '{"type":"assistant","message":{"model":"%s","content":[{"type":"text","text":"stub ok"}]}}\n' "$2" > "$1"
+}
+row2782() {  # <ledger-file> <role> <key> <value> — the LAST row matching role+key, as compact JSON with
+  # <absent> markers (a MISSING key is itself an assertion target, never a rendering accident).
+  node -e '
+    const fs = require("fs");
+    let rows = [];
+    try {
+      rows = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+    } catch (e) {}
+    const mine = rows.filter((j) => j && j.role === process.argv[2] && j[process.argv[3]] === process.argv[4]);
+    const r = mine[mine.length - 1] || {};
+    const f = (k) => (r[k] === undefined ? "<absent>" : r[k]);
+    process.stdout.write(JSON.stringify({ mv: f("modelVersion"), mt: f("modelTier"), pv: f("provider"),
+      dispatch: f("dispatch"), agentId: f("agentId") }));
+  ' "$1" "$2" "$3" "$4"
+}
+
+# ── 2782-AC-1 (must-fire, sibling leak CLOSED): a session whose ONLY tagged transcript is an Agent-tool
+#    plan-review one (claude-opus-5-5); a subprocess-zai pending append + its run-id close bind must land
+#    NO model on the row. Base (red): the blind resolveAgent() search stamped the sibling's claude-opus-5-5
+#    onto the zai subprocess row.
+S2782A="s2782a"
+mk_tagged_model_2782 "$S2782A" "agent-2782-a" "2782a" "plan-review" "claude-opus-5-5"
+ZLED2782A="$TMP/ledger-2782-a/$S2782A/2782a.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-a"
+  node "$LED" append --session "$S2782A" --task 2782a --role plan-review \
+    --dispatch subprocess-zai --run-id 2782n1 --pending >/dev/null 2>&1
+  node "$LED" append --session "$S2782A" --task 2782a --role plan-review \
+    --run-id 2782n1 --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782A="$(row2782 "$ZLED2782A" plan-review run_id 2782n1)"
+{ printf '%s' "$ROW2782A" | command grep -q '"mv":"<absent>"' \
+    && printf '%s' "$ROW2782A" | command grep -q '"dispatch":"subprocess-zai"'; } \
+  && ok "2782-AC-1: the subprocess-zai row bound by run-id carries NO modelVersion (the sibling E1 transcript's model never leaks; row: $ROW2782A)" \
+  || bad "2782-AC-1 FAILED (row: $ROW2782A)"
+
+# ── 2782-AC-2 (must-fire, explicit honored): the same shape + EXPLICIT --model-version/--model-tier/
+#    --provider on the close append are honored VERBATIM (never clobbered by an observed sibling — base
+#    observed-wins clobbered the explicit value; base also refused --provider as an unknown flag).
+S2782B="s2782b"
+mk_tagged_model_2782 "$S2782B" "agent-2782-b" "2782b" "plan-review" "claude-opus-5-5"
+ZLED2782B="$TMP/ledger-2782-b/$S2782B/2782b.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-b" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session "$S2782B" --task 2782b --role plan-review \
+    --dispatch subprocess-zai --run-id 2782n2 --pending >/dev/null 2>&1
+  node "$LED" append --session "$S2782B" --task 2782b --role plan-review --run-id 2782n2 \
+    --model-version glm-5.3 --model-tier opus --provider zai --closed-at 2026-01-02T03:04:05.000Z \
+    --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782B="$(row2782 "$ZLED2782B" plan-review run_id 2782n2)"
+{ printf '%s' "$ROW2782B" | command grep -q '"mv":"glm-5.3"' \
+    && printf '%s' "$ROW2782B" | command grep -q '"mt":"opus"' \
+    && printf '%s' "$ROW2782B" | command grep -q '"pv":"zai"'; } \
+  && ok "2782-AC-2: explicit --model-version glm-5.3 --model-tier opus --provider zai land verbatim on the gated subprocess row (row: $ROW2782B)" \
+  || bad "2782-AC-2 FAILED (row: $ROW2782B)"
+
+# ── 2782-AC-3 (must-NOT-fire, E1 unchanged): an Agent-tool --agent append auto-captures its OWN
+#    transcript model, byte-identical to base (the gate is row-shape-scoped, never agent-blind).
+S2782C="s2782c"
+mk_tagged_model_2782 "$S2782C" "agent-2782-c" "2782c" "plan-review" "claude-sonnet-5-5"
+ZLED2782C="$TMP/ledger-2782-c/$S2782C/2782c.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-c"
+  node "$LED" append --session "$S2782C" --task 2782c --role plan-review \
+    --agent agent-2782-c --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782C="$(row2782 "$ZLED2782C" plan-review agentId agent-2782-c)"
+{ printf '%s' "$ROW2782C" | command grep -q '"mv":"claude-sonnet-5-5"' \
+    && printf '%s' "$ROW2782C" | command grep -q '"dispatch":"<absent>"'; } \
+  && ok "2782-AC-3: an E1 --agent append still observed-captures its own transcript model (claude-sonnet-5-5, no dispatch marker; row: $ROW2782C)" \
+  || bad "2782-AC-3 FAILED (row: $ROW2782C)"
+
+# ── 2782-HO-1 (held-out must-fire, provider-agnostic): --dispatch subprocess-openrouter binds the same
+#    gate — a sibling E1 transcript never lands on an openrouter-class subprocess row either.
+S2782H1="s2782h1"
+mk_tagged_model_2782 "$S2782H1" "agent-2782-h1" "2782h1" "executor" "claude-opus-5-5"
+ZLED2782H1="$TMP/ledger-2782-h1/$S2782H1/2782h1.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-h1"
+  node "$LED" append --session "$S2782H1" --task 2782h1 --role executor \
+    --dispatch subprocess-openrouter --run-id 2782nh1 --pending >/dev/null 2>&1
+  node "$LED" append --session "$S2782H1" --task 2782h1 --role executor \
+    --run-id 2782nh1 --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782H1="$(row2782 "$ZLED2782H1" executor run_id 2782nh1)"
+{ printf '%s' "$ROW2782H1" | command grep -q '"mv":"<absent>"' \
+    && printf '%s' "$ROW2782H1" | command grep -q '"dispatch":"subprocess-openrouter"'; } \
+  && ok "2782-HO-1: the gate is provider-agnostic — a subprocess-openrouter row bound by run-id also carries NO sibling model (row: $ROW2782H1)" \
+  || bad "2782-HO-1 FAILED (row: $ROW2782H1)"
+
+# ── 2782-HO-2 (held-out must-not-fire, mixed E1+E2, N3): a ticket that ALSO had a zai dispatch of the
+#    same role does NOT gate a genuine Agent-tool row — the named agent's own transcript decides (row-level).
+S2782H2="s2782h2"
+mk_tagged_model_2782 "$S2782H2" "agent-2782-h2" "2782h2" "plan-review" "claude-sonnet-5-5"
+ZLED2782H2="$TMP/ledger-2782-h2/$S2782H2/2782h2.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-h2"
+  node "$LED" append --session "$S2782H2" --task 2782h2 --role plan-review \
+    --dispatch subprocess-zai --run-id 2782nh2 --pending >/dev/null 2>&1
+  node "$LED" append --session "$S2782H2" --task 2782h2 --role plan-review \
+    --agent agent-2782-h2 --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782H2="$(row2782 "$ZLED2782H2" plan-review agentId agent-2782-h2)"
+{ printf '%s' "$ROW2782H2" | command grep -q '"mv":"claude-sonnet-5-5"' \
+    && printf '%s' "$ROW2782H2" | command grep -q '"dispatch":"<absent>"'; } \
+  && ok "2782-HO-2: mixed E1+E2 — an explicit --agent append on a ticket that also had a zai dispatch still captures ITS OWN transcript model (row: $ROW2782H2)" \
+  || bad "2782-HO-2 FAILED (row: $ROW2782H2)"
+
+# ── 2782-AC-6 (flag discipline): (a) --provider zai accepted + stamped; (b) --provider bogus refused
+#    fail-closed with a BLOCK naming the SSOT provider ids, NOTHING written; (c) unreadable SSOT refuses
+#    EVERY value (fail-closed on a missing vocabulary); (d) the refusal is the PROVIDER block — the flag
+#    parses as KNOWN (base: --provider was refused by the unknown-flag self-audit instead).
+ZLED2782D="$TMP/ledger-2782-d/s2782d/2782d.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-d" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session s2782d --task 2782d --role executor \
+    --dispatch subprocess-zai --run-id 2782nd --pending >/dev/null 2>&1
+  node "$LED" append --session s2782d --task 2782d --role executor --run-id 2782nd \
+    --provider zai --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782D="$(row2782 "$ZLED2782D" executor run_id 2782nd)"
+printf '%s' "$ROW2782D" | command grep -q '"pv":"zai"' \
+  && ok "2782-AC-6(a): --provider zai is accepted and stamped on the row (row: $ROW2782D)" \
+  || bad "2782-AC-6(a) FAILED (row: $ROW2782D)"
+
+OUT2782D2="$( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-d2" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session s2782d2 --task 2782d2 --role executor --provider bogus \
+    --artifact "$ZFIX2782/artifact.md" 2>&1 )"
+RC2782D2=$?
+{ [ "$RC2782D2" != "0" ] \
+    && printf '%s' "$OUT2782D2" | command grep -q 'BLOCK (3role-ledger provider)' \
+    && printf '%s' "$OUT2782D2" | command grep -q 'openrouter' \
+    && printf '%s' "$OUT2782D2" | command grep -q 'zai' \
+    && ! printf '%s' "$OUT2782D2" | command grep -q 'unknown-flag' \
+    && [ ! -f "$TMP/ledger-2782-d2/s2782d2/2782d2.jsonl" ]; } \
+  && ok "2782-AC-6(b)/(d): --provider bogus exits non-zero with the PROVIDER BLOCK naming both SSOT ids, writes nothing, and is NOT the unknown-flag audit (the flag parses as known)" \
+  || bad "2782-AC-6(b)/(d) FAILED (rc=$RC2782D2 out=$OUT2782D2)"
+
+OUT2782D3="$( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-d3" CC_ROUTES_JSON="$ZFIX2782/no-such-routes-2782.json"
+  node "$LED" append --session s2782d3 --task 2782d3 --role executor --provider zai \
+    --artifact "$ZFIX2782/artifact.md" 2>&1 )"
+RC2782D3=$?
+{ [ "$RC2782D3" != "0" ] \
+    && printf '%s' "$OUT2782D3" | command grep -q 'unreadable' \
+    && [ ! -f "$TMP/ledger-2782-d3/s2782d3/2782d3.jsonl" ]; } \
+  && ok "2782-AC-6(c): an unreadable SSOT refuses EVERY --provider value (fail-closed on a missing vocabulary), nothing written" \
+  || bad "2782-AC-6(c) FAILED (rc=$RC2782D3 out=$OUT2782D3)"
+
+# ── 2782-AC-7 (gate unaffected): on the AC-2 fixture (subprocess row stamped glm-5.3/opus), check
+#    --enforce-role-models prints NO MODEL-POLICY line for plan-review — a row whose agentId cannot
+#    resolve has no transcript to judge. CONTROL: an off-tier E1 row under the same policy still BLOCKs.
+ZPOLICY2782="$ZFIX2782/policy-opus.env"
+printf 'CC_ROLE_PLAN_REVIEW_MODEL=opus\n' > "$ZPOLICY2782"
+CHK2782A="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-b" CC_ROUTES_JSON="$ZROUTES2782" CC_ROLES_ENV="$ZPOLICY2782" \
+  node "$LED" check --session "$S2782B" --task 2782b --enforce-role-models 2>&1)"
+! printf '%s' "$CHK2782A" | command grep -q 'MODEL-POLICY: role plan-review' \
+  && ok "2782-AC-7: check --enforce-role-models prints NO MODEL-POLICY line for the subprocess-stamped plan-review row" \
+  || bad "2782-AC-7 FAILED (out=$CHK2782A)"
+
+S2782CTRL="s2782ctrl"
+mk_tagged_model_2782 "$S2782CTRL" "agent-2782-ctrl" "2782ctrl" "plan-review" "claude-sonnet-5-5"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-ctrl"
+  node "$LED" append --session "$S2782CTRL" --task 2782ctrl --role plan-review \
+    --agent agent-2782-ctrl --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+CHK2782B="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-ctrl" CC_ROLES_ENV="$ZPOLICY2782" \
+  node "$LED" check --session "$S2782CTRL" --task 2782ctrl --enforce-role-models 2>&1)"
+printf '%s' "$CHK2782B" | command grep -q 'MODEL-POLICY: role plan-review' \
+  && ok "2782-AC-7 control: an off-tier E1 plan-review row (sonnet transcript under an opus policy) still yields MODEL-POLICY" \
+  || bad "2782-AC-7 control FAILED — the enforce leg lost power (out=$CHK2782B)"
+
+# ── 2782-AC-8 (repair: bounded, idempotent, dry-run first, per-file backup, E1 never touched) with
+#    2782-HO-3 (transcript gone -> unreadable, untouched) in its own session.
+ZT1_2782="$ZFIX2782/t-glm53.jsonl";   mk_model_file_2782 "$ZT1_2782" "glm-5.3"
+ZT2_2782="$ZFIX2782/t-glm53f.jsonl";  mk_model_file_2782 "$ZT2_2782" "glm-5.3-flash"
+ZTGONE_2782="$ZFIX2782/t-gone.jsonl"    # deliberately NEVER created (held-out 3)
+S2782E="s2782e"
+mk_tagged_model_2782 "$S2782E" "agent-2782-e" "2782e" "executor" "claude-opus-5-5"
+ZLED2782E="$TMP/ledger-2782-e/$S2782E/2782e.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e" CC_ROUTES_JSON="$ZROUTES2782"
+  # (i) a subprocess-zai executor row carrying a WRONG model + a real transcript_path (served glm-5.3)
+  node "$LED" append --session "$S2782E" --task 2782e --role executor \
+    --dispatch subprocess-zai --transcript "$ZT1_2782" --nonce 2782nonce-a --run-id OR-NONCE-2782a \
+    --model-version claude-opus-5-5 --model-tier opus --provider zai \
+    --closed-at 2026-01-02T03:04:05.000Z >/dev/null 2>&1
+  # (ii) a subprocess-zai plan-review row with NO model + a real transcript_path (served glm-5.3-flash)
+  node "$LED" append --session "$S2782E" --task 2782e --role plan-review \
+    --dispatch subprocess-zai --transcript "$ZT2_2782" --nonce 2782nonce-b --run-id OR-NONCE-2782b \
+    --closed-at 2026-01-02T03:04:05.000Z >/dev/null 2>&1
+  # (iii) a genuine E1 executor row (observed claude-opus-5-5, NO dispatch) — must stay byte-identical
+  node "$LED" append --session "$S2782E" --task 2782e --role executor \
+    --agent agent-2782-e --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+SHA2782PRE="$(shasum "$ZLED2782E")"
+OUT2782DRY="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session "$S2782E" --dry-run 2>&1)"; RC2782DRY=$?
+SHA2782DRY="$(shasum "$ZLED2782E")"
+{ [ "$RC2782DRY" = "0" ] \
+    && printf '%s' "$OUT2782DRY" | command grep -q 'would-rewrite=2 rewritten=0' \
+    && [ "$SHA2782PRE" = "$SHA2782DRY" ]; } \
+  && ok "2782-AC-8 dry-run: would-rewrite=2 rewritten=0 and the ledger file is byte-identical across the dry run" \
+  || bad "2782-AC-8 dry-run FAILED (rc=$RC2782DRY out=$OUT2782DRY)"
+OUT2782WET="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session "$S2782E" 2>&1)"; RC2782WET=$?
+NBAK2782="$(ls "$TMP/ledger-2782-e/$S2782E"/2782e.jsonl.bak-* 2>/dev/null | wc -l | tr -d ' ')"
+ROW2782I="$(row2782 "$ZLED2782E" executor run_id OR-NONCE-2782a)"
+ROW2782II="$(row2782 "$ZLED2782E" plan-review run_id OR-NONCE-2782b)"
+ROW2782III="$(row2782 "$ZLED2782E" executor agentId agent-2782-e)"
+{ [ "$RC2782WET" = "0" ] \
+    && printf '%s' "$OUT2782WET" | command grep -q 'rewritten=2' \
+    && printf '%s' "$OUT2782WET" | command grep -q 'backup=' \
+    && [ "$NBAK2782" = "1" ] \
+    && printf '%s' "$ROW2782I" | command grep -q '"mv":"glm-5.3"' \
+    && printf '%s' "$ROW2782I" | command grep -q '"mt":"opus"' \
+    && printf '%s' "$ROW2782I" | command grep -q '"pv":"zai"' \
+    && printf '%s' "$ROW2782II" | command grep -q '"mv":"glm-5.3-flash"' \
+    && printf '%s' "$ROW2782II" | command grep -q '"mt":"sonnet"' \
+    && printf '%s' "$ROW2782II" | command grep -q '"pv":"zai"' \
+    && printf '%s' "$ROW2782III" | command grep -q '"mv":"claude-opus-5-5"' \
+    && printf '%s' "$ROW2782III" | command grep -q '"pv":"<absent>"'; } \
+  && ok "2782-AC-8 wet run: rewritten=2, one per-file backup printed, (i)->glm-5.3/opus/zai, (ii)->glm-5.3-flash/sonnet/zai, (iii) E1 row UNCHANGED (i: $ROW2782I ii: $ROW2782II iii: $ROW2782III)" \
+  || bad "2782-AC-8 wet run FAILED (rc=$RC2782WET out=$OUT2782WET backups=$NBAK2782 i=$ROW2782I ii=$ROW2782II iii=$ROW2782III)"
+OUT2782IDEM="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session "$S2782E" --task 2782e 2>&1)"; RC2782IDEM=$?
+{ [ "$RC2782IDEM" = "0" ] && printf '%s' "$OUT2782IDEM" | command grep -q 'rewritten=0'; } \
+  && ok "2782-AC-8 idempotent: the second run (--task-scoped form) rewrites nothing" \
+  || bad "2782-AC-8 idempotency FAILED (rc=$RC2782IDEM out=$OUT2782IDEM)"
+
+ZLED2782E2="$TMP/ledger-2782-e2/s2782e2/2782e2.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e2" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session s2782e2 --task 2782e2 --role executor \
+    --dispatch subprocess-zai --transcript "$ZTGONE_2782" --nonce 2782nonce-c --run-id OR-NONCE-2782c \
+    --closed-at 2026-01-02T03:04:05.000Z >/dev/null 2>&1 )
+SHA2782E2PRE="$(shasum "$ZLED2782E2")"
+OUT2782GONE="$(THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-e2" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session s2782e2 2>&1)"; RC2782GONE=$?
+SHA2782E2POST="$(shasum "$ZLED2782E2")"
+{ [ "$RC2782GONE" = "0" ] \
+    && printf '%s' "$OUT2782GONE" | command grep -q 'unreadable=1' \
+    && printf '%s' "$OUT2782GONE" | command grep -q 'rewritten=0' \
+    && [ "$SHA2782E2PRE" = "$SHA2782E2POST" ]; } \
+  && ok "2782-HO-3: a row whose transcript_path is gone counts unreadable=1 and is left untouched (file byte-identical)" \
+  || bad "2782-HO-3 FAILED (rc=$RC2782GONE out=$OUT2782GONE)"
+
+# ── 2782-AC-8-tilde: real rows store transcript_path in the ledger's PORTABLE home-tilde form (`~/...`,
+#    the home-tilde store rule). transcriptModelFromPath MUST expand a leading `~/` against os.homedir()
+#    (the same read-side idiom as :1672/:2101/:2777) or every real subprocess row reads as unreadable and
+#    the live repair becomes a silent no-op (measured on the real corpus: would-rewrite=0, unreadable=67).
+#    Fixture: the transcript lives under "$TMP/fakehome2782" and the REPAIR RUN's HOME is pointed there,
+#    so the row's stored "~/t-tilde-2782.jsonl" expands to it — never writing the real $HOME.
+ZHOME2782="$TMP/fakehome2782"
+mkdir -p "$ZHOME2782"
+printf '{"type":"assistant","message":{"model":"glm-5.3","content":[{"type":"text","text":"tilde ok"}]}}\n' \
+  > "$ZHOME2782/t-tilde-2782.jsonl"
+ZLED2782T="$TMP/ledger-2782-t/s2782t/2782t.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-t" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session s2782t --task 2782t --role executor \
+    --dispatch subprocess-zai --transcript '~/t-tilde-2782.jsonl' --nonce 2782nonce-t --run-id OR-NONCE-2782t \
+    --closed-at 2026-01-02T03:04:05.000Z >/dev/null 2>&1 )
+OUT2782TDRY="$(HOME="$ZHOME2782" THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-t" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session s2782t --dry-run 2>&1)"; RC2782TDRY=$?
+OUT2782TWET="$(HOME="$ZHOME2782" THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-t" CC_ROUTES_JSON="$ZROUTES2782" \
+  node "$LED" repair-subprocess-models --session s2782t 2>&1)"; RC2782TWET=$?
+ROW2782T="$(row2782 "$ZLED2782T" executor run_id OR-NONCE-2782t)"
+{ [ "$RC2782TDRY" = "0" ] && printf '%s' "$OUT2782TDRY" | command grep -q 'would-rewrite=1' \
+    && [ "$RC2782TWET" = "0" ] && printf '%s' "$OUT2782TWET" | command grep -q 'rewritten=1' \
+    && printf '%s' "$ROW2782T" | command grep -q '"mv":"glm-5.3"' \
+    && printf '%s' "$ROW2782T" | command grep -q '"mt":"opus"' \
+    && printf '%s' "$ROW2782T" | command grep -q '"pv":"zai"'; } \
+  && ok "2782-AC-8-tilde: a '~/...' transcript_path expands against os.homedir() and repairs (row: $ROW2782T; dry: $OUT2782TDRY)" \
+  || bad "2782-AC-8-tilde FAILED (rc=$RC2782TDRY/$RC2782TWET dry=$OUT2782TDRY wet=$OUT2782TWET row=$ROW2782T)"
+
+# ── 2782-AC-9 (fix-1 regression, execution-review F1): a z.ai row stamped with model+provider zai, then
+#    a --run-id skip, then an Agent-tool --agent append — the merged row must carry the AGENT's own
+#    model and NO provider (base left pv:zai beside the agent's own mv — the Opus-row-labelled-zai class).
+#    The stamped close carries NO --closed-at/--artifact: terminal evidence would make the verdict-less
+#    skip illegal (#1580 clause 1) — this is the operator-reclaim shape F1 repro'd.
+S2782F1="s2782f1"
+mk_tagged_model_2782 "$S2782F1" "agent-2782-f1" "2782f1" "executor" "claude-sonnet-5-5"
+ZLED2782F1="$TMP/ledger-2782-f1/$S2782F1/2782f1.jsonl"
+( export THREE_ROLE_LEDGER_DIR="$TMP/ledger-2782-f1" CC_ROUTES_JSON="$ZROUTES2782"
+  node "$LED" append --session "$S2782F1" --task 2782f1 --role executor \
+    --dispatch subprocess-zai --run-id 2782nf1 --pending >/dev/null 2>&1
+  node "$LED" append --session "$S2782F1" --task 2782f1 --role executor --run-id 2782nf1 \
+    --model-version glm-5.3 --model-tier opus --provider zai >/dev/null 2>&1
+  node "$LED" append --session "$S2782F1" --task 2782f1 --role executor --run-id 2782nf1 \
+    --skip-reason "operator reclaim (2782 fix-1 smoke)" >/dev/null 2>&1
+  node "$LED" append --session "$S2782F1" --task 2782f1 --role executor \
+    --agent agent-2782-f1 --artifact "$ZFIX2782/artifact.md" >/dev/null 2>&1 )
+ROW2782F1="$(row2782 "$ZLED2782F1" executor agentId agent-2782-f1)"
+{ printf '%s' "$ROW2782F1" | command grep -q '"pv":"<absent>"' \
+    && printf '%s' "$ROW2782F1" | command grep -q '"mv":"claude-sonnet-5-5"'; } \
+  && ok "2782-AC-9 (fix-1): skip then Agent-tool append — the merged row carries the agent's OWN model and NO provider (base inherited pv:zai; row: $ROW2782F1)" \
+  || bad "2782-AC-9 (fix-1) FAILED (row: $ROW2782F1)"
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2902 — a z.ai dispatcher close append (--run-id R + --effort-source assigned) must merge onto R's row,
+# never split it; repair-split-run glues already-split rows back together (fail-closed, idempotent).
+# Scratch ledger under $TMP only; fake ids only.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+SP_S="session-2902-x"; SP_T="2902t"; SP_N="OR-NONCE-2902aaaa"; SP_M="OR-NONCE-2902bbbb"
+SP_ART="$TMP/sp-art"; mkdir -p "$SP_ART"; printf '## Review\nDecision: PASS\nDISPATCH-NONCE:%s\n' "$SP_N" > "$SP_ART/p.md"
+SP_ROUTES="$TMP/sp-routes.json"; SP_TX="$TMP/sp-tx.jsonl"
+printf '%s\n' '{ "seats": { "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai", "routed_since": "2025-01-01T00:00:00Z", "agent_tool_fallback": "opus" } } }' > "$SP_ROUTES"
+node -e '
+  const [ , p, n, t ] = process.argv;
+  const L = [ { type:"user", timestamp:"2026-10-01T00:00:00.000Z", message:{ role:"user", content:"3ROLE_TASK:" + t + " ROLE:plan-review\nDISPATCH-NONCE:" + n } },
+              { type:"assistant", timestamp:"2026-10-01T00:00:01.000Z", message:{ model:"glm-5.3", content:[ { type:"text", text:"ok" } ] } } ];
+  require("fs").writeFileSync(p, L.map(x => JSON.stringify(x)).join("\n") + "\n");
+' "$SP_TX" "$SP_N" "$SP_T"
+sp_check() { CC_ROUTES_JSON="$SP_ROUTES" node "$LED" check --session "$1" --task "$2" 2>&1; }
+sp_file() { echo "$THREE_ROLE_LEDGER_DIR/$1/$2.jsonl"; }
+sp_count() { node -e 'const fs=require("fs");let n=0;try{n=fs.readFileSync(process.argv[1],"utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l)).filter(j=>j.role===process.argv[2]).length}catch(e){}console.log(n)' "$(sp_file "$1" "$2")" "$3"; }
+sp_row() { sed -n "${3}p" "$(sp_file "$1" "$2")"; }
+sp_pre() { node "$LED" append --session "$1" --task "$2" --role "$3" --run-id "$4" --pending --artifact "$SP_ART/p.md" --dispatch-nonce "$4" --dispatch subprocess-zai --run-kind bound --run-source dispatch-helper >/dev/null 2>&1; }
+sp_close() { node "$LED" append --session "$1" --task "$2" --role "$3" --run-id "$4" --dispatch subprocess-zai --effort high --effort-source assigned ${6:-} --closed-at 2026-10-01T00:00:00Z --receipt "$4" >/dev/null 2>&1; }
+
+# AC-1 plan-review close merges onto the pending row
+sp_pre s2902a "$SP_T" plan-review "$SP_N"; sp_close s2902a "$SP_T" plan-review "$SP_N" x "--verdict PASS"
+N=$(sp_count s2902a "$SP_T" plan-review); R=$(sp_row s2902a "$SP_T" 1)
+node -e 'const j=JSON.parse(process.argv[1]);const need=["artifact_path","closedAt","effort","effort_source","run_id","verdict"];process.exit(need.every(k=>k in j)&&j.verdict==="PASS"&&j.effort==="high"&&j.effort_source==="assigned"&&!("pending" in j)?0:1)' "$R"; RC=$?
+{ [ "$N" = "1" ] && [ "$RC" = "0" ]; } && ok "#2902 AC-1: assigned-effort close with the row's own run_id merges onto ONE plan-review row (artifact_path+verdict+closedAt+effort kept, no pending)" || bad "#2902 AC-1 FAILED (n=$N rc=$RC row=$R)"
+# AC-2 executor, no verdict
+sp_pre s2902b "$SP_T" executor "$SP_N"; sp_close s2902b "$SP_T" executor "$SP_N" x ""
+N=$(sp_count s2902b "$SP_T" executor); R=$(sp_row s2902b "$SP_T" 1)
+{ [ "$N" = "1" ] && echo "$R" | command grep -q '"artifact_path"' && echo "$R" | command grep -q '"closedAt"' && echo "$R" | command grep -q '"effort_source":"assigned"'; } \
+  && ok "#2902 AC-2: executor close merges onto ONE row with artifact_path+closedAt+effort_source" || bad "#2902 AC-2 FAILED (n=$N row=$R)"
+# AC-3 no run_id, no agent, assigned stamp still opens a new round
+sp_pre s2902c "$SP_T" plan-review "$SP_N"
+node "$LED" append --session s2902c --task "$SP_T" --role plan-review --effort high --effort-source assigned >/dev/null 2>&1
+N=$(sp_count s2902c "$SP_T" plan-review)
+[ "$N" = "2" ] && ok "#2902 AC-3: an unbound assigned-effort stamp still opens a new round (#2701 guard kept)" || bad "#2902 AC-3 FAILED (n=$N)"
+# AC-4 different run_id forks
+sp_pre s2902d "$SP_T" plan-review "$SP_N"; sp_close s2902d "$SP_T" plan-review "$SP_M" x ""
+N=$(sp_count s2902d "$SP_T" plan-review)
+[ "$N" = "2" ] && ok "#2902 AC-4: a close naming a DIFFERENT run_id still forks (identity boundary kept)" || bad "#2902 AC-4 FAILED (n=$N)"
+
+# repair fixtures: write the split shape directly (what the pre-fix dispatcher produced)
+sp_split() { # <session> <task> <run_id> [later-extra-json]
+  mkdir -p "$THREE_ROLE_LEDGER_DIR/$1"
+  node -e '
+    const [ , f, s, r, extra ] = process.argv;
+    const a = { role:"plan-review", session_id:s, ts:"2026-10-01T00:00:00Z", pending:true, artifact_path:"'"$SP_ART"'/p.md", dispatch_nonce:"h", run_kind:"bound", run_source:"dispatch-helper", run_id:r, dispatch:"subprocess-zai" };
+    const b = { role:"plan-review", session_id:s, ts:"2026-10-01T00:01:00Z", closedAt:"2026-10-01T00:01:00Z", verdict:"PASS", effort:"high", effort_source:"assigned", dispatch:"subprocess-zai", transcript_path:"'"$SP_TX"'", nonce:r, receipt:r, run_id:r, only_later:"keep-me" };
+    Object.assign(b, JSON.parse(extra || "{}"));
+    require("fs").writeFileSync(f, JSON.stringify(a) + "\n" + JSON.stringify(b) + "\n");
+  ' "$(sp_file "$1" "$2")" "$1" "$3" "${4:-}"
+}
+SPF="$(sp_file s2902e "$SP_T")"
+sp_split s2902e "$SP_T" "$SP_N"
+CHK_BEFORE=$(sp_check s2902e "$SP_T")
+node "$LED" repair-split-run --session s2902e --task "$SP_T" --run-id "$SP_N" >"$TMP/sp.out" 2>"$TMP/sp.err"; RC=$?
+CHK_AFTER=$(sp_check s2902e "$SP_T")
+N=$(sp_count s2902e "$SP_T" plan-review); R=$(sp_row s2902e "$SP_T" 1)
+node -e 'const j=JSON.parse(process.argv[1]);const a=["role","session_id","ts","artifact_path","dispatch_nonce","run_kind","run_source","run_id","dispatch"],b=["closedAt","verdict","effort","effort_source","transcript_path","nonce","receipt","only_later"];process.exit(a.concat(b).every(k=>k in j)&&j.repair_ticket==="2902"&&!("pending" in j)?0:1)' "$R"; KRC=$?
+NB=$(ls "$(dirname "$SPF")/.repair-backup" 2>/dev/null | wc -l | tr -d ' ')
+{ [ "$RC" = "0" ] && [ "$N" = "1" ] && [ "$KRC" = "0" ] && [ "$NB" -ge 1 ] \
+  && echo "$CHK_BEFORE" | command grep -q 'artifact_path "" not found' && ! echo "$CHK_AFTER" | command grep -q 'artifact_path "" not found' && ! echo "$CHK_AFTER" | command grep -q 'executor artifact_path missing'; } \
+  && ok "#2902 AC-5: repair-split-run merges the split pair into ONE row (no field of either half lost, repair marker, backup made); the split BLOCK in check is present before and absent after" \
+  || bad "#2902 AC-5 FAILED (rc=$RC n=$N keys=$KRC backups=$NB err=$(cat "$TMP/sp.err") before=$CHK_BEFORE after=$CHK_AFTER)"
+# AC-7 idempotent
+cp "$SPF" "$TMP/sp-after1"; node "$LED" repair-split-run --session s2902e --task "$SP_T" --run-id "$SP_N" >"$TMP/sp.out" 2>&1; RC=$?
+{ [ "$RC" = "0" ] && command grep -q 'nothing to repair' "$TMP/sp.out" && cmp -s "$SPF" "$TMP/sp-after1"; } && ok "#2902 AC-7: second repair run is a no-op (nothing to repair, file byte-identical)" || bad "#2902 AC-7 FAILED (rc=$RC out=$(cat "$TMP/sp.out"))"
+# AC-6 dry-run
+sp_split s2902f "$SP_T" "$SP_N"; SPF6="$(sp_file s2902f "$SP_T")"; cp "$SPF6" "$TMP/sp-before6"
+node "$LED" repair-split-run --session s2902f --task "$SP_T" --run-id "$SP_N" --dry-run >"$TMP/sp.out" 2>/dev/null; RC=$?
+NBF=$(ls "$(dirname "$SPF6")/.repair-backup" 2>/dev/null | wc -l | tr -d ' ')
+{ [ "$RC" = "0" ] && cmp -s "$SPF6" "$TMP/sp-before6" && [ "$(command grep -c '^BEFORE:' "$TMP/sp.out")" = "2" ] && [ "$(command grep -c '^AFTER:' "$TMP/sp.out")" = "1" ] && [ "$NBF" = "0" ]; } \
+  && ok "#2902 AC-6: --dry-run prints BEFORE twice and AFTER once, leaves the file byte-identical, makes no backup" || bad "#2902 AC-6 FAILED (rc=$RC backups=$NBF out=$(cat "$TMP/sp.out"))"
+# refusal helper: <label> <session> <expect-term>; fixture already written; asserts rc=3, term named, file unchanged, no backup
+sp_refuse() {
+  local f; f="$(sp_file "$2" "$SP_T")"; cp "$f" "$TMP/sp-ref-before"
+  node "$LED" repair-split-run --session "$2" --task "$SP_T" --run-id "$4" ${5:-} >"$TMP/sp.out" 2>"$TMP/sp.err"; local rc=$?
+  local nb; nb=$(ls "$(dirname "$f")/.repair-backup" 2>/dev/null | wc -l | tr -d ' ')
+  { [ "$rc" = "3" ] && command grep -q "$3" "$TMP/sp.err" && cmp -s "$f" "$TMP/sp-ref-before" && [ "$nb" = "0" ]; } \
+    && ok "#2902 refusal ($1): rc=3 naming $3, file byte-identical, no backup" || bad "#2902 refusal ($1) FAILED (rc=$rc nb=$nb err=$(cat "$TMP/sp.err"))"
+}
+sp_split s2902g "$SP_T" "$SP_N" '{"agentId":"ag2902z"}'; sp_refuse "agent-bearing later row" s2902g "repair-split-run P1" "$SP_N"
+sp_split s2902h "$SP_T" "$SP_N"; node -e 'const fs=require("fs");const f=process.argv[1];const l=fs.readFileSync(f,"utf8").split("\n").filter(Boolean);fs.writeFileSync(f,l[0]+"\n")' "$(sp_file s2902h "$SP_T")"; sp_refuse "single unmarked row" s2902h "repair-split-run P1" "$SP_N"
+sp_split s2902i "$SP_T" "$SP_N"; node -e 'const fs=require("fs");const f=process.argv[1];const l=fs.readFileSync(f,"utf8").split("\n").filter(Boolean).map(x=>JSON.parse(x));l[0].closedAt="2026-10-01T00:00:00Z";fs.writeFileSync(f,l.map(x=>JSON.stringify(x)).join("\n")+"\n")' "$(sp_file s2902i "$SP_T")"; sp_refuse "earlier row already closed" s2902i "repair-split-run P2" "$SP_N"
+sp_split s2902j "$SP_T" "$SP_N" '{"artifact_path":"x.md"}'; sp_refuse "later row has artifact" s2902j "repair-split-run P3" "$SP_N"
+sp_split s2902k "$SP_T" "plain-run-id"; sp_refuse "run id not a dispatcher nonce" s2902k "repair-split-run P1" "plain-run-id"
+# F3: open pending row of another run blocks a wet run; --allow-pending overrides
+sp_split s2902l "$SP_T" "$SP_N"; printf '%s\n' '{"role":"executor","session_id":"s2902l","pending":true,"run_id":"OR-NONCE-2902cccc"}' >> "$(sp_file s2902l "$SP_T")"
+sp_refuse "another run still pending" s2902l "repair-split-run P5" "$SP_N"
+node "$LED" repair-split-run --session s2902l --task "$SP_T" --run-id "$SP_N" --allow-pending >/dev/null 2>&1; RC=$?
+{ [ "$RC" = "0" ] && [ "$(sp_count s2902l "$SP_T" plan-review)" = "1" ]; } && ok "#2902 refusal override: --allow-pending lets the wet repair proceed" || bad "#2902 allow-pending FAILED (rc=$RC)"
+# F3: file changed under the repair -> refuse. A fake node-level race: make the ledger path change between read and rename via a preloaded fs hook.
+sp_split s2902m "$SP_T" "$SP_N"; SPM="$(sp_file s2902m "$SP_T")"; cp "$SPM" "$TMP/sp-race-before"
+cat > "$TMP/sp-race-hook.cjs" <<'SPRACE'
+const fs = require('fs');
+const orig = fs.writeFileSync;
+fs.writeFileSync = function (f, d, ...r) {
+  const out = orig.call(this, f, d, ...r);
+  if (String(f).includes('.tmp-repair-')) fs.appendFileSync(process.env.SP_RACE_TARGET, '{"role":"executor","session_id":"x","late":true}\n');
+  return out;
+};
+SPRACE
+SP_RACE_TARGET="$SPM" node --require "$TMP/sp-race-hook.cjs" "$LED" repair-split-run --session s2902m --task "$SP_T" --run-id "$SP_N" >"$TMP/sp.out" 2>"$TMP/sp.err"; RC=$?
+{ [ "$RC" = "3" ] && command grep -q 'repair-split-run P6' "$TMP/sp.err" && [ "$(wc -l < "$SPM" | tr -d ' ')" = "3" ] && command grep -q '"late":true' "$SPM" && [ "$(ls "$(dirname "$SPM")" | command grep -c 'tmp-repair')" = "0" ]; } \
+  && ok "#2902 race guard: the ledger changing mid-repair makes the repair refuse (P6), keeps the concurrent write, leaves no tmp file" || bad "#2902 race guard FAILED (rc=$RC err=$(cat "$TMP/sp.err"))"
+# AC-12 banner
+BAN=$(node "$LED" 2>&1); echo "$BAN" | command grep -q 'repair-split-run|' && echo "$BAN" | command grep -q '(repair-split-run, #2902' && ok "#2902 AC-12: usage banner lists repair-split-run" || bad "#2902 AC-12 FAILED"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+# #2985 — z.ai routing policy: planner size label (S/M/L) routes the executor; plan-review strike counter;
+# data-class. Resolver-level arms (AC-1, AC-2, AC-5, AC-7, AC-8, AC-10, AC-15 + held-out). Fixtures live in
+# hooks/fixtures/2985-size-label/ (override FIX2985=<dir>); when that dir is absent (a plugin install does
+# not ship it) the section degrades to an honest SKIP — a synced smoke must not FAIL on an ai-brain-only dep.
+# Fixture plans sit under .ai-workspace/plans/ INSIDE the fixture dir because the resolver only accepts a
+# --plan path that contains `.ai-workspace/plans/` (D3 / L8).
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+FX2985="${FIX2985:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/2985-size-label}"
+if [ ! -d "$FX2985/.ai-workspace/plans" ]; then
+  skip "#2985 size-label resolver arms: fixture dir '$FX2985' absent (plugin install) — section not run"
+else
+PL2985="$FX2985/.ai-workspace/plans/2026-10-03-777-plan"
+RR2985() { CC_ROUTES_JSON="$FX2985/routes-zai.json" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" resolve-route "$@"; }
+JF2985() { node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j[process.argv[1]];process.stdout.write(v===undefined?"<absent>":String(v));}catch(e){process.stdout.write("<nojson>");}})' "$1"; }
+
+# ---- AC-1: plan-size parses the one flush-left `size: S|M|L` line; everything else fails closed. ----
+OUT=$(node "$LED" plan-size --plan "$PL2985-L.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "L" ]; } && ok "#2985 AC-1: plan-size L plan -> prints L, exit 0" || bad "#2985 AC-1 L (rc=$RC out=$OUT)"
+OUT=$(node "$LED" plan-size --plan "$PL2985-S.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "S" ]; } && ok "#2985 AC-1: plan-size S plan -> prints S, exit 0" || bad "#2985 AC-1 S (rc=$RC out=$OUT)"
+OUT=$(node "$LED" plan-size --plan "$PL2985-M.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "M" ]; } && ok "#2985 AC-1 held-out: plan-size M plan -> prints M, exit 0" || bad "#2985 AC-1 M (rc=$RC out=$OUT)"
+for pair in "none:SIZE-LABEL-MISSING" "two:SIZE-LABEL-AMBIGUOUS" "xl:SIZE-LABEL-INVALID" "indent:SIZE-LABEL-MISSING" "lower:SIZE-LABEL-INVALID"; do
+  nm="${pair%%:*}"; tok="${pair#*:}"
+  OUT=$(node "$LED" plan-size --plan "$PL2985-$nm.md" 2>&1); RC=$?
+  { [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q "$tok"; } \
+    && ok "#2985 AC-1: plan-size $nm plan -> exit 2 with $tok" || bad "#2985 AC-1 $nm should exit 2 with $tok (rc=$RC out=$OUT)"
+done
+
+# ---- AC-2: effective route is a function of (seat row, size). ----
+OUT=$(RR2985 --seat executor --plan "$PL2985-L.md" --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | JF2985 size)" = "L" ] && [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "plan" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "claude-sonnet-5-5" ]; } \
+  && ok "#2985 AC-2: executor + L plan -> size=L effective_dispatch=agent-tool tier=sonnet model=claude-sonnet-5-5" || bad "#2985 AC-2 L (rc=$RC out=$OUT)"
+for nm in S M; do
+  OUT=$(RR2985 --seat executor --plan "$PL2985-$nm.md" --json 2>/dev/null); RC=$?
+  { [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | JF2985 size)" = "$nm" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ]; } \
+    && ok "#2985 AC-2: executor + $nm plan -> effective_dispatch=subprocess-zai model=glm-5.3-flash" || bad "#2985 AC-2 $nm (rc=$RC out=$OUT)"
+done
+OUT=$(RR2985 --seat executor --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 size)" = "<absent>" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "<absent>" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "<absent>" ] && [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "<absent>" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 model)" = "glm-5.3-flash" ]; } \
+  && ok "#2985 AC-2/M10: resolve-route WITHOUT --plan gains no size/size_source/data_class/effective_* field" || bad "#2985 AC-2/M10 payload without --plan changed (out=$OUT)"
+for nm in none two xl indent lower; do
+  case "$nm" in none|indent) want=missing ;; two) want=ambiguous ;; *) want=invalid ;; esac
+  OUT=$(RR2985 --seat executor --plan "$PL2985-$nm.md" --json 2>/dev/null); RC=$?
+  { [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "$want" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
+    && ok "#2985 AC-2: executor + $nm plan -> size_source=$want and NO agent-tool path (declared route kept)" || bad "#2985 AC-2 $nm (rc=$RC want=$want out=$OUT)"
+done
+
+# ---- AC-5: zai-strikes counter — per task+role+ROUND, reset by a real verdict, drills/legacy never count. ----
+ZS2985() { OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$1" node "$LED" zai-strikes --task "${3:-777}" --role plan-review --round "${2:-1}" 2>&1; }
+for spec in "receipts-0.md:1:0" "receipts-1.md:1:1" "receipts-2.md:1:2" "receipts-reset.md:1:1" "receipts-drill.md:1:0" "receipts-rounds.md:2:1" "receipts-rounds.md:1:2" \
+            "receipts-legacy.md:1:0" "receipts-emptyverdict.md:1:2" "receipts-missingverdict.md:1:2" "receipts-other-task.md:1:1" "receipts-retry.md:1:1" "receipts-xround-reset.md:1:2"; do
+  f="${spec%%:*}"; rest="${spec#*:}"; rd="${rest%%:*}"; want="${rest#*:}"
+  OUT=$(ZS2985 "$f" "$rd"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#2985 AC-5: zai-strikes $f --round $rd -> $want" || bad "#2985 AC-5 $f round $rd want $want (rc=$RC out=$OUT)"
+done
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/no-such-receipts.md" node "$LED" zai-strikes --task 777 --role plan-review --round 1 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "#2985 AC-5: absent receipt file -> 0" || bad "#2985 AC-5 absent file (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-2.md" node "$LED" zai-strikes --task 777 --role plan-review 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-5: zai-strikes without --round fails closed (exit 2)" || bad "#2985 AC-5 no --round should exit 2 (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-2.md" node "$LED" zai-strikes --task 777 --role executor --round 1 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-5: zai-strikes --role executor refused (plan-review only, exit 2)" || bad "#2985 AC-5 executor role should exit 2 (rc=$RC out=$OUT)"
+
+# ---- AC-7: data-class operator-private routes BOTH seats to Claude first-class. ----
+OUT=$(RR2985 --seat plan-review --plan "$PL2985-private.md" --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "opus" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "claude-opus-5-5" ]; } \
+  && ok "#2985 AC-7: plan-review + data-class operator-private -> agent-tool opus" || bad "#2985 AC-7 plan-review private (out=$OUT)"
+OUT=$(RR2985 --seat executor --plan "$PL2985-private.md" --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ]; } \
+  && ok "#2985 AC-7: executor + S plan + data-class operator-private -> agent-tool sonnet" || bad "#2985 AC-7 executor private (out=$OUT)"
+OUT=$(RR2985 --seat plan-review --plan "$PL2985-L.md" --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "public" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#2985 AC-7 control: plan-review + public L plan -> stays subprocess-zai (size never moves plan-review)" || bad "#2985 AC-7 plan-review public (out=$OUT)"
+OUT=$(RR2985 --seat executor --plan "$PL2985-dcbad.md" --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "invalid" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#2985 AC-7: a malformed data-class value -> data_class=invalid, no path opened" || bad "#2985 AC-7 dcbad (out=$OUT)"
+
+# ---- AC-15: task binding + --plan validation. ----
+OUT=$(RR2985 --seat executor --plan "$PL2985-L.md" --task 778 --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "task-mismatch" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#2985 AC-15: L plan bound to 777 asked for --task 778 -> task-mismatch, no agent-tool" || bad "#2985 AC-15 mismatch (rc=$RC out=$OUT)"
+OUT=$(RR2985 --seat executor --plan "$PL2985-L.md" --task 777 --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ]; } \
+  && ok "#2985 AC-15 control: same plan with --task 777 -> agent-tool" || bad "#2985 AC-15 match (out=$OUT)"
+OUT=$(RR2985 --seat executor --plan "$FX2985/.ai-workspace/plans/legacy-slug.md" --task 777 --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "plan" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ]; } \
+  && ok "#2985 AC-15: legacy-slug plan with a flush-left Ticket: #777 line binds to --task 777 -> agent-tool" || bad "#2985 AC-15 ticket-line bind (out=$OUT)"
+OUT=$(RR2985 --seat executor --plan "$FX2985/.ai-workspace/plans/legacy-noticket.md" --task 777 --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 size_source)" = "task-mismatch" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#2985 AC-15: a slug-named plan with no Ticket line cannot bind -> task-mismatch" || bad "#2985 AC-15 no ticket line (out=$OUT)"
+for bad_plan in "/tmp/nope.md" "$FX2985/routes-zai.json" "$FX2985/.ai-workspace/plans"; do
+  OUT=$(RR2985 --seat executor --plan "$bad_plan" --json 2>&1); RC=$?
+  { [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q "unresolvable"; } \
+    && ok "#2985 AC-15/M14: --plan '$(basename "$bad_plan")' (missing / outside plans dir / directory) -> exit 2 unresolvable, never the plain payload" || bad "#2985 AC-15 unresolvable '$bad_plan' (rc=$RC out=$OUT)"
+done
+
+# ---- AC-8: `check` prints ROUTE-SIZE (not ROUTE-BYPASS) for an L-sized executor; S keeps the advisory. ----
+RS_FIX="$TMP/rs2985"; mkdir -p "$RS_FIX/ledger" "$RS_FIX/artifacts"
+printf '## ELI5\na plan\n### Binary AC\n- AC1\n' > "$RS_FIX/artifacts/planner-plan.md"
+rs2985() {  # $1=session $2=reviewed-plan path
+  mk_sub "$1" rs-P; mk_sub "$1" rs-E; mk_sub "$1" rs-V; mk_sub "$1" rs-PR
+  printf '## Review\nverdict: PASS\n' > "$RS_FIX/artifacts/pr-$1.md"
+  printf 'Decision: PASS\n' > "$RS_FIX/artifacts/er-$1.md"
+  node "$LED" append --session "$1" --task 777 --role planner --agent rs-P --artifact "$RS_FIX/artifacts/planner-plan.md" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role plan-review --agent rs-PR --artifact "$RS_FIX/artifacts/pr-$1.md" --verdict PASS --reviewed-plan "$2" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role executor --agent rs-E --artifact "PR #777" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role execution-review --oracle "$RS_FIX/artifacts/er-$1.md" >/dev/null
+}
+for spec in "rs2985L:L" "rs2985S:S"; do
+  sid="${spec%%:*}"; sz="${spec#*:}"
+  ( export THREE_ROLE_LEDGER_DIR="$RS_FIX/ledger"; export CC_ROUTES_JSON="$FX2985/routes-zai.json"; export CC_ROLES_ENV="$FX2985/roles.env"
+    rs2985 "$sid" "$PL2985-$sz.md" )
+  OUT=$(THREE_ROLE_LEDGER_DIR="$RS_FIX/ledger" CC_ROUTES_JSON="$FX2985/routes-zai.json" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" check --session "$sid" --task 777 2>&1); RC=$?
+  if [ "$sz" = "L" ]; then
+    { [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "ROUTE-SIZE: role=executor size=L" && ! printf '%s' "$OUT" | grep -q "ROUTE-BYPASS: role=executor"; } \
+      && ok "#2985 AC-8: L plan -> check prints ROUTE-SIZE for the executor and NO ROUTE-BYPASS: role=executor" || bad "#2985 AC-8 L (rc=$RC out=$OUT)"
+  else
+    { [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "ROUTE-BYPASS: role=executor" && ! printf '%s' "$OUT" | grep -q "ROUTE-SIZE: role=executor"; } \
+      && ok "#2985 AC-8: S plan -> check keeps ROUTE-BYPASS: role=executor and prints no ROUTE-SIZE" || bad "#2985 AC-8 S (rc=$RC out=$OUT)"
+  fi
+done
+
+# ---- AC-10: the seat table is untouched by this ticket (effort + execution-review). Real SSOT; skipped where it is absent (plugin). ----
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json" ]; then
+  for seat in executor plan-review; do
+    OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat "$seat" --json 2>/dev/null)
+    { [ "$(printf '%s' "$OUT" | JF2985 effort)" = "medium" ]; } && ok "#2985 AC-10: real SSOT $seat effort=medium" || bad "#2985 AC-10 real SSOT $seat effort should be medium (out=$OUT)"
+  done
+  OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat execution-review --json 2>/dev/null)
+  { [ "$(printf '%s' "$OUT" | JF2985 provider)" = "anthropic" ] && [ "$(printf '%s' "$OUT" | JF2985 model)" = "claude-opus-5-5" ]; } \
+    && ok "#2985 AC-10: execution-review stays anthropic claude-opus-5-5" || bad "#2985 AC-10 execution-review (out=$OUT)"
+else
+  skip "#2985 AC-10: real config/cc-routes.json absent (plugin install)"
+fi
+fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

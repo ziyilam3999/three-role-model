@@ -289,12 +289,18 @@ echo "== SECTION 4: #2518 D3 generalization — subprocess-zai under hybrid, per
 #      the live axis for this seat's own provider), naming subprocess-zai (not a hard-coded provider) and the
 #      helper path, no home-path leak; identical RE-ISSUE -> exit 0 silent (block-once, same as every other
 #      provider). ----
-P12A='{"session_id":"ac12a","tool_input":{"prompt":"3ROLE_TASK:9701 ROLE:executor\nimplement the plan"}}'
-runh "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
+# #2985: an executor spawn on a subprocess-zai seat must now name its plan (size-label routing), so this arm
+# cites a smoke-written S plan (bound to task 9701 by its basename) and runs the hook with that dir as cwd. The
+# plan is written by the smoke itself so the arm needs no committed fixture (plugin-safe).
+AC12A_DIR="$TMP/ac12a"; mkdir -p "$AC12A_DIR/.ai-workspace/plans"
+printf 'size: S\n' > "$AC12A_DIR/.ai-workspace/plans/2026-10-03-9701-plan.md"
+P12A='{"session_id":"ac12a","tool_input":{"prompt":"3ROLE_TASK:9701 ROLE:executor\nPLAN: .ai-workspace/plans/2026-10-03-9701-plan.md\nimplement the plan"}}'
+runh_in() { local d="$1" routes="$2" payload="$3"; shift 3; CAP=$(cd "$d" && printf '%s' "$payload" | env CC_ROUTES_JSON="$routes" "$@" CC_ROUTE_DISPATCH_STATE_DIR="$STATE" bash "$HOOK" 2>&1); RC=$?; }
+runh_in "$AC12A_DIR" "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
 { [ "$RC" = "2" ] && echo "$CAP" | grep -q "subprocess-zai" && echo "$CAP" | grep -q "tools/openrouter-role-dispatch.sh" && ! echo "$CAP" | grep -q "/Users/"; } \
   && ok "AC-12a: hybrid + subprocess-zai seat -> exit 2 first issue, names subprocess-zai + helper, no home-path leak" \
   || bad "AC-12a hybrid+zai should block first issue naming subprocess-zai + helper (rc=$RC out=$CAP)"
-runh "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
+runh_in "$AC12A_DIR" "$ROUTES_SUBPROC_ZAI" "$P12A" CC_MODE_FILE="$HYB_PIN"
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "AC-12a second issue: hybrid + subprocess-zai re-issue -> exit 0 silent (block-once, not wedged)" \
   || bad "AC-12a second issue should exit 0 silent (rc=$RC out=$CAP)"
@@ -325,4 +331,140 @@ run "$P12D" CC_MODE_FILE="$CONS_PIN"
   && ok "AC-12d: conservative + subprocess-openrouter -> exit 2 (unchanged), naming subprocess-openrouter under the generalized code path" \
   || bad "AC-12d conservative+openrouter should still block first issue (rc=$RC out=$CAP)"
 
+
+echo "== SECTION 5: #2985 — executor routed by plan size label; z.ai plan-review 2-strike rule; data-class =="
+# Fixtures: hooks/fixtures/2985-size-label/ (override FIX2985=<dir>). Absent in a plugin install -> honest SKIP.
+# The hook runs with cwd = the fixture dir so the prompt's repo-relative `.ai-workspace/plans/...` path resolves.
+FX2985="${FIX2985:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/2985-size-label}"
+if [ ! -d "$FX2985/.ai-workspace/plans" ]; then
+  echo "SKIP: #2985 gate arms: fixture dir '$FX2985' absent (plugin install) — section not run"
+else
+RZ2985="$FX2985/routes-zai.json"
+ST2985="$TMP/state2985"; mkdir -p "$ST2985"
+KEY_OK="$TMP/zai-key-present.env"; : > "$KEY_OK"          # empty file: presence is all the gate tests
+KEY_GONE="$TMP/zai-key-absent.env"                          # never created
+LOG2985="$TMP/bypass2985.log"
+PLD="2026-10-03-777-plan"
+# g2985 <payload> [env KEY=VAL ...] -> RC, CAP. hybrid pin, zai fixture routes, cwd = fixture dir.
+g2985() {
+  local payload="$1"; shift
+  CAP=$(cd "$FX2985" && printf '%s' "$payload" | env CC_ROUTES_JSON="$RZ2985" CC_ROLES_ENV="$FX2985/roles.env" CC_MODE_FILE="$HYB_PIN" \
+    ZAI_KEY_FILE="$KEY_OK" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-0.md" "$@" CC_ROUTE_DISPATCH_STATE_DIR="$ST2985" RULE12_LOG="$LOG2985" bash "$HOOK" 2>&1); RC=$?
+}
+mk2985() { printf '{"session_id":"%s","tool_input":{"prompt":"%s"}}' "$1" "$2"; }
+nmark() { ls "$ST2985" 2>/dev/null | grep -c '\.notified$'; }
+nrows() { [ -f "$LOG2985" ] && grep -c "three-role-route-dispatch-gate" "$LOG2985" || echo 0; }
+rowsok() { if [ "$HAS_OVERRIDE_LIB" = "1" ]; then [ "$(nrows)" = "$1" ]; else true; fi; }
+
+# ---- AC-4 executor arms (tagged 3ROLE_TASK:777 ROLE:executor) ----
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g4L "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nimplement")
+g2985 "$P"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } \
+  && ok "#2985 AC-4: executor spawn citing an L plan -> exit 0 silent, no marker, no bypass-audit row (first-class path)" || bad "#2985 AC-4 L plan (rc=$RC markers=$(nmark) rows=$(nrows) out=$CAP)"
+P=$(mk2985 g4S "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nimplement")
+g2985 "$P"; rc1=$RC; out1="$CAP"; m1=$(nmark)
+g2985 "$P"; rc2=$RC; out2="$CAP"
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] && [ -z "$out2" ] && printf '%s' "$out1" | grep -q "tools/openrouter-role-dispatch.sh"; } \
+  && ok "#2985 AC-4: executor + S plan -> exit 2 first (marker), exit 0 second (today's block-once, unchanged)" || bad "#2985 AC-4 S plan (rc1=$rc1 m1=$m1 rc2=$rc2 out1=$out1)"
+P=$(mk2985 g4M "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-M.md\nimplement")
+g2985 "$P"; rc1=$RC; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "0" ]; } && ok "#2985 AC-4 held-out: an M plan behaves exactly as S (block-once)" || bad "#2985 AC-4 M plan (rc1=$rc1 rc2=$rc2)"
+for pair in "none:SIZE-LABEL-MISSING" "indent:SIZE-LABEL-MISSING" "lower:SIZE-LABEL-INVALID" "xl:SIZE-LABEL-INVALID" "two:SIZE-LABEL-AMBIGUOUS"; do
+  nm="${pair%%:*}"; tok="${pair#*:}"
+  P=$(mk2985 "g4$nm" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-$nm.md\nimplement")
+  g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
+  { [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$out1" | grep -q "$tok"; } \
+    && ok "#2985 AC-4: executor + $nm plan -> exit 2 on BOTH calls naming $tok (repeat-block, fail closed)" || bad "#2985 AC-4 $nm (rc1=$rc1 rc2=$rc2 out=$out1)"
+done
+# two plans named in one prompt (both orders) -> ambiguous, repeat, no marker, no audit row
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+for order in "L S" "S L"; do
+  set -- $order
+  P=$(mk2985 "g4two$1$2" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-$1.md\nalso see .ai-workspace/plans/$PLD-$2.md\nimplement")
+  g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
+  { [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$out1" | grep -qi "ambiguous"; } \
+    && ok "#2985 AC-4/M11: prompt naming plan-$1 THEN plan-$2 -> exit 2 on both calls, 'ambiguous'" || bad "#2985 AC-4 two-plan $order (rc1=$rc1 rc2=$rc2 out=$out1)"
+done
+{ [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#2985 AC-4: the two-plan prompts wrote no marker and no audit row" || bad "#2985 AC-4 two-plan side effects (markers=$(nmark) rows=$(nrows))"
+# the same plan cited twice is ONE distinct path -> not ambiguous
+P=$(mk2985 g4dup "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nsee .ai-workspace/plans/$PLD-L.md again")
+g2985 "$P"
+{ [ "$RC" = "0" ]; } && ok "#2985 AC-4: one L plan cited twice is one distinct path -> exit 0" || bad "#2985 AC-4 duplicate cite of one plan (rc=$RC out=$CAP)"
+# no plan / nonexistent plan -> unresolvable
+P=$(mk2985 g4noplan "3ROLE_TASK:777 ROLE:executor\nimplement the plan")
+g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$out1" | grep -qi "unresolvable"; } && ok "#2985 AC-4: executor prompt naming no plan -> exit 2 'unresolvable' (repeat)" || bad "#2985 AC-4 no plan (rc1=$rc1 rc2=$rc2 out=$out1)"
+P=$(mk2985 g4ghost "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/x.md")
+g2985 "$P"
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | grep -qi "unresolvable"; } && ok "#2985 AC-4: nonexistent plan path -> exit 2 'unresolvable'" || bad "#2985 AC-4 ghost plan (rc=$RC out=$CAP)"
+# L + inline token -> exit 0 + INLINE_TOKEN audit row (the unchanged escape)
+rm -f "$LOG2985"
+P=$(mk2985 g4tok "3ROLE_TASK:777 ROLE:executor [route-dispatch-fallback-ok]\nPLAN: .ai-workspace/plans/$PLD-L.md")
+g2985 "$P"
+{ [ "$RC" = "0" ] && rowsok 1; } && ok "#2985 AC-4: L plan + inline token -> exit 0 with one INLINE_TOKEN audit row (unchanged)" || bad "#2985 AC-4 L + token (rc=$RC rows=$(nrows))"
+# task binding (AC-15): a spawn tagged 778 citing the 777-bound L plan
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g15 "3ROLE_TASK:778 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md")
+g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && rowsok 0 && printf '%s' "$out1" | grep -qi "task-mismatch"; } \
+  && ok "#2985 AC-15/M12: 3ROLE_TASK:778 citing the 777-bound L plan -> exit 2 (repeat), task-mismatch, no marker, no audit row" || bad "#2985 AC-15 mismatch (rc1=$rc1 rc2=$rc2 markers=$(nmark) out=$out1)"
+# executor + operator-private S plan -> first-class permit (executor privacy arm)
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g7ex "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-private.md")
+g2985 "$P"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#2985 AC-7: executor + operator-private S plan -> exit 0, no marker, no audit row" || bad "#2985 AC-7 executor private (rc=$RC out=$CAP)"
+P=$(mk2985 g7bad "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-dcbad.md")
+g2985 "$P"
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | grep -q "DATA-CLASS-INVALID"; } && ok "#2985 AC-7: malformed data-class -> exit 2 DATA-CLASS-INVALID" || bad "#2985 AC-7 dcbad (rc=$RC out=$CAP)"
+
+# ---- AC-6 plan-review arms: z.ai first, Opus fallback only after 2 same-round strikes ----
+TK="[route-dispatch-fallback-ok]"
+pr() { mk2985 "$1" "3ROLE_TASK:777 ROLE:plan-review $2\n$3.ai-workspace/plans/$PLD-S.md under review"; }
+R1="$FX2985/receipts-1.md"; R2="$FX2985/receipts-2.md"; RR="$FX2985/receipts-rounds.md"
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(pr g6a "$TK" "ROUND: 1\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R1"; rc1=$RC; out1="$CAP"; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R1"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && rowsok 0 && [ "$(nmark)" = "0" ] && printf '%s' "$out1" | grep -q "zai-strikes"; } \
+  && ok "#2985 AC-6/M5: plan-review + token at strikes=1 -> exit 2 on BOTH calls (repeat-block), no audit row, no marker" || bad "#2985 AC-6 strikes=1 (rc1=$rc1 rc2=$rc2 rows=$(nrows) out=$out1)"
+rm -f "$LOG2985"
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R2"
+{ [ "$RC" = "0" ] && rowsok 1; } && ok "#2985 AC-6: plan-review + token at strikes=2 (same round) -> exit 0 with one INLINE_TOKEN audit row" || bad "#2985 AC-6 strikes=2 (rc=$RC rows=$(nrows) out=$CAP)"
+P=$(pr g6c "" "ROUND: 1\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R2"
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-6: strikes=2 WITHOUT the token -> exit 2" || bad "#2985 AC-6 no token (rc=$RC out=$CAP)"
+P=$(pr g6d "$TK" "ROUND: 2\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R2"
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-6/M13: strikes=2 in round 1 do not carry to ROUND: 2 -> exit 2" || bad "#2985 AC-6 round 2 carry (rc=$RC out=$CAP)"
+P=$(pr g6e "$TK" "no round line here\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R2"
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-6: prompt with no ROUND: line -> strikes treated as 0 -> exit 2" || bad "#2985 AC-6 no round (rc=$RC out=$CAP)"
+P=$(pr g6f "$TK" "round: 1\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$R2"
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-6: lowercase 'round: 1' is not a ROUND: line -> exit 2" || bad "#2985 AC-6 lowercase round (rc=$RC out=$CAP)"
+P=$(pr g6g "$TK" "ROUND: 1\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RR"
+{ [ "$RC" = "0" ]; } && ok "#2985 AC-6: rounds fixture, ROUND: 1 has 2 strikes -> exit 0 (held-out round split)" || bad "#2985 AC-6 rounds r1 (rc=$RC out=$CAP)"
+P=$(pr g6h "$TK" "ROUND: 2\nplan: ")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RR"
+{ [ "$RC" = "2" ]; } && ok "#2985 AC-6: rounds fixture, ROUND: 2 has 1 strike -> exit 2 (held-out round split)" || bad "#2985 AC-6 rounds r2 (rc=$RC out=$CAP)"
+# plan-review below 2 strikes without a token: z.ai first, repeat-block
+P=$(pr g6i "" "ROUND: 1\nplan: ")
+g2985 "$P"; rc1=$RC; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ]; } && ok "#2985 AC-6: plan-review with 0 strikes -> exit 2 on both calls (z.ai first, not block-once)" || bad "#2985 AC-6 strikes=0 (rc1=$rc1 rc2=$rc2)"
+# key file absent -> structurally unavailable -> token honoured at strikes=0
+rm -f "$LOG2985"
+P=$(pr g6j "$TK" "ROUND: 1\nplan: ")
+g2985 "$P" ZAI_KEY_FILE="$KEY_GONE"
+{ [ "$RC" = "0" ] && rowsok 1; } && ok "#2985 AC-6: z.ai key file absent -> route unavailable -> token honoured at strikes=0 (audited)" || bad "#2985 AC-6 key absent (rc=$RC rows=$(nrows) out=$CAP)"
+# AC-7 plan-review + private plan, strikes=0, no token -> first-class permit
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g7pr "3ROLE_TASK:777 ROLE:plan-review\nROUND: 1\nplan .ai-workspace/plans/$PLD-private.md under review")
+g2985 "$P"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#2985 AC-7/M8: plan-review citing an operator-private plan, strikes=0, no token -> exit 0, no marker, no audit row" || bad "#2985 AC-7 plan-review private (rc=$RC out=$CAP)"
+# kill-switch still wins (unchanged)
+P=$(pr g6k "" "ROUND: 1\nplan: ")
+g2985 "$P" CC_ROUTE_DISPATCH_GATE_OFF=1
+{ [ "$RC" = "0" ]; } && ok "#2985: CC_ROUTE_DISPATCH_GATE_OFF=1 still exits 0 on a plan-review spawn" || bad "#2985 kill-switch (rc=$RC)"
+fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
