@@ -32,3 +32,18 @@ w3	-	accept	## **Decision:** **PASS**
 w3	-	reject	## Decision: NEEDS-WORK
 w3	-	reject	## Decision: **FAIL**
 w3	-	reject	Decision: *** PASS
+w3	-	reject	verdict: pass the buck
+w3	-	reject	Decision: PASS with fixes noted below
+w3	-	reject	**Decision: PASS** is what I would say
+# #2911 r2 (2026-10-02) APPENDED one new w3 reject row below the #2462 set (existing rows byte-unchanged,
+# per this header's own rule) -- pinning the r2 F1 hyphen-backtrack class: the grammar must not give a
+# hyphenated word back to an inner hyphen, so a hyphen prefix followed by prose ('PASS-pending CI, see
+# below') must NOT satisfy the W3 ref arm via an invented 'PASS'.
+w3	-	reject	Decision: PASS-pending CI, see below
+# #2911 r3 (2026-10-02) APPENDED one new w3 reject row below the #2911 r2 set (existing rows byte-unchanged,
+# per this header's own rule) -- pinning the r3 R2-F1 closing-emphasis class: a decision token closed by a
+# markdown emphasis run (asterisks or underscores) followed by a punctuation tail is now a VALID line whose
+# VALUE decides accept/reject, so this FAIL-valued decorated line must keep REJECTING the W3 ref arm. On the
+# pre-r3 head the line was invisible (which also rejected), so this row is a regression pin, not a
+# head-vs-base witness; the accept probes in hooks/3role-ledger-smoke-test.sh carry the red-on-head evidence.
+w3	-	reject	**Decision: FAIL** — two blockers remain
