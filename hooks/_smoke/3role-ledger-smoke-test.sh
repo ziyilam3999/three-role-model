@@ -6650,6 +6650,68 @@ THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" node "$LED" repair-strike-pro
   && ok "#3093 AC-10: events seam env occurs once, inside the P6 seam-guard block (grep -c = 1)" \
   || bad "#3093 AC-10 (count=$(command grep -c 'THREE_ROLE_GH_EVENTS_FILE' "$LED"))"
 
+# ---- fix-round-1 arms (execution-review r1 F1/F2/F3/F5/F6) ----
+# F1: live POSTMORTEM rows carry a PATH-shaped evidence= (the fixture's _or-dispatch-postmortem/ prefix
+# mirrors the live shape) — the verb keys by basename, so the counter must too, or the recorded forgive is
+# ignored and the count stays 2 (the red the review caught on the live #3078 shape).
+cp "$FX2985/receipts-exec-forgive-path.md" "$SP3093/f1.md"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f1.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" >/dev/null 2>&1); RC=$?
+OUT2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f1.md" node "$LED" zai-strikes --task 777 --role executor 2>&1)
+{ [ "$RC" = "0" ] && [ "$OUT2" = "1" ]; } \
+  && ok "#3093 F1: path-shaped POSTMORTEM evidence — verb appends, zai-strikes 2 -> 1 (basename key on both sides)" \
+  || bad "#3093 F1 (rc=$RC strikes=$OUT2)"
+# F2: a seam-made (source=events-file) forgive line never forgives on the DEFAULT (live) store — only on a
+# redirected fixture receipt. A scratch copy of the ledger under its own .ai-workspace/status default reads
+# the default store without touching the live one.
+mkdir -p "$SP3093/live/hooks" "$SP3093/live/.ai-workspace/status"
+cp "$LED" "$SP3093/live/hooks/3role-ledger.mjs"
+cp "$FX2985/receipts-exec-forgive.md" "$SP3093/live/.ai-workspace/status/1947-seat-mix-live-smoke.md"
+OUT=$(node "$SP3093/live/hooks/3role-ledger.mjs" zai-strikes --task 777 --role executor 2>&1)
+OUT2=$(ZE3093 receipts-exec-forgive.md)
+{ [ "$OUT" = "2" ] && [ "$OUT2" = "1" ]; } \
+  && ok "#3093 F2: seam-source forgive line ignored on the default store (2), honored on a redirected receipt (1)" \
+  || bad "#3093 F2 (default=$OUT redirect=$OUT2)"
+# F6: a drill=1 forgive line never counts as done — the counter ignores it and P5 repairs past it.
+OUT=$(ZE3093 receipts-exec-forgive-drill.md)
+cp "$FX2985/receipts-exec-forgive-drill.md" "$SP3093/f6.md"
+OUT2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f6.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" 2>/dev/null); RC=$?
+{ [ "$OUT" = "2" ] && [ "$RC" = "0" ] && printf '%s' "$OUT2" | command grep -q '^OK repair-strike-progress: appended'; } \
+  && ok "#3093 F6: drill=1 forgive line — counter stays 2, verb repairs past it (appended, rc 0)" \
+  || bad "#3093 F6 (strikes=$OUT rc=$RC out=$OUT2)"
+# F3: a push with no work of its own is refused at P4 — the branch reset to a master commit, and a branch
+# created at the master tip (before = 40 zeros), both exit 3 and write nothing.
+git -C "$SP3093_REPO" push -q -f origin master:777-fix
+git -C "$SP3093_REPO" fetch -q origin 777-fix
+RSP3093 x events-reset-to-master.json 777-fix 777-executor-1791547185-a1
+RSP3093 y events-create-at-master.json 777-fix 777-executor-1791547185-a1
+git -C "$SP3093_REPO" push -q -f origin 777-fix:777-fix        # restore c1b705 for any later arm
+# F5: GitHub's 300-event feed cap answers page 4 with HTTP 422 — end of feed, not an error: the hit already
+# found on page 3 stands (a scratch gh stub stands in for the network; pages 1-3 feed, page 4 422s).
+mkdir -p "$SP3093/ghbin"
+cat > "$SP3093/ghbin/gh" <<'GHSTUB3093'
+#!/bin/sh
+for a in "$@"; do case "$a" in *page=4) echo "gh: HTTP 422, pagination is limited for this resource (https://docs.github.com/rest)" >&2; exit 1;; esac; done
+for a in "$@"; do
+  case "$a" in *page=1) printf '[{"id":101,"type":"WatchEvent","created_at":"2026-10-09T12:00:00Z"},{"id":102,"type":"WatchEvent","created_at":"2026-10-09T11:50:00Z"}]\n'; exit 0;; esac
+  case "$a" in *page=2) printf '[{"id":201,"type":"WatchEvent","created_at":"2026-10-09T11:45:00Z"},{"id":202,"type":"WatchEvent","created_at":"2026-10-09T11:40:00Z"}]\n'; exit 0;; esac
+  case "$a" in *page=3) printf '[{"id":301,"type":"WatchEvent","created_at":"2026-10-09T11:37:00Z"},{"id":302,"type":"PushEvent","actor":{"id":1,"login":"f777"},"repo":{"id":1,"name":"f/r"},"payload":{"ref":"refs/heads/777-fix","before":"6b96f489f8c2c0e87f9eff02a2b85b353fb73fe2","head":"c1b705eeb1bcd81ceac43222cfbb1ccae362ee61"},"created_at":"2026-10-09T11:36:23Z"}]\n'; exit 0;; esac
+done
+exit 1
+GHSTUB3093
+chmod +x "$SP3093/ghbin/gh"
+cp "$FX2985/receipts-exec-forgive-none.md" "$SP3093/f5.md"
+PATH="$SP3093/ghbin:$PATH" OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f5.md" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" >/dev/null 2>"$SP3093/f5.err"; RC=$?
+N3093="$(command grep -c '^OR-STRIKE-FORGIVE role=executor task=777 ' "$SP3093/f5.md")"
+{ [ "$RC" = "0" ] && [ "$N3093" = "1" ] && command grep -q 'pages=3' "$SP3093/f5.err"; } \
+  && ok "#3093 F5: page-4 HTTP 422 = end of feed — the page-3 hit stands (appended, pages=3)" \
+  || bad "#3093 F5 (rc=$RC n=$N3093 err=$(head -1 "$SP3093/f5.err" 2>/dev/null))"
+
 # ---- AC-14 (usage half): the no-verb usage line names repair-strike-progress ----
 OUT=$(node "$LED" 2>&1); RC=$?
 { [ "$RC" = "2" ]; } && printf '%s' "$OUT" | command grep -q "repair-strike-progress" \

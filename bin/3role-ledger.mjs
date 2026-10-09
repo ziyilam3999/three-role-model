@@ -7461,18 +7461,38 @@ const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config k
 // #3093 D1 — the local-clock vs GitHub-clock slack folded into the dispatch-window proof (never a flag).
 const STRIKE_FORGIVE_SKEW_S = 120;
 
+// #3093 ER-r1 F1 — the ONE evidence-key normalization, shared by every writer and reader of the key: the live
+// dispatcher writes POSTMORTEM `evidence=` as a path whose BASENAME is the id, so every comparison (the verb's
+// P1/P5 lookups, the counter's Set, the Set's own build) goes through the basename — never the raw value, or
+// the writer and the reader disagree on the key's shape and a recorded forgive is silently ignored.
+const evBasename = (v) => (v == null ? '' : String(v).split('/').pop());
+
+// #3093 ER-r1 F2 — is the receipt being read the LIVE store? True iff OPENROUTER_DISPATCH_RECEIPT_FILE is
+// unset or resolves to the default the dispatcher writes (the P6 seam guard's own doctrine): a receipt
+// redirected anywhere else is fixture ground, where a seam-made line is the sanctioned proof.
+function receiptIsDefaultStore() {
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const def = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const rf = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  return !rf || path.resolve(rf) === path.resolve(def);
+}
+
 // #3093 D3 — the evidence-basename Set of every non-drill OR-STRIKE-FORGIVE line for this task+executor seat.
 // A Set, deliberately: duplicated forgive lines for one evidence collapse (one key, one CONTINUE — the pairing
 // below still admits each POSTMORTEM only once), and a line whose key matches no POSTMORTEM, or names another
-// task/role, or is a drill row, simply never intersects the pairing and changes nothing.
+// task/role, or is a drill row, simply never intersects the pairing and changes nothing. Keys are stored and
+// looked up as basenames (ER-r1 F1); a seam-made `source=events-file` line never forgives on the LIVE store
+// (ER-r1 F2 — on a redirected fixture receipt it is the smoke's own sanctioned proof, and stays honored).
 function forgivenEvidence(task, lines) {
+  const liveStore = receiptIsDefaultStore();
   const set = new Set();
   for (const line of lines) {
     if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
     const kv = receiptKv(line);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
-    if (kv.evidence) set.add(kv.evidence);
+    if (liveStore && kv.source === 'events-file') continue;
+    if (kv.evidence) set.add(evBasename(kv.evidence));
   }
   return set;
 }
@@ -7534,7 +7554,7 @@ function countExecutorStrikes(task) {
     if (!('attempt' in kv) || kv.attempt === '1') {
       if (kv.reason === 'timeout') {
         const ev = companionPostmortemEvidence(lines, i, task, kv);
-        if (ev !== null && forgiven.has(ev) && continues < CONTINUE_CAP) { continues++; continue; }
+        if (ev !== null && forgiven.has(evBasename(ev)) && continues < CONTINUE_CAP) { continues++; continue; }
       }
       n++;
     }
@@ -7552,8 +7572,9 @@ function countExecutorStrikes(task) {
 // latency_s - SKEW, END_TS + SKEW] (both inputs dispatcher-written in the POSTMORTEM's evidence basename and
 // latency_s — the run cannot write its own receipt row), exactly one qualifying event, before != head, and
 // payload.head still reachable from refs/remotes/origin/<branch> after a bounded fetch, adding at least one
-// commit not on master (unless the branch has since merged to master, when only reachability holds — the
-// forgive line is then inert because a merged task no longer dispatches).
+// commit of its own that is not on master (before..head — never an earlier push's commits; a push_head that
+// IS a master commit is the no-work reset/creation shape and is refused, ER-r1 F3; a branch since merged to
+// master fails the same test deliberately — a merged task no longer dispatches, so its line is inert).
 function cmdRepairStrikeProgress(o) {
   const session = o.session, task = o.task, role = o.role, branch = o.branch, evidence = o.evidence;
   const cwd = (typeof o.cwd === 'string' && o.cwd) ? o.cwd : '.';
@@ -7598,12 +7619,19 @@ function cmdRepairStrikeProgress(o) {
   }
   const lines = raw.split('\n');
 
-  // P5 — idempotent by the task+evidence key: a forgive line this verb (or an equivalent operator append)
-  // already wrote means there is nothing left to repair. Prints nothing new, exits 0.
+  // P5 — idempotent by the task+evidence key (the basename, ER-r1 F1): a forgive line this verb (or an
+  // equivalent operator append) already wrote means there is nothing left to repair. But ONLY a line the
+  // counter would itself honor counts as done — a drill=1 line (ignored everywhere) and, on the LIVE store,
+  // a seam-made `source=events-file` line (ER-r1 F2/F6) never do, or the verb would dead-end behind a line
+  // that forgives nothing. Prints nothing new, exits 0.
+  const liveStore = receiptIsDefaultStore();
   for (const line of lines) {
     if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
     const kv = receiptKv(line);
-    if (kv.role === 'executor' && kv.task === task && kv.evidence === evidence) {
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (liveStore && kv.source === 'events-file') continue;
+    if (evBasename(kv.evidence) === evidence) {
       console.log('OK repair-strike-progress: nothing to repair');
       process.exit(0);
     }
@@ -7615,7 +7643,6 @@ function cmdRepairStrikeProgress(o) {
   // counter would read differently. Parse failures block: an evidence basename that does not parse as
   // <task>-executor-<END_TS>-a1, or a missing/unparseable latency_s, yields NO window (never a NaN window
   // that silently matches nothing) — plan-review r1 F5.
-  const evBasename = (v) => (v == null ? '' : String(v).split('/').pop());
   let fbIdx = -1, fbKv = null;
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
@@ -7673,7 +7700,8 @@ function cmdRepairStrikeProgress(o) {
   // forger-resistant leg: a commit's committer date is backdatable, a PushEvent is not). Seam mode reads the
   // fixture; live mode pages `gh api` NEWEST-FIRST with an early stop once a page's oldest event predates
   // W.start (plan-review r1 F2 — one page silently defeats the verb once the event scrolls off), bounded at
-  // 4 pages of 100 (the feed itself caps at 300 events / 90 days).
+  // 4 pages of 100 (the feed itself caps at 300 events / 90 days; the page-4 HTTP 422 that cap answers is
+  // end-of-feed, not an error — ER-r1 F5).
   let events = null, pagesRead = 0;
   if (seamEventsFile) {
     let parsed;
@@ -7698,7 +7726,15 @@ function cmdRepairStrikeProgress(o) {
       for (let page = 1; page <= 4; page++) {
         const out = spawnSync('gh', ['api', 'repos/' + rm[1] + '/' + rm[2] + '/events?per_page=100&page=' + page],
           { encoding: 'utf8', timeout: 30000 });
-        if (out.status !== 0) { ghErr = new Error(String(out.stderr || out.error || 'gh api failed')); break; }
+        if (out.status !== 0) {
+          // #3093 ER-r1 F5: GitHub caps the events feed at 300 events, so page 4 answers HTTP 422 — that is
+          // the END OF THE FEED, not an error: stop paging and judge the events already read (a hit found on
+          // pages 1-3 stands; zero hits still fails closed at the hit check below). Any other failure stays
+          // a hard ghErr.
+          const et = String(out.stderr || out.error || '');
+          if (events.length > 0 && /HTTP 422|pagination is limited/.test(et)) break;
+          ghErr = new Error(et || 'gh api failed'); break;
+        }
         let arr; try { arr = JSON.parse(out.stdout); } catch (e) { arr = null; }
         if (!Array.isArray(arr) || arr.length === 0) break;
         pagesRead = page;
@@ -7744,8 +7780,12 @@ function cmdRepairStrikeProgress(o) {
   }
 
   // P4 — after a bounded fetch, payload.head must be reachable from refs/remotes/origin/<branch> (a rebase or
-  // force-push later orphans it — the row stays a strike, by design), and must have added at least one commit
-  // not on master — unless the branch has since merged to master, when only reachability holds.
+  // force-push later orphans it — the row stays a strike, by design), and the push must carry WORK OF ITS OWN
+  // (ER-r1 F3): a push_head that is itself a master commit (merge-base of head and origin/master == head) is
+  // the reset-to-master / created-at-master no-work shape, and before..head must add at least one commit that
+  // is not on origin/master — THIS push's commits, never an earlier push's. A branch since merged to master
+  // fails the same test deliberately: a merged task no longer dispatches, so its forgive line is inert and
+  // refusing is fail-closed, not a dead end.
   const fetchR = spawnSync('git', ['-C', cwd, 'fetch', 'origin', String(branch)], { encoding: 'utf8', timeout: 60000 });
   if (fetchR.status !== 0) {
     console.error('BLOCK (3role-ledger repair-strike-progress P4): git fetch origin ' + sanitize(branch) +
@@ -7760,18 +7800,21 @@ function cmdRepairStrikeProgress(o) {
       'row stays a strike. Nothing written.');
     process.exit(3);
   }
-  const mergedR = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', String(push.head),
+  const mbR = spawnSync('git', ['-C', cwd, 'merge-base', String(push.head),
     'refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
-  const mergedToMaster = mergedR.status === 0;
-  if (!mergedToMaster) {
-    const rlR = spawnSync('git', ['-C', cwd, 'rev-list', '--count', String(push.head),
-      '^refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
-    const added = rlR.status === 0 ? parseInt(rlR.stdout, 10) : NaN;
-    if (!Number.isFinite(added) || added < 1) {
-      console.error('BLOCK (3role-ledger repair-strike-progress P4): the push added no commit that is not on ' +
-        'origin/master (rev-list empty or unresolvable) — the push is not task progress. Nothing written.');
-      process.exit(3);
-    }
+  if (mbR.status === 0 && String(mbR.stdout).trim() === String(push.head).trim()) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): push_head ' + sanitize(push.head) +
+      ' is itself on origin/master (branch reset to, or created at, a master commit) — the push added no ' +
+      'work of its own. Nothing written.');
+    process.exit(3);
+  }
+  const rlR = spawnSync('git', ['-C', cwd, 'rev-list', '--count',
+    String(push.before) + '..' + String(push.head), '^refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
+  const added = rlR.status === 0 ? parseInt(rlR.stdout, 10) : NaN;
+  if (!Number.isFinite(added) || added < 1) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): before..head adds no commit that is not on ' +
+      'origin/master (rev-list empty or unresolvable) — the push is not task progress. Nothing written.');
+    process.exit(3);
   }
 
   const pushAt = hits[0].created_at;
