@@ -466,5 +466,51 @@ g2985 "$P"
 P=$(pr g6k "" "ROUND: 1\nplan: ")
 g2985 "$P" CC_ROUTE_DISPATCH_GATE_OFF=1
 { [ "$RC" = "0" ]; } && ok "#2985: CC_ROUTE_DISPATCH_GATE_OFF=1 still exits 0 on a plan-review spawn" || bad "#2985 kill-switch (rc=$RC)"
+
+# ---- #3060 AC-7: size-L executor on routes WITH size_models -- z.ai first (block-once) until 2 strikes ----
+RZ3060="$FX2985/routes-zai-3060.json"
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g3L "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nimplement")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"; rc1=$RC; m1=$(nmark)
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] && rowsok 0; } \
+  && ok "#3060 AC-7: L plan + 0 strikes (size_models routes) -> exit 2 first call (marker), exit 0 second, no audit row (S/M block-once path)" || bad "#3060 AC-7 L/0 strikes (rc1=$rc1 m1=$m1 rc2=$rc2 rows=$(nrows))"
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g3L2 "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nimplement")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } \
+  && ok "#3060 AC-7: L plan + 2 strikes -> exit 0 silent, no marker, no audit row (first-class Sonnet fallback)" || bad "#3060 AC-7 L/2 strikes (rc=$RC markers=$(nmark) out=$CAP)"
+P=$(mk2985 g3Lr "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nimplement")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-retry.md"; rc1=$RC
+{ [ "$rc1" = "2" ]; } && ok "#3060 AC-7: L plan after ONE invocation that retried internally -> still z.ai first (exit 2)" || bad "#3060 AC-7 retry shape (rc=$rc1 out=$CAP)"
+P=$(mk2985 g3priv "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-private.md\nimplement")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "#3060 AC-7: operator-private plan -> exit 0 silent (unchanged first-class Claude)" || bad "#3060 AC-7 private (rc=$RC out=$CAP)"
+for nm in none dcbad; do
+  P=$(mk2985 "g3$nm" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-$nm.md\nimplement")
+  g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md"; rc1=$RC; g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md"; rc2=$RC
+  { [ "$rc1" = "2" ] && [ "$rc2" = "2" ]; } && ok "#3060 AC-7: plan '$nm' still fails closed with a repeating block, even at 2 strikes" || bad "#3060 AC-7 $nm (rc1=$rc1 rc2=$rc2)"
+done
+
+# ---- #3060 AC-11: research on z.ai -- every Agent-tool research spawn takes the generic block-once path ----
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g11a "3ROLE_TASK:777 ROLE:research\ndata-class: operator-private\nlook up the options")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060"; rc1=$RC; m1=$(nmark)
+g2985 "$P" CC_ROUTES_JSON="$RZ3060"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] && rowsok 0; } \
+  && ok "#3060 AC-11: ROLE:research WITH data-class: operator-private -> exit 2, marker, exit 0 on re-issue, no audit row (no private exemption)" || bad "#3060 AC-11 private (rc1=$rc1 m1=$m1 rc2=$rc2)"
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+P=$(mk2985 g11b "3ROLE_TASK:777 ROLE:research\nlook up the options")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060"; rc1=$RC; m1=$(nmark)
+g2985 "$P" CC_ROUTES_JSON="$RZ3060"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] && rowsok 0; } \
+  && ok "#3060 AC-11: ROLE:research WITHOUT a data-class line -> the same block-once path" || bad "#3060 AC-11 plain (rc1=$rc1 m1=$m1 rc2=$rc2)"
+P=$(mk2985 g11c "3ROLE_TASK:777 ROLE:execution-review\nreview the diff")
+g2985 "$P" CC_ROUTES_JSON="$RZ3060"
+{ [ "$RC" = "0" ] && [ "$(nmark)" = "1" ]; } && ok "#3060 AC-11 control: ROLE:execution-review -> exit 0, no new marker (seat has no subprocess dispatch)" || bad "#3060 AC-11 control (rc=$RC markers=$(nmark))"
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g11d "3ROLE_TASK:777 ROLE:research\nlook up the options")
+g2985 "$P" CC_ROUTES_JSON="$RZ2985"
+{ [ "$RC" = "0" ] && [ "$(nmark)" = "0" ]; } && ok "#3060 AC-11 rollback: research seat with no dispatch field (HEAD row) -> fail-open, no marker" || bad "#3060 AC-11 rollback (rc=$RC markers=$(nmark))"
 fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

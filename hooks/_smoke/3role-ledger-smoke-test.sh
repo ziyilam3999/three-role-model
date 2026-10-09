@@ -6388,5 +6388,126 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json" ]; then
 else
   skip "#2985 AC-10: real config/cc-routes.json absent (plugin install)"
 fi
+
+# ============================================================================================================
+# #3060 — size-L executor on z.ai full model with a per-INVOCATION 2-strike Sonnet fallback; research on z.ai.
+# Fixtures: hooks/fixtures/2985-size-label/{routes-zai-3060*.json,receipts-exec-*.md,head-*.json}.
+# ============================================================================================================
+R3060="${ROUTES3060:-$FX2985/routes-zai-3060.json}"
+RR3060() {  # $1=receipt fixture  $2=plan name  [$3=routes]  -> executor resolve-route --plan --task 777 --json
+  CC_ROUTES_JSON="${3:-$R3060}" CC_ROLES_ENV="$FX2985/roles.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$1" \
+    node "$LED" resolve-route --seat executor --plan "$FX2985/.ai-workspace/plans/$2" --task 777 --json 2>/dev/null; }
+ZE3060() { OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$1" node "$LED" zai-strikes --task "${2:-777}" --role executor 2>&1; }
+
+# ---- AC-1: executor strike counter keys on the INVOCATION boundary (attempt=1 / attempt-less opens one), not line count ----
+for spec in "receipts-exec-0.md:0" "receipts-exec-1.md:1" "receipts-exec-2.md:2" "receipts-exec-reset.md:1" "receipts-exec-drill.md:0" \
+            "receipts-exec-retry.md:1" "receipts-exec-retry-mutant.md:2" "receipts-exec-legacy.md:1" "receipts-exec-legacy-pair.md:2" "receipts-exec-other.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3060 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3060 AC-1: zai-strikes --role executor $f -> $want" || bad "#3060 AC-1 $f want $want (rc=$RC out=$OUT)"
+done
+OUT=$(ZE3060 receipts-exec-other.md 778); { [ "$OUT" = "2" ]; } && ok "#3060 AC-1: task-keyed -- the other task's file counts 2 for task 778" || bad "#3060 AC-1 task 778 (out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md" node "$LED" zai-strikes --task 777 --role executor --round 1 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } && ok "#3060 AC-1: zai-strikes --role executor --round 1 exits 2 (round is not an executor key)" || bad "#3060 AC-1 executor --round (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/no-such-exec-receipts.md" node "$LED" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "#3060 AC-1: absent receipt file -> 0 (fails toward z.ai)" || bad "#3060 AC-1 absent file (rc=$RC out=$OUT)"
+# plan-review branch byte-unchanged: the #2985 asserts above (AC-5) still cover every receipts-*.md fixture.
+
+# ---- AC-2: L -> full model at 0-1 strikes; sonnet at >= 2; per-invocation; other task's strikes do not leak ----
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-L.md)
+{ [ "$(printf '%s' "$OUT" | JF2985 size)" = "L" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "0" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-L-zai" ]; } \
+  && ok "#3060 AC-2: L + 0 strikes -> subprocess-zai glm-5.3 route_reason=size-L-zai" || bad "#3060 AC-2 L/0 (out=$OUT)"
+for spec in "receipts-exec-1.md:1" "receipts-exec-reset.md:1" "receipts-exec-retry.md:1" "receipts-exec-other.md:0" "receipts-exec-drill.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(RR3060 "$f" 2026-10-03-777-plan-L.md)
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "$want" ]; } \
+    && ok "#3060 AC-2: L + $f -> still subprocess-zai glm-5.3 (zai_strikes=$want)" || bad "#3060 AC-2 L/$f (out=$OUT)"
+done
+for f in receipts-exec-2.md receipts-exec-retry-mutant.md receipts-exec-legacy-pair.md; do
+  OUT=$(RR3060 "$f" 2026-10-03-777-plan-L.md)
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "claude-sonnet-5-5" ] && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "zai-strikes" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "2" ]; } \
+    && ok "#3060 AC-2: L + $f (2 strikes) -> agent-tool sonnet route_reason=zai-strikes" || bad "#3060 AC-2 L/$f (out=$OUT)"
+done
+
+# ---- AC-3: S/M unchanged (flash, even at 2 strikes), private stays Claude, plan-review JSON byte-identical to HEAD ----
+for nm in S M; do
+  OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-$nm.md)
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-SM" ]; } \
+    && ok "#3060 AC-3: $nm plan -> subprocess-zai glm-5.3-flash route_reason=size-SM" || bad "#3060 AC-3 $nm (out=$OUT)"
+done
+OUT=$(RR3060 receipts-exec-2.md 2026-10-03-777-plan-S.md)
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ]; } \
+  && ok "#3060 AC-3 (F3): an S plan on a task already at 2 strikes still routes on flash (strikes gate only the L route)" || bad "#3060 AC-3 S/2 strikes (out=$OUT)"
+for nm in private privateL; do
+  OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-$nm.md)
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "data-class-private" ]; } \
+    && ok "#3060 AC-3: $nm plan -> agent-tool sonnet route_reason=data-class-private" || bad "#3060 AC-3 $nm (out=$OUT)"
+done
+CC_ROUTES_JSON="$FX2985/routes-zai.json" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" resolve-route --seat plan-review --plan "$PL2985-private.md" --task 777 --json 2>/dev/null | diff - "$FX2985/head-pr-private.json" >/dev/null
+{ [ "$?" = "0" ] ; } && ok "#3060 AC-3: plan-review + private plan JSON is byte-identical to HEAD (no route_reason/zai_strikes, no stripping)" || bad "#3060 AC-3 plan-review JSON drifted from HEAD"
+OUT=$(CC_ROUTES_JSON="$R3060" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" resolve-route --seat plan-review --plan "$PL2985-L.md" --task 777 --json 2>/dev/null)
+{ [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "<absent>" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "<absent>" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ]; } \
+  && ok "#3060 AC-3: plan-review never gains route_reason/zai_strikes (even with the size_models fixture)" || bad "#3060 AC-3 plan-review fields (out=$OUT)"
+
+# ---- AC-4: rollback switch -- no size_models => the #2985 behaviour byte-for-byte (L -> agent-tool) ----
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-L.md "$FX2985/routes-zai.json")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-L-no-size-model" ]; } \
+  && ok "#3060 AC-4: no size_models + L -> agent-tool sonnet route_reason=size-L-no-size-model (rollback state)" || bad "#3060 AC-4 rollback (out=$OUT)"
+printf '%s' "$OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);delete j.route_reason;delete j.zai_strikes;console.log(JSON.stringify(j));})' | diff - "$FX2985/head-exec-L.json" >/dev/null
+{ [ "$?" = "0" ]; } && ok "#3060 AC-4: rollback JSON minus the two additive fields is byte-identical to HEAD" || bad "#3060 AC-4 rollback JSON drifted from HEAD"
+CC_ROUTES_JSON="$FX2985/routes-zai.json" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" resolve-route --seat executor --json 2>/dev/null | diff - "$FX2985/head-exec-noplan.json" >/dev/null
+{ [ "$?" = "0" ]; } && ok "#3060 AC-4: resolve-route --seat executor --json (no --plan) is byte-identical to HEAD" || bad "#3060 AC-4 no-plan JSON drifted"
+# a size_models value outside the provider vocabulary fails CLOSED at resolve time too (never an undeclared model)
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-L.md "$FX2985/routes-zai-3060-bad.json")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-L-no-size-model" ]; } \
+  && ok "#3060 AC-4: an off-vocabulary size_models value fails closed to agent-tool at resolve time" || bad "#3060 AC-4 off-vocab (out=$OUT)"
+
+# ---- AC-5: SSOT lint ----
+OUT=$(CC_ROUTES_JSON="$FX2985/routes-zai-3060-bad.json" node "$LED" lint-routes 2>/dev/null); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "SIZE-MODEL-UNDECLARED"; } && ok "#3060 AC-5: lint-routes refuses size_models.L=glm-9.9 (exit 2 SIZE-MODEL-UNDECLARED)" || bad "#3060 AC-5 bad (rc=$RC out=$OUT)"
+OUT=$(CC_ROUTES_JSON="$R3060" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" = "0" ]; } && ok "#3060 AC-5: lint-routes clean on the size_models fixture" || bad "#3060 AC-5 good fixture (rc=$RC out=$OUT)"
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json" ]; then
+  RT="$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json"
+  OUT=$(unset CC_ROUTES_JSON; node "$LED" lint-routes 2>&1); RC=$?
+  { [ "$RC" = "0" ]; } && ok "#3060 AC-5: lint-routes clean on the real SSOT" || bad "#3060 AC-5 real SSOT lint (rc=$RC out=$OUT)"
+  { [ "$(jq -r '.seats.executor.size_models.L' "$RT")" = "glm-5.3" ] && [ "$(jq -r '.providers.zai.model_vocabulary["glm-5.3"].tier_equivalent' "$RT")" = "opus" ] \
+    && [ "$(jq -r '.seats.executor.model' "$RT")" = "glm-5.3-flash" ] && [ "$(jq -r '.seats["execution-review"].model' "$RT")" = "claude-opus-5-5" ]; } \
+    && ok "#3060 AC-5: real SSOT size_models.L=glm-5.3, flash default, vocab tier opus, execution-review opus all unchanged" || bad "#3060 AC-5 real SSOT values"
+  # ---- AC-9: research seat on z.ai (real SSOT) ----
+  OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat research --json 2>/dev/null)
+  MODEL9="$(printf '%s' "$OUT" | JF2985 model)"
+  { [ "$(printf '%s' "$OUT" | JF2985 provider)" = "zai" ] && [ "$(printf '%s' "$OUT" | JF2985 dispatch)" = "subprocess-zai" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 agent_tool_fallback)" = "sonnet" ] && [ "$(jq -r --arg m "$MODEL9" '.providers.zai.model_vocabulary | has($m)' "$RT")" = "true" ] \
+    && [ "$MODEL9" = "glm-5.3" ]; } \
+    && ok "#3060 AC-9: research seat -> zai / glm-5.3 / subprocess-zai / fallback sonnet (model in the zai vocabulary)" || bad "#3060 AC-9 research seat (out=$OUT)"
+  OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-role-model --role research 2>/dev/null)
+  { [ "$OUT" = "sonnet" ]; } && ok "#3060 AC-9: resolve-role-model --role research -> sonnet (fallback tier, never the vocabulary's opus)" || bad "#3060 AC-9 resolve-role-model research (out=$OUT)"
+  { jq -e '(.seats.executor._comment_3060|test("PROVISIONAL")) and (.seats.research._comment_3060|test("PROVISIONAL"))' "$RT" >/dev/null; } \
+    && ok "#3060 AC-14: executor and research seats carry a PROVISIONAL _comment_3060" || bad "#3060 AC-14 _comment_3060 missing"
+else
+  skip "#3060 AC-5/AC-9/AC-14: real config/cc-routes.json absent (plugin install)"
+fi
+
+# ---- AC-8: `check` -- ROUTE-SIZE only when the resolver says agent-tool (>=2 strikes); else ROUTE-BYPASS ----
+for spec in "rs3060a:receipts-exec-2.md:size" "rs3060b:receipts-exec-0.md:bypass"; do
+  sid="${spec%%:*}"; rest="${spec#*:}"; rcpt="${rest%%:*}"; kind="${rest#*:}"
+  ( export THREE_ROLE_LEDGER_DIR="$RS_FIX/ledger"; export CC_ROUTES_JSON="$R3060"; export CC_ROLES_ENV="$FX2985/roles.env"
+    rs2985 "$sid" "$PL2985-L.md" )
+  OUT=$(THREE_ROLE_LEDGER_DIR="$RS_FIX/ledger" CC_ROUTES_JSON="$R3060" CC_ROLES_ENV="$FX2985/roles.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$rcpt" node "$LED" check --session "$sid" --task 777 2>&1); RC=$?
+  if [ "$kind" = "size" ]; then
+    { [ "$RC" = "0" ] && printf '%s' "$OUT" | command grep -q "ROUTE-SIZE: role=executor size=L"; } \
+      && ok "#3060 AC-8: L plan + 2 strikes -> check prints ROUTE-SIZE: role=executor size=L" || bad "#3060 AC-8 size (rc=$RC out=$OUT)"
+  else
+    { [ "$RC" = "0" ] && printf '%s' "$OUT" | command grep -q "ROUTE-BYPASS: role=executor" && ! printf '%s' "$OUT" | command grep -q "ROUTE-SIZE"; } \
+      && ok "#3060 AC-8: L plan + 0 strikes -> check keeps ROUTE-BYPASS: role=executor and no ROUTE-SIZE" || bad "#3060 AC-8 bypass (rc=$RC out=$OUT)"
+  fi
+done
 fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
