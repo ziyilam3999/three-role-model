@@ -6410,6 +6410,31 @@ OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md" node "$LED" 
 { [ "$RC" = "2" ]; } && ok "#3060 AC-1: zai-strikes --role executor --round 1 exits 2 (round is not an executor key)" || bad "#3060 AC-1 executor --round (rc=$RC out=$OUT)"
 OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/no-such-exec-receipts.md" node "$LED" zai-strikes --task 777 --role executor 2>&1); RC=$?
 { [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "#3060 AC-1: absent receipt file -> 0 (fails toward z.ai)" || bad "#3060 AC-1 absent file (rc=$RC out=$OUT)"
+
+# ---- #3073 D3/D3b (appended to the #3060 AC-1 block): timeout-with-progress=pushed is a CONTINUE, not a strike ----
+# A timeout invocation-opening FALLBACK row is NOT a strike iff its nearest FOLLOWING companion POSTMORTEM row
+# (same task+role+attempt, reason=timeout) carries progress=pushed; every other case (none/unmeasured/no companion/
+# missing field -- all pre-#3073 rows) stays a strike. D3b: at most 3 CONTINUEs per reset window (4th+ = strike).
+# The same assertions, plus the exec-2 regression row, run standalone in hooks/3073-strikes-targeted-smoke.sh (<10 s).
+for spec in "receipts-exec-timeout-pushed.md:0" "receipts-exec-timeout-none.md:1" "receipts-exec-timeout-unmeasured.md:1" \
+            "receipts-exec-timeout-nocompanion.md:1" "receipts-exec-timeout-pushed-x3.md:0" "receipts-exec-timeout-pushed-x4.md:1" \
+            "receipts-exec-timeout-pushed-x4-reset.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3060 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3: zai-strikes $f -> $want" || bad "#3073 D3 $f want $want (rc=$RC out=$OUT)"
+done
+for spec in "receipts-exec-timeout-pushed.md:{\"strikes\":0,\"continues\":1,\"cap\":3}" \
+            "receipts-exec-timeout-pushed-x3.md:{\"strikes\":0,\"continues\":3,\"cap\":3}" \
+            "receipts-exec-timeout-pushed-x4.md:{\"strikes\":1,\"continues\":3,\"cap\":3}"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$f" node "$LED" zai-strikes --task 777 --role executor --json 2>&1); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3b: zai-strikes --json $f -> $want" || bad "#3073 D3b $f want $want (rc=$RC out=$OUT)"
+done
+# Mutants observed RED (same committed overlays the targeted runner uses): the pre-#3073 strike rule charges a
+# pushed-timeout leg (prints 1 where the build prints 0), and the nocap rule never converts the 4th CONTINUE
+# into a strike (prints 0 where the build prints 1).
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed.md" node "$DIR/_fixtures/3role-ledger-pre3073-strikes-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "1" ]; } && ok "MUTANT-RED strikes ok: pre3073 overlay counts the pushed timeout (1, not 0)" || bad "MUTANT-RED strikes (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed-x4.md" node "$DIR/_fixtures/3role-ledger-nocap-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "MUTANT-RED cap ok: nocap overlay never strikes the 4th CONTINUE (0, not 1)" || bad "MUTANT-RED cap (rc=$RC out=$OUT)"
 # plan-review branch byte-unchanged: the #2985 asserts above (AC-5) still cover every receipts-*.md fixture.
 
 # ---- AC-2: L -> full model at 0-1 strikes; sonnet at >= 2; per-invocation; other task's strikes do not leak ----

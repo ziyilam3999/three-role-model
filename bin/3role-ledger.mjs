@@ -7454,27 +7454,70 @@ function receiptKv(line) {
   return kv;
 }
 
-// #3060 D2 — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. Scanning from the END of the
-// receipt tail: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts iff it opens an invocation
-// (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the same invocation's internal
-// retry and add nothing (the emitter writes them only after that invocation's attempt=1 line). ANY non-drill
-// `OR-SEAT-SMOKE role=executor task=T` (a successful close; its verdict is MISSING for an executor) resets the count.
-function countExecutorStrikes(task) {
+// #3060 D2 / #3073 D3+D3b — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The window is
+// everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row (a successful close; its verdict is
+// MISSING for an executor) — the same reset boundary the #3060 backward scan broke at, so the reset/attempt semantics
+// are byte-identical. Within the window, forward: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts
+// iff it opens an invocation (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the
+// same invocation's internal retry and add nothing (the emitter writes them only after that invocation's attempt=1
+// line). #3073 D3: a `reason=timeout` invocation is NOT a strike iff its companion non-drill
+// `OR-DISPATCH-POSTMORTEM role=executor task=T` row for the SAME invocation (same `attempt` value, `reason=timeout`,
+// the nearest such row AFTER the FALLBACK row in file order -- the emitter writes FALLBACK then POSTMORTEM back to
+// back) carries `progress=pushed`. Every other case is a strike: no companion row, companion with `progress=none` or
+// `progress=unmeasured`, a missing `progress=` field (every pre-#3073 row), or a FALLBACK reason other than timeout.
+// Fail closed, as the ticket requires. #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
+// classified CONTINUE; the 4th and every later timeout-with-pushed counts as a STRIKE (fail closed) so the existing
+// 2-strike route-to-Sonnet rule engages after at most 3 wasted legs.
+const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config key.
+function executorStrikeFacts(task) {
   const lines = readReceiptTail().split('\n');
-  let n = 0;
+  let start = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
-    const isSm = line.startsWith('OR-SEAT-SMOKE ');
-    if (!isFb && !isSm) continue;
-    const kv = receiptKv(line);
+    if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
+    const kv = receiptKv(lines[i]);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
-    if (isSm) break;
-    if (!('attempt' in kv) || kv.attempt === '1') n++;
+    start = i + 1;
+    break;
   }
-  return n;
+  let strikes = 0, continues = 0;
+  for (let i = start; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if ('attempt' in kv && kv.attempt !== '1') continue;
+    if (kv.reason !== 'timeout') { strikes++; continue; }
+    let progress = null;
+    for (let j = i + 1; j < lines.length; j++) {
+      // #3073 ER-r1 F3: STOP at the NEXT invocation-opening FALLBACK for this task (attempt=1 or
+      // legacy no-attempt; the emitter writes FALLBACK then POSTMORTEM back to back, so anything past
+      // the next invocation opener belongs to a LATER invocation). A POSTMORTEM row lost to an append
+      // failure must read as "no companion" (strike, fail closed), never borrow a later dispatch's
+      // progress=pushed (fail open by at most one). attempt=2+ FALLBACK rows are the same
+      // invocation's internal retry and do NOT stop the search (their POSTMORTEM pairs by attempt).
+      if (lines[j].startsWith('OR-DISPATCH-FALLBACK ')) {
+        const fkv = receiptKv(lines[j]);
+        if (fkv.role === 'executor' && fkv.task === task && fkv.drill !== '1'
+          && (!('attempt' in fkv) || fkv.attempt === '1')) break;
+        continue;
+      }
+      if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
+      const pkv = receiptKv(lines[j]);
+      if (pkv.role !== 'executor' || pkv.task !== task) continue;
+      if (pkv.drill === '1') continue;
+      if (pkv.reason !== 'timeout') continue;
+      if ((pkv.attempt || '1') !== (kv.attempt || '1')) continue;
+      progress = pkv.progress || null;
+      break;
+    }
+    if (progress === 'pushed' && continues < CONTINUE_CAP) { continues++; continue; }
+    strikes++;
+  }
+  return { strikes, continues, cap: CONTINUE_CAP };
 }
+
+function countExecutorStrikes(task) { return executorStrikeFacts(task).strikes; }
 
 // zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
 // consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
@@ -7487,7 +7530,11 @@ function cmdZaiStrikes(opts) {
   if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
   if (role === 'executor') {
     if ('round' in opts) { console.error('zai-strikes: --round is not an executor key (executor strikes are per task, per invocation)'); process.exit(2); }
-    console.log(String(countExecutorStrikes(task)));
+    const f3073 = executorStrikeFacts(task);
+    // #3073 D3: `--json` prints the CONTINUE side too (strikes/continues/cap) so the orchestrator can see a
+    // CONTINUE happened without re-reading receipts; the plain integer output and exit code are unchanged.
+    if ('json' in opts) console.log('{"strikes":' + f3073.strikes + ',"continues":' + f3073.continues + ',"cap":' + f3073.cap + '}');
+    else console.log(String(f3073.strikes));
     process.exit(0);
   }
   if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review or executor (the only seats with a strike rule)'); process.exit(2); }
