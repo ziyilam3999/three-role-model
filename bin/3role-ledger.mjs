@@ -7058,6 +7058,20 @@ function lintRoutesConfig(routes) {
       }
     }
   }
+  // #3060 D1 -- seats.<seat>.size_models: only the L key is defined, and its value must be a model the seat's own
+  // provider declares in model_vocabulary (fail closed: an undeclared slug would be dispatched as a hand-typed id).
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_models' in seat)) continue;
+    const sm = seat.size_models;
+    if (!sm || typeof sm !== 'object' || Array.isArray(sm)) { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models must be an object'); continue; }
+    const vocab = ((providers[seat.provider] || {}).model_vocabulary) || {};
+    for (const [k, v] of Object.entries(sm)) {
+      if (k !== 'L') { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' -- only the L key is defined'); continue; }
+      if (typeof v !== 'string' || !Object.prototype.hasOwnProperty.call(vocab, v)) {
+        problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' = "' + v + '" is not in providers.' + seat.provider + '.model_vocabulary');
+      }
+    }
+  }
   return problems;
 }
 
@@ -7345,23 +7359,54 @@ function resolvePlanFacts(planArg, task) {
   let size_source;
   if (!bound) size_source = 'task-mismatch';
   else size_source = sz.ok ? 'plan' : sz.source;
-  return { size: sz.ok ? sz.size : '', size_source, data_class: dc, bound, abs: lp.abs };
+  return { size: sz.ok ? sz.size : '', size_source, data_class: dc, bound, abs: lp.abs, task: task === undefined ? '' : String(task) };
 }
 
 // D3/D4/D8: the effective route. Leaving the declared subprocess route needs ALL of: the seat declares an
 // agent_tool_fallback tier, the plan is bound to the task, and a first-class reason —
-//   executor    : (valid label AND (size L OR data-class operator-private))
+//   executor    : (valid label AND (operator-private OR (size L AND (no usable size_models.L OR >= 2 z.ai strikes))))
 //   plan-review : data-class operator-private
 // Everything else (missing/ambiguous/invalid label, mismatch, invalid data-class) keeps the declared route; the
 // consumers refuse on size_source / data_class instead (fail closed, no path opened).
+// #3060 — an executor + size L + public plan STAYS on the declared z.ai route with the SSOT's `size_models.L`
+// model (D1) until the task has 2 z.ai strikes (D2: one per failed dispatcher INVOCATION, receipt-derived), then
+// leaves for the fallback tier. A `size_models` key that is absent, or whose value is not in the seat provider's
+// model_vocabulary, is the #2985 rule unchanged (L -> fallback tier): the config-only rollback, failing closed.
+// Additive JSON fields `route_reason` + `zai_strikes` are produced for the EXECUTOR seat only (never plan-review).
+function executorSizeModel(seat) {
+  const sm = seat && seat.size_models;
+  if (!sm || typeof sm !== 'object' || Array.isArray(sm)) return '';
+  const v = sm.L;
+  if (typeof v !== 'string' || !v) return '';
+  const loaded = loadRoutesConfig();
+  const prov = loaded.ok && loaded.routes && loaded.routes.providers ? loaded.routes.providers[seat.provider] : null;
+  const vocab = prov && prov.model_vocabulary;
+  if (!vocab || typeof vocab !== 'object' || !Object.prototype.hasOwnProperty.call(vocab, v)) return '';
+  return v;
+}
+
 function effectiveRouteFor(seatKey, seat, facts) {
   const out = { effective_dispatch: seat.dispatch || '', effective_tier: '', effective_model: seat.model || '' };
+  const exec = seatKey === 'executor';
+  if (exec) { out.route_reason = ''; out.zai_strikes = 0; }
   const fb = seat.agent_tool_fallback;
   if (!fb || !ROLE_MODELS.includes(fb) || !facts.bound) return out;
   const privateData = facts.data_class === 'operator-private';
   let leave = false;
-  if (seatKey === 'executor') leave = facts.size_source === 'plan' && (facts.size === 'L' || privateData);
-  else if (seatKey === 'plan-review') leave = privateData;
+  if (exec) {
+    if (facts.size_source === 'plan') {
+      if (privateData) { leave = true; out.route_reason = 'data-class-private'; }
+      else if (facts.size === 'L') {
+        const sizeModel = executorSizeModel(seat);
+        if (!sizeModel) { leave = true; out.route_reason = 'size-L-no-size-model'; }
+        else {
+          out.zai_strikes = facts.task ? countExecutorStrikes(facts.task) : 0;
+          if (out.zai_strikes >= 2) { leave = true; out.route_reason = 'zai-strikes'; }
+          else { out.effective_model = sizeModel; out.route_reason = 'size-L-zai'; }
+        }
+      } else out.route_reason = 'size-SM';
+    }
+  } else if (seatKey === 'plan-review') leave = privateData;
   if (!leave) return out;
   const cfg = loadRoleConfig().cfg || {};
   out.effective_dispatch = 'agent-tool';
@@ -7383,21 +7428,14 @@ function cmdPlanSize(opts) {
   process.exit(0);
 }
 
-// zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
-// consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
-// verdict in the SAME round. Scans from the END so the scan stops at the reset; lines without round= (legacy),
-// drill=1 lines and retry=attempted sub-attempt lines never count.
-function cmdZaiStrikes(opts) {
-  const task = opts.task, role = opts.role, round = opts.round;
-  if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
-  if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review (the only seat with a strike rule)'); process.exit(2); }
-  if (typeof round !== 'string' || !/^[0-9]{1,6}$/.test(round)) { console.error('zai-strikes: --round <n> is required (digits only)'); process.exit(2); }
+// The dispatch helper's receipt file (OPENROUTER_DISPATCH_RECEIPT_FILE honoured), read through the STRIKE_TAIL_BYTES
+// cap. '' when absent/unreadable (every caller then counts 0 -- an undercount fails toward z.ai).
+function readReceiptTail() {
   let file = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
   if (!file) {
     let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
     file = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
   }
-  let text = '';
   try {
     const fd = fs.openSync(file, 'r');
     try {
@@ -7405,9 +7443,56 @@ function cmdZaiStrikes(opts) {
       const len = Math.min(size, STRIKE_TAIL_BYTES);
       const buf = Buffer.alloc(len);
       fs.readSync(fd, buf, 0, len, size - len);
-      text = buf.toString('utf8');
+      return buf.toString('utf8');
     } finally { fs.closeSync(fd); }
-  } catch (e) { console.log('0'); process.exit(0); }
+  } catch (e) { return ''; }
+}
+
+function receiptKv(line) {
+  const kv = {};
+  for (const tok of line.split(/\s+/)) { const eq = tok.indexOf('='); if (eq > 0 && !(tok.slice(0, eq) in kv)) kv[tok.slice(0, eq)] = tok.slice(eq + 1); }
+  return kv;
+}
+
+// #3060 D2 — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. Scanning from the END of the
+// receipt tail: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts iff it opens an invocation
+// (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the same invocation's internal
+// retry and add nothing (the emitter writes them only after that invocation's attempt=1 line). ANY non-drill
+// `OR-SEAT-SMOKE role=executor task=T` (a successful close; its verdict is MISSING for an executor) resets the count.
+function countExecutorStrikes(task) {
+  const lines = readReceiptTail().split('\n');
+  let n = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
+    const isSm = line.startsWith('OR-SEAT-SMOKE ');
+    if (!isFb && !isSm) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (isSm) break;
+    if (!('attempt' in kv) || kv.attempt === '1') n++;
+  }
+  return n;
+}
+
+// zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
+// consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
+// verdict in the SAME round. Scans from the END so the scan stops at the reset; lines without round= (legacy),
+// drill=1 lines and retry=attempted sub-attempt lines never count.
+// #3060: `--role executor --task T` (NO --round; executor dispatches are not round-keyed) prints the per-task,
+// per-invocation executor strike count (countExecutorStrikes above); `--round` with the executor role exits 2.
+function cmdZaiStrikes(opts) {
+  const task = opts.task, role = opts.role, round = opts.round;
+  if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
+  if (role === 'executor') {
+    if ('round' in opts) { console.error('zai-strikes: --round is not an executor key (executor strikes are per task, per invocation)'); process.exit(2); }
+    console.log(String(countExecutorStrikes(task)));
+    process.exit(0);
+  }
+  if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review or executor (the only seats with a strike rule)'); process.exit(2); }
+  if (typeof round !== 'string' || !/^[0-9]{1,6}$/.test(round)) { console.error('zai-strikes: --round <n> is required (digits only)'); process.exit(2); }
+  const text = readReceiptTail();
   const lines = text.split('\n');
   let n = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -7415,8 +7500,7 @@ function cmdZaiStrikes(opts) {
     const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
     const isSm = line.startsWith('OR-SEAT-SMOKE ');
     if (!isFb && !isSm) continue;
-    const kv = {};
-    for (const tok of line.split(/\s+/)) { const eq = tok.indexOf('='); if (eq > 0 && !(tok.slice(0, eq) in kv)) kv[tok.slice(0, eq)] = tok.slice(eq + 1); }
+    const kv = receiptKv(line);
     if (kv.role !== role || kv.task !== task || kv.round !== round) continue;
     if (kv.drill === '1') continue;
     if (isSm) { if (kv.verdict && kv.verdict !== 'MISSING') break; continue; }
@@ -7498,7 +7582,7 @@ function cmdLintRoutes(opts) {
   if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
   const problems = lintRoutesConfig(loaded.routes);
   if (problems.length) {
-    for (const p of problems) process.stderr.write(p + '\n');
+    for (const p of problems) { if (p.startsWith('SIZE-MODEL-')) console.log(p); else process.stderr.write(p + '\n'); }
     process.exit(2);
   }
   console.log('OK: routes lint clean (' + loaded.configPath + ')');
@@ -8241,7 +8325,7 @@ try {
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
-      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--task T --role plan-review --round N (zai-strikes, #2985)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
+      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--task T --role plan-review --round N | --task T --role executor (zai-strikes, #2985/#3060)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
       '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
       '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +

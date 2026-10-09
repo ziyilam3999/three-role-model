@@ -55,6 +55,10 @@
 #     the FIRST-CLASS route (exit 0, no marker, no bypass-audit row). S/M -> today's block-once. A missing /
 #     duplicated / invalid label, zero or 2+ distinct plans, a nonexistent plan or a task mismatch -> exit 2,
 #     REPEATED (no marker): it fails closed to no dispatch, never to a default model.
+#   * #3060: an executor L public plan stays on the subprocess route (the resolver yields subprocess-zai, so the
+#     S/M block-once path applies) until the task has 2 z.ai strikes, when the resolver yields agent-tool and the
+#     Sonnet spawn is silent again. `ROLE:research` is a recognised tag: once the SSOT declares the research seat
+#     subprocess-zai, EVERY Agent-tool research spawn takes the generic block-once path (no private exemption).
 #   * plan-review: z.ai first EVERY round. The Opus fallback token is honoured only when the round has >= 2
 #     recorded strikes (`zai-strikes`, receipts-derived), the z.ai key file is absent, or the plan under review
 #     is operator-private (which routes to Claude first-class, no token). Below that the block repeats.
@@ -124,7 +128,7 @@ read -r ROLE SESSION TASKID BYPASS SIG ROUNDV < <(
     const prompt=[ti.prompt, ti.description, ti.message].map(x=> (x==null?"":String(x))).join("\n");
     const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
     const mTask=prompt.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
-    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
+    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor|research)/i);
     const role = mRole ? mRole[1].toLowerCase() : "-";
     const taskId = mTask ? mTask[1] : "-";
     const bypass = /\[route-dispatch-fallback-ok\]/i.test(prompt) ? "1" : "0";
@@ -207,7 +211,8 @@ emit_repeat_block() {
 THREE-ROLE ROUTE-DISPATCH GATE (#2985): ROLE:${ROLE} for 3ROLE_TASK:${TASKID} -- ${1}: ${2}
 This refusal REPEATS (no block-once marker): the z.ai routing policy is fail-closed. Remedy for an executor: name
 exactly one plan (PLAN: .ai-workspace/plans/<file>.md) that carries one flush-left \`size: S|M|L\` line and is bound
-to this task, then dispatch via tools/openrouter-role-dispatch.sh (S/M) or spawn model:sonnet (L). Remedy for a
+to this task, then dispatch via tools/openrouter-role-dispatch.sh (S/M, and L below 2 z.ai strikes on the task; an L
+plan at 2+ strikes, or an operator-private plan, is the first-class model:sonnet spawn). Remedy for a
 plan-review: dispatch tools/openrouter-role-dispatch.sh --role plan-review first; the Opus fallback token is
 honoured only after 2 same-round strikes (3role-ledger.mjs zai-strikes --task ${TASKID} --role plan-review --round <n>).
 </system-reminder>
@@ -303,7 +308,7 @@ this seat is the FALLBACK path, sanctioned ONLY for: (a) a D3 bounded fallback a
 subprocess dispatch (helper exit 124 or nonzero, <=1 subprocess retry first); (b) the seat's key file
 absent / the route genuinely unavailable; or (c) explicit operator direction. If this spawn IS a sanctioned
 fallback, re-issue it carrying the inline token [route-dispatch-fallback-ok] in the prompt (it is
-audit-logged as a deliberate bypass, never silent) and pass model:opus (plan-review) / model:sonnet (executor)
+audit-logged as a deliberate bypass, never silent) and pass model:opus (plan-review) / model:sonnet (executor, research)
 explicitly. This is ADVISORY + block-once PER session:task:role: you will see this ONCE for this spawn.
 Escapes: inline bypass token [route-dispatch-fallback-ok] in the prompt for a deliberate one-off, or
 kill-switch CC_ROUTE_DISPATCH_GATE_OFF=1 (or THREE_ROLE_INSTRUMENT_OFF=1 / SHIP_PIPELINE=1).
