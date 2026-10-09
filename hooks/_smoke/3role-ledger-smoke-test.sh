@@ -6509,5 +6509,133 @@ for spec in "rs3060a:receipts-exec-2.md:size" "rs3060b:receipts-exec-0.md:bypass
       && ok "#3060 AC-8: L plan + 0 strikes -> check keeps ROUTE-BYPASS: role=executor and no ROUTE-SIZE" || bad "#3060 AC-8 bypass (rc=$RC out=$OUT)"
   fi
 done
+
+# ============================================================================================================
+# #3085 — size-aware served-model provenance for z.ai EXECUTOR rows: `check` derives the expected served
+# model from the dispatcher's own effective route for the plan named in the row's OWN nonce-bound transcript
+# first record (the #3060 rule), not the bare seat default. Fixtures: hooks/fixtures/2985-size-label/
+# {routes-zai-3060.json,routes-zai.json}; scratch ledger/plans/transcripts under $TMP with fake ids only
+# (task 3085x, nonces NNN-*).
+# ============================================================================================================
+Z85="$TMP/3085x-fixtures"
+export Z85   # the transcript writer bakes it in as the recorded dispatch cwd (the #2700 vantage)
+mkdir -p "$Z85/ledger" "$Z85/transcripts" "$Z85/.ai-workspace/plans"
+# plans: flush-left size/data-class lines, bound to task 3085x by the basename prefix (the D4 binding leg).
+mk_z85_plan() {  # $1=file $2=size  [extra flush-left data-class lines...]
+  local F="$1"
+  { printf '# fixture plan (fake ids, #3085 smoke)\nsize: %s\n' "$2"
+    shift 2; for l in "$@"; do printf '%s\n' "$l"; done
+    printf 'Ticket: #3085x\n'; } > "$F"
+}
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-L.md"      L "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-S.md"      S "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-L2.md"     L "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-priv.md"   L "data-class: operator-private"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-dcbad.md"  L "data-class: public" "data-class: public"
+# transcript: enqueue first record = the dispatcher's outbound brief text (tag + nonce + the PLAN line(s)),
+# then a `user` record carrying cwd = the dispatch vantage (#2700 R3 shape), then the served-model line.
+mk_z85_transcript() {  # $1=path $2=nonce $3=served-model $4=brief-body-lines
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, nonce, model, body ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "z85-fixture", content: "3ROLE_TASK:3085x ROLE:executor\nDISPATCH-NONCE:" + nonce + "\n" + body }));
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "z85-fixture" }));
+    lines.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z", cwd: process.env.Z85,
+      message: { role: "user", content: "3ROLE_TASK:3085x ROLE:executor" } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", cwd: process.env.Z85,
+      message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# z85_session <session> <transcript> <nonce> <model-version> — the filler rows plus the executor zai dispatch row.
+z85_session() {
+  printf 'Decision: PASS\n' > "$Z85/er-$1.md"
+  ( export THREE_ROLE_LEDGER_DIR="$Z85/ledger"; export CC_ROUTES_JSON="$R3060"
+    node "$LED" append --session "$1" --task 3085x --role planner --skip-reason "fixture: not under test in #3085" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role plan-review --skip-reason "fixture: not under test in #3085" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role execution-review --oracle "$Z85/er-$1.md" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role executor --dispatch subprocess-zai \
+      --transcript "$2" --nonce "$3" --artifact "PR #3085x-$1" --model-version "$4" >/dev/null 2>&1 )
+}
+# z85_check <session> [routes] — sets ZOUT/ZRC (default the size_models fixture).
+z85_check() {
+  ZOUT=$(Z85="$Z85" THREE_ROLE_LEDGER_DIR="$Z85/ledger" CC_ROUTES_JSON="${2:-$R3060}" \
+    node "$LED" check --session "$1" --task 3085x 2>&1); ZRC=$?
+}
+
+# ---- AC-2: L public bound + served glm-5.3 (the #3081 shape) -> admissible, whole check exits 0 ----
+mk_z85_transcript "$Z85/transcripts/ac2.jsonl" "NNN-AC2" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac2 "$Z85/transcripts/ac2.jsonl" "NNN-AC2" "glm-5.3"
+z85_check z85ac2
+{ [ "$ZRC" = "0" ] && ! printf '%s' "$ZOUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3085 AC-2: L public plan + served glm-5.3 (size_models.L) -> check exits 0, no BLOCK line" \
+  || bad "#3085 AC-2 should pass clean (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-3: S plan + served glm-5.3 still blocks, naming the seat default and size=S (green both ends) ----
+mk_z85_transcript "$Z85/transcripts/ac3.jsonl" "NNN-AC3" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-S.md"
+z85_session z85ac3 "$Z85/transcripts/ac3.jsonl" "NNN-AC3" "glm-5.3"
+z85_check z85ac3
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3-flash"' && printf '%s' "$ZOUT" | command grep -q 'size=S'; } \
+  && ok "#3085 AC-3: S plan + served glm-5.3 -> exit 2, route-expected model \"glm-5.3-flash\" size=S" \
+  || bad "#3085 AC-3 should BLOCK with seat default + size=S (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-4: L plan + served flash (the small model) blocks, naming size_models.L and size=L ----
+mk_z85_transcript "$Z85/transcripts/ac4.jsonl" "NNN-AC4" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac4 "$Z85/transcripts/ac4.jsonl" "NNN-AC4" "glm-5.3-flash"
+z85_check z85ac4
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3"' && printf '%s' "$ZOUT" | command grep -q 'size=L'; } \
+  && ok "#3085 AC-4: L plan + served glm-5.3-flash -> exit 2, route-expected model \"glm-5.3\" size=L" \
+  || bad "#3085 AC-4 should BLOCK with size_models.L + size=L (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-5: brief names NO plan path -> SIZE-ROUTE-UNRESOLVABLE (fail closed) ----
+mk_z85_transcript "$Z85/transcripts/ac5.jsonl" "NNN-AC5" "glm-5.3-flash" "do the work; no plan line at all"
+z85_session z85ac5 "$Z85/transcripts/ac5.jsonl" "NNN-AC5" "glm-5.3-flash"
+z85_check z85ac5
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-5: brief with no plan path -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-5 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-6: brief names TWO distinct plan paths -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac6.jsonl" "NNN-AC6" "glm-5.3-flash" \
+  "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md and .ai-workspace/plans/2026-01-01-3085x-plan-L2.md"
+z85_session z85ac6 "$Z85/transcripts/ac6.jsonl" "NNN-AC6" "glm-5.3-flash"
+z85_check z85ac6
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-6: brief with two distinct plan paths -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-6 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-7: operator-private plan -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-priv.md"
+z85_session z85ac7 "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash"
+z85_check z85ac7
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-7: data-class operator-private -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-7 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-8: rollback config (no size_models) + L + served glm-5.3 -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac8.jsonl" "NNN-AC8" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac8 "$Z85/transcripts/ac8.jsonl" "NNN-AC8" "glm-5.3"
+z85_check z85ac8 "$FX2985/routes-zai.json"
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-8: rollback routes (no size_models) + L + served glm-5.3 -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-8 should fail closed on the rollback config (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-9: nonce mismatch keeps the M2 text, never a size/route token (order guard) ----
+mk_z85_transcript "$Z85/transcripts/ac9.jsonl" "NNN-OTHER-RUN" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac9 "$Z85/transcripts/ac9.jsonl" "NNN-AC9" "glm-5.3"
+z85_check z85ac9
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'does not carry BOTH the spawn tag' && ! printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-9: nonce mismatch -> exit 2 with the M2 text, no size/route token (an unbound transcript never steers)" \
+  || bad "#3085 AC-9 should BLOCK on M2 only (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-14: TWO flush-left data-class lines (parsePlanDataClass -> invalid) + L + served glm-5.3 -> fail closed ----
+mk_z85_transcript "$Z85/transcripts/ac14.jsonl" "NNN-AC14" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-dcbad.md"
+z85_session z85ac14 "$Z85/transcripts/ac14.jsonl" "NNN-AC14" "glm-5.3"
+z85_check z85ac14
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-14: duplicated data-class line (invalid) + L + served glm-5.3 -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-14 should fail closed on invalid data-class (rc=$ZRC out=$ZOUT)"
 fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
