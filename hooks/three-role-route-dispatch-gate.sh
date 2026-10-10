@@ -51,7 +51,7 @@
 # #2985 — z.ai routing policy (PROVIDER=zai seats only; every other provider keeps the behaviour above):
 #   * executor: the spawn prompt must name exactly ONE plan (.ai-workspace/plans/<file>.md). The ledger helper
 #     (resolve-route --plan) answers from the plan's flush-left `size: S|M|L` line and `data-class:` line:
-#     L (or operator-private) bound to this task -> an Agent-tool spawn at the seat's agent_tool_fallback tier is
+#     L bound to this task -> an Agent-tool spawn at the seat's agent_tool_fallback tier is
 #     the FIRST-CLASS route (exit 0, no marker, no bypass-audit row). S/M -> today's block-once. A missing /
 #     duplicated / invalid label, zero or 2+ distinct plans, a nonexistent plan or a task mismatch -> exit 2,
 #     REPEATED (no marker): it fails closed to no dispatch, never to a default model.
@@ -60,8 +60,9 @@
 #     Sonnet spawn is silent again. `ROLE:research` is a recognised tag: once the SSOT declares the research seat
 #     subprocess-zai, EVERY Agent-tool research spawn takes the generic block-once path (no private exemption).
 #   * plan-review: z.ai first EVERY round. The Opus fallback token is honoured only when the round has >= 2
-#     recorded strikes (`zai-strikes`, receipts-derived), the z.ai key file is absent, or the plan under review
-#     is operator-private (which routes to Claude first-class, no token). Below that the block repeats.
+#     recorded strikes (`zai-strikes`, receipts-derived) or the z.ai key file is absent. Below that the block
+#     repeats. (#3078: a `data-class:` operator-private label is a recorded fact on every plan, never a reroute
+#     -- a private plan-review brief takes the same path as a public one.)
 # INPUT-BOUND (#2985): at most the first 1 MiB of the prompt is scanned, at most 3 distinct plan paths are
 # examined, and each plan file is read through the resolver's 1 MiB cap -- per-spawn work is O(1 MiB).
 #
@@ -212,7 +213,7 @@ THREE-ROLE ROUTE-DISPATCH GATE (#2985): ROLE:${ROLE} for 3ROLE_TASK:${TASKID} --
 This refusal REPEATS (no block-once marker): the z.ai routing policy is fail-closed. Remedy for an executor: name
 exactly one plan (PLAN: .ai-workspace/plans/<file>.md) that carries one flush-left \`size: S|M|L\` line and is bound
 to this task, then dispatch via tools/openrouter-role-dispatch.sh (S/M, and L below 2 z.ai strikes on the task; an L
-plan at 2+ strikes, or an operator-private plan, is the first-class model:sonnet spawn). Remedy for a
+plan at 2+ strikes is the first-class model:sonnet spawn; a `data-class:` label is recorded, never a reroute #3078). Remedy for a
 plan-review: dispatch tools/openrouter-role-dispatch.sh --role plan-review first; the Opus fallback token is
 honoured only after 2 same-round strikes (3role-ledger.mjs zai-strikes --task ${TASKID} --role plan-review --round <n>).
 </system-reminder>
@@ -234,15 +235,8 @@ prompt_plans() {
 json_field() { ROUTE_PAYLOAD="$2" node -e 'try{const j=JSON.parse(process.env.ROUTE_PAYLOAD||"");const v=j[process.argv[1]];process.stdout.write(v===undefined?"":String(v));}catch(e){}' "$1" 2>/dev/null; }
 
 if [ "$PROVIDER" = "zai" ] && [ "$ROLE" = "plan-review" ]; then
-  # data-class: ANY cited plan operator-private -> Claude first-class, no token, no marker, no audit row.
-  PLANS_PR="$(prompt_plans)"
-  while IFS= read -r PP; do
-    [ -n "$PP" ] || continue
-    RJ=$(node "$LEDGER_HELPER" resolve-route --seat "$ROLE" --plan "$PP" --task "$TASKID" --json 2>/dev/null) || continue
-    if [ "$(json_field data_class "$RJ")" = "operator-private" ] && [ "$(json_field effective_dispatch "$RJ")" = "agent-tool" ]; then exit 0; fi
-  done <<EOF3
-$PLANS_PR
-EOF3
+  # #3078 -- a `data-class: operator-private` label never admits the inline fallback token and never
+  # silently permits a spawn: a private plan-review brief takes the SAME block-once path as a public one.
   STRIKES=0
   if [ "$ROUNDV" != "-" ]; then
     STRIKES=$(node "$LEDGER_HELPER" zai-strikes --task "$TASKID" --role plan-review --round "$ROUNDV" 2>/dev/null)
@@ -259,7 +253,7 @@ EOF3
   [ -f "$KEYF" ] || ADMIT=1
   if [ "$BYPASS" = "1" ] && [ "$ADMIT" = "1" ]; then log_inline_token; exit 0; fi
   if [ "$BYPASS" = "1" ]; then
-    emit_repeat_block "FALLBACK-NOT-ADMITTED" "the inline fallback token is honoured only after 2 same-round z.ai strikes (this round: ${STRIKES}), a missing z.ai key file, or an operator-private plan -- dispatch tools/openrouter-role-dispatch.sh --role plan-review (round ${ROUNDV}) first"
+    emit_repeat_block "FALLBACK-NOT-ADMITTED" "the inline fallback token is honoured only after 2 same-round z.ai strikes (this round: ${STRIKES}) or a missing z.ai key file -- dispatch tools/openrouter-role-dispatch.sh --role plan-review (round ${ROUNDV}) first"
   fi
   emit_repeat_block "ZAI-FIRST" "plan-review is dispatched on z.ai every round (strikes this round: ${STRIKES}; a ROUND: <n> line in the prompt keys the count). Opus fallback after 2 strikes: re-issue with the inline token"
 fi
@@ -281,7 +275,7 @@ if [ "$PROVIDER" = "zai" ] && [ "$ROLE" = "executor" ]; then
     ambiguous) emit_repeat_block "SIZE-LABEL-AMBIGUOUS" "${PLANS_EX} has more than one size: line (ambiguous)" ;;
     *) emit_repeat_block "SIZE-LABEL-INVALID" "${PLANS_EX} has a size: line that is not exactly S, M or L (invalid)" ;;
   esac
-  # First-class route: L (or operator-private) -> Agent-tool spawn at the fallback tier. Not a bypass: silent.
+  # First-class route: L at the fallback tier -> Agent-tool spawn. Not a bypass: silent.
   [ "$EFFD" = "agent-tool" ] && exit 0
 fi
 

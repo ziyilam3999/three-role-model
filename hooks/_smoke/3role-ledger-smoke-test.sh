@@ -6315,15 +6315,15 @@ OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-2.md" node "$LED" zai-s
 OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-2.md" node "$LED" zai-strikes --task 777 --role executor --round 1 2>&1); RC=$?
 { [ "$RC" = "2" ]; } && ok "#2985 AC-5: zai-strikes --role executor refused (plan-review only, exit 2)" || bad "#2985 AC-5 executor role should exit 2 (rc=$RC out=$OUT)"
 
-# ---- AC-7: data-class operator-private routes BOTH seats to Claude first-class. ----
+# ---- AC-7 (#3078): a `data-class: operator-private` label is RECORDED, never a routing input. ----
 OUT=$(RR2985 --seat plan-review --plan "$PL2985-private.md" --json 2>/dev/null)
-{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] \
-  && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "opus" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "claude-opus-5-5" ]; } \
-  && ok "#2985 AC-7: plan-review + data-class operator-private -> agent-tool opus" || bad "#2985 AC-7 plan-review private (out=$OUT)"
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ]; } \
+  && ok "#3078 AC-7: plan-review + data-class operator-private -> subprocess-zai glm-5.3 (recorded, never rerouted)" || bad "#3078 AC-7 plan-review private (out=$OUT)"
 OUT=$(RR2985 --seat executor --plan "$PL2985-private.md" --json 2>/dev/null)
-{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] \
-  && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ]; } \
-  && ok "#2985 AC-7: executor + S plan + data-class operator-private -> agent-tool sonnet" || bad "#2985 AC-7 executor private (out=$OUT)"
+{ [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ]; } \
+  && ok "#3078 AC-7: executor + S plan + data-class operator-private -> subprocess-zai glm-5.3-flash (same as public S)" || bad "#3078 AC-7 executor private (out=$OUT)"
 OUT=$(RR2985 --seat plan-review --plan "$PL2985-L.md" --json 2>/dev/null)
 { [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "public" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ]; } \
   && ok "#2985 AC-7 control: plan-review + public L plan -> stays subprocess-zai (size never moves plan-review)" || bad "#2985 AC-7 plan-review public (out=$OUT)"
@@ -6410,6 +6410,31 @@ OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md" node "$LED" 
 { [ "$RC" = "2" ]; } && ok "#3060 AC-1: zai-strikes --role executor --round 1 exits 2 (round is not an executor key)" || bad "#3060 AC-1 executor --round (rc=$RC out=$OUT)"
 OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/no-such-exec-receipts.md" node "$LED" zai-strikes --task 777 --role executor 2>&1); RC=$?
 { [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "#3060 AC-1: absent receipt file -> 0 (fails toward z.ai)" || bad "#3060 AC-1 absent file (rc=$RC out=$OUT)"
+
+# ---- #3073 D3/D3b (appended to the #3060 AC-1 block): timeout-with-progress=pushed is a CONTINUE, not a strike ----
+# A timeout invocation-opening FALLBACK row is NOT a strike iff its nearest FOLLOWING companion POSTMORTEM row
+# (same task+role+attempt, reason=timeout) carries progress=pushed; every other case (none/unmeasured/no companion/
+# missing field -- all pre-#3073 rows) stays a strike. D3b: at most 3 CONTINUEs per reset window (4th+ = strike).
+# The same assertions, plus the exec-2 regression row, run standalone in hooks/3073-strikes-targeted-smoke.sh (<10 s).
+for spec in "receipts-exec-timeout-pushed.md:0" "receipts-exec-timeout-none.md:1" "receipts-exec-timeout-unmeasured.md:1" \
+            "receipts-exec-timeout-nocompanion.md:1" "receipts-exec-timeout-pushed-x3.md:0" "receipts-exec-timeout-pushed-x4.md:1" \
+            "receipts-exec-timeout-pushed-x4-reset.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3060 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3: zai-strikes $f -> $want" || bad "#3073 D3 $f want $want (rc=$RC out=$OUT)"
+done
+for spec in "receipts-exec-timeout-pushed.md:{\"strikes\":0,\"continues\":1,\"cap\":3}" \
+            "receipts-exec-timeout-pushed-x3.md:{\"strikes\":0,\"continues\":3,\"cap\":3}" \
+            "receipts-exec-timeout-pushed-x4.md:{\"strikes\":1,\"continues\":3,\"cap\":3}"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$f" node "$LED" zai-strikes --task 777 --role executor --json 2>&1); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3b: zai-strikes --json $f -> $want" || bad "#3073 D3b $f want $want (rc=$RC out=$OUT)"
+done
+# Mutants observed RED (same committed overlays the targeted runner uses): the pre-#3073 strike rule charges a
+# pushed-timeout leg (prints 1 where the build prints 0), and the nocap rule never converts the 4th CONTINUE
+# into a strike (prints 0 where the build prints 1).
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed.md" node "$DIR/_fixtures/3role-ledger-pre3073-strikes-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "1" ]; } && ok "MUTANT-RED strikes ok: pre3073 overlay counts the pushed timeout (1, not 0)" || bad "MUTANT-RED strikes (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed-x4.md" node "$DIR/_fixtures/3role-ledger-nocap-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "MUTANT-RED cap ok: nocap overlay never strikes the 4th CONTINUE (0, not 1)" || bad "MUTANT-RED cap (rc=$RC out=$OUT)"
 # plan-review branch byte-unchanged: the #2985 asserts above (AC-5) still cover every receipts-*.md fixture.
 
 # ---- AC-2: L -> full model at 0-1 strikes; sonnet at >= 2; per-invocation; other task's strikes do not leak ----
@@ -6442,11 +6467,12 @@ done
 OUT=$(RR3060 receipts-exec-2.md 2026-10-03-777-plan-S.md)
 { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ]; } \
   && ok "#3060 AC-3 (F3): an S plan on a task already at 2 strikes still routes on flash (strikes gate only the L route)" || bad "#3060 AC-3 S/2 strikes (out=$OUT)"
-for nm in private privateL; do
+for spec in "private:glm-5.3-flash:size-SM" "privateL:glm-5.3:size-L-zai"; do
+  nm="${spec%%:*}"; rest="${spec#*:}"; model="${rest%%:*}"; reason="${rest#*:}"
   OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-$nm.md)
-  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
-    && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "data-class-private" ]; } \
-    && ok "#3060 AC-3: $nm plan -> agent-tool sonnet route_reason=data-class-private" || bad "#3060 AC-3 $nm (out=$OUT)"
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "$model" ] \
+    && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "$reason" ] && [ "$(printf '%s' "$OUT" | JF2985 data_class)" = "operator-private" ]; } \
+    && ok "#3078 AC-6: $nm plan -> subprocess-zai $model route_reason=$reason data_class=operator-private (private routes like public)" || bad "#3078 AC-6 $nm (out=$OUT)"
 done
 CC_ROUTES_JSON="$FX2985/routes-zai.json" CC_ROLES_ENV="$FX2985/roles.env" node "$LED" resolve-route --seat plan-review --plan "$PL2985-private.md" --task 777 --json 2>/dev/null | diff - "$FX2985/head-pr-private.json" >/dev/null
 { [ "$?" = "0" ] ; } && ok "#3060 AC-3: plan-review + private plan JSON is byte-identical to HEAD (no route_reason/zai_strikes, no stripping)" || bad "#3060 AC-3 plan-review JSON drifted from HEAD"

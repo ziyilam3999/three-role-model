@@ -409,11 +409,11 @@ P=$(mk2985 g15 "3ROLE_TASK:778 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.m
 g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
 { [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && rowsok 0 && printf '%s' "$out1" | grep -qi "task-mismatch"; } \
   && ok "#2985 AC-15/M12: 3ROLE_TASK:778 citing the 777-bound L plan -> exit 2 (repeat), task-mismatch, no marker, no audit row" || bad "#2985 AC-15 mismatch (rc1=$rc1 rc2=$rc2 markers=$(nmark) out=$out1)"
-# executor + operator-private S plan -> first-class permit (executor privacy arm)
+# executor + operator-private S plan -> the SAME block-once path as a public S plan (#3078 privacy arm)
 rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
 P=$(mk2985 g7ex "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-private.md")
-g2985 "$P"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#2985 AC-7: executor + operator-private S plan -> exit 0, no marker, no audit row" || bad "#2985 AC-7 executor private (rc=$RC out=$CAP)"
+g2985 "$P"; rc1=$RC; m1=$(nmark); g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] && rowsok 0; } && ok "#3078 AC-7: executor + operator-private S plan -> SAME path as public S: exit 2 + marker first, exit 0 second, no audit row" || bad "#3078 AC-7 executor private (rc1=$rc1 m1=$m1 rc2=$rc2 rows=$(nrows) out=$CAP)"
 P=$(mk2985 g7bad "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-dcbad.md")
 g2985 "$P"
 { [ "$RC" = "2" ] && printf '%s' "$CAP" | grep -q "DATA-CLASS-INVALID"; } && ok "#2985 AC-7: malformed data-class -> exit 2 DATA-CLASS-INVALID" || bad "#2985 AC-7 dcbad (rc=$RC out=$CAP)"
@@ -457,11 +457,11 @@ rm -f "$LOG2985"
 P=$(pr g6j "$TK" "ROUND: 1\nplan: ")
 g2985 "$P" ZAI_KEY_FILE="$KEY_GONE"
 { [ "$RC" = "0" ] && rowsok 1; } && ok "#2985 AC-6: z.ai key file absent -> route unavailable -> token honoured at strikes=0 (audited)" || bad "#2985 AC-6 key absent (rc=$RC rows=$(nrows) out=$CAP)"
-# AC-7 plan-review + private plan, strikes=0, no token -> first-class permit
+# #3078 plan-review + private plan, strikes=0, no token -> the SAME ZAI-FIRST repeat as public
 rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
 P=$(mk2985 g7pr "3ROLE_TASK:777 ROLE:plan-review\nROUND: 1\nplan .ai-workspace/plans/$PLD-private.md under review")
-g2985 "$P"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#2985 AC-7/M8: plan-review citing an operator-private plan, strikes=0, no token -> exit 0, no marker, no audit row" || bad "#2985 AC-7 plan-review private (rc=$RC out=$CAP)"
+g2985 "$P"; rc1=$RC; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && rowsok 0; } && ok "#3078 AC-7: plan-review citing an operator-private plan, strikes=0, no token -> exit 2 on both calls, no marker (z.ai first, same as public)" || bad "#3078 AC-7 plan-review private (rc1=$rc1 rc2=$rc2 markers=$(nmark) rows=$(nrows) out=$CAP)"
 # kill-switch still wins (unchanged)
 P=$(pr g6k "" "ROUND: 1\nplan: ")
 g2985 "$P" CC_ROUTE_DISPATCH_GATE_OFF=1
@@ -483,9 +483,11 @@ g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/re
 P=$(mk2985 g3Lr "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-L.md\nimplement")
 g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-retry.md"; rc1=$RC
 { [ "$rc1" = "2" ]; } && ok "#3060 AC-7: L plan after ONE invocation that retried internally -> still z.ai first (exit 2)" || bad "#3060 AC-7 retry shape (rc=$rc1 out=$CAP)"
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
 P=$(mk2985 g3priv "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-private.md\nimplement")
-g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"
-{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "#3060 AC-7: operator-private plan -> exit 0 silent (unchanged first-class Claude)" || bad "#3060 AC-7 private (rc=$RC out=$CAP)"
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"; rc1=$RC; m1=$(nmark)
+g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-0.md"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ]; } && ok "#3078: operator-private S plan (size_models routes, 0 strikes) -> same block-once as public S (exit 2 + marker, then exit 0)" || bad "#3078 private S block-once (rc1=$rc1 m1=$m1 rc2=$rc2 out=$CAP)"
 for nm in none dcbad; do
   P=$(mk2985 "g3$nm" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-$nm.md\nimplement")
   g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md"; rc1=$RC; g2985 "$P" CC_ROUTES_JSON="$RZ3060" OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-2.md"; rc2=$RC

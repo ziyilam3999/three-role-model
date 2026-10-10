@@ -103,7 +103,7 @@ command -v node >/dev/null 2>&1 || exit 0
 # match-then-statSync-existence-gate capability hooks/review-round-state.mjs's resolvePlanPath already has,
 # applied to the SAME prompt text this hook already parses (never tool_response, never the reviewer's own
 # artifact). "-" when unresolved (no match, or the matched path doesn't exist on disk from this spawn's cwd).
-read -r TASKID ROLE SESSION AGENTID PLANPATH DISPATCHNONCE < <(
+read -r TASKID ROLE SESSION AGENTID PLANPATH DISPATCHNONCE HOOKEVENT < <(
   HOOK_INPUT="$INPUT" node -e '
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
     const ti=d.tool_input||{};
@@ -148,7 +148,7 @@ read -r TASKID ROLE SESSION AGENTID PLANPATH DISPATCHNONCE < <(
     // (b) regex over the STRINGIFIED tool_response: an agentId/agent_id label then a hex/uuid-ish token.
     if(!agent){
       let s=""; try{ s=(typeof tr==="string")? tr : JSON.stringify(tr||""); }catch(e){ s=""; }
-      const m=s.match(/agent[_-]?id["'"'"'\s:=]+["'"'"']?([0-9a-fA-F][0-9a-fA-F_-]{6,})/);
+      const m=s.match(/agent[_-]?id["'"'"'\s:=]+["'"'"']?([0-9a-fA-F][0-9a-fA-F_-]{6,})/i);
       if(m) agent=clean(m[1]);
       // (b2) a bare subagents/agent-<id>.jsonl path occasionally echoed back in the response.
       if(!agent){ const m2=s.match(/subagents\/agent-([0-9A-Za-z_-]+)\.jsonl/); if(m2) agent=clean(m2[1]); }
@@ -187,7 +187,7 @@ read -r TASKID ROLE SESSION AGENTID PLANPATH DISPATCHNONCE < <(
       if (mDN) dispatchNonce = mDN[1];
     }
     // (c) empty -> degrade to {role}-only.
-    process.stdout.write(mTask[1] + " " + role + " " + (session||"-") + " " + (agent||"-") + " " + planPath + " " + dispatchNonce);
+    process.stdout.write(mTask[1] + " " + role + " " + (session||"-") + " " + (agent||"-") + " " + planPath + " " + dispatchNonce + " " + hookEvent);
   ' 2>/dev/null
 )
 
@@ -253,6 +253,26 @@ if [ -n "$AGENTID" ] && [ "$AGENTID" != "-" ]; then
   node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $ASSIGNED_FLAGS --sense-reroute >/dev/null 2>&1
 else
   node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" $ASSIGNED_FLAGS --sense-reroute >/dev/null 2>&1
+fi
+
+# #3098 Leg A — lane step-log `started`, on the PostToolUse edge ONLY. The PreToolUse edge of this hook
+# writes NOTHING to the step log for ANY role (plan premise 2b / fold blocker 1): a PreToolUse side effect
+# runs even when a sibling gate denies the call, and a denied spawn gets no PostToolUse — so a PreToolUse
+# start would be a PHANTOM lane the slot gate then trusts. PostToolUse fires only for a spawn that ran
+# (at dispatch for backgrounded spawns), carrying the agentId as the pairing id. Idempotence (id-level,
+# in lane-events.mjs): a re-fired PostToolUse for the same agentId writes no second start. --id is passed
+# ONLY when the extractor actually found one (r2 executor note 2 — never a fabricated pairing id).
+# Fail-open like everything above: a writer error never blocks the spawn.
+if [ "${HOOKEVENT:-}" != "PreToolUse" ]; then
+  STEPLOG_ID_FLAGS=""
+  if [ -n "$AGENTID" ] && [ "$AGENTID" != "-" ]; then
+    STEPLOG_ID_FLAGS="--id $AGENTID"
+  fi
+  STEPLOG_MODEL_FLAG=""
+  if [ -n "${AVERSION:-}" ] && [ "$AVERSION" != "-" ]; then
+    STEPLOG_MODEL_FLAG="--model $AVERSION"
+  fi
+  node "$HOOK_DIR/lane-events.mjs" append --session "$SESSION" --task "$TASKID" --step "$ROLE" --kind started --where claude $STEPLOG_ID_FLAGS $STEPLOG_MODEL_FLAG >/dev/null 2>&1
 fi
 
 # Both append branches merge here. Resync the live board on this AUTOMATED write
