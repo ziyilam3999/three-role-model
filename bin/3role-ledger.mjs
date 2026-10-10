@@ -2196,8 +2196,10 @@ function briefPlanPaths(text) {
 // effectiveRouteFor would have picked for the plan named in the row's OWN nonce-bound transcript first
 // record, re-derived through the SAME resolver the dispatcher called (resolvePlanFacts + executorSizeModel,
 // the #2434 single-generator discipline). Every outcome the dispatcher itself refuses pre-stamp (exit
-// 10/11/12: no/ambiguous plan path, unresolvable plan, size missing/ambiguous/invalid, task mismatch,
-// private OR invalid data-class, L-with-fallback-but-no-size-model) is a BLOCK here — a z.ai row claiming
+// 10/11: no/ambiguous plan path, unresolvable plan, size missing/ambiguous/invalid, task mismatch,
+// invalid data-class — #3078 retired exit 12, so post-#3078 an operator-private plan routes exactly like
+// a public one and #3122 mirrored that here (the PLAN_DATA_CLASSES allowlist); L-with-fallback-but-no-
+// size-model) is a BLOCK here — a z.ai row claiming
 // one is inadmissible (fail closed, never a silent seat-model default). Strikes are deliberately NOT
 // consulted (D3): zai_strikes is time-varying, and the row's existence already proves the route stayed on
 // z.ai at dispatch time, so reading strikes at check time could block a row correct when it closed.
@@ -2227,7 +2229,7 @@ function zaiExecutorRouteExpected(e, info, task, decl) {
   }
   if (!facts) return { block: true, reason: 'plan "' + rel + '" is unresolvable from the transcript vantage or the checker chain' };
   if (facts.size_source !== 'plan') return { block: true, reason: 'plan "' + rel + '" size_source=' + facts.size_source };
-  if (facts.data_class !== 'public') return { block: true, reason: 'plan "' + rel + '" data_class=' + facts.data_class };
+  if (!PLAN_DATA_CLASSES.includes(facts.data_class)) return { block: true, reason: 'plan "' + rel + '" data_class=' + facts.data_class };
   if (facts.size === 'L') {
     const fb = decl.seat.agent_tool_fallback;
     if (fb && ROLE_MODELS.includes(fb)) {

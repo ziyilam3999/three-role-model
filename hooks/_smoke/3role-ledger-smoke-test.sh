@@ -6632,13 +6632,17 @@ z85_check z85ac6
   && ok "#3085 AC-6: brief with two distinct plan paths -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
   || bad "#3085 AC-6 should fail closed (rc=$ZRC out=$ZOUT)"
 
-# ---- AC-7: operator-private plan -> SIZE-ROUTE-UNRESOLVABLE ----
+# ---- AC-7 (#3122 rewrite): private L plan + mismatched served model still BLOCKs on the comparison ----
+# Pre-#3078 this arm asserted private -> SIZE-ROUTE-UNRESOLVABLE; #3078 retired exit 12 and #3122 mirrored
+# that in the checker (PLAN_DATA_CLASSES allowlist), so a private plan now expects the model a public plan
+# of the same size expects. The row keeps its hard exit 2 but on the served-model comparison.
 mk_z85_transcript "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-priv.md"
 z85_session z85ac7 "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash"
 z85_check z85ac7
-{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
-  && ok "#3085 AC-7: data-class operator-private -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
-  || bad "#3085 AC-7 should fail closed (rc=$ZRC out=$ZOUT)"
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3"' && printf '%s' "$ZOUT" | command grep -q 'size=L' \
+  && ! printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-7: private L plan + served glm-5.3-flash -> exit 2, route-expected model \"glm-5.3\" size=L, no SIZE-ROUTE token (#3122)" \
+  || bad "#3085 AC-7 private mismatched served model should BLOCK on the model comparison (rc=$ZRC out=$ZOUT)"
 
 # ---- AC-8: rollback config (no size_models) + L + served glm-5.3 -> SIZE-ROUTE-UNRESOLVABLE ----
 mk_z85_transcript "$Z85/transcripts/ac8.jsonl" "NNN-AC8" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
