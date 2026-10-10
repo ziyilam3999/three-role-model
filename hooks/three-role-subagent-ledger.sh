@@ -206,6 +206,14 @@ CLOSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # fail-open semantics as the spawn edge (see three-role-spawn-ledger.sh) -- a no-op for an ordinary session.
 node "$HELPER" append --session "$SESSION" --task "$TASKID" --role "$ROLE" --agent "$AGENTID" $SELF_FLAG $EFFORT_FLAG --closed-at "$CLOSED_AT" --sense-reroute >/dev/null 2>&1
 
+# #3098 Leg A — lane step-log `finished` at the one trustworthy close edge (this hook fires exclusively
+# at a real SubagentStop gated on a real subagent transcript), pairing with the spawn hook's `started` on
+# the SAME authoritative agentId. No outcome is stamped here: SubagentStop observes no verdict (the
+# reader treats an outcome-less review finish by its own rules; a work-role finish is non-fail). A
+# `finished` with no matching `started` (foreground spawn — its start arrived only now, or never) is the
+# 9003 orphan shape: the reader's last-event rules handle it, never a phantom `running`. Fail-open.
+node "$(dirname "${BASH_SOURCE[0]}")/lane-events.mjs" append --session "$SESSION" --task "$TASKID" --step "$ROLE" --kind finished --id "$AGENTID" --where claude >/dev/null 2>&1
+
 # Redesign (2026-08-29, work/ship-tail pool split) — spawn-intent MARKER LIFECYCLE: unlink the marker
 # hooks/lane-ceiling-gate.sh wrote at this role's spawn PERMIT, now that the role has genuinely stopped.
 # Best-effort, never blocks: a missing marker (never written -- e.g. the ceiling gate was killed-switched at
