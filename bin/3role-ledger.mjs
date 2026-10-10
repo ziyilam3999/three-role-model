@@ -7539,6 +7539,7 @@ function receiptKv(line) {
 // (a forgive line here, `progress=pushed` on #3073's branch); the cap+1-th and every later one is a STRIKE (fail
 // closed) so the existing 2-strike route-to-Sonnet rule still engages after at most 3 continued legs.
 const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config key.
+
 // #3093 D1 — the local-clock vs GitHub-clock slack folded into the dispatch-window proof (never a flag).
 const STRIKE_FORGIVE_SKEW_S = 120;
 
@@ -7581,10 +7582,10 @@ function forgivenEvidence(task, lines) {
 // #3093 D3 — the companion POSTMORTEM pairing #3073 uses, copied verbatim from its executorStrikeFacts inner
 // loop (ER-r1 F3 stop rule) so the two implementations stay textually identical: for the invocation-opening
 // FALLBACK at lines[i] (its kv passed in), the nearest non-drill timeout POSTMORTEM of the same attempt before
-// the NEXT invocation opener — returns its `evidence=` basename, or null (no companion). Master's counter keeps
-// its own backward #3060 scan; only this pairing is shared.
+// the NEXT invocation opener — returns `{progress, evidence}` from that row, or null (no companion) — #3073 reads
+// .progress, #3093 reads .evidence, so one shared pairing serves both CONTINUE routes (merge #3073+#3093).
 function companionPostmortemEvidence(lines, i, task, kv) {
-  let evidence = null;
+  let pm = null;
   for (let j = i + 1; j < lines.length; j++) {
     // #3073 ER-r1 F3: STOP at the NEXT invocation-opening FALLBACK for this task (attempt=1 or
     // legacy no-attempt; the emitter writes FALLBACK then POSTMORTEM back to back, so anything past
@@ -7604,44 +7605,64 @@ function companionPostmortemEvidence(lines, i, task, kv) {
     if (pkv.drill === '1') continue;
     if (pkv.reason !== 'timeout') continue;
     if ((pkv.attempt || '1') !== (kv.attempt || '1')) continue;
-    evidence = pkv.evidence || null;
+    pm = { progress: pkv.progress || null, evidence: pkv.evidence || null };
     break;
   }
-  return evidence;
+  return pm;
 }
 
-// #3060 D2 — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. Scanning from the END of the
-// receipt tail: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts iff it opens an invocation
-// (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the same invocation's internal
-// retry and add nothing (the emitter writes them only after that invocation's attempt=1 line). ANY non-drill
-// `OR-SEAT-SMOKE role=executor task=T` (a successful close; its verdict is MISSING for an executor) resets the count.
-// #3093 D3: a `reason=timeout` invocation opener is NOT a strike iff its companion POSTMORTEM's `evidence=` basename
-// carries a non-drill OR-STRIKE-FORGIVE line for this task (the repair-strike-progress verb's audited, append-only
-// record that the run pushed to origin/<task-branch> inside its own dispatch window) — under the same CONTINUE_CAP
-// #3073 introduces; the cap+1-th forgive, a non-timeout opener, and an unforgiven timeout all stay strikes.
-function countExecutorStrikes(task) {
+// #3060 D2 / #3073 D3+D3b — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The window is
+// everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row (a successful close; its verdict is
+// MISSING for an executor) — the same reset boundary the #3060 backward scan broke at, so the reset/attempt semantics
+// are byte-identical. Within the window, forward: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts
+// iff it opens an invocation (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the
+// same invocation's internal retry and add nothing (the emitter writes them only after that invocation's attempt=1
+// line). #3073 D3: a `reason=timeout` invocation is NOT a strike iff its companion non-drill
+// `OR-DISPATCH-POSTMORTEM role=executor task=T` row for the SAME invocation (same `attempt` value, `reason=timeout`,
+// the nearest such row AFTER the FALLBACK row in file order -- the emitter writes FALLBACK then POSTMORTEM back to
+// back) carries `progress=pushed`. Every other case is a strike: no companion row, companion with `progress=none` or
+// `progress=unmeasured`, a missing `progress=` field (every pre-#3073 row), or a FALLBACK reason other than timeout.
+// Fail closed, as the ticket requires. #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
+// classified CONTINUE; the 4th and every later timeout-with-pushed counts as a STRIKE (fail closed) so the existing
+// 2-strike route-to-Sonnet rule engages after at most 3 wasted legs.
+// MERGE #3073+#3093 (fix round 3): a timeout invocation is CONTINUE iff its companion POSTMORTEM carries
+// `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE line
+// (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP, one shared pairing helper.
+function executorStrikeFacts(task) {
   const lines = readReceiptTail().split('\n');
   const forgiven = forgivenEvidence(task, lines);
-  let n = 0, continues = 0;
+  let start = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
-    const isSm = line.startsWith('OR-SEAT-SMOKE ');
-    if (!isFb && !isSm) continue;
-    const kv = receiptKv(line);
+    if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
+    const kv = receiptKv(lines[i]);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
-    if (isSm) break;
-    if (!('attempt' in kv) || kv.attempt === '1') {
-      if (kv.reason === 'timeout') {
-        const ev = companionPostmortemEvidence(lines, i, task, kv);
-        if (ev !== null && forgiven.has(evBasename(ev)) && continues < CONTINUE_CAP) { continues++; continue; }
-      }
-      n++;
-    }
+    start = i + 1;
+    break;
   }
-  return n;
+  let strikes = 0, continues = 0;
+  for (let i = start; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if ('attempt' in kv && kv.attempt !== '1') continue;
+    if (kv.reason !== 'timeout') { strikes++; continue; }
+    // #3073 D3 + #3093 D3 (merge): the ONE shared pairing helper (with the #3073 ER-r1 F3 stop rule), so
+    // the counter and the forgive verb can never read a row differently. CONTINUE iff the companion
+    // carries `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE
+    // line for this task (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP.
+    const pm = companionPostmortemEvidence(lines, i, task, kv);
+    const pushed = pm !== null && pm.progress === 'pushed';
+    const forgivenHit = pm !== null && pm.evidence !== null && forgiven.has(evBasename(pm.evidence));
+    if ((pushed || forgivenHit) && continues < CONTINUE_CAP) { continues++; continue; }
+    strikes++;
+  }
+  return { strikes, continues, cap: CONTINUE_CAP };
 }
+
+function countExecutorStrikes(task) { return executorStrikeFacts(task).strikes; }
+
 
 // #3093 D1/D2 — repair-strike-progress: the ONE sanctioned repair for a PAST executor timeout invocation that
 // pushed real progress to origin/<task-branch> inside its own dispatch window. Append-only (a new
@@ -7732,7 +7753,7 @@ function cmdRepairStrikeProgress(o) {
     if ('attempt' in kv && kv.attempt !== '1') continue;
     if (kv.reason !== 'timeout') continue;
     const ev = companionPostmortemEvidence(lines, i, task, kv);
-    if (ev !== null && evBasename(ev) === evidence) { fbIdx = i; fbKv = kv; break; }
+    if (ev !== null && evBasename(ev.evidence) === evidence) { fbIdx = i; fbKv = kv; break; }
   }
   let pmKv = null;
   if (fbIdx >= 0) {
@@ -7932,7 +7953,11 @@ function cmdZaiStrikes(opts) {
   if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
   if (role === 'executor') {
     if ('round' in opts) { console.error('zai-strikes: --round is not an executor key (executor strikes are per task, per invocation)'); process.exit(2); }
-    console.log(String(countExecutorStrikes(task)));
+    const f3073 = executorStrikeFacts(task);
+    // #3073 D3: `--json` prints the CONTINUE side too (strikes/continues/cap) so the orchestrator can see a
+    // CONTINUE happened without re-reading receipts; the plain integer output and exit code are unchanged.
+    if ('json' in opts) console.log('{"strikes":' + f3073.strikes + ',"continues":' + f3073.continues + ',"cap":' + f3073.cap + '}');
+    else console.log(String(f3073.strikes));
     process.exit(0);
   }
   if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review or executor (the only seats with a strike rule)'); process.exit(2); }
