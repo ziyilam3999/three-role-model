@@ -7444,10 +7444,11 @@ function resolvePlanFacts(planArg, task) {
 
 // D3/D4/D8: the effective route. Leaving the declared subprocess route needs ALL of: the seat declares an
 // agent_tool_fallback tier, the plan is bound to the task, and a first-class reason —
-//   executor    : (valid label AND (operator-private OR (size L AND (no usable size_models.L OR >= 2 z.ai strikes))))
-//   plan-review : data-class operator-private
-// Everything else (missing/ambiguous/invalid label, mismatch, invalid data-class) keeps the declared route; the
-// consumers refuse on size_source / data_class instead (fail closed, no path opened).
+//   executor    : valid label AND size L AND (no usable size_models.L OR >= 2 z.ai strikes)
+// #3078 — a `data-class: operator-private` plan label is a RECORDED fact, never a routing input: a private
+// plan routes exactly like a public one for both the executor and plan-review seats (operator directive
+// 2026-10-09). Everything else (missing/ambiguous/invalid label, mismatch, invalid data-class) keeps the
+// declared route; the consumers refuse on size_source / data_class instead (fail closed, no path opened).
 // #3060 — an executor + size L + public plan STAYS on the declared z.ai route with the SSOT's `size_models.L`
 // model (D1) until the task has 2 z.ai strikes (D2: one per failed dispatcher INVOCATION, receipt-derived), then
 // leaves for the fallback tier. A `size_models` key that is absent, or whose value is not in the seat provider's
@@ -7471,12 +7472,10 @@ function effectiveRouteFor(seatKey, seat, facts) {
   if (exec) { out.route_reason = ''; out.zai_strikes = 0; }
   const fb = seat.agent_tool_fallback;
   if (!fb || !ROLE_MODELS.includes(fb) || !facts.bound) return out;
-  const privateData = facts.data_class === 'operator-private';
   let leave = false;
   if (exec) {
     if (facts.size_source === 'plan') {
-      if (privateData) { leave = true; out.route_reason = 'data-class-private'; }
-      else if (facts.size === 'L') {
+      if (facts.size === 'L') {
         const sizeModel = executorSizeModel(seat);
         if (!sizeModel) { leave = true; out.route_reason = 'size-L-no-size-model'; }
         else {
@@ -7486,7 +7485,7 @@ function effectiveRouteFor(seatKey, seat, facts) {
         }
       } else out.route_reason = 'size-SM';
     }
-  } else if (seatKey === 'plan-review') leave = privateData;
+  }
   if (!leave) return out;
   const cfg = loadRoleConfig().cfg || {};
   out.effective_dispatch = 'agent-tool';
