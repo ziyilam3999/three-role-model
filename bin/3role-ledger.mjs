@@ -2175,6 +2175,70 @@ function subprocessFirstRecordBound(firstText, task, role, nonce) {
   return tagRe.test(firstText) && firstText.indexOf(n) !== -1;
 }
 
+// #3085 D1 — the dispatcher's own plan-path extraction rule (the #3060 zai block in tools/openrouter-
+// role-dispatch.sh): every DISTINCT `.ai-workspace/plans/<...>.md` path in the brief text, at most 8.
+// Never a second hand-rolled regex — the checker re-derives the one path the dispatcher sized from, using
+// the dispatcher's own matcher, so the two sides can never disagree on what the brief named.
+// INPUT-BOUND: the scan is capped at the same 1 MiB the dispatcher reads, so an oversized transcript brief
+// cannot loop the matcher (a truncation only ever drops paths -> fail closed, never a silent default).
+function briefPlanPaths(text) {
+  const s = String(text == null ? '' : text).slice(0, 1048576);
+  const re = /[.\w/-]*\.ai-workspace\/plans\/[^\s"'`)]+\.md/g;
+  const seen = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (!seen.includes(m[0])) { seen.push(m[0]); if (seen.length >= 8) break; }
+  }
+  return seen;
+}
+
+// #3085 D2 — the expected served model for an executor subprocess-zai row: the model the dispatcher's own
+// effectiveRouteFor would have picked for the plan named in the row's OWN nonce-bound transcript first
+// record, re-derived through the SAME resolver the dispatcher called (resolvePlanFacts + executorSizeModel,
+// the #2434 single-generator discipline). Every outcome the dispatcher itself refuses pre-stamp (exit
+// 10/11/12: no/ambiguous plan path, unresolvable plan, size missing/ambiguous/invalid, task mismatch,
+// private OR invalid data-class, L-with-fallback-but-no-size-model) is a BLOCK here — a z.ai row claiming
+// one is inadmissible (fail closed, never a silent seat-model default). Strikes are deliberately NOT
+// consulted (D3): zai_strikes is time-varying, and the row's existence already proves the route stayed on
+// z.ai at dispatch time, so reading strikes at check time could block a row correct when it closed.
+// The L branch mirrors effectiveRouteFor's own precondition exactly: the size model applies ONLY when the
+// seat also declares a valid agent_tool_fallback (a ROLE_MODELS member); with no valid fallback the
+// dispatcher never sizes and serves the seat model for L, so the checker expects the seat model too —
+// mirror, never stricter. Returns {block:true, reason} | {model, size}.
+function zaiExecutorRouteExpected(e, info, task, decl) {
+  const paths = briefPlanPaths(info.firstText);
+  if (paths.length === 0) return { block: true, reason: 'the brief text names no .ai-workspace/plans/<file>.md path' };
+  if (paths.length > 1) return { block: true, reason: 'the brief text names ' + paths.length + ' distinct plan paths' };
+  const rel = paths[0];
+  // D1 vantage-first resolution: the transcript's own recorded cwd (only an ABSOLUTE one — 2700-pr1), then
+  // today's chain exactly as `check` already resolves a plan-review row's reviewed_plan (cwd, then the repo
+  // holding this helper). A miss on every candidate is a BLOCK, never a silent pass.
+  const cands = [];
+  if (typeof info.dispatchCwd === 'string' && info.dispatchCwd.startsWith('/')) cands.push(path.join(info.dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    cands.push(path.join(selfDir, '..', rel));
+  }
+  let facts = null;
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) { facts = f; break; }
+  }
+  if (!facts) return { block: true, reason: 'plan "' + rel + '" is unresolvable from the transcript vantage or the checker chain' };
+  if (facts.size_source !== 'plan') return { block: true, reason: 'plan "' + rel + '" size_source=' + facts.size_source };
+  if (facts.data_class !== 'public') return { block: true, reason: 'plan "' + rel + '" data_class=' + facts.data_class };
+  if (facts.size === 'L') {
+    const fb = decl.seat.agent_tool_fallback;
+    if (fb && ROLE_MODELS.includes(fb)) {
+      const sizeModel = executorSizeModel(decl.seat);
+      if (!sizeModel) return { block: true, reason: 'size L with a valid agent_tool_fallback but no usable size_models.L in the seat' };
+      return { model: sizeModel, size: 'L' };
+    }
+  }
+  return { model: decl.seat.model, size: facts.size };   // S/M always; L only when the seat cannot size (mirror)
+}
+
 // conservative-seat-map-single-slot-local-dispatch (2026-08-30), D7 — the subprocess-local sibling of
 // seatDispatchIsSubprocess(). Reads the NEW conservative_seat_map[role].primary overlay (never `seats[role]`,
 // which stays byte-untouched — see config/cc-routes.json's own overlay comment), fresh at check time, exactly
@@ -2232,7 +2296,23 @@ function checkSubprocessProvenance(role, e, session, task) {
       'not carry BOTH the spawn tag (3ROLE_TASK:' + task + ' ROLE:' + role + ') and this dispatch\'s nonce "' +
       (e.nonce || '<missing>') + '" — a replayed/reused transcript is not admissible (M2)';
   }
-  if (!info.servedModel || info.servedModel !== decl.seat.model) {
+  // #3085 D1/D2/D4 — for the ONE class the dispatcher sizes (executor + subprocess-zai), the expected
+  // served model is the dispatcher's own effective route for THIS row's plan (size-aware), never the bare
+  // seat default: since #3060 a size-L public plan is deliberately served on size_models.L. Slotted
+  // strictly AFTER the tag+nonce binding above (an unbound transcript never steers resolution) and AT the
+  // served-model comparison; every earlier check, and every OTHER dispatch class (plan-review, research,
+  // subprocess-local, subprocess-openrouter) keeps today's byte-identical seat-model comparison (D4).
+  if (role === 'executor' && e.dispatch === 'subprocess-zai') {
+    const route = zaiExecutorRouteExpected(e, info, task, decl);
+    if (route.block) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
+        route.reason;
+    }
+    if (!info.servedModel || info.servedModel !== route.model) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
+    }
+  } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
     return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
       (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
   }
@@ -7454,6 +7534,82 @@ function receiptKv(line) {
   return kv;
 }
 
+// #3093 D3b — the CONTINUE cap. At most CONTINUE_CAP timeout invocations per window may be classified CONTINUE
+// (a forgive line here, `progress=pushed` on #3073's branch); the cap+1-th and every later one is a STRIKE (fail
+// closed) so the existing 2-strike route-to-Sonnet rule still engages after at most 3 continued legs.
+const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config key.
+
+// #3093 D1 — the local-clock vs GitHub-clock slack folded into the dispatch-window proof (never a flag).
+const STRIKE_FORGIVE_SKEW_S = 120;
+
+// #3093 ER-r1 F1 — the ONE evidence-key normalization, shared by every writer and reader of the key: the live
+// dispatcher writes POSTMORTEM `evidence=` as a path whose BASENAME is the id, so every comparison (the verb's
+// P1/P5 lookups, the counter's Set, the Set's own build) goes through the basename — never the raw value, or
+// the writer and the reader disagree on the key's shape and a recorded forgive is silently ignored.
+const evBasename = (v) => (v == null ? '' : String(v).split('/').pop());
+
+// #3093 ER-r1 F2 — is the receipt being read the LIVE store? True iff OPENROUTER_DISPATCH_RECEIPT_FILE is
+// unset or resolves to the default the dispatcher writes (the P6 seam guard's own doctrine): a receipt
+// redirected anywhere else is fixture ground, where a seam-made line is the sanctioned proof.
+function receiptIsDefaultStore() {
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const def = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const rf = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  return !rf || path.resolve(rf) === path.resolve(def);
+}
+
+// #3093 D3 — the evidence-basename Set of every non-drill OR-STRIKE-FORGIVE line for this task+executor seat.
+// A Set, deliberately: duplicated forgive lines for one evidence collapse (one key, one CONTINUE — the pairing
+// below still admits each POSTMORTEM only once), and a line whose key matches no POSTMORTEM, or names another
+// task/role, or is a drill row, simply never intersects the pairing and changes nothing. Keys are stored and
+// looked up as basenames (ER-r1 F1); a seam-made `source=events-file` line never forgives on the LIVE store
+// (ER-r1 F2 — on a redirected fixture receipt it is the smoke's own sanctioned proof, and stays honored).
+function forgivenEvidence(task, lines) {
+  const liveStore = receiptIsDefaultStore();
+  const set = new Set();
+  for (const line of lines) {
+    if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (liveStore && kv.source === 'events-file') continue;
+    if (kv.evidence) set.add(evBasename(kv.evidence));
+  }
+  return set;
+}
+
+// #3093 D3 — the companion POSTMORTEM pairing #3073 uses, copied verbatim from its executorStrikeFacts inner
+// loop (ER-r1 F3 stop rule) so the two implementations stay textually identical: for the invocation-opening
+// FALLBACK at lines[i] (its kv passed in), the nearest non-drill timeout POSTMORTEM of the same attempt before
+// the NEXT invocation opener — returns `{progress, evidence}` from that row, or null (no companion) — #3073 reads
+// .progress, #3093 reads .evidence, so one shared pairing serves both CONTINUE routes (merge #3073+#3093).
+function companionPostmortemEvidence(lines, i, task, kv) {
+  let pm = null;
+  for (let j = i + 1; j < lines.length; j++) {
+    // #3073 ER-r1 F3: STOP at the NEXT invocation-opening FALLBACK for this task (attempt=1 or
+    // legacy no-attempt; the emitter writes FALLBACK then POSTMORTEM back to back, so anything past
+    // the next invocation opener belongs to a LATER invocation). A POSTMORTEM row lost to an append
+    // failure must read as "no companion" (strike, fail closed), never borrow a later dispatch's
+    // progress=pushed (fail open by at most one). attempt=2+ FALLBACK rows are the same
+    // invocation's internal retry and do NOT stop the search (their POSTMORTEM pairs by attempt).
+    if (lines[j].startsWith('OR-DISPATCH-FALLBACK ')) {
+      const fkv = receiptKv(lines[j]);
+      if (fkv.role === 'executor' && fkv.task === task && fkv.drill !== '1'
+        && (!('attempt' in fkv) || fkv.attempt === '1')) break;
+      continue;
+    }
+    if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
+    const pkv = receiptKv(lines[j]);
+    if (pkv.role !== 'executor' || pkv.task !== task) continue;
+    if (pkv.drill === '1') continue;
+    if (pkv.reason !== 'timeout') continue;
+    if ((pkv.attempt || '1') !== (kv.attempt || '1')) continue;
+    pm = { progress: pkv.progress || null, evidence: pkv.evidence || null };
+    break;
+  }
+  return pm;
+}
+
 // #3060 D2 / #3073 D3+D3b — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The window is
 // everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row (a successful close; its verdict is
 // MISSING for an executor) — the same reset boundary the #3060 backward scan broke at, so the reset/attempt semantics
@@ -7468,9 +7624,12 @@ function receiptKv(line) {
 // Fail closed, as the ticket requires. #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
 // classified CONTINUE; the 4th and every later timeout-with-pushed counts as a STRIKE (fail closed) so the existing
 // 2-strike route-to-Sonnet rule engages after at most 3 wasted legs.
-const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config key.
+// MERGE #3073+#3093 (fix round 3): a timeout invocation is CONTINUE iff its companion POSTMORTEM carries
+// `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE line
+// (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP, one shared pairing helper.
 function executorStrikeFacts(task) {
   const lines = readReceiptTail().split('\n');
+  const forgiven = forgivenEvidence(task, lines);
   let start = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
@@ -7488,36 +7647,299 @@ function executorStrikeFacts(task) {
     if (kv.drill === '1') continue;
     if ('attempt' in kv && kv.attempt !== '1') continue;
     if (kv.reason !== 'timeout') { strikes++; continue; }
-    let progress = null;
-    for (let j = i + 1; j < lines.length; j++) {
-      // #3073 ER-r1 F3: STOP at the NEXT invocation-opening FALLBACK for this task (attempt=1 or
-      // legacy no-attempt; the emitter writes FALLBACK then POSTMORTEM back to back, so anything past
-      // the next invocation opener belongs to a LATER invocation). A POSTMORTEM row lost to an append
-      // failure must read as "no companion" (strike, fail closed), never borrow a later dispatch's
-      // progress=pushed (fail open by at most one). attempt=2+ FALLBACK rows are the same
-      // invocation's internal retry and do NOT stop the search (their POSTMORTEM pairs by attempt).
-      if (lines[j].startsWith('OR-DISPATCH-FALLBACK ')) {
-        const fkv = receiptKv(lines[j]);
-        if (fkv.role === 'executor' && fkv.task === task && fkv.drill !== '1'
-          && (!('attempt' in fkv) || fkv.attempt === '1')) break;
-        continue;
-      }
-      if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
-      const pkv = receiptKv(lines[j]);
-      if (pkv.role !== 'executor' || pkv.task !== task) continue;
-      if (pkv.drill === '1') continue;
-      if (pkv.reason !== 'timeout') continue;
-      if ((pkv.attempt || '1') !== (kv.attempt || '1')) continue;
-      progress = pkv.progress || null;
-      break;
-    }
-    if (progress === 'pushed' && continues < CONTINUE_CAP) { continues++; continue; }
+    // #3073 D3 + #3093 D3 (merge): the ONE shared pairing helper (with the #3073 ER-r1 F3 stop rule), so
+    // the counter and the forgive verb can never read a row differently. CONTINUE iff the companion
+    // carries `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE
+    // line for this task (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP.
+    const pm = companionPostmortemEvidence(lines, i, task, kv);
+    const pushed = pm !== null && pm.progress === 'pushed';
+    const forgivenHit = pm !== null && pm.evidence !== null && forgiven.has(evBasename(pm.evidence));
+    if ((pushed || forgivenHit) && continues < CONTINUE_CAP) { continues++; continue; }
     strikes++;
   }
   return { strikes, continues, cap: CONTINUE_CAP };
 }
 
 function countExecutorStrikes(task) { return executorStrikeFacts(task).strikes; }
+
+
+// #3093 D1/D2 — repair-strike-progress: the ONE sanctioned repair for a PAST executor timeout invocation that
+// pushed real progress to origin/<task-branch> inside its own dispatch window. Append-only (a new
+// OR-STRIKE-FORGIVE receipt line — never a rewrite of an existing row, so no backup is needed: nothing is
+// destroyed and the AUDIT stderr line plus the self-describing row are the audit trail); idempotent by
+// task+evidence key ("nothing to repair", exit 0); P1-P6 fail closed (BLOCK + exit 3, nothing written, each
+// names the failing leg); --dry-run prints the exact line it would append and writes nothing. The proof legs
+// (D1): a GitHub PushEvent with a SERVER-stamped created_at inside the invocation's window W = [END_TS -
+// latency_s - SKEW, END_TS + SKEW] (both inputs dispatcher-written in the POSTMORTEM's evidence basename and
+// latency_s — the run cannot write its own receipt row), exactly one qualifying event, before != head, and
+// payload.head still reachable from refs/remotes/origin/<branch> after a bounded fetch, adding at least one
+// commit of its own that is not on master (before..head — never an earlier push's commits; a push_head that
+// IS a master commit is the no-work reset/creation shape and is refused, ER-r1 F3; a branch since merged to
+// master fails the same test deliberately — a merged task no longer dispatches, so its line is inert).
+function cmdRepairStrikeProgress(o) {
+  const session = o.session, task = o.task, role = o.role, branch = o.branch, evidence = o.evidence;
+  const cwd = (typeof o.cwd === 'string' && o.cwd) ? o.cwd : '.';
+  const dryRun = ('dry-run' in o);
+  if (!session || !task || !role || !branch || !evidence) {
+    console.error('repair-strike-progress: --session, --task, --role executor, --branch, --evidence are required');
+    process.exit(2);
+  }
+  if (role !== 'executor') {
+    console.error('repair-strike-progress: --role must be executor (the only seat whose strike counter reads OR-STRIKE-FORGIVE)');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-strike-progress', 2);
+
+  // The receipt file resolves exactly as readReceiptTail does; the default is recomputed here so the P6 seam
+  // guard can compare the override against it WITHOUT ever running a seam against the live store.
+  const receiptFileEnv = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const defaultReceiptFile = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const receiptFile = receiptFileEnv || defaultReceiptFile;
+
+  // ── P6 seam guard + seam arming — the ONLY block in this file where the events-file override is consulted
+  //    (AC-10 pins that by grep). The seam is armed ONLY when the receipt is redirected to a NON-default file
+  //    (D2 arming doctrine): a fixture seam must never touch (or prove anything about) the live store. ──
+  let seamEventsFile = null;
+  {
+    const ef = process.env.THREE_ROLE_GH_EVENTS_FILE;
+    if (ef && !(receiptFileEnv && path.resolve(receiptFileEnv) !== path.resolve(defaultReceiptFile))) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P6): the events-file seam is set while the ' +
+        'receipt resolves to its DEFAULT location — a fixture seam must never touch the live store ' +
+        '(#3093 D2 arming doctrine). Nothing written.');
+      process.exit(3);
+    }
+    if (ef) seamEventsFile = ef;
+  }
+
+  let raw;
+  try { raw = fs.readFileSync(receiptFile, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): the receipt file is unreadable — no ' +
+      'POSTMORTEM for evidence ' + sanitize(evidence) + ' can be read. Nothing written.');
+    process.exit(3);
+  }
+  const lines = raw.split('\n');
+
+  // P5 — idempotent by the task+evidence key (the basename, ER-r1 F1): a forgive line this verb (or an
+  // equivalent operator append) already wrote means there is nothing left to repair. But ONLY a line the
+  // counter would itself honor counts as done — a drill=1 line (ignored everywhere) and, on the LIVE store,
+  // a seam-made `source=events-file` line (ER-r1 F2/F6) never do, or the verb would dead-end behind a line
+  // that forgives nothing. Prints nothing new, exits 0.
+  const liveStore = receiptIsDefaultStore();
+  for (const line of lines) {
+    if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (liveStore && kv.source === 'events-file') continue;
+    if (evBasename(kv.evidence) === evidence) {
+      console.log('OK repair-strike-progress: nothing to repair');
+      process.exit(0);
+    }
+  }
+
+  // P1 — the named evidence must be a non-drill timeout POSTMORTEM of this task, opened by a timeout
+  // invocation FALLBACK (attempt=1 or legacy no-attempt). The pairing is the counter's own
+  // companionPostmortemEvidence (#3073 ER-r1 F3 stop rule), so the verb can never forgive a row the
+  // counter would read differently. Parse failures block: an evidence basename that does not parse as
+  // <task>-executor-<END_TS>-a1, or a missing/unparseable latency_s, yields NO window (never a NaN window
+  // that silently matches nothing) — plan-review r1 F5.
+  let fbIdx = -1, fbKv = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task || kv.drill === '1') continue;
+    if ('attempt' in kv && kv.attempt !== '1') continue;
+    if (kv.reason !== 'timeout') continue;
+    const ev = companionPostmortemEvidence(lines, i, task, kv);
+    if (ev !== null && evBasename(ev.evidence) === evidence) { fbIdx = i; fbKv = kv; break; }
+  }
+  let pmKv = null;
+  if (fbIdx >= 0) {
+    for (let j = fbIdx + 1; j < lines.length; j++) {
+      if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
+      const pkv = receiptKv(lines[j]);
+      if (pkv.role !== 'executor' || pkv.task !== task || pkv.drill === '1' || pkv.reason !== 'timeout') continue;
+      if ((pkv.attempt || '1') !== (fbKv.attempt || '1')) continue;
+      if (evBasename(pkv.evidence) === evidence) { pmKv = pkv; break; }
+    }
+  }
+  if (fbIdx < 0 || !pmKv) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): no non-drill timeout POSTMORTEM with ' +
+      'evidence=' + sanitize(evidence) + ' opened by a timeout attempt=1 executor FALLBACK for task ' +
+      sanitize(task) + ' in the receipt. Nothing written.');
+    process.exit(3);
+  }
+  const evPrefix = String(task) + '-executor-';
+  const evTail = String(evidence).startsWith(evPrefix) ? String(evidence).slice(evPrefix.length) : '';
+  const evM = evTail.match(/^([0-9]{9,12})-a1$/);
+  const latencyS = parseInt(pmKv.latency_s, 10);
+  if (!evM || !Number.isFinite(latencyS) || latencyS <= 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): the invocation cannot yield a window — ' +
+      'evidence must parse as <task>-executor-<END_TS>-a1 and the POSTMORTEM must carry a positive latency_s ' +
+      '(parse failure blocks, never a NaN window). Nothing written.');
+    process.exit(3);
+  }
+  const endTs = parseInt(evM[1], 10);
+  const wStart = endTs - latencyS - STRIKE_FORGIVE_SKEW_S, wEnd = endTs + STRIKE_FORGIVE_SKEW_S;
+
+  // P2 — the branch is named explicitly and is task-scoped (#2462); when the POSTMORTEM carries a cwd= (the
+  // dispatcher's own record of the run's worktree), the branch must be that worktree's basename — a sibling
+  // lane of the same task is not this run's progress (plan-review r1 F3, cheap cross-check).
+  if (!/^[0-9A-Za-z._-]+$/.test(String(branch)) || !String(branch).startsWith(String(task) + '-')) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P2): --branch \'' + sanitize(branch) +
+      '\' must start with \'' + sanitize(task) + '-\' (#2462 task-scoped branch naming). Nothing written.');
+    process.exit(3);
+  }
+  if (pmKv.cwd && path.basename(String(pmKv.cwd)) !== String(branch)) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P2): --branch does not match the POSTMORTEM\'s ' +
+      'own worktree (cwd= basename) — the pushed branch is not this run\'s lane. Nothing written.');
+    process.exit(3);
+  }
+
+  // P3 — exactly one PushEvent for refs/heads/<branch> with a SERVER-stamped created_at inside W (the
+  // forger-resistant leg: a commit's committer date is backdatable, a PushEvent is not). Seam mode reads the
+  // fixture; live mode pages `gh api` NEWEST-FIRST with an early stop once a page's oldest event predates
+  // W.start (plan-review r1 F2 — one page silently defeats the verb once the event scrolls off), bounded at
+  // 4 pages of 100 (the feed itself caps at 300 events / 90 days; the page-4 HTTP 422 that cap answers is
+  // end-of-feed, not an error — ER-r1 F5).
+  let events = null, pagesRead = 0;
+  if (seamEventsFile) {
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(seamEventsFile, 'utf8')); } catch (e) { parsed = null; }
+    if (!Array.isArray(parsed)) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): the events seam file is unreadable or ' +
+        'not a JSON array — no proof can be read (fail closed). Nothing written.');
+      process.exit(3);
+    }
+    events = parsed; pagesRead = 1;
+  } else {
+    const gr = spawnSync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 30000 });
+    const rm = gr.status === 0 ? String(gr.stdout).match(/[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/) : null;
+    if (!rm) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): no origin remote URL parses as ' +
+        '<owner>/<repo> in --cwd — the events feed cannot be named (fail closed, R4). Nothing written.');
+      process.exit(3);
+    }
+    events = [];
+    let ghErr = null;
+    try {
+      for (let page = 1; page <= 4; page++) {
+        const out = spawnSync('gh', ['api', 'repos/' + rm[1] + '/' + rm[2] + '/events?per_page=100&page=' + page],
+          { encoding: 'utf8', timeout: 30000 });
+        if (out.status !== 0) {
+          // #3093 ER-r1 F5: GitHub caps the events feed at 300 events, so page 4 answers HTTP 422 — that is
+          // the END OF THE FEED, not an error: stop paging and judge the events already read (a hit found on
+          // pages 1-3 stands; zero hits still fails closed at the hit check below). Any other failure stays
+          // a hard ghErr.
+          const et = String(out.stderr || out.error || '');
+          if (events.length > 0 && /HTTP 422|pagination is limited/.test(et)) break;
+          ghErr = new Error(et || 'gh api failed'); break;
+        }
+        let arr; try { arr = JSON.parse(out.stdout); } catch (e) { arr = null; }
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        pagesRead = page;
+        events = events.concat(arr);
+        const oldestAt = arr[arr.length - 1].created_at ? Math.floor(Date.parse(arr[arr.length - 1].created_at) / 1000) : null;
+        if (oldestAt !== null && Number.isFinite(oldestAt) && oldestAt < wStart) break;
+      }
+    } catch (e) { ghErr = e; }
+    if (ghErr) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): gh api events failed (' +
+        (ghErr.message || 'error') + ') — a network/auth failure is NOT zero events, but both fail closed (R4). ' +
+        'Nothing written.');
+      process.exit(3);
+    }
+  }
+  const refWant = 'refs/heads/' + branch;
+  const hits = [];
+  for (const e of events) {
+    if (!e || e.type !== 'PushEvent' || !e.payload) continue;
+    if (e.payload.ref !== refWant) continue;
+    const at = e.created_at ? Math.floor(Date.parse(e.created_at) / 1000) : NaN;
+    if (!Number.isFinite(at)) continue;
+    if (at < wStart || at > wEnd) continue;
+    hits.push(e);
+  }
+  if (hits.length === 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): no PushEvent for branch ' + sanitize(branch) +
+      ' inside the dispatch window [' + wStart + ',' + wEnd + '] — no proof (events age out of the capped ' +
+      'feed, R1; run the verb promptly). Nothing written.');
+    process.exit(3);
+  }
+  if (hits.length > 1) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): ' + hits.length + ' PushEvents for branch ' +
+      sanitize(branch) + ' inside the dispatch window — ambiguous feed, and the verb forgives ONE row per ' +
+      'invocation (D1 leg 5). Nothing written.');
+    process.exit(3);
+  }
+  const push = hits[0].payload;
+  if (!push.before || !push.head || push.before === push.head) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): the PushEvent carries before == head (a ' +
+      'no-op push is not progress). Nothing written.');
+    process.exit(3);
+  }
+
+  // P4 — after a bounded fetch, payload.head must be reachable from refs/remotes/origin/<branch> (a rebase or
+  // force-push later orphans it — the row stays a strike, by design), and the push must carry WORK OF ITS OWN
+  // (ER-r1 F3): a push_head that is itself a master commit (merge-base of head and origin/master == head) is
+  // the reset-to-master / created-at-master no-work shape, and before..head must add at least one commit that
+  // is not on origin/master — THIS push's commits, never an earlier push's. A branch since merged to master
+  // fails the same test deliberately: a merged task no longer dispatches, so its forgive line is inert and
+  // refusing is fail-closed, not a dead end.
+  const fetchR = spawnSync('git', ['-C', cwd, 'fetch', 'origin', String(branch)], { encoding: 'utf8', timeout: 60000 });
+  if (fetchR.status !== 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): git fetch origin ' + sanitize(branch) +
+      ' failed in --cwd (or timed out) — reachability cannot be proven. Nothing written.');
+    process.exit(3);
+  }
+  const ancR = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', String(push.head),
+    'refs/remotes/origin/' + branch], { encoding: 'utf8', timeout: 30000 });
+  if (ancR.status !== 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): push_head is not reachable from ' +
+      'refs/remotes/origin/' + sanitize(branch) + ' after fetch (rebased/force-pushed/deleted branch) — the ' +
+      'row stays a strike. Nothing written.');
+    process.exit(3);
+  }
+  const mbR = spawnSync('git', ['-C', cwd, 'merge-base', String(push.head),
+    'refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
+  if (mbR.status === 0 && String(mbR.stdout).trim() === String(push.head).trim()) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): push_head ' + sanitize(push.head) +
+      ' is itself on origin/master (branch reset to, or created at, a master commit) — the push added no ' +
+      'work of its own. Nothing written.');
+    process.exit(3);
+  }
+  const rlR = spawnSync('git', ['-C', cwd, 'rev-list', '--count',
+    String(push.before) + '..' + String(push.head), '^refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
+  const added = rlR.status === 0 ? parseInt(rlR.stdout, 10) : NaN;
+  if (!Number.isFinite(added) || added < 1) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): before..head adds no commit that is not on ' +
+      'origin/master (rev-list empty or unresolvable) — the push is not task progress. Nothing written.');
+    process.exit(3);
+  }
+
+  const pushAt = hits[0].created_at;
+  const src = seamEventsFile ? 'events-file' : 'github-events';
+  const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const outLine = 'OR-STRIKE-FORGIVE role=executor task=' + sanitize(task) + ' attempt=' + (fbKv.attempt || '1') +
+    ' evidence=' + sanitize(evidence) + ' branch=' + sanitize(branch) + ' push_at=' + pushAt +
+    ' push_head=' + sanitize(push.head) + ' push_before=' + sanitize(push.before) +
+    ' source=' + src + ' session=' + sanitize(session) + ' repaired_at=' + nowIso;
+  console.error('AUDIT: repair-strike-progress — session=' + sanitize(session) + ' task=' + sanitize(task) +
+    ' evidence=' + sanitize(evidence) + ' branch=' + sanitize(branch) + ' push_at=' + pushAt +
+    ' push_head=' + sanitize(push.head) + ' push_before=' + sanitize(push.before) +
+    ' source=' + src + ' window=[' + wStart + ',' + wEnd + '] pages=' + pagesRead +
+    (dryRun ? ' dry-run' : ''));
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-strike-progress: would append:');
+    console.log(outLine);
+    process.exit(0);
+  }
+  fs.appendFileSync(receiptFile, (raw.length && !raw.endsWith('\n') ? '\n' : '') + outLine + '\n');
+  console.log('OK repair-strike-progress: appended OR-STRIKE-FORGIVE for task ' + sanitize(task) +
+    ' evidence ' + sanitize(evidence) + ' (source=' + src + ')');
+  process.exit(0);
+}
 
 // zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
 // consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
@@ -8336,6 +8758,7 @@ try {
   else if (cmd === 'repair-crosswire') cmdRepairCrosswire(opts);
   else if (cmd === 'repair-subprocess-models') cmdRepairSubprocessModels(opts);
   else if (cmd === 'repair-split-run') cmdRepairSplitRun(opts);
+  else if (cmd === 'repair-strike-progress') cmdRepairStrikeProgress(opts);
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
@@ -8382,7 +8805,8 @@ try {
       ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]' +
       ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]' +
       ' [--session S [--task T] [--dry-run] (repair-subprocess-models, #2782 — rewrites modelVersion/modelTier/provider on subprocess-provenance rows ONLY, from each row\'s own transcript_path; backed up, idempotent, dry-run first)]' +
-      ' [--session S --task T --run-id ID [--dry-run] [--allow-pending] (repair-split-run, #2902 — merges a split dispatcher run, P1-P6 fail-closed, backed up, idempotent)]');
+      ' [--session S --task T --run-id ID [--dry-run] [--allow-pending] (repair-split-run, #2902 — merges a split dispatcher run, P1-P6 fail-closed, backed up, idempotent)]' +
+      ' [--session S --task T --role executor --branch B --evidence E [--cwd D] [--dry-run] (repair-strike-progress, #3093 — proves a past timeout pushed to origin/<task-branch> in its dispatch window and appends an OR-STRIKE-FORGIVE receipt line, P1-P6 fail-closed, append-only, idempotent)]');
     process.exit(2);
   }
 } catch (e) {

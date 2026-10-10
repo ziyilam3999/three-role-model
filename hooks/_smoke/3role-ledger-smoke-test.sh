@@ -6534,5 +6534,340 @@ for spec in "rs3060a:receipts-exec-2.md:size" "rs3060b:receipts-exec-0.md:bypass
       && ok "#3060 AC-8: L plan + 0 strikes -> check keeps ROUTE-BYPASS: role=executor and no ROUTE-SIZE" || bad "#3060 AC-8 bypass (rc=$RC out=$OUT)"
   fi
 done
+
+# ============================================================================================================
+# #3085 — size-aware served-model provenance for z.ai EXECUTOR rows: `check` derives the expected served
+# model from the dispatcher's own effective route for the plan named in the row's OWN nonce-bound transcript
+# first record (the #3060 rule), not the bare seat default. Fixtures: hooks/fixtures/2985-size-label/
+# {routes-zai-3060.json,routes-zai.json}; scratch ledger/plans/transcripts under $TMP with fake ids only
+# (task 3085x, nonces NNN-*).
+# ============================================================================================================
+Z85="$TMP/3085x-fixtures"
+export Z85   # the transcript writer bakes it in as the recorded dispatch cwd (the #2700 vantage)
+mkdir -p "$Z85/ledger" "$Z85/transcripts" "$Z85/.ai-workspace/plans"
+# plans: flush-left size/data-class lines, bound to task 3085x by the basename prefix (the D4 binding leg).
+mk_z85_plan() {  # $1=file $2=size  [extra flush-left data-class lines...]
+  local F="$1"
+  { printf '# fixture plan (fake ids, #3085 smoke)\nsize: %s\n' "$2"
+    shift 2; for l in "$@"; do printf '%s\n' "$l"; done
+    printf 'Ticket: #3085x\n'; } > "$F"
+}
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-L.md"      L "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-S.md"      S "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-L2.md"     L "data-class: public"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-priv.md"   L "data-class: operator-private"
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-dcbad.md"  L "data-class: public" "data-class: public"
+# transcript: enqueue first record = the dispatcher's outbound brief text (tag + nonce + the PLAN line(s)),
+# then a `user` record carrying cwd = the dispatch vantage (#2700 R3 shape), then the served-model line.
+mk_z85_transcript() {  # $1=path $2=nonce $3=served-model $4=brief-body-lines
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, nonce, model, body ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "z85-fixture", content: "3ROLE_TASK:3085x ROLE:executor\nDISPATCH-NONCE:" + nonce + "\n" + body }));
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "z85-fixture" }));
+    lines.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z", cwd: process.env.Z85,
+      message: { role: "user", content: "3ROLE_TASK:3085x ROLE:executor" } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", cwd: process.env.Z85,
+      message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# z85_session <session> <transcript> <nonce> <model-version> — the filler rows plus the executor zai dispatch row.
+z85_session() {
+  printf 'Decision: PASS\n' > "$Z85/er-$1.md"
+  ( export THREE_ROLE_LEDGER_DIR="$Z85/ledger"; export CC_ROUTES_JSON="$R3060"
+    node "$LED" append --session "$1" --task 3085x --role planner --skip-reason "fixture: not under test in #3085" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role plan-review --skip-reason "fixture: not under test in #3085" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role execution-review --oracle "$Z85/er-$1.md" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3085x --role executor --dispatch subprocess-zai \
+      --transcript "$2" --nonce "$3" --artifact "PR #3085x-$1" --model-version "$4" >/dev/null 2>&1 )
+}
+# z85_check <session> [routes] — sets ZOUT/ZRC (default the size_models fixture).
+z85_check() {
+  ZOUT=$(Z85="$Z85" THREE_ROLE_LEDGER_DIR="$Z85/ledger" CC_ROUTES_JSON="${2:-$R3060}" \
+    node "$LED" check --session "$1" --task 3085x 2>&1); ZRC=$?
+}
+
+# ---- AC-2: L public bound + served glm-5.3 (the #3081 shape) -> admissible, whole check exits 0 ----
+mk_z85_transcript "$Z85/transcripts/ac2.jsonl" "NNN-AC2" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac2 "$Z85/transcripts/ac2.jsonl" "NNN-AC2" "glm-5.3"
+z85_check z85ac2
+{ [ "$ZRC" = "0" ] && ! printf '%s' "$ZOUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3085 AC-2: L public plan + served glm-5.3 (size_models.L) -> check exits 0, no BLOCK line" \
+  || bad "#3085 AC-2 should pass clean (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-3: S plan + served glm-5.3 still blocks, naming the seat default and size=S (green both ends) ----
+mk_z85_transcript "$Z85/transcripts/ac3.jsonl" "NNN-AC3" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-S.md"
+z85_session z85ac3 "$Z85/transcripts/ac3.jsonl" "NNN-AC3" "glm-5.3"
+z85_check z85ac3
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3-flash"' && printf '%s' "$ZOUT" | command grep -q 'size=S'; } \
+  && ok "#3085 AC-3: S plan + served glm-5.3 -> exit 2, route-expected model \"glm-5.3-flash\" size=S" \
+  || bad "#3085 AC-3 should BLOCK with seat default + size=S (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-4: L plan + served flash (the small model) blocks, naming size_models.L and size=L ----
+mk_z85_transcript "$Z85/transcripts/ac4.jsonl" "NNN-AC4" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac4 "$Z85/transcripts/ac4.jsonl" "NNN-AC4" "glm-5.3-flash"
+z85_check z85ac4
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3"' && printf '%s' "$ZOUT" | command grep -q 'size=L'; } \
+  && ok "#3085 AC-4: L plan + served glm-5.3-flash -> exit 2, route-expected model \"glm-5.3\" size=L" \
+  || bad "#3085 AC-4 should BLOCK with size_models.L + size=L (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-5: brief names NO plan path -> SIZE-ROUTE-UNRESOLVABLE (fail closed) ----
+mk_z85_transcript "$Z85/transcripts/ac5.jsonl" "NNN-AC5" "glm-5.3-flash" "do the work; no plan line at all"
+z85_session z85ac5 "$Z85/transcripts/ac5.jsonl" "NNN-AC5" "glm-5.3-flash"
+z85_check z85ac5
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-5: brief with no plan path -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-5 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-6: brief names TWO distinct plan paths -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac6.jsonl" "NNN-AC6" "glm-5.3-flash" \
+  "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md and .ai-workspace/plans/2026-01-01-3085x-plan-L2.md"
+z85_session z85ac6 "$Z85/transcripts/ac6.jsonl" "NNN-AC6" "glm-5.3-flash"
+z85_check z85ac6
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-6: brief with two distinct plan paths -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-6 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-7: operator-private plan -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-priv.md"
+z85_session z85ac7 "$Z85/transcripts/ac7.jsonl" "NNN-AC7" "glm-5.3-flash"
+z85_check z85ac7
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-7: data-class operator-private -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-7 should fail closed (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-8: rollback config (no size_models) + L + served glm-5.3 -> SIZE-ROUTE-UNRESOLVABLE ----
+mk_z85_transcript "$Z85/transcripts/ac8.jsonl" "NNN-AC8" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac8 "$Z85/transcripts/ac8.jsonl" "NNN-AC8" "glm-5.3"
+z85_check z85ac8 "$FX2985/routes-zai.json"
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-8: rollback routes (no size_models) + L + served glm-5.3 -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-8 should fail closed on the rollback config (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-9: nonce mismatch keeps the M2 text, never a size/route token (order guard) ----
+mk_z85_transcript "$Z85/transcripts/ac9.jsonl" "NNN-OTHER-RUN" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-L.md"
+z85_session z85ac9 "$Z85/transcripts/ac9.jsonl" "NNN-AC9" "glm-5.3"
+z85_check z85ac9
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'does not carry BOTH the spawn tag' && ! printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-9: nonce mismatch -> exit 2 with the M2 text, no size/route token (an unbound transcript never steers)" \
+  || bad "#3085 AC-9 should BLOCK on M2 only (rc=$ZRC out=$ZOUT)"
+
+# ---- AC-14: TWO flush-left data-class lines (parsePlanDataClass -> invalid) + L + served glm-5.3 -> fail closed ----
+mk_z85_transcript "$Z85/transcripts/ac14.jsonl" "NNN-AC14" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-dcbad.md"
+z85_session z85ac14 "$Z85/transcripts/ac14.jsonl" "NNN-AC14" "glm-5.3"
+z85_check z85ac14
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'SIZE-ROUTE-UNRESOLVABLE'; } \
+  && ok "#3085 AC-14: duplicated data-class line (invalid) + L + served glm-5.3 -> exit 2 SIZE-ROUTE-UNRESOLVABLE" \
+  || bad "#3085 AC-14 should fail closed on invalid data-class (rc=$ZRC out=$ZOUT)"
+fi
+
+# ============================================================================================================
+# #3093 — forgive a z.ai executor strike whose run pushed real work: an OR-STRIKE-FORGIVE receipt line the
+# strike counter reads (the repair-strike-progress verb appends it; its arms follow the #3060 block below).
+# Fixtures: hooks/fixtures/2985-size-label/{receipts-exec-forgive*.md,events-*.json}.
+# ============================================================================================================
+if [ -f "$FX2985/receipts-exec-forgive.md" ]; then
+ZE3093() { OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$1" node "$LED" zai-strikes --task "${2:-777}" --role executor 2>&1; }
+
+# ---- AC-1: a non-drill OR-STRIKE-FORGIVE line whose evidence matches a timeout POSTMORTEM turns that invocation into a CONTINUE ----
+OUT=$(ZE3093 receipts-exec-forgive.md); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "1" ]; } && ok "#3093 AC-1: forgive line for run 1 -> zai-strikes prints 1 (was 2)" || bad "#3093 AC-1 (rc=$RC out=$OUT)"
+
+# ---- AC-2: the same two timeout triples WITHOUT a forgive line still count 2 ----
+OUT=$(ZE3093 receipts-exec-forgive-none.md); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "2" ]; } && ok "#3093 AC-2: no forgive line -> 2" || bad "#3093 AC-2 (rc=$RC out=$OUT)"
+
+# ---- AC-3: dangling evidence and foreign (other task / drill / plan-review) forgive lines change nothing ----
+for spec in "receipts-exec-forgive-dangling.md:2" "receipts-exec-forgive-other.md:2"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3093 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3093 AC-3: $f -> $want (dangling/foreign/drill forgive lines ignored)" || bad "#3093 AC-3 $f want $want (rc=$RC out=$OUT)"
+done
+
+# ---- AC-4: CONTINUE cap — the 4th forgiven timeout invocation is a strike ----
+OUT=$(ZE3093 receipts-exec-forgive-x4.md); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "1" ]; } && ok "#3093 AC-4: four forgiven timeouts -> 1 (cap 3, the 4th is a strike)" || bad "#3093 AC-4 (rc=$RC out=$OUT)"
+# set semantics (plan-review r1 F6): duplicated OR-STRIKE-FORGIVE lines for one evidence collapse in
+# forgivenEvidence()'s Set — one evidence key buys at most one CONTINUE, so no separate arm is needed.
+
+# ---- AC-5: every #3060 AC-1 fixture still prints its pinned value (no forgive lines exist in any of them) ----
+for spec in "receipts-exec-0.md:0" "receipts-exec-1.md:1" "receipts-exec-2.md:2" "receipts-exec-reset.md:1" "receipts-exec-drill.md:0" \
+            "receipts-exec-retry.md:1" "receipts-exec-retry-mutant.md:2" "receipts-exec-legacy.md:1" "receipts-exec-legacy-pair.md:2" "receipts-exec-other.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3093 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3093 AC-5: $f still -> $want (#3060 AC-1 pins unchanged, receipts-exec-2.md -> 2 for #3073 AC-3)" || bad "#3093 AC-5 $f want $want (rc=$RC out=$OUT)"
+done
+
+# ---- AC-6..AC-10: the repair-strike-progress verb. A throwaway repo with a bare origin (deterministic
+# empty commits — fixed author/committer/name/date — so the events-*.json fixtures' shas reproduce on any
+# host); the events seam (THREE_ROLE_GH_EVENTS_FILE) is armed only against a redirected receipt. ----
+SP3093="$(mktemp -d)"
+SP3093_REPO="$SP3093/repo"
+SID3093="00000000-0000-4000-8000-000000000777"
+git init -q --bare "$SP3093/origin.git"
+git clone -q "$SP3093/origin.git" "$SP3093_REPO" 2>/dev/null
+git -C "$SP3093_REPO" checkout -q -b master
+git -C "$SP3093_REPO" config user.email f777@fixture.invalid
+git -C "$SP3093_REPO" config user.name f777
+GIT_AUTHOR_NAME=f777 GIT_AUTHOR_EMAIL=f777@fixture.invalid GIT_COMMITTER_NAME=f777 GIT_COMMITTER_EMAIL=f777@fixture.invalid \
+  GIT_AUTHOR_DATE="2026-10-09T00:00:00+00:00" GIT_COMMITTER_DATE="2026-10-09T00:00:00+00:00" \
+  git -C "$SP3093_REPO" commit -q --allow-empty -m "777 base"
+git -C "$SP3093_REPO" push -q origin master
+git -C "$SP3093_REPO" checkout -q -b 777-fix
+GIT_AUTHOR_NAME=f777 GIT_AUTHOR_EMAIL=f777@fixture.invalid GIT_COMMITTER_NAME=f777 GIT_COMMITTER_EMAIL=f777@fixture.invalid \
+  GIT_AUTHOR_DATE="2026-10-09T00:00:00+00:00" GIT_COMMITTER_DATE="2026-10-09T00:00:00+00:00" \
+  git -C "$SP3093_REPO" commit -q --allow-empty -m "777 fix"
+git -C "$SP3093_REPO" push -q origin 777-fix
+{ [ "$(git -C "$SP3093_REPO" rev-parse master)" = "6b96f489f8c2c0e87f9eff02a2b85b353fb73fe2" ] \
+  && [ "$(git -C "$SP3093_REPO" rev-parse 777-fix)" = "c1b705eeb1bcd81ceac43222cfbb1ccae362ee61" ]; } \
+  && ok "#3093 AC-6: fixture repo reproduced the deterministic shas events-*.json name" \
+  || bad "#3093 AC-6: fixture repo shas drifted from events-*.json ($(git -C "$SP3093_REPO" rev-parse master 2>/dev/null) / $(git -C "$SP3093_REPO" rev-parse 777-fix 2>/dev/null))"
+
+# ---- AC-6: green path (seam mode) — exactly one OR-STRIKE-FORGIVE line, one AUDIT line naming the source, count 2 -> 1 ----
+cp "$FX2985/receipts-exec-forgive-none.md" "$SP3093/ac6.md"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/ac6.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" 2>"$SP3093/ac6.err"); RC=$?
+N3093="$(command grep -c '^OR-STRIKE-FORGIVE role=executor task=777 ' "$SP3093/ac6.md")"
+OUT2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/ac6.md" node "$LED" zai-strikes --task 777 --role executor 2>&1)
+{ [ "$RC" = "0" ] && [ "$N3093" = "1" ] \
+  && [ "$(command grep -c '^AUDIT: repair-strike-progress' "$SP3093/ac6.err")" = "1" ] \
+  && command grep -q 'source=events-file' "$SP3093/ac6.err" && [ "$OUT2" = "1" ]; } \
+  && ok "#3093 AC-6: verb (seam) appends one forgive line, one AUDIT source=events-file line, zai-strikes 2 -> 1" \
+  || bad "#3093 AC-6 (rc=$RC n=$N3093 strikes=$OUT2 err=$(head -1 "$SP3093/ac6.err" 2>/dev/null))"
+
+# ---- AC-7: idempotent — rerun prints "nothing to repair", exit 0, receipt byte size unchanged ----
+SZ3093_A=$(wc -c < "$SP3093/ac6.md" | tr -d ' ')
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/ac6.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" 2>/dev/null); RC=$?
+SZ3093_B=$(wc -c < "$SP3093/ac6.md" | tr -d ' ')
+{ [ "$RC" = "0" ] && [ "$OUT" = "OK repair-strike-progress: nothing to repair" ] && [ "$SZ3093_A" = "$SZ3093_B" ]; } \
+  && ok "#3093 AC-7: rerun exits 0, nothing to repair, receipt byte size unchanged" \
+  || bad "#3093 AC-7 (rc=$RC out=$OUT size $SZ3093_A -> $SZ3093_B)"
+
+# ---- AC-8: --dry-run prints the would-append line and writes nothing ----
+cp "$FX2985/receipts-exec-forgive-none.md" "$SP3093/ac8.md"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/ac8.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" --dry-run 2>/dev/null); RC=$?
+cmp -s "$FX2985/receipts-exec-forgive-none.md" "$SP3093/ac8.md"; CMP3093=$?
+{ [ "$RC" = "0" ] && [ "$CMP3093" = "0" ] \
+  && printf '%s' "$OUT" | command grep -q '^OR-STRIKE-FORGIVE role=executor task=777 attempt=1 evidence=777-executor-1791547185-a1 branch=777-fix'; } \
+  && ok "#3093 AC-8: --dry-run exits 0, prints the would-append line, receipt byte-identical" \
+  || bad "#3093 AC-8 (rc=$RC cmp=$CMP3093 out=$OUT)"
+
+# ---- AC-9: fail closed — each arm exits 3, leaves the receipt byte-identical, BLOCKs with its P-leg ----
+RSP3093() {  # $1=arm  $2=events fixture ("" = leave the seam unset)  $3=branch  $4=evidence
+  local arm="$1" evs="$2" br="$3" ev="$4"
+  local rcpt="$SP3093/rcpt-$arm.md" errf="$SP3093/err-$arm" rc
+  cp "$FX2985/receipts-exec-forgive-none.md" "$rcpt"
+  if [ -n "$evs" ]; then
+    OPENROUTER_DISPATCH_RECEIPT_FILE="$rcpt" THREE_ROLE_GH_EVENTS_FILE="$FX2985/$evs" \
+      node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch "$br" \
+      --evidence "$ev" --cwd "$SP3093_REPO" >/dev/null 2>"$errf"
+  else
+    OPENROUTER_DISPATCH_RECEIPT_FILE="$rcpt" \
+      node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch "$br" \
+      --evidence "$ev" --cwd "$SP3093_REPO" >/dev/null 2>"$errf"
+  fi
+  rc=$?
+  { [ "$rc" = "3" ] && cmp -s "$FX2985/receipts-exec-forgive-none.md" "$rcpt" \
+    && command grep -q "^BLOCK (3role-ledger repair-strike-progress P[1-6])" "$errf"; } \
+    && ok "#3093 AC-9$arm: exits 3, receipt byte-identical, BLOCK P-leg on stderr ($(head -1 "$errf" | cut -c1-60)...)" \
+    || bad "#3093 AC-9$arm (rc=$rc err=$(head -1 "$errf" 2>/dev/null))"
+}
+RSP3093 a events-ok.json 777-fix 777-executor-9999999999-a1   # (a) evidence names no POSTMORTEM
+RSP3093 b events-ok.json fix-777 777-executor-1791547185-a1   # (b) branch without the leading task id
+RSP3093 c events-outside.json 777-fix 777-executor-1791547185-a1  # (c) push 1h after the window
+RSP3093 d events-two.json 777-fix 777-executor-1791547185-a1  # (d) two qualifying pushes
+RSP3093 e events-noop.json 777-fix 777-executor-1791547185-a1 # (e) before == head
+# (f) the branch is force-moved so the pushed commit is unreachable from origin/777-fix
+git -C "$SP3093_REPO" push -q -f origin master:777-fix
+git -C "$SP3093_REPO" fetch -q origin 777-fix
+RSP3093 f events-ok.json 777-fix 777-executor-1791547185-a1
+git -C "$SP3093_REPO" push -q -f origin 777-fix:777-fix        # restore C for any later arm
+# (g) the seam env while the receipt resolves to the DEFAULT location — P6 before any network call
+THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" node "$LED" repair-strike-progress --session "$SID3093" \
+  --task 777 --role executor --branch 777-fix --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" \
+  >"$SP3093/ac9g.out" 2>"$SP3093/err-g"; RC=$?
+{ [ "$RC" = "3" ] && command grep -q "^BLOCK (3role-ledger repair-strike-progress P6)" "$SP3093/err-g" \
+  && [ ! -s "$SP3093/ac9g.out" ]; } \
+  && ok "#3093 AC-9g: seam env + DEFAULT receipt -> P6 exit 3 before any network call, nothing written" \
+  || bad "#3093 AC-9g (rc=$RC err=$(head -1 "$SP3093/err-g" 2>/dev/null))"
+
+# ---- AC-10: no forgery by env — the seam env appears exactly once in the ledger, inside the P6 seam-guard block ----
+{ [ "$(command grep -c 'THREE_ROLE_GH_EVENTS_FILE' "$LED")" = "1" ] \
+  && command grep -B5 'THREE_ROLE_GH_EVENTS_FILE' "$LED" | command grep -q 'P6 seam guard'; } \
+  && ok "#3093 AC-10: events seam env occurs once, inside the P6 seam-guard block (grep -c = 1)" \
+  || bad "#3093 AC-10 (count=$(command grep -c 'THREE_ROLE_GH_EVENTS_FILE' "$LED"))"
+
+# ---- fix-round-1 arms (execution-review r1 F1/F2/F3/F5/F6) ----
+# F1: live POSTMORTEM rows carry a PATH-shaped evidence= (the fixture's _or-dispatch-postmortem/ prefix
+# mirrors the live shape) — the verb keys by basename, so the counter must too, or the recorded forgive is
+# ignored and the count stays 2 (the red the review caught on the live #3078 shape).
+cp "$FX2985/receipts-exec-forgive-path.md" "$SP3093/f1.md"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f1.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" >/dev/null 2>&1); RC=$?
+OUT2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f1.md" node "$LED" zai-strikes --task 777 --role executor 2>&1)
+{ [ "$RC" = "0" ] && [ "$OUT2" = "1" ]; } \
+  && ok "#3093 F1: path-shaped POSTMORTEM evidence — verb appends, zai-strikes 2 -> 1 (basename key on both sides)" \
+  || bad "#3093 F1 (rc=$RC strikes=$OUT2)"
+# F2: a seam-made (source=events-file) forgive line never forgives on the DEFAULT (live) store — only on a
+# redirected fixture receipt. A scratch copy of the ledger under its own .ai-workspace/status default reads
+# the default store without touching the live one.
+mkdir -p "$SP3093/live/hooks" "$SP3093/live/.ai-workspace/status"
+cp "$LED" "$SP3093/live/hooks/3role-ledger.mjs"
+cp "$FX2985/receipts-exec-forgive.md" "$SP3093/live/.ai-workspace/status/1947-seat-mix-live-smoke.md"
+OUT=$(node "$SP3093/live/hooks/3role-ledger.mjs" zai-strikes --task 777 --role executor 2>&1)
+OUT2=$(ZE3093 receipts-exec-forgive.md)
+{ [ "$OUT" = "2" ] && [ "$OUT2" = "1" ]; } \
+  && ok "#3093 F2: seam-source forgive line ignored on the default store (2), honored on a redirected receipt (1)" \
+  || bad "#3093 F2 (default=$OUT redirect=$OUT2)"
+# F6: a drill=1 forgive line never counts as done — the counter ignores it and P5 repairs past it.
+OUT=$(ZE3093 receipts-exec-forgive-drill.md)
+cp "$FX2985/receipts-exec-forgive-drill.md" "$SP3093/f6.md"
+OUT2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f6.md" THREE_ROLE_GH_EVENTS_FILE="$FX2985/events-ok.json" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" 2>/dev/null); RC=$?
+{ [ "$OUT" = "2" ] && [ "$RC" = "0" ] && printf '%s' "$OUT2" | command grep -q '^OK repair-strike-progress: appended'; } \
+  && ok "#3093 F6: drill=1 forgive line — counter stays 2, verb repairs past it (appended, rc 0)" \
+  || bad "#3093 F6 (strikes=$OUT rc=$RC out=$OUT2)"
+# F3: a push with no work of its own is refused at P4 — the branch reset to a master commit, and a branch
+# created at the master tip (before = 40 zeros), both exit 3 and write nothing.
+git -C "$SP3093_REPO" push -q -f origin master:777-fix
+git -C "$SP3093_REPO" fetch -q origin 777-fix
+RSP3093 x events-reset-to-master.json 777-fix 777-executor-1791547185-a1
+RSP3093 y events-create-at-master.json 777-fix 777-executor-1791547185-a1
+git -C "$SP3093_REPO" push -q -f origin 777-fix:777-fix        # restore c1b705 for any later arm
+# F5: GitHub's 300-event feed cap answers page 4 with HTTP 422 — end of feed, not an error: the hit already
+# found on page 3 stands (a scratch gh stub stands in for the network; pages 1-3 feed, page 4 422s).
+mkdir -p "$SP3093/ghbin"
+cat > "$SP3093/ghbin/gh" <<'GHSTUB3093'
+#!/bin/sh
+for a in "$@"; do case "$a" in *page=4) echo "gh: HTTP 422, pagination is limited for this resource (https://docs.github.com/rest)" >&2; exit 1;; esac; done
+for a in "$@"; do
+  case "$a" in *page=1) printf '[{"id":101,"type":"WatchEvent","created_at":"2026-10-09T12:00:00Z"},{"id":102,"type":"WatchEvent","created_at":"2026-10-09T11:50:00Z"}]\n'; exit 0;; esac
+  case "$a" in *page=2) printf '[{"id":201,"type":"WatchEvent","created_at":"2026-10-09T11:45:00Z"},{"id":202,"type":"WatchEvent","created_at":"2026-10-09T11:40:00Z"}]\n'; exit 0;; esac
+  case "$a" in *page=3) printf '[{"id":301,"type":"WatchEvent","created_at":"2026-10-09T11:37:00Z"},{"id":302,"type":"PushEvent","actor":{"id":1,"login":"f777"},"repo":{"id":1,"name":"f/r"},"payload":{"ref":"refs/heads/777-fix","before":"6b96f489f8c2c0e87f9eff02a2b85b353fb73fe2","head":"c1b705eeb1bcd81ceac43222cfbb1ccae362ee61"},"created_at":"2026-10-09T11:36:23Z"}]\n'; exit 0;; esac
+done
+exit 1
+GHSTUB3093
+chmod +x "$SP3093/ghbin/gh"
+cp "$FX2985/receipts-exec-forgive-none.md" "$SP3093/f5.md"
+PATH="$SP3093/ghbin:$PATH" OPENROUTER_DISPATCH_RECEIPT_FILE="$SP3093/f5.md" \
+  node "$LED" repair-strike-progress --session "$SID3093" --task 777 --role executor --branch 777-fix \
+  --evidence 777-executor-1791547185-a1 --cwd "$SP3093_REPO" >/dev/null 2>"$SP3093/f5.err"; RC=$?
+N3093="$(command grep -c '^OR-STRIKE-FORGIVE role=executor task=777 ' "$SP3093/f5.md")"
+{ [ "$RC" = "0" ] && [ "$N3093" = "1" ] && command grep -q 'pages=3' "$SP3093/f5.err"; } \
+  && ok "#3093 F5: page-4 HTTP 422 = end of feed — the page-3 hit stands (appended, pages=3)" \
+  || bad "#3093 F5 (rc=$RC n=$N3093 err=$(head -1 "$SP3093/f5.err" 2>/dev/null))"
+
+# ---- AC-14 (usage half): the no-verb usage line names repair-strike-progress ----
+OUT=$(node "$LED" 2>&1); RC=$?
+{ [ "$RC" = "2" ]; } && printf '%s' "$OUT" | command grep -q "repair-strike-progress" \
+  && ok "#3093 AC-14: usage line lists repair-strike-progress" || bad "#3093 AC-14 (rc=$RC)"
 fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
