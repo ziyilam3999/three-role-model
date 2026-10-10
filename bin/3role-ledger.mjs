@@ -2175,6 +2175,70 @@ function subprocessFirstRecordBound(firstText, task, role, nonce) {
   return tagRe.test(firstText) && firstText.indexOf(n) !== -1;
 }
 
+// #3085 D1 — the dispatcher's own plan-path extraction rule (the #3060 zai block in tools/openrouter-
+// role-dispatch.sh): every DISTINCT `.ai-workspace/plans/<...>.md` path in the brief text, at most 8.
+// Never a second hand-rolled regex — the checker re-derives the one path the dispatcher sized from, using
+// the dispatcher's own matcher, so the two sides can never disagree on what the brief named.
+// INPUT-BOUND: the scan is capped at the same 1 MiB the dispatcher reads, so an oversized transcript brief
+// cannot loop the matcher (a truncation only ever drops paths -> fail closed, never a silent default).
+function briefPlanPaths(text) {
+  const s = String(text == null ? '' : text).slice(0, 1048576);
+  const re = /[.\w/-]*\.ai-workspace\/plans\/[^\s"'`)]+\.md/g;
+  const seen = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (!seen.includes(m[0])) { seen.push(m[0]); if (seen.length >= 8) break; }
+  }
+  return seen;
+}
+
+// #3085 D2 — the expected served model for an executor subprocess-zai row: the model the dispatcher's own
+// effectiveRouteFor would have picked for the plan named in the row's OWN nonce-bound transcript first
+// record, re-derived through the SAME resolver the dispatcher called (resolvePlanFacts + executorSizeModel,
+// the #2434 single-generator discipline). Every outcome the dispatcher itself refuses pre-stamp (exit
+// 10/11/12: no/ambiguous plan path, unresolvable plan, size missing/ambiguous/invalid, task mismatch,
+// private OR invalid data-class, L-with-fallback-but-no-size-model) is a BLOCK here — a z.ai row claiming
+// one is inadmissible (fail closed, never a silent seat-model default). Strikes are deliberately NOT
+// consulted (D3): zai_strikes is time-varying, and the row's existence already proves the route stayed on
+// z.ai at dispatch time, so reading strikes at check time could block a row correct when it closed.
+// The L branch mirrors effectiveRouteFor's own precondition exactly: the size model applies ONLY when the
+// seat also declares a valid agent_tool_fallback (a ROLE_MODELS member); with no valid fallback the
+// dispatcher never sizes and serves the seat model for L, so the checker expects the seat model too —
+// mirror, never stricter. Returns {block:true, reason} | {model, size}.
+function zaiExecutorRouteExpected(e, info, task, decl) {
+  const paths = briefPlanPaths(info.firstText);
+  if (paths.length === 0) return { block: true, reason: 'the brief text names no .ai-workspace/plans/<file>.md path' };
+  if (paths.length > 1) return { block: true, reason: 'the brief text names ' + paths.length + ' distinct plan paths' };
+  const rel = paths[0];
+  // D1 vantage-first resolution: the transcript's own recorded cwd (only an ABSOLUTE one — 2700-pr1), then
+  // today's chain exactly as `check` already resolves a plan-review row's reviewed_plan (cwd, then the repo
+  // holding this helper). A miss on every candidate is a BLOCK, never a silent pass.
+  const cands = [];
+  if (typeof info.dispatchCwd === 'string' && info.dispatchCwd.startsWith('/')) cands.push(path.join(info.dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    cands.push(path.join(selfDir, '..', rel));
+  }
+  let facts = null;
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) { facts = f; break; }
+  }
+  if (!facts) return { block: true, reason: 'plan "' + rel + '" is unresolvable from the transcript vantage or the checker chain' };
+  if (facts.size_source !== 'plan') return { block: true, reason: 'plan "' + rel + '" size_source=' + facts.size_source };
+  if (facts.data_class !== 'public') return { block: true, reason: 'plan "' + rel + '" data_class=' + facts.data_class };
+  if (facts.size === 'L') {
+    const fb = decl.seat.agent_tool_fallback;
+    if (fb && ROLE_MODELS.includes(fb)) {
+      const sizeModel = executorSizeModel(decl.seat);
+      if (!sizeModel) return { block: true, reason: 'size L with a valid agent_tool_fallback but no usable size_models.L in the seat' };
+      return { model: sizeModel, size: 'L' };
+    }
+  }
+  return { model: decl.seat.model, size: facts.size };   // S/M always; L only when the seat cannot size (mirror)
+}
+
 // conservative-seat-map-single-slot-local-dispatch (2026-08-30), D7 — the subprocess-local sibling of
 // seatDispatchIsSubprocess(). Reads the NEW conservative_seat_map[role].primary overlay (never `seats[role]`,
 // which stays byte-untouched — see config/cc-routes.json's own overlay comment), fresh at check time, exactly
@@ -2232,7 +2296,23 @@ function checkSubprocessProvenance(role, e, session, task) {
       'not carry BOTH the spawn tag (3ROLE_TASK:' + task + ' ROLE:' + role + ') and this dispatch\'s nonce "' +
       (e.nonce || '<missing>') + '" — a replayed/reused transcript is not admissible (M2)';
   }
-  if (!info.servedModel || info.servedModel !== decl.seat.model) {
+  // #3085 D1/D2/D4 — for the ONE class the dispatcher sizes (executor + subprocess-zai), the expected
+  // served model is the dispatcher's own effective route for THIS row's plan (size-aware), never the bare
+  // seat default: since #3060 a size-L public plan is deliberately served on size_models.L. Slotted
+  // strictly AFTER the tag+nonce binding above (an unbound transcript never steers resolution) and AT the
+  // served-model comparison; every earlier check, and every OTHER dispatch class (plan-review, research,
+  // subprocess-local, subprocess-openrouter) keeps today's byte-identical seat-model comparison (D4).
+  if (role === 'executor' && e.dispatch === 'subprocess-zai') {
+    const route = zaiExecutorRouteExpected(e, info, task, decl);
+    if (route.block) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
+        route.reason;
+    }
+    if (!info.servedModel || info.servedModel !== route.model) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
+    }
+  } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
     return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
       (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
   }
