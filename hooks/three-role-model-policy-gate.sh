@@ -142,7 +142,7 @@ ROLE=""; SESSION=""; TASKID=""; REQMODEL=""; BYPASS=""; SIG=""; TXPATH=""; SUBAG
 # infra). resolve-role-model fails SAFE to opus and always exits 0, so an empty EXPECTED means the helper
 # itself is missing (not "policy is opus").
 [ -f "$LEDGER_HELPER" ] || exit 0
-read -r EXPECTED EFFORT < <(node "$LEDGER_HELPER" resolve-role-model --role "$ROLE" --with-effort 2>/dev/null)
+read -r EXPECTED EFFORT < <(node "$LEDGER_HELPER" resolve-role-model --role "$ROLE" --task "$TASKID" --session "$SESSION" --with-effort 2>/dev/null)
 [ -n "${EXPECTED:-}" ] || exit 0
 
 # EFFECTIVE tier (#1494): the requested model if present, else the EFFECTIVE-TIER SENSOR's read of the

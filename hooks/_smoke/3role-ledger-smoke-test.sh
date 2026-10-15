@@ -7048,4 +7048,79 @@ OUT=$(node "$LED" 2>&1); RC=$?
 { [ "$RC" = "2" ]; } && printf '%s' "$OUT" | command grep -q "repair-strike-progress" \
   && ok "#3093 AC-14: usage line lists repair-strike-progress" || bad "#3093 AC-14 (rc=$RC)"
 fi
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# #3140 Leg 2 -- size-aware PLANNER tier (resolve-role-model --task/--session/--tasks-dir). Fable ONLY for a
+# size-L ticket (ticket metadata.size), Opus otherwise, an operator seat pin wins. Fixture tickets only
+# (synthetic ids 9001-9006, subject FIXTURE-SUBJECT-SENTINEL); self-contained fixture routes (config/cc-routes.json
+# is not bundled in the plugin), plus live-config arms that SKIP when it is absent.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+S3140="$TMP/s3140"; mkdir -p "$S3140/tasks/sess1"
+cat > "$S3140/routes.json" <<'S3140J'
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+S3140J
+sed 's/"L":"claude-fable-5-1"/"L":"not-a-model"/' "$S3140/routes.json" > "$S3140/routes-bad.json"
+sed 's/,"size_models":{"L":"claude-fable-5-1"}//' "$S3140/routes.json" > "$S3140/routes-nosize.json"
+for t3140 in 9001:'"size":"L"' 9002:'"size":"S"' 9003:'"size":"M"' 9004:'"x":1' 9005:'"size":"XL"' 9006:'"size":"l"'; do
+  printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{%s}}' "${t3140%%:*}" "${t3140#*:}" > "$S3140/tasks/sess1/${t3140%%:*}.json"
+done
+# rs3140 <routes-file|live> <task> [extra env KEY=VAL ...]  -> RS_OUT (stdout) RS_ERR (stderr) RS_RC
+rs3140() {
+  local rf="$1" t="$2"; shift 2
+  local rfenv=""; [ "$rf" != "live" ] && rfenv="CC_ROUTES_JSON=$rf"
+  RS_OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON ${rfenv:+"$rfenv"} "$@" node "$LED" resolve-role-model --role planner --task "$t" --session sess1 --tasks-dir "$S3140/tasks" 2>"$S3140/err"); RS_RC=$?
+  RS_ERR="$(cat "$S3140/err")"
+}
+ALL3140=""
+rs3140 "$S3140/routes.json" 9001
+{ [ "$RS_RC" = "0" ] && [ "${RS_OUT%% *}" = "fable" ] && ! printf '%s' "$RS_ERR" | command grep -q 'SIZE-TIER-DEFAULT'; } \
+  && ok "#3140 AC-2.1/2.2: size-L ticket 9001 -> fable, exit 0, no SIZE-TIER-DEFAULT note" || bad "#3140 AC-2.1: 9001 should resolve fable (rc=$RS_RC out=$RS_OUT err=$RS_ERR)"
+ALL3140="$ALL3140$RS_OUT$RS_ERR"
+for t3140 in 9002 9003; do
+  rs3140 "$S3140/routes.json" $t3140
+  { [ "$RS_RC" = "0" ] && [ "${RS_OUT%% *}" = "opus" ] && ! printf '%s' "$RS_ERR" | command grep -q 'SIZE-TIER-DEFAULT'; } \
+    && ok "#3140 AC-2.1/2.2: valid S/M ticket $t3140 -> opus, no SIZE-TIER-DEFAULT note" || bad "#3140 AC-2.1: $t3140 should resolve opus quietly (rc=$RS_RC out=$RS_OUT err=$RS_ERR)"
+  ALL3140="$ALL3140$RS_OUT$RS_ERR"
+done
+for t3140 in 9004 9005 9006 9999; do
+  rs3140 "$S3140/routes.json" $t3140
+  { [ "$RS_RC" = "0" ] && [ "${RS_OUT%% *}" = "opus" ] && printf '%s' "$RS_ERR" | command grep -q 'SIZE-TIER-DEFAULT'; } \
+    && ok "#3140 AC-2.1/2.2: no/invalid-size ticket $t3140 -> opus + SIZE-TIER-DEFAULT note" || bad "#3140 AC-2.1: $t3140 should resolve opus with the note (rc=$RS_RC out=$RS_OUT err=$RS_ERR)"
+  ALL3140="$ALL3140$RS_OUT$RS_ERR"
+done
+printf '%s' "$ALL3140" | command grep -q 'FIXTURE-SUBJECT-SENTINEL' \
+  && bad "#3140 AC-2.2/D7: ticket subject/description leaked into resolver output" || ok "#3140 AC-2.2/D7: zero FIXTURE-SUBJECT-SENTINEL in resolver output"
+# AC-2.3: the call shape with NO --task is unchanged (seat default, no note).
+OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3140/routes.json" node "$LED" resolve-role-model --role planner 2>"$S3140/err"); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "opus" ] && [ ! -s "$S3140/err" ]; } \
+  && ok "#3140 AC-2.3: no --task -> seat default opus, silent (existing call shape unchanged)" || bad "#3140 AC-2.3 (rc=$RC out=$OUT err=$(cat "$S3140/err"))"
+# Other roles ignore the size args.
+OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3140/routes.json" node "$LED" resolve-role-model --role execution-review --task 9001 --session sess1 --tasks-dir "$S3140/tasks" 2>/dev/null); RC=$?
+[ "$RC" = "0" ] && [ "$OUT" != "fable" ] && ok "#3140 D3: a non-planner role ignores the size args (never fable via the overlay)" || bad "#3140 D3: non-planner role must ignore the size overlay (out=$OUT)"
+# AC-2.4: rollback = no size_models key -> opus for the L ticket; off-vocabulary size_models.L -> lint-routes fails.
+rs3140 "$S3140/routes-nosize.json" 9001
+{ [ "$RS_RC" = "0" ] && [ "${RS_OUT%% *}" = "opus" ]; } && ok "#3140 AC-2.4: no size_models key -> size-L ticket resolves opus (config-only rollback)" || bad "#3140 AC-2.4 rollback (rc=$RS_RC out=$RS_OUT)"
+rs3140 "$S3140/routes-bad.json" 9001
+{ [ "${RS_OUT%% *}" = "opus" ]; } && ok "#3140 AC-2.4: off-vocabulary size_models.L never selects a model (opus)" || bad "#3140 AC-2.4 off-vocab (out=$RS_OUT)"
+OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3140/routes-bad.json" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'SIZE-MODEL-UNDECLARED'; } && ok "#3140 AC-2.4: lint-routes rejects size_models.L=not-a-model (SIZE-MODEL-UNDECLARED)" || bad "#3140 AC-2.4 lint-routes (rc=$RC)"
+# Live-config arms (skip cleanly where config/cc-routes.json is not bundled, i.e. the plugin copy).
+if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  [ "$OUT" = "fable medium claude-fable-5-1" ] && ok "#3140 AC-2.1 (live config): 9001 -> 'fable medium claude-fable-5-1'" || bad "#3140 AC-2.1 live config (got: $OUT)"
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" resolve-role-model --role planner --task 9002 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  [ "$OUT" = "opus medium claude-opus-5-5" ] && ok "#3140 AC-2.1 (live config): 9002 -> 'opus medium claude-opus-5-5'" || bad "#3140 AC-2.1 live config 9002 (got: $OUT)"
+  # AC-2.5: an operator seat pin wins over the size rule, and clearing it restores fable.
+  export CC_SEAT_PINS_FILE="$S3140/pins.json"
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier opus --reason "ac-2.5 fixture" >/dev/null 2>&1
+  rs3140 live 9001
+  PIN_OUT="${RS_OUT%% *}"
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "ac-2.5 fixture cleanup" >/dev/null 2>&1
+  rs3140 live 9001
+  { [ "$PIN_OUT" = "opus" ] && [ "${RS_OUT%% *}" = "fable" ]; } \
+    && ok "#3140 AC-2.5: seat pin wins over the size-L rule (opus), cleared -> fable again" || bad "#3140 AC-2.5 (pinned=$PIN_OUT cleared=${RS_OUT%% *})"
+  unset CC_SEAT_PINS_FILE
+else
+  ok "#3140 live-config arms SKIPPED: config/cc-routes.json not bundled here (plugin copy)"
+fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

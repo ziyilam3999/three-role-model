@@ -772,4 +772,46 @@ runh "$HOOK" "$PKILLD" CC_ROLE_AGENTS_DIR="$AGENTS_FULL"; rc_killd=$RC
 #      No separate row needed here — this whole file's [ "$fail" = "0" ] tally IS AC-REGRESSION's mechanical
 #      backstop, and it re-runs on every invocation.
 
+
+echo "== SECTION 5: #3140 Leg 2 -- size-aware PLANNER spawn gate (fable only for a size-L ticket; fixture routes + fixture tickets) =="
+# The expected tier is resolved by `resolve-role-model --role planner --task T --session S` from the TICKET's
+# metadata.size (PROGRESS_TASKS_DIR knob). CC_ROLES_ENV is unset for these arms (it is the terminal legacy
+# override that ignores the SSOT); config/cc-routes.json is not bundled in the plugin so a self-contained
+# fixture routes file is used. One FRESH session per case (the tickets live under <tasks>/<session>/ and the
+# block-once marker is keyed session:task:role, so a reused signature would make a later arm vacuous).
+SZ="$TMP/sz3140"; mkdir -p "$SZ/tasks"
+cat > "$SZ/routes.json" <<'SZJ'
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+SZJ
+# szcase <n> <task> <ticket-metadata-json-body|-> <model> -> RC CAP (fresh session ac3140NN-...)
+szcase() {
+  local n="$1" task="$2" meta="$3" model="$4" sid
+  sid="ac3140$(printf '%02d' "$n")-0000-4000-8000-0000000031$(printf '%02d' "$n")"
+  mkdir -p "$SZ/tasks/$sid"
+  [ "$meta" != "-" ] && printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","metadata":{%s}}' "$task" "$meta" > "$SZ/tasks/$sid/$task.json"
+  local payload
+  payload='{"session_id":"'"$sid"'","tool_input":{"model":"'"$model"'","prompt":"3ROLE_TASK:'"$task"' ROLE:planner\nPlan it."}}'
+  CAP=$(printf '%s' "$payload" \
+    | env -u CC_ROLES_ENV CC_ROUTES_JSON="$SZ/routes.json" PROGRESS_TASKS_DIR="$SZ/tasks" CC_ROLE_AGENTS_DIR="$AGENTS_FIX" CC_ROLE_MODEL_POLICY_STATE_DIR="$STATE_DIR" bash "$HOOK" 2>&1); RC=$?
+}
+szcase 1 9001 '"size":"L"' fable
+{ [ "$RC" = "0" ]; } && ok "#3140 AC-2.6: size-L ticket + model:fable -> exit 0" || bad "#3140 AC-2.6 {9001,fable} should be allowed (rc=$RC out=$CAP)"
+szcase 2 9001 '"size":"L"' opus
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | command grep -q 'policy = fable'; } && ok "#3140 AC-2.6: size-L ticket + model:opus -> exit 2 naming fable" || bad "#3140 AC-2.6 {9001,opus} should block naming fable (rc=$RC out=$CAP)"
+szcase 3 9002 '"size":"S"' fable
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | command grep -q 'policy = opus'; } && ok "#3140 AC-2.6: size-S ticket + model:fable -> exit 2 naming opus" || bad "#3140 AC-2.6 {9002,fable} should block naming opus (rc=$RC out=$CAP)"
+szcase 4 9002 '"size":"S"' opus
+{ [ "$RC" = "0" ]; } && ok "#3140 AC-2.6: size-S ticket + model:opus -> exit 0" || bad "#3140 AC-2.6 {9002,opus} should be allowed (rc=$RC out=$CAP)"
+szcase 5 9004 '"x":1' opus
+{ [ "$RC" = "0" ]; } && ok "#3140 AC-2.6: no-size ticket + model:opus -> exit 0" || bad "#3140 AC-2.6 {9004,opus} should be allowed (rc=$RC out=$CAP)"
+szcase 6 9004 '"x":1' fable
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | command grep -q 'policy = opus'; } && ok "#3140 AC-2.6: no-size ticket + model:fable -> exit 2 naming opus" || bad "#3140 AC-2.6 {9004,fable} should block (rc=$RC out=$CAP)"
+szcase 7 9005 '"size":"XL"' fable
+{ [ "$RC" = "2" ]; } && ok "#3140 AC-2.6 (held-out): invalid size XL + model:fable -> exit 2 (fails toward opus)" || bad "#3140 AC-2.6 {XL,fable} should block (rc=$RC out=$CAP)"
+szcase 8 9003 '"size":"M"' opus
+{ [ "$RC" = "0" ]; } && ok "#3140 AC-2.6 (held-out): size-M ticket + model:opus -> exit 0" || bad "#3140 AC-2.6 {M,opus} should be allowed (rc=$RC out=$CAP)"
+szcase 9 9999 - fable
+{ [ "$RC" = "2" ]; } && ok "#3140 AC-2.6 (held-out): missing ticket file + model:fable -> exit 2 (fails toward opus)" || bad "#3140 AC-2.6 {missing,fable} should block (rc=$RC out=$CAP)"
+printf '%s' "$CAP" | command grep -q 'FIXTURE-SUBJECT-SENTINEL' && bad "#3140 D7: ticket subject leaked into the gate output" || ok "#3140 D7: zero FIXTURE-SUBJECT-SENTINEL in the gate output"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
