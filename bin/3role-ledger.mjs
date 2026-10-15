@@ -5189,6 +5189,43 @@ function cmdCheck(o) {
           // #3140 Leg 2: when the fable expectation CAME FROM the size-L overlay (not the seat default), a
           // planner that ran on opus is a real down-tier for a size-L ticket, not a silent reroute: no exemption.
           if (expected === 'fable' && actual === 'opus' && !sizeOv.applies) continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+          // #3149 -- pre-cutover size-L GRANDFATHER (plan D1-D5). Scope: ONLY the planner, ONLY when the
+          // size-L overlay (never a seat pin -- the pin overlay above already had its chance to win, D5)
+          // set the fable expectation, ONLY an Opus observation (the pre-Leg-2 rule's allowed shape; every
+          // other path is byte-identical in effect, D3). The anchor is the transcript's earliest harness-
+          // written timestamp (D1), compared to the SSOT-recorded cutover AS INSTANTS, strictly-before (R2:
+          // both straddling arms carry non-UTC offsets so a string compare fails them). Fail closed on an
+          // absent/malformed/future cutover (D2, with a stderr note) and on an unreadable run start (D4).
+          if (sizeOv.applies && expected === 'fable' && actual === 'opus' && !seatPin.pinned) {
+            const cut = plannerSizeCutover(routesLoaded);
+            if (cut.note) process.stderr.write(cut.note);
+            const started = transcriptRunStartEpoch(session, e.agentId);
+            const startIso = isNaN(started) ? '<unreadable>' : new Date(started).toISOString();
+            const cutIso = cut.ok ? new Date(cut.epoch).toISOString() : '<not a usable cutover: seats.planner.size_models_cutover>';
+            if (cut.ok && !isNaN(started) && started < cut.epoch) {
+              // Allowed, never silently: a distinct token on stderr (D3). A run that started pre-cutover and
+              // ran past it is still grandfathered -- the run predates the rule (LOW-2, stated intent).
+              process.stderr.write('SIZE-L-GRANDFATHERED: role planner ran on opus (transcript model ' + actualId +
+                ') on a size-L ticket, but its run STARTED ' + startIso + ', strictly before the size-L planner ' +
+                'cutover ' + cutIso + ' -- judged by the rule of its time (allowed with note; no action needed).\n');
+              continue;
+            }
+            // D6 -- the size-L rule is what set the expectation, so the block names the rule, the ticket's
+            // size, the honest recoveries (Fable re-run FIRST; the operator-only, machine-wide seat pin as
+            // an explicit LAST RESORT), the automatic pre-cutover acceptance, and both instants so the
+            // reader can see WHY this row was not grandfathered. It never names the planner seat-default
+            // env var: editing it cannot fix a size-derived expectation.
+            problems.push('MODEL-POLICY: role planner ran on opus (transcript model ' + actualId + ') but the ' +
+              'SIZE-L RULE (seats.planner.size_models.L in the cc-routes.json SSOT) resolves planner -> fable ' +
+              'for this size-' + sizeOv.size + ' ticket -- the seat default is not the source of this expectation, ' +
+              'so changing it in cc-roles.env cannot fix this. Recovery 1 (do this first): re-run the planner on ' +
+              'fable (it is accepted automatically once the Fable cap allows). Recovery 2 (operator-only, LAST ' +
+              'RESORT, machine-wide for EVERY ticket while it is set): set-seat-pin --role planner --tier opus ' +
+              '--reason "<why>", then clear-seat-pin to undo it afterwards. A planner whose run STARTED before ' +
+              'the size-L cutover is accepted automatically (this run started ' + startIso + '; cutover ' + cutIso +
+              '). Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+            continue;
+          }
           // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
           // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
           // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
@@ -6960,6 +6997,63 @@ function plannerSizeOverlay(routesLoaded, role, session, task, tasksDirOpt) {
   return base;
 }
 
+// #3149 D2 -- the size-L planner CUTOVER instant, read ONLY from the routes SSOT (live, or a fixture routes
+// under the pre-existing CC_ROUTES_JSON test seam -- the same seam that already governs size_models and is
+// audit-logged; LOW-1: that seam can move the cutover with the whole routes file, posture unchanged). NO CLI
+// flag, env var or ledger field can supply it. FAILS CLOSED: absent/empty key => { ok:false } with NO note
+// (today's behaviour: block, A5); a present-but-unparsable value or one in the FUTURE (later than the gate's
+// own clock) => { ok:false } PLUS a one-line stderr note naming the key (A6/A11). Callers compare as
+// INSTANTS (epoch ms), never as strings (R2).
+function plannerSizeCutover(routesLoaded) {
+  const none = { ok: false, epoch: NaN, note: '' };
+  if (!routesLoaded || !routesLoaded.ok || !routesLoaded.routes) return none;
+  const seat = (routesLoaded.routes.seats || {}).planner;
+  if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) return none;
+  const v = seat.size_models_cutover;
+  if (typeof v !== 'string' || !v || isNaN(Date.parse(v))) {
+    return { ok: false, epoch: NaN, note: 'SIZE-L-CUTOVER-INVALID: seats.planner.size_models_cutover = "' + v +
+      '" is not a parseable ISO 8601 instant -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
+  }
+  const epoch = Date.parse(v);
+  if (epoch > Date.now()) {
+    return { ok: false, epoch, note: 'SIZE-L-CUTOVER-FUTURE: seats.planner.size_models_cutover = "' + v +
+      '" is later than the gate\'s own clock -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
+  }
+  return { ok: true, epoch, note: '' };
+}
+
+// #3149 D1 -- a planner's harness-recorded RUN START: the EARLIEST `timestamp` field across the rows of the
+// planner's own Agent-tool transcript (same glob transcriptModel()/agentResolves() read for the observed
+// model). The ledger row's `ts` is NEVER trusted: overlayAppend refreshes it on every append, so a later
+// close stamp would fake a post-cutover start (the live #2949 pair: transcript start 12:00:27Z < cutover
+// 12:18:54Z < row ts 12:22:17Z). Returns NaN on any unreadable/missing/unparsable shape (D4: the caller
+// fails CLOSED -- not grandfathered). A run that STARTS pre-cutover and CONTINUES past it (resume or long
+// run) is grandfathered by this anchor by design (LOW-2): the run predates the rule.
+function transcriptRunStartEpoch(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return NaN;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return NaN; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let best = NaN;
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (j && typeof j.timestamp === 'string') {
+        const t = Date.parse(j.timestamp);
+        if (!isNaN(t) && (isNaN(best) || t < best)) best = t;
+      }
+    }
+    if (!isNaN(best)) return best;
+  }
+  return NaN;
+}
+
 function cmdResolveRoleModel(o) {
   const role = o.role;
   if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research|ship-tail)'); process.exit(2); }
@@ -7330,6 +7424,17 @@ function lintRoutesConfig(routes) {
       if (typeof v !== 'string' || !Object.prototype.hasOwnProperty.call(vocab, v)) {
         problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' = "' + v + '" is not in providers.' + seat.provider + '.model_vocabulary');
       }
+    }
+  }
+  // #3149 D2 -- seats.<seat>.size_models_cutover: the OPTIONAL grandfather cutover instant for the size-L
+  // planner rule (a planner whose run STARTED strictly before it is judged by the pre-rule expectation).
+  // Anything present but not a parseable ISO 8601 string fails closed AT LINT TIME too -- the gate would
+  // already refuse to grandfather on it, but the lint names the key so the SSOT never ships malformed.
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) continue;
+    const cv = seat.size_models_cutover;
+    if (typeof cv !== 'string' || isNaN(Date.parse(cv))) {
+      problems.push('SIZE-MODEL-CUTOVER-INVALID: seats.' + sid + '.size_models_cutover = "' + cv + '" is not a parseable ISO 8601 date');
     }
   }
   // #3145 D5 -- seats.<seat>.size_route_since: the OPTIONAL transition pin (rows closed strictly before it
