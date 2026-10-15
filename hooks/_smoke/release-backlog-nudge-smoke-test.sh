@@ -9,6 +9,7 @@
 # Parameterized by RELEASE_BACKLOG_HOOK so the red-first receipt generator can point
 # it at a surgically-broken copy and watch a case flip to FAIL (RED), then GREEN.
 set -u
+export RULE12_LOG="${TMPDIR:-/tmp}/rbn-rule12-$$.log"  # #3109: never write the operator's real audit log (passed through env -i below).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="${RELEASE_BACKLOG_HOOK:-$SCRIPT_DIR/../release-backlog-nudge.sh}"
@@ -85,7 +86,7 @@ mk_repo_at() {
 run_hook() {
   local cwd="$1" envline="$2"
   local payload; payload="$(node -e "process.stdout.write(JSON.stringify({hook_event_name:'SessionStart',cwd:process.argv[1]}))" "$cwd")"
-  OUT="$(printf '%s' "$payload" | env -i HOME="$HOME" PATH="$PATH" PWD="$cwd" $envline bash "$HOOK" 2>/dev/null)"
+  OUT="$(printf '%s' "$payload" | env -i RULE12_LOG="${RULE12_LOG:-}" HOME="$HOME" PATH="$PATH" PWD="$cwd" $envline bash "$HOOK" 2>/dev/null)"
 }
 
 # Run the hook with a Stop payload carrying session_id + stop_hook_active, and an
@@ -95,7 +96,7 @@ run_hook_stop() {
   local cwd="$1" envline="$2" sid="$3" sa="$4" home="${5:-$HOME}"
   local payload
   payload="$(node -e "process.stdout.write(JSON.stringify({hook_event_name:'Stop',cwd:process.argv[1],session_id:process.argv[2],stop_hook_active:(process.argv[3]==='true')}))" "$cwd" "$sid" "$sa")"
-  OUT="$(printf '%s' "$payload" | env -i HOME="$home" PATH="$PATH" PWD="$cwd" $envline bash "$HOOK" 2>/dev/null)"
+  OUT="$(printf '%s' "$payload" | env -i RULE12_LOG="${RULE12_LOG:-}" HOME="$home" PATH="$PATH" PWD="$cwd" $envline bash "$HOOK" 2>/dev/null)"
 }
 
 has_nudge() { case "$OUT" in *_NUDGE:*) return 0;; *) return 1;; esac; }

@@ -16,6 +16,7 @@ bad() { echo "FAIL: $1"; fail=1; }
 # R4: a SINGLE pinned mktemp -d state dir shared by ALL fixtures, so the marker dropped by fixture 1 is visible
 # to fixture 2, and the R1 different-signature fixture reads the SAME location. Dependent fixtures run in order.
 STATE_DIR="$(mktemp -d)"; trap 'rm -rf "$STATE_DIR"' EXIT
+export RULE12_LOG="$STATE_DIR/rule12.log"  # #3109: never write the operator's real audit log during a suite run.
 
 # run <payload-json> [env KEY=VAL ...] -> sets RC, CAP. Every run pins the shared STATE_DIR.
 run() {
