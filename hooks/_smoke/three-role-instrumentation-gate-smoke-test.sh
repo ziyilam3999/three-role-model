@@ -1585,4 +1585,76 @@ if [ -f "$CORPUS_2437" ]; then
   done < "$CORPUS_2437"
 fi
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3140 Leg 2 -- completion gate, size-aware PLANNER expected tier (AC-2.7). The expected side of
+# `check --enforce-role-models` applies the SAME size overlay as the resolver (plannerSizeOverlay): a size-L
+# ticket expects fable, so a planner transcript on opus is a real down-tier (MODEL-POLICY, exit 2) and one on
+# fable is clean; a size-S ticket expects opus, so a fable planner is a strict up-tier (CLOSE-UPTIER note,
+# exit 0, the unchanged #1624 rule) and an opus planner is clean. Fixture routes (config/cc-routes.json is not
+# bundled in the plugin) + fixture tickets (synthetic ids 9001/9002, subject FIXTURE-SUBJECT-SENTINEL); the
+# legacy cc-roles.env is the repo's own (planner=opus + the tier version pins).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+T3140="$TMP/t3140"; mkdir -p "$T3140"
+cat > "$T3140/routes.json" <<'T3140J'
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+T3140J
+# plan3140 <session> <task> <ticket-size> <planner-model-id> -> RC OUT (check --enforce-role-models exit + output)
+plan3140() {
+  local s="$1" t="$2" sz="$3" pm="$4"
+  mkdir -p "$T3140/tasks/$s"
+  printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"%s"}}' "$t" "$sz" > "$T3140/tasks/$s/$t.json"
+  # every role carries an on-policy transcript model (the version-pin sub-leg fails CLOSED on a model-less one)
+  mk_sub_model "$s" agP "$pm"; mk_sub_model "$s" agR claude-opus-5-5; mk_sub_model "$s" agE claude-sonnet-5-5; mk_sub_model "$s" agV claude-opus-5-5
+  appendL --session "$s" --task "$t" --role planner          --agent agP --artifact "$LART_PLAN"
+  appendL --session "$s" --task "$t" --role plan-review       --agent agR --artifact "$LART_REV"
+  appendL --session "$s" --task "$t" --role executor          --agent agE --artifact "branch feat/x"
+  appendL --session "$s" --task "$t" --role execution-review  --agent agV --artifact "$LART_REV"
+  OUT=$(env -u CC_ROLES_ENV THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" \
+    CC_ROUTES_JSON="$T3140/routes.json" PROGRESS_TASKS_DIR="$T3140/tasks" node "$LED" check --session "$s" --task "$t" --enforce-role-models 2>&1); RC=$?
+}
+plan3140 s3140a 9001 L claude-opus-5-5
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+  && ok "#3140 AC-2.7: size-L ticket + planner on opus -> exit 2 MODEL-POLICY (down-tier vs the size-L expectation)" || bad "#3140 AC-2.7 {L,opus} should block (rc=$RC out=$OUT)"
+plan3140 s3140b 9001 L claude-fable-5-1
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+  && ok "#3140 AC-2.7: size-L ticket + planner on fable -> exit 0, no MODEL-POLICY" || bad "#3140 AC-2.7 {L,fable} should pass (rc=$RC out=$OUT)"
+plan3140 s3140c 9002 S claude-fable-5-1
+{ [ "$RC" = "0" ] && printf '%s' "$OUT" | command grep -q 'CLOSE-UPTIER'; } \
+  && ok "#3140 AC-2.7: size-S ticket + planner on fable -> exit 0 with a CLOSE-UPTIER note (unchanged #1624 rule)" || bad "#3140 AC-2.7 {S,fable} should be an allowed up-tier (rc=$RC out=$OUT)"
+plan3140 s3140d 9002 S claude-opus-5-5
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'CLOSE-UPTIER\|MODEL-POLICY:'; } \
+  && ok "#3140 AC-2.7: size-S ticket + planner on opus -> exit 0, no note" || bad "#3140 AC-2.7 {S,opus} should be clean (rc=$RC out=$OUT)"
+plan3140 s3140e 9003 XL claude-opus-5-5
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+  && ok "#3140 AC-2.7 (held-out): invalid size XL + planner on opus -> exit 0 (fails toward opus)" || bad "#3140 AC-2.7 {XL,opus} should pass (rc=$RC out=$OUT)"
+LEAK3140="$OUT"
+if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
+  # Pin-wins on the completion gate needs the LIVE routes (a pin is blind under the CC_ROUTES_JSON seam).
+  export CC_SEAT_PINS_FILE="$T3140/pins.json"
+  mkdir -p "$T3140/tasks/s3140g"; printf '{"id":"9005","subject":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"L"}}' > "$T3140/tasks/s3140g/9005.json"
+  mk_sub_model s3140g agP claude-opus-5-5; mk_sub_model s3140g agR claude-opus-5-5; mk_sub_model s3140g agE claude-sonnet-5-5; mk_sub_model s3140g agV claude-opus-5-5
+  appendL --session s3140g --task 9005 --role planner --agent agP --artifact "$LART_PLAN"
+  appendL --session s3140g --task 9005 --role plan-review --agent agR --artifact "$LART_REV"
+  appendL --session s3140g --task 9005 --role executor --agent agE --artifact "branch feat/x"
+  appendL --session s3140g --task 9005 --role execution-review --agent agV --artifact "$LART_REV"
+  # control: with NO pin the live size-L overlay expects fable, so the opus planner is a MODEL-POLICY block
+  # (proves this arm is discriminating on the live config, not passing on an opus fail-safe).
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "3140 AC-2.7 fixture control" >/dev/null 2>&1
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" PROGRESS_TASKS_DIR="$T3140/tasks" \
+    node "$LED" check --session s3140g --task 9005 --enforce-role-models 2>&1); RC=$?
+  { [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+    && ok "#3140 AC-2.7 (live config, control): unpinned size-L ticket + opus planner -> MODEL-POLICY block" || bad "#3140 live control (rc=$RC out=$OUT)"
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier opus --reason "3140 AC-2.7 fixture pin" >/dev/null 2>&1
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" PROGRESS_TASKS_DIR="$T3140/tasks" \
+    node "$LED" check --session s3140g --task 9005 --enforce-role-models 2>&1); RC=$?
+  { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+    && ok "#3140 AC-2.5/D3 (live config): a planner seat pin (opus) wins on the completion gate for a size-L ticket" || bad "#3140 pin-wins on the completion gate (rc=$RC out=$OUT)"
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "3140 AC-2.7 fixture cleanup" >/dev/null 2>&1
+  unset CC_SEAT_PINS_FILE
+else
+  ok "#3140 pin-wins completion-gate arm SKIPPED: config/cc-routes.json not bundled here (plugin copy)"
+fi
+printf '%s%s' "$LEAK3140" "$OUT" | command grep -q 'FIXTURE-SUBJECT-SENTINEL' && bad "#3140 D7: ticket subject leaked into check output" || ok "#3140 D7: zero FIXTURE-SUBJECT-SENTINEL in check output"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

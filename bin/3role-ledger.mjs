@@ -5154,6 +5154,10 @@ function cmdCheck(o) {
           // BYTE-IDENTICAL to the pre-#1640 comparison for every role whose seat is not SSOT-declared non-
           // Anthropic (expectedSide.tier === legacyExpected in that case).
           let expected = roleModelFromCfg(cfg, role);
+          // #3140 Leg 2 -- planner size overlay on the completion gate's expected side (same function as the
+          // resolver: plannerSizeOverlay). Applied BEFORE the seat pin below, so a pin still wins.
+          const sizeOv = plannerSizeOverlay(routesLoaded, role, session, task, o['tasks-dir']);
+          if (sizeOv.applies) expected = sizeOv.tier;
           // #1918 D2/AC3/AC4(b)/AC5(b) — TIER pin overlay on the completion gate's OWN tier-mismatch
           // comparison (the actual gate this role's Anthropic-observed transcript is judged against).
           // Gated on `routesLoaded.ok`, which is ALREADY forced false under CC_ROLES_ENV (line ~3022) —
@@ -5182,7 +5186,9 @@ function cmdCheck(o) {
               '_MODEL_VERSION), then re-run the plugin sync; else investigate. Kill-switch: CC_ROLE_VERSION_GATE_OFF=1.');
             continue;
           }
-          if (expected === 'fable' && actual === 'opus') continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+          // #3140 Leg 2: when the fable expectation CAME FROM the size-L overlay (not the seat default), a
+          // planner that ran on opus is a real down-tier for a size-L ticket, not a silent reroute: no exemption.
+          if (expected === 'fable' && actual === 'opus' && !sizeOv.applies) continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
           // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
           // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
           // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
@@ -6906,6 +6912,54 @@ function configDirSparseOmissionProblem(repoRoot) {
     ' -- refusing to silently fall back to opus. Restore config/ in this worktree, or set CC_ROLES_ENV explicitly.';
 }
 
+// #3140 Leg 2 -- size-aware PLANNER tier. ONE implementation, three callers (cmdResolveRoleModel, the
+// `check --enforce-role-models` expected side, and -- via resolve-role-model -- the spawn gate): #2434 single-
+// generator discipline. The size comes from the TICKET (`<tasks-root>/<session>/<task>.json` .metadata.size),
+// never from the plan file (no plan exists at planner spawn time). Valid values: exactly S, M, L. D7: this
+// reader loads ONLY metadata.size and never prints or returns subject/description. INPUT-BOUND: a ticket file
+// larger than 4 MiB, a non-regular file, or a session/task token outside [0-9A-Za-z._-]{1,128} (or containing
+// "..") is treated as "no size" (fails toward Opus, never toward the capped tier).
+function readTicketSize(tasksDirOpt, session, task) {
+  const out = { size: '', shown: 'none' };
+  const safe = /^[0-9A-Za-z._-]{1,128}$/;
+  const s = session == null ? '' : String(session);
+  const t = task == null ? '' : String(task);
+  if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return out;
+  const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
+    : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
+  try {
+    const p = path.join(root, s, t + '.json');
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const v = j && j.metadata && typeof j.metadata === 'object' ? j.metadata.size : undefined;
+    if (v === 'S' || v === 'M' || v === 'L') { out.size = v; out.shown = v; return out; }
+    if (typeof v === 'string' && /^[A-Za-z0-9]{1,8}$/.test(v)) out.shown = v;
+    else if (v !== undefined && v !== null) out.shown = 'invalid';
+  } catch (e) { /* unreadable / missing / bad JSON => no size */ }
+  return out;
+}
+
+// The planner size overlay: returns { applies, tier, model, size, shown }.  `applies` is true ONLY for
+// role==='planner' with a --task/--session pair, a valid SSOT seat carrying a vocabulary-valid size_models.L,
+// and a ticket size of exactly 'L'. Deleting size_models.L restores all-Opus (config-only rollback, D2).
+// `eligible` says the overlay machinery is live for this call (so a non-L answer should note SIZE-TIER-DEFAULT).
+function plannerSizeOverlay(routesLoaded, role, session, task, tasksDirOpt) {
+  const none = { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' };
+  if (role !== 'planner' || !task || !session) return none;
+  if (!routesLoaded || !routesLoaded.ok || !routesLoaded.routes) return none;
+  const seat = (routesLoaded.routes.seats || {}).planner;
+  if (!seat) return none;
+  const sm = seat.size_models;
+  if (!sm || typeof sm !== 'object' || Array.isArray(sm) || typeof sm.L !== 'string' || !sm.L) return none;
+  const ident = identifyModel(routesLoaded.routes, sm.L);
+  if (!ident.ok || !ident.tierEquivalent) return none;
+  const r = readTicketSize(tasksDirOpt, session, task);
+  const base = { applies: false, eligible: true, tier: ident.tierEquivalent, model: sm.L, size: r.size, shown: r.shown };
+  if (r.size === 'L') base.applies = true;
+  return base;
+}
+
 function cmdResolveRoleModel(o) {
   const role = o.role;
   if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research|ship-tail)'); process.exit(2); }
@@ -6974,6 +7028,12 @@ function cmdResolveRoleModel(o) {
       return;
     }
     let tier = ident.tierEquivalent;
+    // #3140 Leg 2 -- size overlay (planner only): L ticket -> size_models.L tier. Applied BEFORE the seat pin so
+    // an operator seat pin still wins (D3 confirmation, "pin wins").
+    let sizeModel = '';
+    const sov = plannerSizeOverlay(routesLoaded, role, o.session, o.task, o['tasks-dir']);
+    if (sov.applies) { tier = sov.tier; sizeModel = sov.model; }
+    else if (sov.eligible && !sov.size) process.stderr.write('SIZE-TIER-DEFAULT: planner size=' + sov.shown + ' -> ' + tier + '\n');
     // #1918 D2/D3(c) — TIER pin overlay, AFTER the clean-SSOT resolve above (D3c) and AFTER the #2401
     // sparse-omission guard at the top of this function — a pin can never mask a config/ sparse-omission or
     // rescue a broken SSOT, it only overlays an ALREADY-clean resolve. resolveTierPin() is itself seam-blind
@@ -6990,7 +7050,7 @@ function cmdResolveRoleModel(o) {
     const { found: legacyFound, cfg: legacyCfg } = loadRoleConfig();
     if (legacyFound) lintRoleConfig(legacyCfg);
     const effort = legacyFound ? roleEffortFromCfg(legacyCfg, role) : '';
-    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || (pin.pinned ? tier : (seat.model || tier));
+    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || (pin.pinned ? tier : (sizeModel || seat.model || tier));
     printRoleModel(tier, effort, version, withEffort, withVersion);
     return;
   }
