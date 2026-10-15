@@ -22,6 +22,7 @@ ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; fail=1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+export RULE12_LOG="$TMP/rule12.log"  # #3109: never write the operator's real audit log during a suite run.
 LEDGERDIR="$TMP/ledger"; PROJROOT="$TMP/projects"
 
 appendL()      { THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" node "$LED" append "$@" >/dev/null 2>&1; }
