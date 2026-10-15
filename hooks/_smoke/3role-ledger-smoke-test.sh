@@ -7123,4 +7123,155 @@ if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
 else
   ok "#3140 live-config arms SKIPPED: config/cc-routes.json not bundled here (plugin copy)"
 fi
+# #3149 — grandfather pre-cutover size-L planners at the model-policy gate (both-ends arms A1-A11).
+# Fixture tickets only (synthetic ids 9960-9962, subject FIXTURE-SUBJECT-SENTINEL); self-contained fixture
+# routes (config/cc-routes.json is not bundled in the plugin); fixture transcripts under the fixture
+# projects root. A run start BEFORE the cutover is judged by the rule of its time (grandfathered, allow-
+# with-note); AFTER it blocks exactly as today. Cutover and run start are compared AS INSTANTS: A1/A2
+# straddle the cutover via non-UTC offsets so a naive string compare fails both directions (R2).
+S3149="$TMP/s3149"; mkdir -p "$S3149"
+R3149CUT='"size_models_cutover":"2026-10-15T12:18:54Z"'
+cat > "$S3149/routes.json" <<S3149J
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"},"claude-sonnet-5-5":{"tier_equivalent":"sonnet"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"},${R3149CUT}}}}
+S3149J
+sed "s/,${R3149CUT}//" "$S3149/routes.json" > "$S3149/routes-nocut.json"
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"not-a-date"/' "$S3149/routes.json" > "$S3149/routes-badcut.json"
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"2999-01-01T00:00:00Z"/' "$S3149/routes.json" > "$S3149/routes-futcut.json"
+mk_sub_ts() { # <session> <agentId> <model> <ts-first> <ts-second> — a transcript whose rows carry harness-style timestamps
+  mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"
+  { printf '{"isSidechain":true,"agentId":"%s","sessionId":"%s","type":"user","timestamp":"%s"}\n' "$2" "$1" "$4";
+    printf '{"type":"assistant","agentId":"%s","timestamp":"%s","message":{"model":"%s","role":"assistant","content":[]}}\n' "$2" "$5" "$3"; } \
+    > "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents/agent-$2.jsonl"
+}
+# g3149_ledger <session> <task> <size> <planner-model> <ts1> <ts2> — full 4-role ledger, planner carrying model+timestamps
+g3149_ledger() {
+  mkdir -p "$S3149/tasks/$1"
+  printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"%s"}}' "$2" "$3" > "$S3149/tasks/$1/$2.json"
+  mk_sub_model "$1" gR "claude-opus-5-5"; mk_sub_model "$1" gV "claude-opus-5-5"; mk_sub_model "$1" gE "claude-sonnet-5-5"; mk_sub_ts "$1" gP "$4" "$5" "$6"
+  node "$LED" append --session "$1" --task "$2" --role planner         --agent gP --artifact "$TMP/plan.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role plan-review      --agent gR --artifact "$TMP/rev.md" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role executor         --agent gE --artifact "PR #9" >/dev/null
+  node "$LED" append --session "$1" --task "$2" --role execution-review --agent gV --artifact "$TMP/rev.md" >/dev/null
+}
+# g3149_check <session> <task> <routes-file> — the gate's own check, fixture routes, no seat pin file
+g3149_check() {
+  OUT=$(env -u CC_ROLES_ENV CC_SEAT_PINS_FILE="$S3149/no-pins.json" CC_ROUTES_JSON="$3" \
+    node "$LED" check --session "$1" --task "$2" --enforce-role-models --tasks-dir "$S3149/tasks" 2>&1); RC=$?
+}
+# A1: size-L + Opus planner, run start 2026-10-15T20:10:00+08:00 (=12:10:00Z, BEFORE the cutover; lexically
+# AFTER the UTC cutover string, so a string compare fails this arm) -> pass + grandfather note, no planner block.
+g3149_ledger ga1 9960 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check ga1 9960 "$S3149/routes.json"
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner' && printf '%s' "$OUT" | command grep -q 'SIZE-L-GRANDFATHERED'; } \
+  && ok "3149-A1: pre-cutover Opus planner on size-L -> pass, SIZE-L-GRANDFATHERED note, no planner MODEL-POLICY (rc=$RC)" || bad "3149-A1 (rc=$RC out=$OUT)"
+# A2: run start 2026-10-15T04:20:00-08:00 (=12:20:00Z, AFTER the cutover; lexically BEFORE the UTC cutover
+# string) -> planner MODEL-POLICY block, non-zero exit exactly as today.
+g3149_ledger ga2 9960 L "claude-opus-5-5" "2026-10-15T04:20:00-08:00" "2026-10-15T04:30:00-08:00"
+g3149_check ga2 9960 "$S3149/routes.json"
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
+  && ok "3149-A2: post-cutover Opus planner on size-L -> MODEL-POLICY block, non-zero exit (rc=$RC)" || bad "3149-A2 (rc=$RC out=$OUT)"
+# A3: the A2 message names the size rule, both recoveries and BOTH instants; never the seat-default env var.
+{ printf '%s' "$OUT" | command grep -q 'set-seat-pin' && printf '%s' "$OUT" | command grep -q 'clear-seat-pin' \
+  && printf '%s' "$OUT" | command grep -qi 'fable' && printf '%s' "$OUT" | command grep -qi 'size' \
+  && printf '%s' "$OUT" | command grep -q '2026-10-15T12:18:54.000Z' && printf '%s' "$OUT" | command grep -q '2026-10-15T12:20:00.000Z' \
+  && ! printf '%s' "$OUT" | command grep -q 'CC_ROLE_PLANNER_MODEL'; } \
+  && ok "3149-A3: A2 message names size rule + fable re-run + seat-pin last resort + both instants; no CC_ROLE_PLANNER_MODEL" || bad "3149-A3 (out=$OUT)"
+# A4: same shape as A1 but the ledger row ts is FORCED post-cutover -> still grandfathered (D1: the anchor is
+# the transcript start, never the mutable row ts refreshed by every append).
+g3149_ledger ga4 9960 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+node -e '
+  const fs = require("fs"); const f = process.argv[1];
+  const lines = fs.readFileSync(f, "utf8").split("\n").map(function (l) {
+    if (l.indexOf("\"role\":\"planner\"") === -1) return l;
+    const j = JSON.parse(l); j.ts = "2026-10-15T12:40:00.000Z"; return JSON.stringify(j);
+  });
+  fs.writeFileSync(f, lines.join("\n"));
+' "$THREE_ROLE_LEDGER_DIR/ga4/9960.jsonl"
+g3149_check ga4 9960 "$S3149/routes.json"
+{ [ "$RC" = "0" ] && printf '%s' "$OUT" | command grep -q 'SIZE-L-GRANDFATHERED'; } \
+  && ok "3149-A4: pre-cutover transcript + post-cutover row ts -> still grandfathered (anchor is the transcript start)" || bad "3149-A4 (rc=$RC out=$OUT)"
+# A5: no cutover recorded -> the A1 shape blocks (absent key fails closed, no grandfathering by default).
+g3149_ledger ga5 9960 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check ga5 9960 "$S3149/routes-nocut.json"
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
+  && ok "3149-A5: absent size_models_cutover -> no grandfathering, A1 shape blocks (rc=$RC)" || bad "3149-A5 (rc=$RC out=$OUT)"
+# A6: malformed cutover -> blocks AND stderr names the malformed value (fail closed, loudly).
+g3149_ledger ga6 9960 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check ga6 9960 "$S3149/routes-badcut.json"
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner' && printf '%s' "$OUT" | command grep -q 'SIZE-L-CUTOVER-INVALID'; } \
+  && ok "3149-A6: malformed cutover -> block + SIZE-L-CUTOVER-INVALID names the key (rc=$RC)" || bad "3149-A6 (rc=$RC out=$OUT)"
+# A7: planner transcript with NO usable timestamp -> run start unreadable -> blocks (D4 fail closed).
+mkdir -p "$S3149/tasks/ga7"
+printf '{"id":"9960","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"L"}}' > "$S3149/tasks/ga7/9960.json"
+mk_sub_model ga7 gR "claude-opus-5-5"; mk_sub_model ga7 gV "claude-opus-5-5"; mk_sub_model ga7 gE "claude-sonnet-5-5"; mk_sub_model ga7 gP "claude-opus-5-5"
+node "$LED" append --session ga7 --task 9960 --role planner         --agent gP --artifact "$TMP/plan.md" >/dev/null
+node "$LED" append --session ga7 --task 9960 --role plan-review      --agent gR --artifact "$TMP/rev.md" >/dev/null
+node "$LED" append --session ga7 --task 9960 --role executor         --agent gE --artifact "PR #9" >/dev/null
+node "$LED" append --session ga7 --task 9960 --role execution-review --agent gV --artifact "$TMP/rev.md" >/dev/null
+g3149_check ga7 9960 "$S3149/routes.json"
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner' && printf '%s' "$OUT" | command grep -q '<unreadable>'; } \
+  && ok "3149-A7: unreadable run start -> block, message shows <unreadable> (fail closed, rc=$RC)" || bad "3149-A7 (rc=$RC out=$OUT)"
+# A8: size-S ticket, Opus planner after the cutover -> passes unchanged, NO grandfather note (not in scope).
+g3149_ledger ga8 9961 S "claude-opus-5-5" "2026-10-15T04:20:00-08:00" "2026-10-15T04:30:00-08:00"
+g3149_check ga8 9961 "$S3149/routes.json"
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'SIZE-L-GRANDFATHERED' && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
+  && ok "3149-A8: size-S + Opus planner post-cutover -> pass, no grandfather note (unchanged path)" || bad "3149-A8 (rc=$RC out=$OUT)"
+# A9: size-L ticket, FABLE planner after the cutover -> passes (the rule satisfied, unchanged path).
+g3149_ledger ga9 9960 L "claude-fable-5-1" "2026-10-15T04:20:00-08:00" "2026-10-15T04:30:00-08:00"
+g3149_check ga9 9960 "$S3149/routes.json"
+{ [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
+  && ok "3149-A9: size-L + Fable planner post-cutover -> pass (rule satisfied)" || bad "3149-A9 (rc=$RC out=$OUT)"
+# A11: cutover recorded in the FUTURE -> the A1 shape blocks and stderr names the cutover key (fail closed).
+g3149_ledger ga11 9960 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check ga11 9960 "$S3149/routes-futcut.json"
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner' && printf '%s' "$OUT" | command grep -q 'SIZE-L-CUTOVER-FUTURE'; } \
+  && ok "3149-A11: future cutover -> block + SIZE-L-CUTOVER-FUTURE names the key (rc=$RC)" || bad "3149-A11 (rc=$RC out=$OUT)"
+# L1 (AC-4): lint-routes accepts a well-formed cutover and FAILS a malformed one, naming the key.
+OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3149/routes.json" node "$LED" lint-routes 2>&1); RC=$?
+OUT2=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3149/routes-badcut.json" node "$LED" lint-routes 2>&1); RC2=$?
+{ [ "$RC" = "0" ] && [ "$RC2" != "0" ] && printf '%s' "$OUT2" | command grep -q 'size_models_cutover'; } \
+  && ok "3149-L1: lint-routes clean on a well-formed cutover, non-zero + names size_models_cutover on a malformed one" || bad "3149-L1 (rc=$RC rc2=$RC2 out2=$OUT2)"
+# fix1 (M1) F1-F3 (must-fire, ids 9970-9972): a cutover that Date.parse ACCEPTS but that is not an ISO 8601
+# instant with an explicit offset (non-ISO text / offset-less / date-only) must fail CLOSED: lint non-zero
+# AND no grandfathering (the A1 shape blocks + names the key). Each ledger reuses the A1 pre-cutover start
+# (12:10Z) so under the old Date.parse-only reader F1 would grandfather through the widened window.
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"Oct 15 2026 12:30:00 GMT"/' "$S3149/routes.json" > "$S3149/routes-noniso.json"
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"2026-10-15T12:30:00"/' "$S3149/routes.json" > "$S3149/routes-nooff.json"
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"2026-10-15"/' "$S3149/routes.json" > "$S3149/routes-dateonly.json"
+f1_arm() { # <routes-key> <task-id> <arm-label> <variant-desc> — lint non-zero + the A1 shape no longer grandfathered
+  OUTL=$(env -u CC_ROUTES_ENV CC_ROUTES_JSON="$S3149/routes-$1.json" node "$LED" lint-routes 2>&1); RCL=$?
+  g3149_ledger "ga$1" "$2" L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+  g3149_check "ga$1" "$2" "$S3149/routes-$1.json"
+  { [ "$RCL" != "0" ] && printf '%s' "$OUTL" | command grep -q 'size_models_cutover' \
+    && [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner' \
+    && printf '%s' "$OUT" | command grep -q 'SIZE-L-CUTOVER-INVALID'; } \
+    && ok "$3: $4 -> lint non-zero + gate blocks, both name the key" || bad "$3: $4 (lint rc=$RCL gate rc=$RC lint=$OUTL gate=$OUT)"
+}
+f1_arm noniso 9970 "3149-F1" "non-ISO cutover (Oct 15 2026 12:30:00 GMT)"
+f1_arm nooff 9971 "3149-F2" "offset-less ISO cutover (2026-10-15T12:30:00)"
+f1_arm dateonly 9972 "3149-F3" "date-only cutover (2026-10-15)"
+# fix1 F4/F5 (must-not-fire, ids 9973-9974): an explicit-offset instant is accepted in BOTH offset spellings
+# of the SAME instant (Z and +08:00) -- lint clean and the pre-cutover planner still grandfathered.
+sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"2026-10-15T20:18:54+08:00"/' "$S3149/routes.json" > "$S3149/routes-offcut.json"
+g3149_ledger gaF4 9973 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check gaF4 9973 "$S3149/routes.json"
+RCF4=$RC; OUTF4=$OUT
+g3149_ledger gaF5 9974 L "claude-opus-5-5" "2026-10-15T20:10:00+08:00" "2026-10-15T20:25:00+08:00"
+g3149_check gaF5 9974 "$S3149/routes-offcut.json"
+OUTL=$(env -u CC_ROUTES_ENV CC_ROUTES_JSON="$S3149/routes-offcut.json" node "$LED" lint-routes 2>&1); RCLF5=$?
+{ [ "$RCF4" = "0" ] && printf '%s' "$OUTF4" | command grep -q 'SIZE-L-GRANDFATHERED' && [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | command grep -q 'SIZE-L-GRANDFATHERED' && [ "$RCLF5" = "0" ]; } \
+  && ok "3149-F4/F5: Z and +08:00 spellings of the same instant -> lint 0, pre-cutover planner grandfathered both" || bad "3149-F4/F5 (f4=$RCF4 f5=$RC lint=$RCLF5 out=$OUT)"
+# fix1 F6 (must-not-fire, id 9975): the MODEL-POLICY message's clear-seat-pin command, copied verbatim
+# (only the pin file is a fixture), runs rc 0 in the sandbox.
+printf '{}' > "$S3149/no-pins.json"
+env -u CC_ROLES_ENV CC_SEAT_PINS_FILE="$S3149/no-pins.json" node "$LED" clear-seat-pin --role planner --reason "<why>" >/dev/null 2>&1; RCF6=$?
+[ "$RCF6" = "0" ] && ok "3149-F6: message's clear-seat-pin --role planner --reason form runs rc 0" || bad "3149-F6 (rc=$RCF6)"
+# A10 (AC-2): a NON-overlay mismatch keeps the master wording (seat-default env var named, size rule absent).
+model_ledger ms3149A10 9962 "claude-sonnet-4-6"
+OUT=$(CC_ROLES_ENV="$MFAB" node "$LED" check --session ms3149A10 --task 9962 --enforce-role-models 2>&1); RC=$?
+{ [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role executor' \
+  && printf '%s' "$OUT" | command grep -q 'CC_ROLE_EXECUTOR_MODEL in cc-roles.env'; } \
+  && ok "3149-A10: non-overlay mismatch (executor sonnet vs fable) -> master wording incl. CC_ROLE_EXECUTOR_MODEL in cc-roles.env" || bad "3149-A10 (rc=$RC out=$OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
