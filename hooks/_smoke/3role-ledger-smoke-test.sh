@@ -6670,6 +6670,179 @@ z85_check z85ac14
 fi
 
 # ============================================================================================================
+# #3145 leg 1 — plan-review routes by plan size (flash for S/M) + fold-only re-reviews on flash. D1
+# resolver (`plan-review-route`) on brief TEXT, D5 checker branch in checkSubprocessProvenance (with the
+# size_route_since transition), resolve-route single-plan view, lint-routes size_route_since. Fixtures:
+# hooks/fixtures/3145-plan-review-size/{routes-post-flip.json,routes-preflip.json} (post-flip seat shape:
+# model glm-5.3-flash + size_models.L glm-5.3 + size_route_since; preflip: today's live shape); scratch
+# ledger/plans/transcripts under $TMP with fake ids only (task 3145fx, nonces NNN-*).
+# ============================================================================================================
+FX3145="${FIX3145:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/3145-plan-review-size}"
+if [ ! -d "$FX3145/.ai-workspace/plans" ]; then
+  skip "#3145 plan-review-size arms: fixture dir '$FX3145' absent (plugin install) — section not run"
+else
+R3145="$FX3145/routes-post-flip.json"
+PF3145="$FX3145/.ai-workspace/plans/2026-01-02-3145fx-plan"
+J3145() { node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j[process.argv[1]];process.stdout.write(v===undefined?"<absent>":String(v));}catch(e){process.stdout.write("<nojson>");}})' "$1"; }
+mk_3145_brief() { # $1=path, rest: body lines (PLAN/ROUND/PRIOR-REVIEW)
+  local F="$1"; shift
+  { printf '3ROLE_TASK:3145fx ROLE:plan-review\n'; for l in "$@"; do printf '%s\n' "$l"; done; } > "$F"
+}
+PR3145() { CC_ROUTES_JSON="$R3145" node "$LED" plan-review-route "$@"; }
+
+# ---- AC-1: the D1 resolver on brief text, under the post-flip fixture seat shape ----
+mk_3145_brief "$TMP/3145b-S"  "PLAN: $PF3145-S.md"
+mk_3145_brief "$TMP/3145b-M"  "PLAN: $PF3145-M.md"
+mk_3145_brief "$TMP/3145b-L"  "PLAN: $PF3145-L.md"
+mk_3145_brief "$TMP/3145b-none" "PLAN: $PF3145-none.md"
+mk_3145_brief "$TMP/3145b-mix" "PLAN: $PF3145-S.md and $PF3145-L.md"
+mk_3145_brief "$TMP/3145b-fold"  "ROUND: 2" "PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md" "PLAN: $PF3145-L.md"
+mk_3145_brief "$TMP/3145b-r2np"  "ROUND: 2" "PLAN: $PF3145-L.md"
+mk_3145_brief "$TMP/3145b-r1pr"  "ROUND: 1" "PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md" "PLAN: $PF3145-L.md"
+for spec in \
+  "S:glm-5.3-flash:S:false:size-SM" \
+  "M:glm-5.3-flash:M:false:size-SM" \
+  "L:glm-5.3:L:false:size-L-zai" \
+  "none:glm-5.3:none:false:unsized-full" \
+  "mix:glm-5.3:L:false:size-L-zai" \
+  "fold:glm-5.3-flash:L:true:fold-only" \
+  "r2np:glm-5.3:L:false:size-L-zai" \
+  "r1pr:glm-5.3:L:false:size-L-zai"; do
+  nm="${spec%%:*}"; rest="${spec#*:}"; wantM="${rest%%:*}"; rest="${rest#*:}"; wantS="${rest%%:*}"; rest="${rest#*:}"; wantF="${rest%%:*}"; wantR="${rest#*:}"
+  OUT=$(PR3145 --brief-text-file "$TMP/3145b-$nm" --task 3145fx --json 2>/dev/null); RC=$?
+  { [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 model)" = "$wantM" ] && [ "$(printf '%s' "$OUT" | J3145 size)" = "$wantS" ] \
+    && [ "$(printf '%s' "$OUT" | J3145 fold_only)" = "$wantF" ] && [ "$(printf '%s' "$OUT" | J3145 route_reason)" = "$wantR" ]; } \
+    && ok "#3145 AC-1: brief $nm -> model=$wantM size=$wantS fold_only=$wantF route_reason=$wantR" \
+    || bad "#3145 AC-1 $nm want model=$wantM size=$wantS fold=$wantF reason=$wantR (rc=$RC out=$OUT)"
+done
+# held-out: ROUND 3 + PRIOR-REVIEW on S also folds; a malformed ROUND line reads as round 0 (full review);
+# two ROUND lines read as round 0 (ambiguous, never fold).
+mk_3145_brief "$TMP/3145b-r3fold" "ROUND: 3" "PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md" "PLAN: $PF3145-S.md"
+OUT=$(PR3145 --brief-text-file "$TMP/3145b-r3fold" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 model)" = "glm-5.3-flash" ] && [ "$(printf '%s' "$OUT" | J3145 fold_only)" = "true" ]; } \
+  && ok "#3145 AC-1 held-out: ROUND 3 + PRIOR-REVIEW + S -> flash fold_only" || bad "#3145 AC-1 r3fold (rc=$RC out=$OUT)"
+mk_3145_brief "$TMP/3145b-badround" "ROUND: 2x" "PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md" "PLAN: $PF3145-L.md"
+OUT=$(PR3145 --brief-text-file "$TMP/3145b-badround" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 model)" = "glm-5.3" ] && [ "$(printf '%s' "$OUT" | J3145 fold_only)" = "false" ]; } \
+  && ok "#3145 AC-1 held-out: malformed ROUND line -> round 0, full review on the size-routed model" || bad "#3145 AC-1 badround (rc=$RC out=$OUT)"
+mk_3145_brief "$TMP/3145b-2rounds" "ROUND: 1" "ROUND: 2" "PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md" "PLAN: $PF3145-L.md"
+OUT=$(PR3145 --brief-text-file "$TMP/3145b-2rounds" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 fold_only)" = "false" ]; } \
+  && ok "#3145 AC-1 held-out: two ROUND lines -> ambiguous, never fold" || bad "#3145 AC-1 2rounds (rc=$RC out=$OUT)"
+# resolver neutrality: same briefs under the PREFLIP seat shape (no size_models) -> the seat model everywhere.
+OUT=$(CC_ROUTES_JSON="$FX3145/routes-preflip.json" node "$LED" plan-review-route --brief-text-file "$TMP/3145b-S" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 model)" = "glm-5.3" ]; } \
+  && ok "#3145 AC-1 neutrality: S brief under preflip routes -> seat model glm-5.3 (no size_models = D7 rollback)" || bad "#3145 AC-1 preflip (rc=$RC out=$OUT)"
+OUT=$(CC_ROUTES_JSON="$FX3145/routes-preflip.json" node "$LED" plan-review-route --brief-text-file "$TMP/3145b-fold" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 model)" = "glm-5.3" ]; } \
+  && ok "#3145 AC-1 neutrality: fold brief under preflip routes -> seat model glm-5.3" || bad "#3145 AC-1 preflip fold (rc=$RC out=$OUT)"
+
+# ---- AC-2: the D5 checker branch (plan-review + subprocess-zai rows, post-flip fixture seat) ----
+Z45="$TMP/3145fx-scratch"; export Z45
+mkdir -p "$Z45/ledger" "$Z45/transcripts" "$Z45/art" "$Z45/.ai-workspace/plans"
+for s in S L; do
+  printf '# fixture plan (fake ids, #3145 smoke)\nsize: %s\ndata-class: public\nTicket: #3145fx\n' "$s" > "$Z45/.ai-workspace/plans/2026-01-02-3145fx-plan-$s.md"
+done
+mk_z45_transcript() { # $1=path $2=nonce $3=served-model $4=brief-body
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, nonce, model, body ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "z45-fixture", content: "3ROLE_TASK:3145fx ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n" + body }));
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "z45-fixture" }));
+    lines.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:02.000Z", cwd: process.env.Z45,
+      message: { role: "user", content: "3ROLE_TASK:3145fx ROLE:plan-review" } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", cwd: process.env.Z45,
+      message: { model, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4"
+}
+# z45_session <session> <transcript> <nonce> <model-version> <closedAt> — filler rows plus the plan-review zai row.
+z45_session() {
+  printf 'Decision: PASS\n' > "$Z45/er-$1.md"
+  printf '## Review\nDISPATCH-NONCE:%s\nDecision: PASS\nverdict: PASS\n' "$3" > "$Z45/art/$1.md"
+  ( export THREE_ROLE_LEDGER_DIR="$Z45/ledger"; export CC_ROUTES_JSON="$R3145"
+    node "$LED" append --session "$1" --task 3145fx --role planner --skip-reason "fixture: not under test in #3145" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3145fx --role executor --skip-reason "fixture: not under test in #3145" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3145fx --role execution-review --oracle "$Z45/er-$1.md" >/dev/null 2>&1
+    node "$LED" append --session "$1" --task 3145fx --role plan-review --dispatch subprocess-zai \
+      --transcript "$2" --nonce "$3" --artifact "$Z45/art/$1.md" --model-version "$4" --closed-at "$5" --receipt "$3" --verdict PASS >/dev/null 2>&1 )
+}
+z45_check() { # <session> [routes]
+  Z45OUT=$(Z45="$Z45" THREE_ROLE_LEDGER_DIR="$Z45/ledger" CC_ROUTES_JSON="${2:-$R3145}" \
+    node "$LED" check --session "$1" --task 3145fx 2>&1); Z45RC=$?
+}
+
+# AC-2a: S plan + served glm-5.3-flash, closed AFTER size_route_since -> admissible, check exits 0.
+mk_z45_transcript "$Z45/transcripts/a.jsonl" "NNN-3145a" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-S.md"
+z45_session z45a "$Z45/transcripts/a.jsonl" "NNN-3145a" "glm-5.3-flash" 2026-12-01T00:00:00Z
+z45_check z45a
+{ [ "$Z45RC" = "0" ] && ! printf '%s' "$Z45OUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3145 AC-2: S plan + served glm-5.3-flash (closed after size_route_since) -> check exits 0" \
+  || bad "#3145 AC-2a should pass clean (rc=$Z45RC out=$Z45OUT)"
+
+# AC-2b: S plan + served glm-5.3, closed AFTER size_route_since -> BLOCK naming expected glm-5.3-flash.
+mk_z45_transcript "$Z45/transcripts/b.jsonl" "NNN-3145b" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-S.md"
+z45_session z45b "$Z45/transcripts/b.jsonl" "NNN-3145b" "glm-5.3" 2026-12-01T00:00:00Z
+z45_check z45b
+{ [ "$Z45RC" = "2" ] && printf '%s' "$Z45OUT" | command grep -q 'route-expected model "glm-5.3-flash"' && printf '%s' "$Z45OUT" | command grep -q 'size=S'; } \
+  && ok "#3145 AC-2: S plan + served glm-5.3 (closed after size_route_since) -> exit 2, route-expected model \"glm-5.3-flash\" size=S" \
+  || bad "#3145 AC-2b should BLOCK naming glm-5.3-flash (rc=$Z45RC out=$Z45OUT)"
+
+# AC-2c: S plan + served glm-5.3, closed BEFORE size_route_since -> transition admits the pre-change model.
+mk_z45_transcript "$Z45/transcripts/c.jsonl" "NNN-3145c" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-S.md"
+z45_session z45c "$Z45/transcripts/c.jsonl" "NNN-3145c" "glm-5.3" 2026-10-01T00:00:00Z
+z45_check z45c
+{ [ "$Z45RC" = "0" ] && ! printf '%s' "$Z45OUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3145 AC-2: S plan + served glm-5.3 (closed before size_route_since) -> transition, check exits 0" \
+  || bad "#3145 AC-2c transition should pass (rc=$Z45RC out=$Z45OUT)"
+
+# AC-2d: L round-1 plan + served glm-5.3-flash -> BLOCK naming expected glm-5.3 (size_models.L).
+mk_z45_transcript "$Z45/transcripts/d.jsonl" "NNN-3145d" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-L.md"
+z45_session z45d "$Z45/transcripts/d.jsonl" "NNN-3145d" "glm-5.3-flash" 2026-12-01T00:00:00Z
+z45_check z45d
+{ [ "$Z45RC" = "2" ] && printf '%s' "$Z45OUT" | command grep -q 'route-expected model "glm-5.3"' && printf '%s' "$Z45OUT" | command grep -q 'size=L'; } \
+  && ok "#3145 AC-2: L round-1 plan + served glm-5.3-flash -> exit 2, route-expected model \"glm-5.3\" size=L" \
+  || bad "#3145 AC-2d should BLOCK naming glm-5.3 (rc=$Z45RC out=$Z45OUT)"
+
+# held-out checker arms: fold row (ROUND 2 + PRIOR-REVIEW + L) served flash passes; the same S row under the
+# PREFLIP seat shape (no size_models) keeps the bare seat-model comparison -> served glm-5.3 passes (neutrality).
+mk_z45_transcript "$Z45/transcripts/fold.jsonl" "NNN-3145f" "glm-5.3-flash" \
+  "ROUND: 2"$'\n'"PRIOR-REVIEW: .ai-workspace/reviews/2026-10-15-3145fx-plan-review.md"$'\n'"PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-L.md"
+z45_session z45fold "$Z45/transcripts/fold.jsonl" "NNN-3145f" "glm-5.3-flash" 2026-12-01T00:00:00Z
+z45_check z45fold
+{ [ "$Z45RC" = "0" ] && ! printf '%s' "$Z45OUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3145 AC-2 held-out: fold (ROUND 2 + PRIOR-REVIEW + L) + served glm-5.3-flash -> check exits 0" \
+  || bad "#3145 AC-2 fold should pass (rc=$Z45RC out=$Z45OUT)"
+mk_z45_transcript "$Z45/transcripts/pre.jsonl" "NNN-3145p" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-02-3145fx-plan-S.md"
+z45_session z45pre "$Z45/transcripts/pre.jsonl" "NNN-3145p" "glm-5.3" 2026-12-01T00:00:00Z
+z45_check z45pre "$FX3145/routes-preflip.json"
+{ [ "$Z45RC" = "0" ] && ! printf '%s' "$Z45OUT" | command grep -q '^BLOCK:'; } \
+  && ok "#3145 AC-2 neutrality: S plan + served glm-5.3 under preflip routes (no size_models) -> seat-model comparison, exits 0" \
+  || bad "#3145 AC-2 preflip should pass (rc=$Z45RC out=$Z45OUT)"
+
+# ---- AC-3/AC-4: resolve-route single-plan view + lint (neutrality pins, green on master by design) ----
+# `env -u` because earlier sections may still have CC_ROUTES_JSON/CC_ROLES_ENV exported in THIS shell —
+# the live-config arms must read the real config/cc-routes.json, never a section fixture.
+OUT=$(env -u CC_ROUTES_JSON -u CC_ROLES_ENV node "$LED" resolve-route --seat plan-review --plan "$PF3145-S.md" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 effective_model)" = "glm-5.3" ]; } \
+  && ok "#3145 AC-3: live config (pre-flip) + S plan -> resolve-route effective_model glm-5.3 (behaviour-neutral until the flip)" \
+  || bad "#3145 AC-3 want effective_model glm-5.3 under the live config (rc=$RC out=$OUT)"
+OUT=$(CC_ROUTES_JSON="$R3145" node "$LED" resolve-route --seat plan-review --plan "$PF3145-S.md" --task 3145fx --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3145 effective_model)" = "glm-5.3-flash" ]; } \
+  && ok "#3145 AC-3 held-out: post-flip fixture + S plan -> effective_model glm-5.3-flash" || bad "#3145 AC-3 flip want flash (rc=$RC out=$OUT)"
+OUT=$(env -u CC_ROUTES_JSON -u CC_ROLES_ENV node "$LED" lint-routes 2>&1); RC=$?
+[ "$RC" = "0" ] && ok "#3145 AC-4: lint-routes exits 0 on the live config" || bad "#3145 AC-4 live lint rc=$RC out=$OUT"
+OUT=$(CC_ROUTES_JSON="$R3145" node "$LED" lint-routes 2>&1); RC=$?
+[ "$RC" = "0" ] && ok "#3145 AC-4: lint-routes exits 0 on the post-flip fixture routes (size_route_since accepted)" \
+  || bad "#3145 AC-4 fixture lint rc=$RC out=$OUT"
+OUT=$(CC_ROUTES_JSON="$FX3145/routes-since-bad.json" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'SIZE-ROUTE-SINCE-INVALID'; } \
+  && ok "#3145 AC-4 held-out: a garbage size_route_since -> exit 2 SIZE-ROUTE-SINCE-INVALID" || bad "#3145 AC-4 bad-since want exit 2 token (rc=$RC out=$OUT)"
+fi
+
+# ============================================================================================================
 # #3093 — forgive a z.ai executor strike whose run pushed real work: an OR-STRIKE-FORGIVE receipt line the
 # strike counter reads (the repair-strike-progress verb appends it; its arms follow the #3060 block below).
 # Fixtures: hooks/fixtures/2985-size-label/{receipts-exec-forgive*.md,events-*.json}.

@@ -2241,6 +2241,107 @@ function zaiExecutorRouteExpected(e, info, task, decl) {
   return { model: decl.seat.model, size: facts.size };   // S/M always; L only when the seat cannot size (mirror)
 }
 
+// #3145 D1 — the ONE plan-review route resolver (the #2434 single-generator discipline, sibling of the
+// executor block above): a plan-review brief's TEXT alone decides {model, size, round, fold_only,
+// route_reason, data_class}. Called by the `plan-review-route` CLI (the dispatcher's Leg-2 call site) and
+// by the D5 checker branch below — never a second copy of the rule. INPUT-BOUND: the brief text is read
+// through the same 1 MiB cap briefPlanPaths already applies, and briefPlanPaths' own 8-distinct-path cap
+// bounds the per-brief plan-resolution loop, so an oversized brief cannot fan the resolver into unbounded
+// file reads. Round grammar mirrors the dispatcher's own `^ROUND: ([0-9]{1,6})$` flush-left line; zero or
+// 2+ ROUND lines read as round 0 (round-1 semantics — fails toward the full review, quality/cost-safe).
+// PRIOR-REVIEW grammar is prefix-strict (executor note 1, option b): ANY flush-left `PRIOR-REVIEW: <non-
+// empty value>` counts as present — the dispatcher (Leg 2) refuses the dispatch when the value names no
+// existing file, so the checker can decide fold from the text alone: any admitted row with the line had a
+// real file behind it.
+function briefRoundNumber(text) {
+  const hits = String(text == null ? '' : text).split('\n').map((l) => l.replace(/\r$/, ''))
+    .filter((l) => /^ROUND: [0-9]{1,6}[ \t]*$/.test(l));
+  if (hits.length !== 1) return 0;
+  return parseInt(hits[0].replace(/^ROUND: /, ''), 10) || 0;
+}
+
+function briefPriorReviewPresent(text) {
+  return String(text == null ? '' : text).split('\n').map((l) => l.replace(/\r$/, ''))
+    .some((l) => /^PRIOR-REVIEW: \S/.test(l));
+}
+
+// #2700 vantage chain, factored for the plan-review resolver (the executor block above keeps its own inline
+// copy byte-for-byte — this leg must not move a #3085-tested line): transcript cwd first, then the process
+// cwd, then the repo holding this helper. A miss on every candidate returns null (the CALLER decides what
+// that means — for plan-review it is exclusion from the size max, never a refusal, D2).
+function planFactsFromVantage(dispatchCwd, rel, task) {
+  const cands = [];
+  if (typeof dispatchCwd === 'string' && dispatchCwd.startsWith('/')) cands.push(path.join(dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    cands.push(path.join(selfDir, '..', rel));
+  }
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) return f;
+  }
+  return null;
+}
+
+// D2/D3: size = the LARGEST valid label among cited plans that resolve with size_source=plan (binding to
+// the task is implied — task-mismatch overrides size_source). No cited plan has a valid size -> size 'none'
+// -> size_models.L (unsized-full), NOT a refusal: flagging a missing size label is plan-review's own
+// BLOCKING job, refusing would deadlock the fix, and unsized-full is byte-identical to today's route.
+// fold_only (ROUND >= 2 + PRIOR-REVIEW) -> the seat model for EVERY size, route_reason=fold-only.
+// With no usable size_models.L (the pre-flip live config, D7 rollback) EVERY case returns the seat model —
+// Leg 1 is behaviour-neutral until the flip.
+function planReviewRouteFromBrief(briefText, task, seat, dispatchCwd) {
+  const out = { model: seat.model || '', size: 'none', round: 0, fold_only: false, route_reason: '', data_class: '' };
+  out.round = briefRoundNumber(briefText);
+  const sizeModel = executorSizeModel(seat);
+  const RANK = { S: 1, M: 2, L: 3 };
+  let best = ''; let bestRank = 0;
+  for (const rel of briefPlanPaths(briefText)) {
+    const facts = planFactsFromVantage(dispatchCwd, rel, task);
+    if (!facts || facts.size_source !== 'plan') continue;
+    const rank = RANK[facts.size] || 0;
+    if (rank > bestRank) { bestRank = rank; best = facts.size; out.data_class = facts.data_class; }
+  }
+  if (best) out.size = best;
+  if (out.round >= 2 && briefPriorReviewPresent(briefText)) {
+    out.fold_only = true; out.route_reason = 'fold-only';
+    return out;   // the seat model for every size (D3)
+  }
+  if (!best) {
+    out.route_reason = 'unsized-full';
+    if (sizeModel) out.model = sizeModel;
+    return out;
+  }
+  if (best === 'L' && sizeModel) { out.model = sizeModel; out.route_reason = 'size-L-zai'; }
+  else if (best === 'L') out.route_reason = 'size-L-no-size-model';
+  else out.route_reason = 'size-SM';
+  return out;
+}
+
+// #3145 D5 — the checker-side twin of the executor branch: the expected served model for a plan-review
+// subprocess-zai row, re-derived through the SAME resolver above from the row's OWN nonce-bound transcript
+// first record. Mirrors zaiExecutorRouteExpected's decl (pin-overlaid seat) usage exactly (#1918 layering
+// inherited, never bypassed: the S/M/fold model IS decl.seat.model, which seatDispatchIsSubprocess already
+// overlaid with any valid slug pin). Never BLOCKs on resolution (D2: unsized routes full, it does not
+// refuse) — the only failure this branch can report is the served-model comparison itself. D5 transition:
+// a row whose closedAt STRICTLY pre-dates the seat's committed size_route_since also admits the pre-change
+// model (= size_models.L — glm-5.3 in the flip config), so in-flight tasks reviewed before the flip still
+// close. Strikes are not consulted (same time-invariance reason as #3085 D3).
+function zaiPlanReviewRouteExpected(e, info, task, decl) {
+  const route = planReviewRouteFromBrief(info.firstText, task, decl.seat, info.dispatchCwd);
+  const since = decl.seat.size_route_since;
+  const closed = e && e.closedAt;
+  let preChange = '';
+  if (typeof since === 'string' && !isNaN(Date.parse(since)) && closed && !isNaN(Date.parse(String(closed)))
+    && Date.parse(String(closed)) < Date.parse(since)) {
+    const sm = executorSizeModel(decl.seat);
+    if (sm && sm !== route.model) preChange = sm;
+  }
+  route.pre_change_model = preChange;
+  return route;
+}
+
 // conservative-seat-map-single-slot-local-dispatch (2026-08-30), D7 — the subprocess-local sibling of
 // seatDispatchIsSubprocess(). Reads the NEW conservative_seat_map[role].primary overlay (never `seats[role]`,
 // which stays byte-untouched — see config/cc-routes.json's own overlay comment), fresh at check time, exactly
@@ -2313,6 +2414,23 @@ function checkSubprocessProvenance(role, e, session, task) {
     if (!info.servedModel || info.servedModel !== route.model) {
       return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
+    }
+  } else if (role === 'plan-review' && e.dispatch === 'subprocess-zai' && executorSizeModel(decl.seat)) {
+    // #3145 D5 — the plan-review twin of the executor branch above, taken ONLY when the seat declares a
+    // usable size_models.L (the post-flip shape): with today's live config (no size_models) the resolver
+    // returns the seat model for every case, so the row keeps the byte-identical seat-model comparison
+    // below — Leg 1 is behaviour-neutral until the flip (AC-3). Expected model = the D1 resolver on THIS
+    // row's nonce-bound transcript first record (size / fold_only re-derived, never the row's own claim);
+    // a closedAt strictly before the seat's size_route_since also admits the pre-change model (D5
+    // transition). The #1918 slug-pin layering is inherited, not bypassed: decl.seat is the pin-overlaid
+    // row seatDispatchIsSubprocess already returned, and the resolver reads its .model directly.
+    const route = zaiPlanReviewRouteExpected(e, info, task, decl);
+    const okModels = [route.model];
+    if (route.pre_change_model) okModels.push(route.pre_change_model);
+    if (!info.servedModel || !okModels.includes(info.servedModel)) {
+      return 'plan-review dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size +
+        (route.fold_only ? ' fold_only' : '') + ')';
     }
   } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
     return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
@@ -7154,6 +7272,16 @@ function lintRoutesConfig(routes) {
       }
     }
   }
+  // #3145 D5 -- seats.<seat>.size_route_since: the OPTIONAL transition pin (rows closed strictly before it
+  // also admit the pre-change model). Anything present but not a parseable ISO 8601 string fails closed at
+  // lint time -- a garbage pin would silently widen the transition window to "every row" (Date.parse NaN).
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_route_since' in seat)) continue;
+    const v = seat.size_route_since;
+    if (typeof v !== 'string' || isNaN(Date.parse(v))) {
+      problems.push('SIZE-ROUTE-SINCE-INVALID: seats.' + sid + '.size_route_since = "' + v + '" is not a parseable ISO 8601 date');
+    }
+  }
   return problems;
 }
 
@@ -7455,7 +7583,8 @@ function resolvePlanFacts(planArg, task) {
 // model (D1) until the task has 2 z.ai strikes (D2: one per failed dispatcher INVOCATION, receipt-derived), then
 // leaves for the fallback tier. A `size_models` key that is absent, or whose value is not in the seat provider's
 // model_vocabulary, is the #2985 rule unchanged (L -> fallback tier): the config-only rollback, failing closed.
-// Additive JSON fields `route_reason` + `zai_strikes` are produced for the EXECUTOR seat only (never plan-review).
+// Additive JSON fields `route_reason` + `zai_strikes` are produced for the EXECUTOR seat only (`zai_strikes`
+// never plan-review; `route_reason` reaches a size_models-declaring plan-review seat too since #3145 D1).
 function executorSizeModel(seat) {
   const sm = seat && seat.size_models;
   if (!sm || typeof sm !== 'object' || Array.isArray(sm)) return '';
@@ -7487,6 +7616,23 @@ function effectiveRouteFor(seatKey, seat, facts) {
         }
       } else out.route_reason = 'size-SM';
     }
+  } else if (seatKey === 'plan-review') {
+    // #3145 D1 — resolve-route's single-plan view of the same rule planReviewRouteFromBrief encodes for
+    // brief text: S/M -> seat model, L -> size_models.L, no valid size -> size_models.L (unsized-full).
+    // NEVER leaves for agent-tool (plan-review strikes route through the dispatcher's existing Opus
+    // fallback, D8) and never reports zai_strikes (still executor-only). Gated on a usable size_models.L —
+    // the same gate the D5 checker branch uses — so a seat WITHOUT size_models (the pre-flip live config,
+    // D7 rollback) returns the #2985 output byte-for-byte: no route_reason field, seat model for every
+    // case (the #3060 AC-3 pin; Leg 1 is behaviour-neutral until the flip, AC-3).
+    const sizeModel = executorSizeModel(seat);
+    if (!sizeModel) return out;
+    if (facts.size_source === 'plan') {
+      if (facts.size === 'L') { out.effective_model = sizeModel; out.route_reason = 'size-L-zai'; }
+      else out.route_reason = 'size-SM';
+    } else {
+      out.effective_model = sizeModel;
+      out.route_reason = 'unsized-full';
+    }
   }
   if (!leave) return out;
   const cfg = loadRoleConfig().cfg || {};
@@ -7494,6 +7640,34 @@ function effectiveRouteFor(seatKey, seat, facts) {
   out.effective_tier = fb;
   out.effective_model = cfg['CC_TIER_' + fb.toUpperCase() + '_VERSION'] || fb;
   return out;
+}
+
+// plan-review-route --brief-text-file <path> [--task T] [--json]  (#3145 D1): the ONE plan-review route
+// resolver as a CLI — the dispatcher's Leg-2 call site. Prints model/size/round/fold_only/route_reason/
+// data_class for the brief TEXT (routing reads the text, the one record the checker can re-derive). The
+// seat row comes from the SSOT with the #1918 slug-pin overlay applied exactly as seatDispatchIsSubprocess
+// applies it (silent overlay — resolve-route already surfaces SEAT-PIN-HONORED where an operator watches).
+// INPUT-BOUND: the brief file is stat'd and refused above PLAN_MAX_BYTES before any read, so an oversized
+// brief cannot loop or balloon the resolver (the same cap briefPlanPaths applies to the text itself).
+function cmdPlanReviewRoute(opts) {
+  const file = opts['brief-text-file'];
+  if (typeof file !== 'string' || !file) { console.log('BLOCK: plan-review-route requires --brief-text-file <path>'); process.exit(2); }
+  let st; try { st = fs.statSync(file); } catch (e) { st = null; }
+  if (!st || !st.isFile()) { console.log('BRIEF-UNREADABLE: --brief-text-file ' + file + ' is not an existing regular file'); process.exit(2); }
+  if (st.size > PLAN_MAX_BYTES) { console.log('BRIEF-TOO-LARGE: --brief-text-file ' + file + ' is larger than ' + PLAN_MAX_BYTES + ' bytes'); process.exit(2); }
+  let text; try { text = fs.readFileSync(file, 'utf8'); } catch (e) { console.log('BRIEF-UNREADABLE: --brief-text-file ' + file + ' cannot be read'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const seatRow = (loaded.routes.seats || {})['plan-review'];
+  if (!seatRow) { console.log('ROUTE-SEAT-NOT-FOUND: no seat "plan-review" in the SSOT'); process.exit(2); }
+  let seat = seatRow;
+  const pin = resolveSlugPin('plan-review', loaded.routes, seatRow);
+  if (pin.pinned) seat = Object.assign({}, seatRow, { model: pin.slug });
+  const task = ('task' in opts && opts.task) ? opts.task : undefined;
+  const route = planReviewRouteFromBrief(text, task, seat, undefined);
+  if ('json' in opts) console.log(JSON.stringify(route));
+  else console.log('model=' + route.model + ' size=' + route.size + ' round=' + route.round + ' fold_only=' + (route.fold_only ? 1 : 0) + ' route_reason=' + route.route_reason + ' data_class=' + (route.data_class || 'none'));
+  process.exit(0);
 }
 
 // plan-size --plan <path> : prints S|M|L, or a SIZE-* token with exit 2.
@@ -8772,6 +8946,7 @@ try {
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
   else if (cmd === 'plan-size') cmdPlanSize(opts);
+  else if (cmd === 'plan-review-route') cmdPlanReviewRoute(opts);
   else if (cmd === 'zai-strikes') cmdZaiStrikes(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
@@ -8784,7 +8959,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|plan-size|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -8796,7 +8971,7 @@ try {
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
       '[--session S --task T (gate-plan-review, #1575)] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
-      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--task T --role plan-review --round N | --task T --role executor (zai-strikes, #2985/#3060)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
+      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--brief-text-file P [--task T] [--json] (plan-review-route, #3145 D1)] [--task T --role plan-review --round N | --task T --role executor (zai-strikes, #2985/#3060)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
       '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
       '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
