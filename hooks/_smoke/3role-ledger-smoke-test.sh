@@ -7147,7 +7147,7 @@ mk_sub_ts() { # <session> <agentId> <model> <ts-first> <ts-second> — a transcr
 g3149_ledger() {
   mkdir -p "$S3149/tasks/$1"
   printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"%s"}}' "$2" "$3" > "$S3149/tasks/$1/$2.json"
-  mk_sub "$1" gR; mk_sub "$1" gV; mk_sub_model "$1" gE "claude-sonnet-5-5"; mk_sub_ts "$1" gP "$4" "$5" "$6"
+  mk_sub_model "$1" gR "claude-opus-5-5"; mk_sub_model "$1" gV "claude-opus-5-5"; mk_sub_model "$1" gE "claude-sonnet-5-5"; mk_sub_ts "$1" gP "$4" "$5" "$6"
   node "$LED" append --session "$1" --task "$2" --role planner         --agent gP --artifact "$TMP/plan.md" >/dev/null
   node "$LED" append --session "$1" --task "$2" --role plan-review      --agent gR --artifact "$TMP/rev.md" >/dev/null
   node "$LED" append --session "$1" --task "$2" --role executor         --agent gE --artifact "PR #9" >/dev/null
@@ -7203,7 +7203,7 @@ g3149_check ga6 9960 "$S3149/routes-badcut.json"
 # A7: planner transcript with NO usable timestamp -> run start unreadable -> blocks (D4 fail closed).
 mkdir -p "$S3149/tasks/ga7"
 printf '{"id":"9960","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{"size":"L"}}' > "$S3149/tasks/ga7/9960.json"
-mk_sub ga7 gR; mk_sub ga7 gV; mk_sub_model ga7 gE "claude-sonnet-5-5"; mk_sub_model ga7 gP "claude-opus-5-5"
+mk_sub_model ga7 gR "claude-opus-5-5"; mk_sub_model ga7 gV "claude-opus-5-5"; mk_sub_model ga7 gE "claude-sonnet-5-5"; mk_sub_model ga7 gP "claude-opus-5-5"
 node "$LED" append --session ga7 --task 9960 --role planner         --agent gP --artifact "$TMP/plan.md" >/dev/null
 node "$LED" append --session ga7 --task 9960 --role plan-review      --agent gR --artifact "$TMP/rev.md" >/dev/null
 node "$LED" append --session ga7 --task 9960 --role executor         --agent gE --artifact "PR #9" >/dev/null
