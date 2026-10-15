@@ -5221,7 +5221,8 @@ function cmdCheck(o) {
               'so changing it in cc-roles.env cannot fix this. Recovery 1 (do this first): re-run the planner on ' +
               'fable (it is accepted automatically once the Fable cap allows). Recovery 2 (operator-only, LAST ' +
               'RESORT, machine-wide for EVERY ticket while it is set): set-seat-pin --role planner --tier opus ' +
-              '--reason "<why>", then clear-seat-pin to undo it afterwards. A planner whose run STARTED before ' +
+              '--reason "<why>", then clear-seat-pin --role planner --reason "<why>" to undo it afterwards. ' +
+              'A planner whose run STARTED before ' +
               'the size-L cutover is accepted automatically (this run started ' + startIso + '; cutover ' + cutIso +
               '). Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
             continue;
@@ -7004,17 +7005,26 @@ function plannerSizeOverlay(routesLoaded, role, session, task, tasksDirOpt) {
 // (today's behaviour: block, A5); a present-but-unparsable value or one in the FUTURE (later than the gate's
 // own clock) => { ok:false } PLUS a one-line stderr note naming the key (A6/A11). Callers compare as
 // INSTANTS (epoch ms), never as strings (R2).
+// #3149 fix1 (M1) -- the ONE shape every reader and every lint of the cutover key accepts: an ISO 8601
+// instant with an EXPLICIT offset (`Z` or ±hh:mm). Date.parse alone also accepts non-ISO text ("Oct 15
+// 2026 ...") and reads an offset-less value as LOCAL time -- both silently widen the grandfather window.
+// Anything off-shape fails closed: NaN here => the reader refuses to grandfather and the lint names the key.
+const ISO_INSTANT_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+function parseIsoInstantWithOffset(v) {
+  if (typeof v !== 'string' || !ISO_INSTANT_WITH_OFFSET.test(v)) return NaN;
+  return Date.parse(v); // still NaN on calendar-invalid shapes (month 13, etc.)
+}
 function plannerSizeCutover(routesLoaded) {
   const none = { ok: false, epoch: NaN, note: '' };
   if (!routesLoaded || !routesLoaded.ok || !routesLoaded.routes) return none;
   const seat = (routesLoaded.routes.seats || {}).planner;
   if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) return none;
   const v = seat.size_models_cutover;
-  if (typeof v !== 'string' || !v || isNaN(Date.parse(v))) {
+  const epoch = parseIsoInstantWithOffset(v);
+  if (typeof v !== 'string' || !v || !Number.isFinite(epoch)) {
     return { ok: false, epoch: NaN, note: 'SIZE-L-CUTOVER-INVALID: seats.planner.size_models_cutover = "' + v +
-      '" is not a parseable ISO 8601 instant -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
+      '" is not an ISO 8601 instant with an explicit offset (Z or ±hh:mm) -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
   }
-  const epoch = Date.parse(v);
   if (epoch > Date.now()) {
     return { ok: false, epoch, note: 'SIZE-L-CUTOVER-FUTURE: seats.planner.size_models_cutover = "' + v +
       '" is later than the gate\'s own clock -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
@@ -7428,13 +7438,14 @@ function lintRoutesConfig(routes) {
   }
   // #3149 D2 -- seats.<seat>.size_models_cutover: the OPTIONAL grandfather cutover instant for the size-L
   // planner rule (a planner whose run STARTED strictly before it is judged by the pre-rule expectation).
-  // Anything present but not a parseable ISO 8601 string fails closed AT LINT TIME too -- the gate would
-  // already refuse to grandfather on it, but the lint names the key so the SSOT never ships malformed.
+  // Anything present but not an ISO 8601 instant with an EXPLICIT offset (Z or ±hh:mm) fails closed AT
+  // LINT TIME too -- the gate would already refuse to grandfather on it, but the lint names the key so the
+  // SSOT never ships malformed (fix1/M1: Date.parse alone also accepts non-ISO text and local time).
   for (const [sid, seat] of Object.entries(routes.seats || {})) {
     if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) continue;
     const cv = seat.size_models_cutover;
-    if (typeof cv !== 'string' || isNaN(Date.parse(cv))) {
-      problems.push('SIZE-MODEL-CUTOVER-INVALID: seats.' + sid + '.size_models_cutover = "' + cv + '" is not a parseable ISO 8601 date');
+    if (typeof cv !== 'string' || !Number.isFinite(parseIsoInstantWithOffset(cv))) {
+      problems.push('SIZE-MODEL-CUTOVER-INVALID: seats.' + sid + '.size_models_cutover = "' + cv + '" is not an ISO 8601 instant with an explicit offset (Z or ±hh:mm)');
     }
   }
   // #3145 D5 -- seats.<seat>.size_route_since: the OPTIONAL transition pin (rows closed strictly before it
