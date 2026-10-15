@@ -19,8 +19,8 @@ skip() { echo "SKIP: $1"; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export THREE_ROLE_LEDGER_DIR="$TMP/ledger"
 export THREE_ROLE_PROJECTS_ROOT="$TMP/projects"
-export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
 export RULE12_LOG="$TMP/rule12.log"  # D4: never write the operator's real audit log during a suite run.
+export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1  # D4: this fixture's execution-review artifacts are absolute mktemp paths.
 SID="sess-ledger"; TASK="700"
 LEDFILE="$THREE_ROLE_LEDGER_DIR/$SID/$TASK.jsonl"
 
@@ -3338,7 +3338,7 @@ p1_gate "$P1_FIX/routes.json" "p1-ac33" "t1"
   || bad "#2169 S3-AC11 FAILED (check_out=$PCOUT gate_rc=$PGRC gate_out=$PGOUT)"
 
 # All S3 fixtures above ran; unset the redirected audit log so it never leaks into any later section.
-unset RULE12_LOG
+# #3109: the pin stays for the whole run (no unset) so later sections never write the live audit log.
 
 
 # =====================================================================================================

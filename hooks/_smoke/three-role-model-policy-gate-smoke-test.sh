@@ -41,6 +41,7 @@ ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; fail=1; }
 
 TMP="$(mktemp -d)"
+export RULE12_LOG="$TMP/rule12.log"  # #3109: never write the operator's real audit log during a suite run.
 # ── PRE-FIX hook: a PINNED, COMMITTED heredoc SNAPSHOT — never a moving `origin/master:` ref (#1494 follow-up) ──
 # The two RED-on-HEAD-first control arms (AC-8, AC-11) prove the pre-#1494 leak (a badge-less spawn silently
 # satisfied opus-seat policy) EXISTED and is now closed — they compare the CURRENT hook against the PRE-FIX
