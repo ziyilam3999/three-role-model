@@ -171,6 +171,33 @@ resolve_path(){
   esac
 }
 
+# #2576 -- resolve a file's REAL absolute location through every symlink hop (relative targets
+# included), without assuming GNU `readlink -f` (which only ships on macOS >= 12.3). One-hop plain
+# `readlink` (present wherever bash is) walks the link chain a hop at a time; `cd -P` + `pwd -P`
+# (in the command-substitution subshell, so this hook's own cwd is untouched) canonicalizes any
+# symlinked DIRECTORIES left in the path. Bounded at 40 hops -- a longer chain is a loop, and a
+# loop FAILS (returns non-zero), as does any resolver error: this helper gates the privacy leg's
+# two hook-relative paths below, and a resolution failure must surface as the loud
+# REAL-LOCATION-UNRESOLVED refusal there -- NEVER as a silent fall-back to the unresolved symlink
+# directory (that fallback is exactly the fail-open #2576 closes).
+resolve_real_self() {
+  local cur="$1" t dir phys rrc hops=0
+  while :; do
+    t="$(readlink "$cur" 2>/dev/null)"; rrc=$?
+    if [ "$rrc" = "1" ]; then break; fi     # not a symlink -- $cur is the real file itself
+    if [ "$rrc" != "0" ] || [ -z "$t" ]; then return 1; fi
+    dir="$(dirname "$cur")"
+    case "$t" in
+      /*) cur="$t" ;;
+      *)  cur="$dir/$t" ;;
+    esac
+    hops=$((hops+1)); [ "$hops" -gt 40 ] && return 1
+  done
+  dir="$(dirname "$cur")"
+  phys="$(cd -P "$dir" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$phys" "$(basename "$cur")"
+}
+
 # #2401 S2 -- distinguish "scripts/ genuinely isn't part of this install" (plugin-dormant: the
 # public three-role-model plugin ports this hook file but never scripts/privacy-scan.sh, so the
 # quiet skip below is intentional and correct there) from "scripts/ is tracked in this repo's
@@ -227,7 +254,29 @@ fi
 # omission, or a ported plugin hook that dropped the scanner but kept the tracked path) REFUSES loudly via
 # sparse_scripts_omission_marker() below — never a silent skip. See hooks/1660-sl10-rolechain-rebase-smoke-
 # test.sh for the RED (needle blocks) / GREEN (scrubbed passes) / scanner-absent (REFUSES) proof.
-PRIVACY_SCANNER="${THREE_ROLE_PRIVACY_SCANNER:-$(dirname "${BASH_SOURCE[0]}")/../scripts/privacy-scan.sh}"
+# #2576 -- the two hook-relative privacy-leg computations (the scanner default here, the
+# sparse-omission repo root below) are anchored on the hook's REAL location, resolved through
+# every symlink hop by resolve_real_self() above -- NEVER on the symlink's own directory. In
+# production this hook is invoked through a per-file symlink under the user's hooks dir, so the
+# old `dirname BASH_SOURCE/../scripts/privacy-scan.sh` looked NEXT TO THE LINK (no scripts/ there)
+# and the privacy leg silently went dormant for every tagged completion -- a fail-open of a
+# privacy gate while every repo smoke stayed green (they run the hook from its real path). The
+# test-seam override keeps its old semantics untouched; when the override is unset and resolution
+# FAILS, PRIVACY_SCANNER stays empty so the -f guard below falls through to the loud
+# REAL-LOCATION-UNRESOLVED refusal -- never back to the symlink directory.
+GATE_REAL_PATH=""
+if [ -z "${THREE_ROLE_PRIVACY_SCANNER:-}" ]; then
+  GATE_REAL_PATH="$(resolve_real_self "${BASH_SOURCE[0]}")" || GATE_REAL_PATH=""
+fi
+GATE_REAL_DIR=""
+[ -n "$GATE_REAL_PATH" ] && GATE_REAL_DIR="$(dirname "$GATE_REAL_PATH")"
+if [ -n "${THREE_ROLE_PRIVACY_SCANNER:-}" ]; then
+  PRIVACY_SCANNER="$THREE_ROLE_PRIVACY_SCANNER"
+elif [ -n "$GATE_REAL_DIR" ]; then
+  PRIVACY_SCANNER="$GATE_REAL_DIR/../scripts/privacy-scan.sh"
+else
+  PRIVACY_SCANNER=""
+fi
 if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
   if [ -f "$LEDGER_HELPER" ]; then
     LEGA_ARGS=(check --session "$SESSION" --task "$TASKID" --enforce-tracked-artifacts)
@@ -254,7 +303,22 @@ if [ -n "$MODELRUN" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
         # #2401 S2 -- before falling quiet, check whether this is a sparse-checkout omission
         # rather than a genuine plugin-dormant install. Only reachable here because
         # THREE_ROLE_PRIVACY_SCANNER is unset, so $PRIVACY_SCANNER IS the real co-located default.
-        SPARSE_SCRIPTS_MARKER="$(sparse_scripts_omission_marker "$(dirname "${BASH_SOURCE[0]}")/..")"
+        # #2576 -- the repo root is the REAL hook directory's parent (the tree the symlink points
+        # INTO), never the caller's cwd / CLAUDE_PROJECT_DIR / the completing run's worktree: the
+        # hook bytes, the scanner and the git index that says "tracked" must all come from ONE
+        # tree. And if the real location itself could not be resolved, REFUSE -- do not fall back
+        # to the unresolved symlink directory (that fallback is the #2576 fail-open).
+        if [ -z "$GATE_REAL_DIR" ]; then
+          {
+            echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
+            echo "  REAL-LOCATION-UNRESOLVED: this hook's real location (through its symlink) could not be"
+            echo "  determined, so the co-located privacy scanner cannot be located safely. Refusing rather"
+            echo "  than guessing a directory -- a wrong guess here silently disables the artifact-privacy leg."
+            echo "  Master kill-switch (disables the WHOLE instrumentation gate, not just this leg): THREE_ROLE_INSTRUMENT_OFF=1."
+          } >&2
+          exit 2
+        fi
+        SPARSE_SCRIPTS_MARKER="$(sparse_scripts_omission_marker "$GATE_REAL_DIR/..")"
         if [ -n "$SPARSE_SCRIPTS_MARKER" ]; then
           {
             echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
