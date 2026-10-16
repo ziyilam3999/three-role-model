@@ -5506,6 +5506,15 @@ function cmdCheck(o) {
       if (j && j.role === role && isSubprocessDispatch(j.dispatch)) { stampSurvives = true; break; }
     }
     if (stampSurvives) continue;
+    // #3190 -- a needle-receipt agent-tool close is NOT a bypass either: when the task's current receipt
+    // window holds a non-drill executor NEEDLE-LINT row (task-keyed; the brief binding was enforced at spawn
+    // time by the route gate's resolve-route --brief call), print ROUTE-NEEDLE instead of ROUTE-BYPASS.
+    // Exit code unchanged (advisory), same as the ROUTE-SIZE branch below.
+    if (role === 'executor' && o.task && needleReceiptAdmits(o.task, null)) {
+      const fbTier3190 = (decl.seat && decl.seat.agent_tool_fallback) || '<unknown>';
+      console.log('ROUTE-NEEDLE: role=' + role + ' -> agent-tool ' + fbTier3190 + ' (first-class, needle receipt)');
+      continue;
+    }
     // #2985 D9 -- a first-class Agent-tool route is NOT a bypass: when the plan-review row's reviewed_plan
     // resolves (same resolver as the gate and the helper) to an effective agent-tool route for THIS task,
     // print ROUTE-SIZE instead of ROUTE-BYPASS. Anything unresolvable keeps today's advisory.
@@ -7773,7 +7782,7 @@ function executorSizeModel(seat) {
   return v;
 }
 
-function effectiveRouteFor(seatKey, seat, facts) {
+function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
   const out = { effective_dispatch: seat.dispatch || '', effective_tier: '', effective_model: seat.model || '' };
   const exec = seatKey === 'executor';
   if (exec) { out.route_reason = ''; out.zai_strikes = 0; }
@@ -7792,6 +7801,14 @@ function effectiveRouteFor(seatKey, seat, facts) {
         }
       } else out.route_reason = 'size-SM';
     }
+    // #3190 — the dispatcher's needle-lint refusal receipt: a FIRST-CLASS, size-independent route to the
+    // fallback tier for the exact (task, brief bytes) pair the dispatcher refused (the #2888 deadlock: the
+    // dispatcher sends a needle brief to a Claude seat, the route gate sends an S/M plan back to the
+    // dispatcher). Precedence: an ALREADY-agent-tool answer above (zai-strikes, size-L-no-size-model) is
+    // unchanged; otherwise the needle receipt wins over size-SM / size-L-zai — an L brief that names a
+    // needle file has the same deadlock below two strikes. Callers that pass no brief (check, the
+    // dispatcher's own plan check) pass no needleAdmit and get the pre-#3190 answer byte-for-byte.
+    if (needleAdmit && !leave && facts.size_source === 'plan') { leave = true; out.route_reason = 'needle-receipt'; }
   } else if (seatKey === 'plan-review') {
     // #3145 D1 — resolve-route's single-plan view of the same rule planReviewRouteFromBrief encodes for
     // brief text: S/M -> seat model, L -> size_models.L, no valid size -> size_models.L (unsized-full).
@@ -7986,22 +8003,53 @@ function companionPostmortemEvidence(lines, i, task, kv) {
 // `continues` counter consumed in receipt order by pushed timeouts and PARTIAL closes alike, so at most 3 paid
 // kept-going legs per window of EITHER kind; the 4th neutral candidate is a strike, fail closed); MISSING-side +
 // anything else (`none`, `unmeasured`, absent `progress=` -- every pre-#3065 row) -> HOLLOW: one strike, no reset.
-function executorStrikeFacts(task) {
-  const lines = readReceiptTail().split('\n');
-  const forgiven = forgivenEvidence(task, lines);
-  // #3065 — MISSING-side artifact predicate: absent field or MISSING* value. One definition for the
-  // boundary scan and the in-window SMOKE classification, so they can never disagree.
-  const missingSide = (kv) => !kv.artifact || kv.artifact.startsWith('MISSING');
-  let start = 0;
+// #3065 — MISSING-side artifact predicate: absent field or MISSING* value. One definition for the
+// boundary scan (executorWindowStart) and the in-window SMOKE classification (executorStrikeFacts), so
+// they can never disagree.
+const execMissingSide = (kv) => !kv.artifact || kv.artifact.startsWith('MISSING');
+
+// #3190 — the task's CURRENT receipt window: everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor
+// task=T` row that RECORDS a PR. The SAME boundary executorStrikeFacts scans from the END, extracted into ONE
+// shared definition so the strike counter and the needle-receipt admission below can never read different
+// windows. `lines` are the receipt tail split on '\n'; returns the first in-window line index (0 = whole file).
+function executorWindowStart(lines, task) {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
     const kv = receiptKv(lines[i]);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
-    if (missingSide(kv)) continue; // #3065: only a RECORDED PR resets the window.
-    start = i + 1;
-    break;
+    if (execMissingSide(kv)) continue; // #3065: only a RECORDED PR resets the window.
+    return i + 1;
   }
+  return 0;
+}
+
+// #3190 — needle-receipt admission (#2888 deadlock): does the task's CURRENT window hold a non-drill
+// `OR-DISPATCH-REFUSED role=executor reason=NEEDLE-LINT task=T` row? With briefId (the 16-hex SHA-256
+// fingerprint of the brief file's bytes) the row must ALSO carry `brief=<briefId>` exactly — the admission
+// is bound to the exact refused bytes, so a later, different brief for the same task never matches; with
+// briefId === null the check is task-keyed alone (the `check` ROUTE-NEEDLE advisory — the brief binding was
+// enforced at spawn time by the route gate). A row can only exist for a brief the dispatcher's lint actually
+// FLAGGED (a clean brief writes no row) and only when the dispatch carried --task; drills never admit.
+function needleReceiptAdmits(task, briefId) {
+  if (!task || !/^[0-9A-Za-z._-]+$/.test(String(task))) return false;
+  const t = String(task);
+  const lines = readReceiptTail().split('\n');
+  const start = executorWindowStart(lines, t);
+  for (let i = start; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-REFUSED ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.reason !== 'NEEDLE-LINT' || kv.task !== t) continue;
+    if (kv.drill === '1') continue;
+    if (briefId === null || kv.brief === briefId) return true;
+  }
+  return false;
+}
+
+function executorStrikeFacts(task) {
+  const lines = readReceiptTail().split('\n');
+  const forgiven = forgivenEvidence(task, lines);
+  let start = executorWindowStart(lines, task);
   let strikes = 0, continues = 0, hollow = 0, partial = 0;
   for (let i = start; i < lines.length; i++) {
     if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) {
@@ -8012,7 +8060,7 @@ function executorStrikeFacts(task) {
         if (kv.role !== 'executor' || kv.task !== task) continue;
         if (kv.drill === '1') continue;
         if ('attempt' in kv && kv.attempt !== '1') continue;
-        if (!missingSide(kv)) continue; // a recorded PR inside the window: not the LAST boundary row's concern.
+        if (!execMissingSide(kv)) continue; // a recorded PR inside the window: not the LAST boundary row's concern.
         if (kv.progress === 'pushed') {
           partial++;
           if (continues < CONTINUE_CAP) { continues++; continue; }
@@ -8363,7 +8411,9 @@ function cmdZaiStrikes(opts) {
   process.exit(0);
 }
 
-// resolve-route --seat <domain.seat> [--json] [--plan <path> [--task <id>]]  (#2985: --plan adds plan-derived fields)
+// resolve-route --seat <domain.seat> [--json] [--plan <path> [--task <id>]] [--brief <path>]
+// (#2985: --plan adds plan-derived fields; #3190: --brief fingerprints the dispatcher-refused brief and, when
+// the task's current window holds a matching NEEDLE-LINT receipt row, adds the first-class needle-receipt route.)
 function cmdResolveRoute(opts) {
   const seatKey = opts.seat;
   if (!seatKey) { console.log('BLOCK: resolve-route requires --seat <domain.seat>'); process.exit(2); }
@@ -8373,6 +8423,33 @@ function cmdResolveRoute(opts) {
   if (!result.ok) { process.stderr.write(result.reason + '\n'); process.exit(2); }
   // #2985 D3/L8: --plan is VALIDATED, never silently ignored -- anything that is not an existing regular file
   // under .ai-workspace/plans/ is unresolvable (exit 2).
+  // #3190 — --brief <path>: the dispatcher-refused brief whose needle-lint receipt row (if any) admits the
+  // first-class agent-tool route for THIS task. VALIDATED, never silently ignored (the #2985 --plan
+  // doctrine): anything that is not an existing regular file, or is over the 1 MiB input bound, is
+  // BRIEF-UNRESOLVABLE (exit 2) — never a pass. Validated BEFORE --plan so a bad brief is never masked by a
+  // plan refusal. The admission itself is executor-only and needs --task (a receipt bound to no task, or a
+  // brief read with no task in scope, admits nothing); a --brief on any other seat is inert metadata.
+  let needleAdmit = false;
+  if ('brief' in opts) {
+    const bArg = opts.brief;
+    let bst = null;
+    if (typeof bArg === 'string' && bArg) { try { bst = fs.statSync(bArg); } catch (e) { bst = null; } }
+    if (!bst || !bst.isFile()) {
+      console.log('BRIEF-UNRESOLVABLE: --brief ' + (typeof bArg === 'string' ? bArg : '<none>') + ' is not an existing regular file');
+      process.exit(2);
+    }
+    if (bst.size > PLAN_MAX_BYTES) {
+      console.log('BRIEF-UNRESOLVABLE: --brief ' + bArg + ' is larger than ' + PLAN_MAX_BYTES + ' bytes');
+      process.exit(2);
+    }
+    if (seatKey === 'executor' && typeof opts.task === 'string' && opts.task) {
+      let bBytes = null;
+      try { bBytes = fs.readFileSync(bArg); } catch (e) { bBytes = null; }
+      if (bBytes !== null) {
+        needleAdmit = needleReceiptAdmits(opts.task, crypto.createHash('sha256').update(bBytes).digest('hex').slice(0, 16));
+      }
+    }
+  }
   let planFacts = null;
   if ('plan' in opts) {
     planFacts = resolvePlanFacts(opts.plan, opts.task);
@@ -8394,13 +8471,13 @@ function cmdResolveRoute(opts) {
     if (result.acceptance) payload.accepted_disclosure_applied = result.acceptance;
     if (planFacts) {
       Object.assign(payload, { size: planFacts.size, size_source: planFacts.size_source, data_class: planFacts.data_class },
-        effectiveRouteFor(seatKey, result.seat, planFacts));
+        effectiveRouteFor(seatKey, result.seat, planFacts, needleAdmit));
     }
     console.log(JSON.stringify(payload));
   } else {
     console.log(seatKey + ' -> ' + result.seat.provider + ' / ' + (result.seat.model || ''));
     if (planFacts) {
-      const eff = effectiveRouteFor(seatKey, result.seat, planFacts);
+      const eff = effectiveRouteFor(seatKey, result.seat, planFacts, needleAdmit);
       console.log('size=' + (planFacts.size || '-') + ' size_source=' + planFacts.size_source + ' data_class=' + planFacts.data_class + ' effective_dispatch=' + eff.effective_dispatch);
     }
   }
