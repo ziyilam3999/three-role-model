@@ -7961,10 +7961,11 @@ function companionPostmortemEvidence(lines, i, task, kv) {
   return pm;
 }
 
-// #3060 D2 / #3073 D3+D3b — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The window is
-// everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row (a successful close; its verdict is
-// MISSING for an executor) — the same reset boundary the #3060 backward scan broke at, so the reset/attempt semantics
-// are byte-identical. Within the window, forward: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts
+// #3060 D2 / #3073 D3+D3b / #3065 — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The
+// window is everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row that RECORDS A PR — i.e.
+// whose `artifact=` field is PRESENT and does NOT start with `MISSING` (#3065: a hollow exit-0 close never resets;
+// a row with no `artifact=` field at all is MISSING-side, fail closed, the same doctrine as an absent `progress=`).
+// Within the window, forward: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts
 // iff it opens an invocation (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the
 // same invocation's internal retry and add nothing (the emitter writes them only after that invocation's attempt=1
 // line). #3073 D3: a `reason=timeout` invocation is NOT a strike iff its companion non-drill
@@ -7978,21 +7979,50 @@ function companionPostmortemEvidence(lines, i, task, kv) {
 // MERGE #3073+#3093 (fix round 3): a timeout invocation is CONTINUE iff its companion POSTMORTEM carries
 // `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE line
 // (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP, one shared pairing helper.
+// #3065: an exit-0 close row (non-drill executor SMOKE, `attempt=1`-or-attempt-less — the same invocation unit R1
+// applies to FALLBACK rows, so an attempt=2 close's invocation was already classified at its attempt=1 FALLBACK) is
+// classified by (artifact, progress): PR recorded -> SUCCESS (the reset boundary above, nothing counted here);
+// MISSING-side + `progress=pushed` -> PARTIAL: real work, no PR — neutral up to the SHARED CONTINUE_CAP (one
+// `continues` counter consumed in receipt order by pushed timeouts and PARTIAL closes alike, so at most 3 paid
+// kept-going legs per window of EITHER kind; the 4th neutral candidate is a strike, fail closed); MISSING-side +
+// anything else (`none`, `unmeasured`, absent `progress=` -- every pre-#3065 row) -> HOLLOW: one strike, no reset.
 function executorStrikeFacts(task) {
   const lines = readReceiptTail().split('\n');
   const forgiven = forgivenEvidence(task, lines);
+  // #3065 — MISSING-side artifact predicate: absent field or MISSING* value. One definition for the
+  // boundary scan and the in-window SMOKE classification, so they can never disagree.
+  const missingSide = (kv) => !kv.artifact || kv.artifact.startsWith('MISSING');
   let start = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
     const kv = receiptKv(lines[i]);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
+    if (missingSide(kv)) continue; // #3065: only a RECORDED PR resets the window.
     start = i + 1;
     break;
   }
-  let strikes = 0, continues = 0;
+  let strikes = 0, continues = 0, hollow = 0, partial = 0;
   for (let i = start; i < lines.length; i++) {
-    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) {
+      // #3065 — the exit-0 close row is its own strike evidence (no new FALLBACK line): a dispatcher
+      // that forgot the `progress=` stamp fails closed here (HOLLOW), and none can double-count.
+      if (lines[i].startsWith('OR-SEAT-SMOKE ')) {
+        const kv = receiptKv(lines[i]);
+        if (kv.role !== 'executor' || kv.task !== task) continue;
+        if (kv.drill === '1') continue;
+        if ('attempt' in kv && kv.attempt !== '1') continue;
+        if (!missingSide(kv)) continue; // a recorded PR inside the window: not the LAST boundary row's concern.
+        if (kv.progress === 'pushed') {
+          partial++;
+          if (continues < CONTINUE_CAP) { continues++; continue; }
+          strikes++;
+          continue;
+        }
+        strikes++; hollow++;
+      }
+      continue;
+    }
     const kv = receiptKv(lines[i]);
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
@@ -8008,7 +8038,7 @@ function executorStrikeFacts(task) {
     if ((pushed || forgivenHit) && continues < CONTINUE_CAP) { continues++; continue; }
     strikes++;
   }
-  return { strikes, continues, cap: CONTINUE_CAP };
+  return { strikes, continues, cap: CONTINUE_CAP, hollow, partial };
 }
 
 function countExecutorStrikes(task) { return executorStrikeFacts(task).strikes; }
@@ -8306,7 +8336,9 @@ function cmdZaiStrikes(opts) {
     const f3073 = executorStrikeFacts(task);
     // #3073 D3: `--json` prints the CONTINUE side too (strikes/continues/cap) so the orchestrator can see a
     // CONTINUE happened without re-reading receipts; the plain integer output and exit code are unchanged.
-    if ('json' in opts) console.log('{"strikes":' + f3073.strikes + ',"continues":' + f3073.continues + ',"cap":' + f3073.cap + '}');
+    // #3065: `hollow` (HOLLOW close rows in the window) and `partial` (PARTIAL closes, neutral or struck)
+    // appended additively — the orchestrator reads them before each size-L dispatch.
+    if ('json' in opts) console.log('{"strikes":' + f3073.strikes + ',"continues":' + f3073.continues + ',"cap":' + f3073.cap + ',"hollow":' + f3073.hollow + ',"partial":' + f3073.partial + '}');
     else console.log(String(f3073.strikes));
     process.exit(0);
   }

@@ -6422,9 +6422,9 @@ for spec in "receipts-exec-timeout-pushed.md:0" "receipts-exec-timeout-none.md:1
   f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3060 "$f"); RC=$?
   { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3: zai-strikes $f -> $want" || bad "#3073 D3 $f want $want (rc=$RC out=$OUT)"
 done
-for spec in "receipts-exec-timeout-pushed.md:{\"strikes\":0,\"continues\":1,\"cap\":3}" \
-            "receipts-exec-timeout-pushed-x3.md:{\"strikes\":0,\"continues\":3,\"cap\":3}" \
-            "receipts-exec-timeout-pushed-x4.md:{\"strikes\":1,\"continues\":3,\"cap\":3}"; do
+for spec in "receipts-exec-timeout-pushed.md:{\"strikes\":0,\"continues\":1,\"cap\":3,\"hollow\":0,\"partial\":0}" \
+            "receipts-exec-timeout-pushed-x3.md:{\"strikes\":0,\"continues\":3,\"cap\":3,\"hollow\":0,\"partial\":0}" \
+            "receipts-exec-timeout-pushed-x4.md:{\"strikes\":1,\"continues\":3,\"cap\":3,\"hollow\":0,\"partial\":0}"; do
   f="${spec%%:*}"; want="${spec#*:}"; OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$f" node "$LED" zai-strikes --task 777 --role executor --json 2>&1); RC=$?
   { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3073 D3b: zai-strikes --json $f -> $want" || bad "#3073 D3b $f want $want (rc=$RC out=$OUT)"
 done
@@ -6436,6 +6436,52 @@ OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed.md"
 OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-timeout-pushed-x4.md" node "$DIR/_fixtures/3role-ledger-nocap-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
 { [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "MUTANT-RED cap ok: nocap overlay never strikes the 4th CONTINUE (0, not 1)" || bad "MUTANT-RED cap (rc=$RC out=$OUT)"
 # plan-review branch byte-unchanged: the #2985 asserts above (AC-5) still cover every receipts-*.md fixture.
+
+# ---- #3065 (appended to the #3060 AC-1 block): a hollow exit-0 close is a strike, only a recorded PR resets ----
+# Three-way close classification by (artifact, progress): PR recorded -> SUCCESS/reset; MISSING-side +
+# progress=pushed -> PARTIAL (neutral under the SHARED CONTINUE_CAP, strike past it); MISSING-side + anything
+# else (none/unmeasured/absent -- pre-#3065 rows) -> HOLLOW strike. Absent `artifact=` is MISSING-side.
+# SMOKE rows join accounting only at attempt=1-or-absent (R1's invocation unit); an attempt=2 real-PR row still
+# resets. The same assertions run standalone in hooks/3065-hollow-strike-targeted-smoke.sh (< 10 s).
+for spec in "receipts-exec-hollow-1.md:1" "receipts-exec-hollow-after-2.md:3" "receipts-exec-hollow-unmeasured.md:1" \
+            "receipts-exec-hollow-legacy.md:1" "receipts-exec-hollow-noartifact.md:3" "receipts-exec-hollow-drill.md:0" \
+            "receipts-exec-hollow-other.md:0" "receipts-exec-hollow-x2.md:2" "receipts-exec-hollow-x3.md:3" \
+            "receipts-exec-hollow-attempt2.md:1" "receipts-exec-pr-reset.md:0" "receipts-exec-pr-reset-attempt2.md:0" \
+            "receipts-exec-hollow-pushed.md:1" "receipts-exec-partial-x3.md:0" "receipts-exec-partial-x4.md:1" \
+            "receipts-exec-timeout-pushed-x2-partial-x2.md:1" "receipts-exec-partial-x4-pr-reset.md:0"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(ZE3060 "$f"); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3065: zai-strikes $f -> $want" || bad "#3065 $f want $want (rc=$RC out=$OUT)"
+done
+OUT=$(ZE3060 receipts-exec-hollow-other.md 778); { [ "$OUT" = "1" ]; } && ok "#3065: hollow rows keyed by task -- task 778 counts 1, task 777 counts 0" || bad "#3065 hollow-other task 778 (out=$OUT)"
+for spec in "receipts-exec-hollow-pushed.md:{\"strikes\":1,\"continues\":1,\"cap\":3,\"hollow\":0,\"partial\":1}" \
+            "receipts-exec-hollow-x3.md:{\"strikes\":3,\"continues\":0,\"cap\":3,\"hollow\":3,\"partial\":0}" \
+            "receipts-exec-partial-x3.md:{\"strikes\":0,\"continues\":3,\"cap\":3,\"hollow\":0,\"partial\":3}" \
+            "receipts-exec-partial-x4.md:{\"strikes\":1,\"continues\":3,\"cap\":3,\"hollow\":0,\"partial\":4}" \
+            "receipts-exec-timeout-pushed-x2-partial-x2.md:{\"strikes\":1,\"continues\":3,\"cap\":3,\"hollow\":0,\"partial\":2}"; do
+  f="${spec%%:*}"; want="${spec#*:}"; OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/$f" node "$LED" zai-strikes --task 777 --role executor --json 2>&1); RC=$?
+  { [ "$RC" = "0" ] && [ "$OUT" = "$want" ]; } && ok "#3065: zai-strikes --json $f -> $want" || bad "#3065 json $f want $want (rc=$RC out=$OUT)"
+done
+# AC 14 pin: one strike per invocation -- the attempt=2 hollow close adds nothing over its attempt=1 opener.
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-hollow-attempt2.md" node "$LED" zai-strikes --task 777 --role executor --json 2>&1)
+printf '%s' "$OUT" | command grep -q '"hollow":0' && ok "#3065 AC-14: attempt2 json carries hollow:0 (the attempt=2 close is not counted)" || bad "#3065 AC-14 attempt2 json (out=$OUT)"
+# route arms: hollow strikes engage the (unchanged, 2) threshold; a PARTIAL x3 window does not; a PR resets.
+OUT=$(RR3060 receipts-exec-hollow-after-2.md 2026-10-03-777-plan-L.md)
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "zai-strikes" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "3" ]; } \
+  && ok "#3065: L + hollow-after-2 (3 strikes, no reset) -> agent-tool sonnet route_reason=zai-strikes" || bad "#3065 route hollow-after-2 (out=$OUT)"
+for spec in "receipts-exec-hollow-x2.md:agent-tool:2" "receipts-exec-hollow-x3.md:agent-tool:3" "receipts-exec-partial-x3.md:subprocess-zai:0" "receipts-exec-pr-reset.md:subprocess-zai:0"; do
+  f="${spec%%:*}"; rest="${spec#*:}"; wantd="${rest%%:*}"; wants="${rest#*:}"; OUT=$(RR3060 "$f" 2026-10-03-777-plan-L.md)
+  { [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "$wantd" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "$wants" ]; } \
+    && ok "#3065: L + $f -> $wantd (zai_strikes=$wants)" || bad "#3065 route $f (out=$OUT)"
+done
+OUT=$(RR3060 receipts-exec-hollow-x3.md 2026-10-03-777-plan-L.md)
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "claude-sonnet-5-5" ]; } && ok "#3065: L + hollow-x3 -> agent-tool on sonnet" || bad "#3065 route hollow-x3 model (out=$OUT)"
+# Mutant observed RED: the pre-#3065 rule (resets on ANY SMOKE row, counts no hollow, caps no PARTIAL) prints 0
+# where the build prints 3 (hollow-after-2) and 0 where the build prints 1 (partial-x4).
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-hollow-after-2.md" node "$DIR/_fixtures/3role-ledger-pre3065-hollow-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "MUTANT-RED hollow ok: pre3065 overlay resets on the hollow close (0, not 3)" || bad "MUTANT-RED hollow (rc=$RC out=$OUT)"
+OUT=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$FX2985/receipts-exec-partial-x4.md" node "$DIR/_fixtures/3role-ledger-pre3065-hollow-overlay.mjs" zai-strikes --task 777 --role executor 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ "$OUT" = "0" ]; } && ok "MUTANT-RED partial ok: pre3065 overlay neither counts nor caps PARTIAL (0, not 1)" || bad "MUTANT-RED partial (rc=$RC out=$OUT)"
 
 # ---- AC-2: L -> full model at 0-1 strikes; sonnet at >= 2; per-invocation; other task's strikes do not leak ----
 OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-L.md)
