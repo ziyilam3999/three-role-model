@@ -1657,4 +1657,48 @@ else
 fi
 printf '%s%s' "$LEAK3140" "$OUT" | command grep -q 'FIXTURE-SUBJECT-SENTINEL' && bad "#3140 D7: ticket subject leaked into check output" || ok "#3140 D7: zero FIXTURE-SUBJECT-SENTINEL in check output"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3154 -- size-S waiver at the completion gate. REAL shape: a throw-away repo holds COPIES of this hook and of
+# the ledger helper, the S plan lives only at refs/remotes/origin/<task>-fixture, and the convention reviews dir
+# holds an UNRELATED task's review (the newest *.md, no `cairn:` line) -- the shape that, without the 4b skip,
+# lets another task's review decide. Labels: size-s-4b-waived / size-s-4b-m-blocks (+ size-s-gate-allow, the
+# case-1 completion shape, and size-s-4b-red against the pre-#3154 helper).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+export PROGRESS_TASKS_DIR="$TMP/s3154-tasks" THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT"
+. "$DIR/_fixtures/size-s-fixture-lib.sh"
+SZ_SNAP="$DIR/_fixtures/3role-ledger-pre3154-size-s-snapshot.mjs"
+printf '# 3-role performance log\n## rounds for #93001 #93002 #93003\n' > "$TMP/perf-s3154.md"
+# sz_gate_case <task> <ticket-size> <helper-src> -> builds the fixture repo + ledger; sets SZ_REPO and SZ_PLANS
+sz_gate_case() {
+  local t="$1" size="$2" helper="$3" sess="sS$1"
+  SZ_REPO="$TMP/s3154-g$t"
+  sz_mk_repo "$SZ_REPO" "$helper" "$t" S
+  cp "$HOOK" "$SZ_REPO/hooks/three-role-instrumentation-gate.sh"
+  sz_ticket "$sess" "$t" "$size"
+  sz_planner "$SZ_REPO/hooks/3role-ledger.mjs" "$sess" "$t"
+  sz_chain_tail "$SZ_REPO/hooks/3role-ledger.mjs" "$sess" "$t" "$LART_REV"
+  SZ_PLANS="$SZ_REPO/.ai-workspace/plans"
+  mkdir -p "$SZ_PLANS" "$SZ_REPO/.ai-workspace/reviews"
+  printf '## ELI5\nplan\ncairn: "planner hit"\n### Binary AC\n- AC1\n' > "$SZ_PLANS/p.md"
+  # the newest review in the convention dir belongs to an UNRELATED task and carries no cairn: line
+  printf '## Review\nno citation here\n' > "$SZ_REPO/.ai-workspace/reviews/unrelated-other-task.md"
+}
+sz_gate_run() { # <task> : run the gate copy from the repo, completion payload citing the perf card
+  local t="$1" s="sS$1"
+  CAP=$(cd "$SZ_REPO" && printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-s3154.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
+    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" THREE_ROLE_PLANS_DIR="$SZ_PLANS" CLAUDE_PROJECT_DIR="$SZ_REPO" bash "$SZ_REPO/hooks/three-role-instrumentation-gate.sh" 2>&1 >/dev/null); RC=$?
+}
+sz_gate_case 93001 S "$LED"; sz_gate_run 93001
+{ [ "$RC" = "0" ] && echo "$CAP" | grep -q '4b: waived size-s'; } \
+  && ok "size-s-4b-waived ok: S ticket, NO plan-review, newest review is an unrelated task's with no cairn: line -> ALLOW, prints '4b: waived size-s'" \
+  || bad "size-s-4b-waived (rc=$RC out=$CAP)"
+{ [ "$RC" = "0" ]; } && ok "size-s-gate-allow ok: the case-1 shape (ticket S + plan S, planner/executor/execution-review only) completes through the real gate" || bad "size-s-gate-allow (rc=$RC out=$CAP)"
+sz_gate_case 93002 M "$LED"; sz_gate_run 93002
+{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi 'size-s: ticket-size-M'; } \
+  && ok "size-s-4b-m-blocks ok: same fixture with ticket M -> BLOCK (missing plan-review, names 'size-s: ticket-size-M')" \
+  || bad "size-s-4b-m-blocks (rc=$RC out=$CAP)"
+sz_gate_case 93003 S "$SZ_SNAP"; sz_gate_run 93003
+{ [ "$RC" = "2" ]; } && ok "size-s-4b-red ok: the same S fixture against the pre-#3154 helper -> BLOCK (the waiver comes from the predicate)" || bad "size-s-4b-red (rc=$RC out=$CAP)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

@@ -429,7 +429,7 @@ block_ledger(){
     echo "THREE-ROLE INSTRUMENTATION GATE (three-role-instrumentation-gate): cannot mark task #${TASKID} (a tagged 3-role run) completed."
     echo "  role-ledger leg FAILED: $1"
     echo "  A tagged 3-role completion must prove the four roles actually RAN (parent-claude.md Invariant #6, #851) —"
-    echo "  not just that a perf entry was written. Required roles: planner, plan-review, executor, execution-review."
+    echo "  not just that a perf entry was written. Required roles: planner, plan-review, executor, execution-review (plan-review waived for size-S tickets)."
     echo "  Each role is satisfied by EITHER (a) an agentId that resolves to a real"
     echo "    ~/.claude/projects/*/<session>/subagents/agent-<id>.jsonl transcript (a FORGED agentId has no file -> BLOCK)"
     echo "    plus a well-shaped artifact_path, OR (b) an explicit, SPECIFIC inline-skip:<reason>."
@@ -692,6 +692,17 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
   # `## Review` section instead. So when the reviewer's genuine `cairn:` line lives only in the separate
   # review file, RE-POINTING the ledger's artifact_path at that file (rather than editing the plan) is a
   # legitimate, gate-legal fix — not a workaround (this is exactly how #1585 and #1535 were closed honestly).
+  # #3154 D2b -- a size-S ticket has NO plan-reviewer, so there is no reviewer `cairn:` line to demand; without
+  # this skip the newest-review fallback below would let an UNRELATED task's review decide. The decision is the
+  # ONE shared predicate (`size-s-exempt`: exit 0 = ticket S AND plan S AND no plan-review row). Evaluated BEFORE
+  # any review-file resolution. M/L/unsized tickets (any non-zero) keep today's 4b exactly, byte for byte.
+  SZ_4B_WAIVED=0
+  if [ -f "$LEDGER_HELPER" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ] \
+     && node "$LEDGER_HELPER" size-s-exempt --session "$SESSION" --task "$TASKID" >/dev/null 2>&1; then
+    SZ_4B_WAIVED=1
+    echo "  4b: waived size-s (#3154: ticket S + plan S, no plan-review seat -- there is no reviewer cairn line to demand)" >&2
+  fi
+  if [ "$SZ_4B_WAIVED" != "1" ]; then
   AREVIEW=""
   if [ -f "$LEDGER_HELPER" ] && [ -n "$SESSION" ] && [ "$SESSION" != "-" ]; then
     AREVIEW="$(node "$LEDGER_HELPER" resolve-artifact --session "$SESSION" --task "$TASKID" --role plan-review 2>/dev/null)"
@@ -729,6 +740,7 @@ if [ -n "$APLAN" ] && [ -f "$APLAN" ]; then
     awk '/^## Review/{r=1} r&&/^[[:space:]]*([-*+>`#]+[[:space:]]*)*[Cc]airn[*`]*([[:space:]]*\([^()]*\))?[*`]*:/{found=1} END{exit !found}' "$APLAN" 2>/dev/null \
       || block "the plan-review (## Review section in $APLAN) carries no \`cairn:\` citation line — the plan-reviewer must independently search memory and cite it. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1."
   fi
+  fi   # /#3154 SZ_4B_WAIVED
 fi
 
 # ── outcome_eval leg (VEI #1430) ─────────────────────────────────────────────────────────────────────

@@ -693,4 +693,87 @@ run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F
   && ok "#2700 AC-4b: nonce-less VANTAGE copy + nonce-bearing PRIMARY copy -> the nonce still wins -> ALLOW (kills first-existing-wins, M5)" \
   || bad "#2700 AC-4b should ALLOW (rc=$RC out=$CAP) -- a first-existing-wins implementation blocks this"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3154 -- size-S plan-review waiver at the transition gate. Labels size-s-01 .. size-s-13 = plan cases 1-8,
+# 13 and 14a-14d. REAL shape (plan fold B1): each fixture is a throw-away repo holding a COPY of the helper
+# and of this hook, the plan lives ONLY at refs/remotes/origin/<task>-fixture (never on the cwd's disk), and
+# every must-pass is first run against the pre-#3154 snapshot, where it must FAIL (RED-first).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+export THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" PROGRESS_TASKS_DIR="$TMP/s3154-tasks"
+. "$DIR/_fixtures/size-s-fixture-lib.sh"
+SZ_SNAP="$DIR/_fixtures/3role-ledger-pre3154-size-s-snapshot.mjs"
+SZS="sess-3154g"
+# sz_case <label> <task> <ticket-size|-> <plan-variant|-> : build a fixture repo (helper + hook copies) and a planner row.
+sz_case() {
+  local repo="$TMP/s3154-$2"
+  sz_mk_repo "$repo" "$LED" "$2" "$4"
+  cp "$HOOK" "$repo/hooks/three-role-transition-gate.sh"
+  sz_ticket "$SZS" "$2" "$3"
+  sz_planner "$repo/hooks/3role-ledger.mjs" "$SZS" "$2"
+  SZ_REPO="$repo"
+}
+# gate through the helper copy in the fixture repo, from the repo cwd (plan not on disk there)
+sz_gate() { sz_run "$SZ_REPO/hooks/3role-ledger.mjs" "$SZ_REPO" gate-plan-review --session "$SZS" --task "$1"; }
+# the REAL hook, executor spawn payload, from the fixture repo
+sz_hook() { CAP=$(cd "$SZ_REPO" && printf '%s' "$(agent "3ROLE_TASK:$1 ROLE:executor -- implement it" "$SZS")" | bash "$SZ_REPO/hooks/three-role-transition-gate.sh" 2>&1 >/dev/null); RC=$?; }
+
+# size-s-01 (case 1): RED on the snapshot, GREEN on the new helper, GREEN through the real hook
+sz_case 01 92001 S S
+sz_run "$SZ_SNAP" "$SZ_REPO" gate-plan-review --session "$SZS" --task 92001; RED=$SZ_RC
+sz_gate 92001; G=$SZ_RC; sz_hook 92001
+{ [ "$RED" = "2" ] && [ "$G" = "0" ] && [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "size-s-01 ok: ticket S + plan S, no plan-review -> snapshot BLOCK(2), new gate ALLOW(0), real hook ALLOW silent" || bad "size-s-01 (snapshot=$RED gate=$G hook=$RC/$CAP)"
+# size-s-02: ticket M, plan S -> BLOCK naming ticket-size-M; the real hook's text names the S rule + keeps the no-skip line
+sz_case 02 92002 M S; sz_gate 92002; G=$SZ_RC; GO=$SZ_OUT; sz_hook 92002
+{ [ "$G" = "2" ] && printf '%s' "$GO" | command grep -q 'size-s: ticket-size-M' && [ "$RC" = "2" ] \
+  && printf '%s' "$CAP" | command grep -q 'There is NO skip path for plan-review' && printf '%s' "$CAP" | command grep -q 'size-S' \
+  && printf '%s' "$CAP" | command grep -q 'size-s: ticket-size-M'; } \
+  && ok "size-s-02 ok: ticket M, plan S -> BLOCK 'size-s: ticket-size-M'; hook text keeps 'There is NO skip path' and names the size-S rule" || bad "size-s-02 (gate=$G/$GO hook=$RC/$CAP)"
+# size-s-03: ticket L, plan L
+sz_case 03 92003 L L; sz_gate 92003
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ticket-size-L'; } && ok "size-s-03 ok: ticket L, plan L -> BLOCK 'size-s: ticket-size-L'" || bad "size-s-03 (rc=$SZ_RC out=$SZ_OUT)"
+# size-s-04: ticket file absent
+sz_case 04 92004 - S; sz_gate 92004
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ticket-size-none'; } && ok "size-s-04 ok: ticket file absent -> BLOCK 'size-s: ticket-size-none'" || bad "size-s-04 (rc=$SZ_RC out=$SZ_OUT)"
+# size-s-05: ticket S, plan M
+sz_case 05 92005 S M; sz_gate 92005
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: plan-size-M'; } && ok "size-s-05 ok: ticket S, plan size: M -> BLOCK 'size-s: plan-size-M'" || bad "size-s-05 (rc=$SZ_RC out=$SZ_OUT)"
+# size-s-06: upgrade mid-flight -- case 1 passes, ticket rewritten to M, gate AND check both block (live read)
+sz_case 06 92006 S S
+printf '## Review\nverdict: PASS\n' > "$TMP/s3154-rev.md"
+sz_chain_tail "$SZ_REPO/hooks/3role-ledger.mjs" "$SZS" 92006 "$TMP/s3154-rev.md"
+sz_gate 92006; P1=$SZ_RC
+sz_run "$SZ_REPO/hooks/3role-ledger.mjs" "$SZ_REPO" check --session "$SZS" --task 92006; P2=$SZ_RC; P2O=$SZ_OUT
+sz_ticket "$SZS" 92006 M
+sz_gate 92006; P3=$SZ_RC; P3O=$SZ_OUT
+sz_run "$SZ_REPO/hooks/3role-ledger.mjs" "$SZ_REPO" check --session "$SZS" --task 92006; P4=$SZ_RC; P4O=$SZ_OUT
+{ [ "$P1" = "0" ] && [ "$P2" = "0" ] && [ "$P3" = "2" ] && [ "$P4" = "2" ] && printf '%s' "$P3O" | command grep -q 'ticket-size-M' && printf '%s' "$P4O" | command grep -q 'size-s: ticket-size-M'; } \
+  && ok "size-s-06 ok: S passes gate+check, then ticket rewritten to M -> both exit 2 'ticket-size-M' (live read)" || bad "size-s-06 ($P1 $P2 $P3 $P4 | $P3O | $P4O)"
+# size-s-07: ticket S, plan S, plus a NEEDS-WORK plan-review row -> BLOCK (the review governs; negative-verdict wins)
+sz_case 07 92007 S S; sz_review_row "$SZ_REPO/hooks/3role-ledger.mjs" "$SZS" 92007 "$TMP/s3154-rev.md" NEEDS-WORK; sz_gate 92007
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'negative-verdict' && printf '%s' "$SZ_OUT" | command grep -q 'size-s: review-row-present'; } \
+  && ok "size-s-07 ok: S + S with a NEEDS-WORK plan-review row -> BLOCK negative-verdict (size-s: review-row-present)" || bad "size-s-07 (rc=$SZ_RC out=$SZ_OUT)"
+# size-s-08: plan unbound to the task (no Ticket line, no task id in the file name)
+sz_mk_repo "$TMP/s3154-92008" "$LED" 92008 unbound ".ai-workspace/plans/2026-10-16-unrelated-plan.md"; SZ_REPO="$TMP/s3154-92008"
+sz_ticket "$SZS" 92008 S; sz_planner "$SZ_REPO/hooks/3role-ledger.mjs" "$SZS" 92008 ".ai-workspace/plans/2026-10-16-unrelated-plan.md"; sz_gate 92008
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: plan-unbound'; } && ok "size-s-08 ok: plan lacks 'Ticket: #<task>' and the task id in its name -> BLOCK 'size-s: plan-unbound'" || bad "size-s-08 (rc=$SZ_RC out=$SZ_OUT)"
+# size-s-09 (case 13): audit -- one SIZE-S-SKIP PERMIT per ALLOWING evaluation, none for blocked ones; carries plan + ticket_size
+export RULE12_LOG="$TMP/s3154-r12.log"; : > "$RULE12_LOG"
+sz_case 09 92009 S S; sz_gate 92009; A1=$SZ_RC
+sz_ticket "$SZS" 92009 M; sz_gate 92009; A2=$SZ_RC
+N=$(command grep -c 'SIZE-S-SKIP' "$RULE12_LOG"); LINE=$(command grep 'SIZE-S-SKIP' "$RULE12_LOG" | tail -1)
+{ [ "$A1" = "0" ] && [ "$A2" = "2" ] && [ "$N" = "1" ] && printf '%s' "$LINE" | command grep -q '"decision":"PERMIT"' && printf '%s' "$LINE" | command grep -q '"task":"92009"' \
+  && printf '%s' "$LINE" | command grep -q '"plan":".ai-workspace/plans/' && printf '%s' "$LINE" | command grep -q '"ticket_size":"S"'; } \
+  && ok "size-s-09 ok: exactly one SIZE-S-SKIP PERMIT line (allowing eval), none for the blocked one; carries plan + ticket_size" || bad "size-s-09 (a1=$A1 a2=$A2 n=$N line=$LINE)"
+# size-s-10 .. size-s-13 (cases 14a-14d)
+sz_case 10 92010 XL S; sz_gate 92010
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ticket-size-invalid'; } && ok "size-s-10 ok: ticket metadata.size \"XL\" -> BLOCK 'size-s: ticket-size-invalid'" || bad "size-s-10 (rc=$SZ_RC out=$SZ_OUT)"
+sz_case 11 92011 S nosize; sz_gate 92011
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: plan-size-missing'; } && ok "size-s-11 ok: plan with no flush-left size: line -> BLOCK 'size-s: plan-size-missing'" || bad "size-s-11 (rc=$SZ_RC out=$SZ_OUT)"
+sz_case 12 92012 S twosize; sz_gate 92012
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: plan-size-ambiguous'; } && ok "size-s-12 ok: plan with two flush-left size: lines -> BLOCK 'size-s: plan-size-ambiguous'" || bad "size-s-12 (rc=$SZ_RC out=$SZ_OUT)"
+sz_case 13 92013 S S; printf 'this line is not json\n' >> "$LEDGERDIR/$SZS/92013.jsonl"; sz_gate 92013
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ledger-junk'; } && ok "size-s-13 ok: ledger with trailing junk after the planner row -> BLOCK 'size-s: ledger-junk'" || bad "size-s-13 (rc=$SZ_RC out=$SZ_OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
