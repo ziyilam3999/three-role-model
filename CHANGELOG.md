@@ -1,3 +1,21 @@
+## [0.16.0] - 2026-10-16
+
+### Changed
+- **sync (#3190): receipt-based needle admission + BRIEF: transport + heredoc fix.** Regenerated
+  `hooks/three-role-route-dispatch-gate.sh`, `hooks/_smoke/three-role-route-dispatch-gate-smoke-test.sh`,
+  `bin/3role-ledger.mjs` and `hooks/_smoke/3role-ledger-smoke-test.sh` from ai-brain master via
+  `scripts/sync-three-role-plugin.mjs write` (never hand-edited). `resolve-route` gains an optional
+  `--brief <path>`: a dispatcher `OR-DISPATCH-REFUSED reason=NEEDLE-LINT` receipt row (task + 16-hex
+  SHA-256 brief fingerprint) admits the first-class agent-tool executor route
+  (`route_reason=needle-receipt`) for that exact task+brief pair inside the task's current receipt
+  window; the route gate transports an executor spawn's single flush-left `BRIEF:` line to the resolver
+  (two distinct lines -> `BRIEF-AMBIGUOUS`, a missing brief -> `BRIEF-UNRESOLVABLE`, both repeat-blocks;
+  zero lines -> byte-identical to before). The plugin population writes no needle rows (its dispatcher
+  hand-port ships no lint), so the resolver branch is inert here by construction. Also fixes the gate's
+  unescaped-backtick heredoc (`data-class:: command not found` on the SIZE-LABEL-MISSING arm) and adds
+  `check`'s `ROUTE-NEEDLE` advisory. The new smoke arms are mktemp-self-contained or live in the
+  fixture-guarded #2985 section, so both plugin smokes stay green without the fixture dir.
+
 ## [0.11.0] - 2026-07-04
 
 ### Added

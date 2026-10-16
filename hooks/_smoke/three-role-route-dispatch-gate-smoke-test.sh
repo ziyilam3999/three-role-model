@@ -515,5 +515,64 @@ rm -rf "$ST2985"; mkdir -p "$ST2985"
 P=$(mk2985 g11d "3ROLE_TASK:777 ROLE:research\nlook up the options")
 g2985 "$P" CC_ROUTES_JSON="$RZ2985"
 { [ "$RC" = "0" ] && [ "$(nmark)" = "0" ]; } && ok "#3060 AC-11 rollback: research seat with no dispatch field (HEAD row) -> fail-open, no marker" || bad "#3060 AC-11 rollback (rc=$RC markers=$(nmark))"
+
+# ---- #3190: receipt-based needle admission (BRIEF: transport; line-202 heredoc fix) ----
+# Fixtures: brief-777-needle.txt (F, the brief the dispatcher's needle lint refused -- committed so the
+# receipt row's brief= fingerprint is stable) + receipts-needle.md (its OR-DISPATCH-REFUSED reason=NEEDLE-LINT
+# row, task=777, inside the task's current window). The gate holds no needle predicate: admission is only
+# ever the resolver's answer over the SAME fingerprint.
+NB3190="$FX2985/brief-777-needle.txt"; RN3190="$FX2985/receipts-needle.md"
+CH3190="$TMP/brief-777-needle-changed.txt"; { cat "$NB3190"; printf X; } > "$CH3190"   # one byte appended -> different fingerprint
+# AC-1: the emit_repeat_block heredoc no longer executes its backticks (stderr carries no 'command not found')
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190a "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-none.md\nimpl")
+g2985 "$P"; rc1=$RC; out1="$CAP"; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$out1" | grep -q "SIZE-LABEL-MISSING" && [ "$(printf '%s' "$out1" | grep -c 'command not found')" = "0" ]; } \
+  && ok "#3190 AC-1: none plan -> exit 2 twice, SIZE-LABEL-MISSING, ZERO 'command not found' in stderr (line-202 fix)" || bad "#3190 AC-1 (rc1=$rc1 rc2=$rc2 out=$out1)"
+# AC-6: S/M plan + BRIEF: <F> with the matching receipt row -> FIRST-CLASS silent admission, no marker, no audit row
+for nm in S M; do
+  rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+  P=$(mk2985 "g3190$nm" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-$nm.md\nBRIEF: $NB3190\nimpl")
+  g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"
+  g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC; o2="$CAP"
+  { [ "$rc1" = "0" ] && [ -z "$o1" ] && [ "$rc2" = "0" ] && [ -z "$o2" ] && [ "$(nmark)" = "0" ] && rowsok 0; } \
+    && ok "#3190 AC-6: executor + $nm plan + BRIEF with needle receipt -> exit 0 silent on BOTH calls, no marker, no bypass-audit row" || bad "#3190 AC-6 $nm (rc1=$rc1 rc2=$rc2 markers=$(nmark) out=$o1)"
+done
+# AC-7 ii: BRIEF: present but the receipt file holds no NEEDLE-LINT row -> today's block-once (2 then 0)
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190norow "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nBRIEF: $NB3190\nimpl")
+g2985 "$P"; rc1=$RC; o1="$CAP"; g2985 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "0" ] && printf '%s' "$o1" | grep -q "tools/openrouter-role-dispatch.sh"; } \
+  && ok "#3190 AC-7(ii): BRIEF: with no receipt row -> block-once (exit 2 then 0), remedy names the helper" || bad "#3190 AC-7(ii) no row (rc1=$rc1 rc2=$rc2 out=$o1)"
+# AC-7 iii: spawn tagged 778 citing the 777 plan + the 777 row -> SIZE-TASK-MISMATCH, repeat, no marker
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190mm "3ROLE_TASK:778 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nBRIEF: $NB3190\nimpl")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && printf '%s' "$o1" | grep -q "SIZE-TASK-MISMATCH"; } \
+  && ok "#3190 AC-7(iii): 3ROLE_TASK:778 + the 777 row -> exit 2 twice, SIZE-TASK-MISMATCH, no marker" || bad "#3190 AC-7(iii) mismatch (rc1=$rc1 rc2=$rc2 out=$o1)"
+# AC-7 iv: one byte of the brief changed after the row was written -> fingerprint mismatch -> block-once
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190ch "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nBRIEF: $CH3190\nimpl")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "0" ]; } \
+  && ok "#3190 AC-7(iv): BRIEF: naming a one-byte-changed brief -> NOT admitted (block-once, 2 then 0)" || bad "#3190 AC-7(iv) changed brief (rc1=$rc1 rc2=$rc2)"
+# AC-7 v: BRIEF: naming a nonexistent file -> BRIEF-UNRESOLVABLE, repeat, no marker, no home-path leak
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190ghost "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nBRIEF: $TMP/no-such-brief-3190.txt\nimpl")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && printf '%s' "$o1" | grep -q "BRIEF-UNRESOLVABLE" && ! printf '%s' "$o1" | grep -q "/Users/"; } \
+  && ok "#3190 AC-7(v): BRIEF: naming a nonexistent file -> exit 2 twice, BRIEF-UNRESOLVABLE, no marker, no home-path leak" || bad "#3190 AC-7(v) ghost (rc1=$rc1 rc2=$rc2 out=$o1)"
+# AC-7 vi: two distinct BRIEF: lines -> BRIEF-AMBIGUOUS, repeat, no marker, no home-path leak
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190amb "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nBRIEF: $NB3190\nBRIEF: $CH3190\nimpl")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$(nmark)" = "0" ] && printf '%s' "$o1" | grep -q "BRIEF-AMBIGUOUS" && ! printf '%s' "$o1" | grep -q "/Users/"; } \
+  && ok "#3190 AC-7(vi): two distinct BRIEF: lines -> exit 2 twice, BRIEF-AMBIGUOUS, no marker, no home-path leak" || bad "#3190 AC-7(vi) ambiguous (rc1=$rc1 rc2=$rc2 out=$o1)"
+# AC-7 vii: a plan-review spawn carrying a BRIEF: line behaves exactly as today (ZAI-FIRST repeat; the line is inert)
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+P=$(mk2985 g3190pr "3ROLE_TASK:777 ROLE:plan-review\nROUND: 1\nBRIEF: $NB3190\nreview .ai-workspace/plans/$PLD-S.md")
+g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"; g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$o1" | grep -q "ZAI-FIRST"; } \
+  && ok "#3190 AC-7(vii): plan-review + BRIEF: line -> ZAI-FIRST repeat-block, the BRIEF: line is ignored for that seat" || bad "#3190 AC-7(vii) plan-review (rc1=$rc1 rc2=$rc2 out=$o1)"
 fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

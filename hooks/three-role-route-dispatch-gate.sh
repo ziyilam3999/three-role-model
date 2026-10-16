@@ -66,6 +66,17 @@
 # INPUT-BOUND (#2985): at most the first 1 MiB of the prompt is scanned, at most 3 distinct plan paths are
 # examined, and each plan file is read through the resolver's 1 MiB cap -- per-spawn work is O(1 MiB).
 #
+# #3190 — RECEIPT-BASED NEEDLE ADMISSION (the #2888 deadlock fix). When the dispatcher refuses a brief with
+# its positive-control needle lint (exit 9), it writes an OR-DISPATCH-REFUSED reason=NEEDLE-LINT receipt row
+# (task + a 16-hex SHA-256 fingerprint of the brief's bytes). An executor spawn prompt may then carry exactly
+# ONE flush-left `BRIEF: <path>` line (path resolved like PLAN:, against this hook's cwd); the gate transports
+# it to `resolve-route --brief` and admits via the resolver ONLY (effective_dispatch=agent-tool = the existing
+# silent first-class exit). This gate holds NO needle predicate and reads no path list: typing a BRIEF: line
+# into a prompt admits nothing unless the dispatcher's lint actually flagged those exact bytes for that task.
+# Two or more distinct BRIEF: paths -> BRIEF-AMBIGUOUS repeat-block; a brief that does not exist (or is over
+# the resolver's 1 MiB cap) -> BRIEF-UNRESOLVABLE repeat-block. Both fail closed, no marker. Zero BRIEF: lines
+# -> byte-identical to the pre-#3190 gate.
+#
 # Env overrides (for the smoke): CC_ROUTE_DISPATCH_STATE_DIR (default
 # ~/.claude/.three-role-route-dispatch-state); CC_ROUTES_JSON points resolve-route at a fixture config (the
 # same fixture mechanism 3role-ledger-smoke-test.sh already uses 15x). No `set -e` (a non-block non-zero must
@@ -213,7 +224,11 @@ THREE-ROLE ROUTE-DISPATCH GATE (#2985): ROLE:${ROLE} for 3ROLE_TASK:${TASKID} --
 This refusal REPEATS (no block-once marker): the z.ai routing policy is fail-closed. Remedy for an executor: name
 exactly one plan (PLAN: .ai-workspace/plans/<file>.md) that carries one flush-left \`size: S|M|L\` line and is bound
 to this task, then dispatch via tools/openrouter-role-dispatch.sh (S/M, and L below 2 z.ai strikes on the task; an L
-plan at 2+ strikes is the first-class model:sonnet spawn; a `data-class:` label is recorded, never a reroute #3078). Remedy for a
+plan at 2+ strikes is the first-class model:sonnet spawn; a \`data-class:\` label is recorded, never a reroute #3078).
+#3190 receipt route: if tools/openrouter-role-dispatch.sh refused this seat's brief with its needle lint (#2888, exit 9),
+the refusal's receipt row is itself the first-class remedy -- re-issue this Agent-tool spawn carrying PLAN: <that plan> AND
+BRIEF: <the refused brief's path> (exactly one BRIEF: line); the gate admits the Sonnet spawn only for that exact task+brief.
+Remedy for a
 plan-review: dispatch tools/openrouter-role-dispatch.sh --role plan-review first; the Opus fallback token is
 honoured only after 2 same-round strikes (3role-ledger.mjs zai-strikes --task ${TASKID} --role plan-review --round <n>).
 </system-reminder>
@@ -229,6 +244,21 @@ prompt_plans() {
     const re=new RegExp("[.\\w/-]*\\.ai-workspace/plans/[^\\s\"\x27`)]+\\.md","g");
     const seen=[]; let m;
     while((m=re.exec(prompt))!==null){ if(!seen.includes(m[0])){ seen.push(m[0]); if(seen.length>=3) break; } }
+    process.stdout.write(seen.join("\n"));
+  ' 2>/dev/null
+}
+# #3190 — prompt_briefs: distinct flush-left `BRIEF: <path>` paths cited in the prompt, one per line
+# (max 3 -- 2+ is already ambiguous). Mirrors prompt_plans: same joined prompt+description+message field set,
+# same 1 MiB scan cap, same repo-relative path transport (resolved by the resolver against this hook's cwd,
+# exactly like PLAN:). The gate itself holds NO needle predicate and reads no path list -- it only transports
+# the path to `resolve-route --brief`, where a needle-lint receipt row (if any) admits the first-class route.
+prompt_briefs() {
+  HOOK_INPUT="$INPUT" node -e '
+    let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){ process.exit(0); }
+    const ti=d.tool_input||{};
+    const prompt=[ti.prompt, ti.description, ti.message].map(x=>(x==null?"":String(x))).join("\n").slice(0,1048576);
+    const seen=[]; let m; const re=/^BRIEF:[ \t]*([^\s"\x27`)]+)[ \t]*$/gm;
+    while((m=re.exec(prompt))!==null){ if(!seen.includes(m[1])){ seen.push(m[1]); if(seen.length>=3) break; } }
     process.stdout.write(seen.join("\n"));
   ' 2>/dev/null
 }
@@ -264,8 +294,25 @@ if [ "$PROVIDER" = "zai" ] && [ "$ROLE" = "executor" ]; then
 ' "$PLANS_EX" | grep -c .)
   [ "$NPL" -ne 0 ] || emit_repeat_block "SIZE-PLAN-UNRESOLVABLE" "the spawn prompt names no .ai-workspace/plans/<file>.md path, so the plan is unresolvable (add a PLAN: line)"
   [ "$NPL" -eq 1 ] || emit_repeat_block "SIZE-PLAN-AMBIGUOUS" "the spawn prompt names ${NPL}+ distinct plan paths -- ambiguous; name exactly one"
-  RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --json 2>/dev/null); RJRC=$?
-  { [ "$RJRC" -eq 0 ] && [ -n "$RJ" ]; } || emit_repeat_block "SIZE-PLAN-UNRESOLVABLE" "${PLANS_EX} is unresolvable (not an existing file under .ai-workspace/plans/)"
+  # #3190 — BRIEF: transport (see prompt_briefs above). Two or more DISTINCT paths -> ambiguous (repeat-block,
+  # fail closed, no marker); zero -> today's behaviour exactly; one -> passed to resolve-route --brief, whose
+  # needle-receipt admission (dispatcher #2888 refusal row for THIS task + the exact brief bytes) comes back
+  # as effective_dispatch=agent-tool: the same silent first-class exit below, no token, no audit row.
+  BRIEFS_EX="$(prompt_briefs)"
+  NBR=0; [ -n "$BRIEFS_EX" ] && NBR=$(printf '%s
+' "$BRIEFS_EX" | command grep -c .)
+  [ "$NBR" -le 1 ] || emit_repeat_block "BRIEF-AMBIGUOUS" "the spawn prompt names ${NBR}+ distinct BRIEF: paths -- ambiguous; name exactly one (the refused brief the dispatcher's needle-lint receipt was written for)"
+  if [ "$NBR" -eq 1 ]; then
+    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --brief "$BRIEFS_EX" --json 2>/dev/null); RJRC=$?
+  else
+    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --json 2>/dev/null); RJRC=$?
+  fi
+  { [ "$RJRC" -eq 0 ] && [ -n "$RJ" ]; } || {
+    # The resolver validated --brief BEFORE --plan (#3190): a nonexistent/oversized brief is BRIEF-UNRESOLVABLE,
+    # never masked by the plan verdict. The brief path itself is never echoed into stderr (N5 home-path rule).
+    printf '%s' "$RJ" | command grep -q 'BRIEF-UNRESOLVABLE' && emit_repeat_block "BRIEF-UNRESOLVABLE" "the BRIEF: line names no existing readable brief file at or under the resolver's 1 MiB input bound (fail closed; re-issue naming the exact brief the dispatcher refused)"
+    emit_repeat_block "SIZE-PLAN-UNRESOLVABLE" "${PLANS_EX} is unresolvable (not an existing file under .ai-workspace/plans/)"
+  }
   SZ_SRC="$(json_field size_source "$RJ")"; DCLS="$(json_field data_class "$RJ")"; EFFD="$(json_field effective_dispatch "$RJ")"
   [ "$DCLS" != "invalid" ] || emit_repeat_block "DATA-CLASS-INVALID" "${PLANS_EX} carries a malformed data-class line (public|operator-private only)"
   case "$SZ_SRC" in
@@ -300,7 +347,10 @@ seat's declared non-Anthropic model; only the fresh-OS-process subprocess can, a
 made an accidental Agent-tool spawn silently gate-clean before this gate existed.) The Agent-tool spawn of
 this seat is the FALLBACK path, sanctioned ONLY for: (a) a D3 bounded fallback after a failed/timed-out
 subprocess dispatch (helper exit 124 or nonzero, <=1 subprocess retry first); (b) the seat's key file
-absent / the route genuinely unavailable; or (c) explicit operator direction. If this spawn IS a sanctioned
+absent / the route genuinely unavailable; or (c) explicit operator direction. #3190 FIRST-CLASS route (not a
+fallback, no inline token): if tools/openrouter-role-dispatch.sh refused this task's brief with its needle lint
+(#2888, exit 9), re-issue the spawn carrying PLAN: <the plan> AND BRIEF: <the refused brief's path> -- the
+refusal's receipt row admits exactly that task+brief pair on the seat's agent_tool_fallback tier. If this spawn IS a sanctioned
 fallback, re-issue it carrying the inline token [route-dispatch-fallback-ok] in the prompt (it is
 audit-logged as a deliberate bypass, never silent) and pass model:opus (plan-review) / model:sonnet (executor, research)
 explicitly. This is ADVISORY + block-once PER session:task:role: you will see this ONCE for this spawn.

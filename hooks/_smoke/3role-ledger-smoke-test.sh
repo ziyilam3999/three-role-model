@@ -6715,6 +6715,114 @@ z85_check z85ac14
   || bad "#3085 AC-14 should fail closed on invalid data-class (rc=$ZRC out=$ZOUT)"
 fi
 
+
+# ============================================================================================================
+# #3190 — receipt-based needle admission (the #2888 dispatcher-vs-gate deadlock fix): resolve-route --brief,
+# the zai-strikes precedence, and the check ROUTE-NEEDLE advisory. ENTIRELY mktemp-self-contained (routes +
+# roles + plans + briefs + receipts all under $TMP): runs unchanged in BOTH populations -- the plugin ships
+# no 2985 fixture dir and no needle lint, and nothing here needs either (the resolver only fingerprints bytes).
+# ============================================================================================================
+N3190="$TMP/n3190"; mkdir -p "$N3190/.ai-workspace/plans"
+printf 'size: S\n' > "$N3190/.ai-workspace/plans/2026-10-03-777-plan-S.md"
+printf 'size: M\n' > "$N3190/.ai-workspace/plans/2026-10-03-777-plan-M.md"
+printf 'size: L\n' > "$N3190/.ai-workspace/plans/2026-10-03-777-plan-L.md"
+cat > "$N3190/routes.json" <<'N3190ROUTES'
+{
+  "providers": {
+    "zai": { "auth": "env:ZAI_API_KEY", "endpoint": "https://api.z.ai/api/anthropic",
+             "data_posture": { "class": "no-training-default" },
+             "model_vocabulary": { "glm-5.3": { "tier_equivalent": "opus", "context_window": 1000000 },
+                                   "glm-5.3-flash": { "tier_equivalent": "sonnet" } } }
+  },
+  "task_classes": { "sustained-agentic": { "allowed_providers": ["anthropic", "zai"] } },
+  "seats": {
+    "executor": { "provider": "zai", "model": "glm-5.3-flash", "dispatch": "subprocess-zai", "effort": "medium",
+                  "size_models": { "L": "glm-5.3" },
+                  "agent_tool_fallback": "sonnet", "task_class": "sustained-agentic", "data_sensitivity": "public" },
+    "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai", "effort": "medium",
+                     "agent_tool_fallback": "opus", "task_class": "sustained-agentic", "data_sensitivity": "public" }
+  }
+}
+N3190ROUTES
+printf 'CC_TIER_SONNET_VERSION=claude-sonnet-5-5\nCC_TIER_OPUS_VERSION=claude-opus-5-5\n' > "$N3190/roles.env"
+printf 'the refused brief bytes\n' > "$N3190/brief.txt"
+N3190ID="$(shasum -a 256 "$N3190/brief.txt" | cut -c1-16)"
+n3190row() { printf 'OR-DISPATCH-REFUSED role=%s reason=NEEDLE-LINT task=%s session=none predicate=%s brief=%s ts=1\n' "$1" "$2" "$3" "${4:-$N3190ID}"; }
+{ n3190row executor 777 P-path; } > "$N3190/r-needle.md"
+printf 'OR-DISPATCH-FALLBACK role=executor reason=x model=m session=n/a task=999 drill=0 attempt=1\n' > "$N3190/r-none.md"
+{ n3190row executor 778 P-path; } > "$N3190/r-other-task.md"
+{ n3190row executor 777 P-path 0000000000000000; } > "$N3190/r-wrong-id.md"
+{ printf 'OR-DISPATCH-REFUSED role=executor reason=NEEDLE-LINT task=777 session=none predicate=P-path brief=%s drill=1 ts=1\n' "$N3190ID"; } > "$N3190/r-drill.md"
+{ n3190row executor 777 P-path; printf 'OR-SEAT-SMOKE role=executor task=777 artifact=https://example.invalid/pr/1 verdict=PASS\n'; } > "$N3190/r-stale.md"
+{ n3190row executor 777 P-path; printf 'OR-DISPATCH-FALLBACK role=executor reason=no-transcript model=glm-5.3-flash session=n/a task=777 latency_s=5 drill=0 attempt=1\n'; printf 'OR-DISPATCH-FALLBACK role=executor reason=no-transcript model=glm-5.3-flash session=n/a task=777 latency_s=5 drill=0 attempt=1\n'; } > "$N3190/r-strikes2.md"
+RR3190() {  # $1=receipt fixture  $2=plan suffix (-S|-M|-L)  $3=brief ("-" = none)  -> JSON on stdout
+  local rr=(node "$LED" resolve-route --seat executor --plan "$N3190/.ai-workspace/plans/2026-10-03-777-plan$2.md" --task 777 --json)
+  [ "$3" != "-" ] && rr+=(--brief "$3")
+  CC_ROUTES_JSON="$N3190/routes.json" CC_ROLES_ENV="$N3190/roles.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$N3190/$1" "${rr[@]}" 2>/dev/null; }
+J3190() { node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j[process.argv[1]];process.stdout.write(v===undefined?"<absent>":String(v));}catch(e){process.stdout.write("<nojson>");}})' "$1"; }
+
+# ---- AC-3: the resolver admits via the needle receipt, size-INDEPENDENTLY (S / M / L) ----
+for nm in S M; do
+  OUT=$(RR3190 r-needle.md "-$nm" "$N3190/brief.txt"); RC=$?
+  { [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "agent-tool" ] \
+    && [ "$(printf '%s' "$OUT" | J3190 effective_tier)" = "sonnet" ] && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "needle-receipt" ]; } \
+    && ok "#3190 AC-3: executor + $nm plan + --brief with the needle row -> agent-tool sonnet route_reason=needle-receipt" || bad "#3190 AC-3 $nm (rc=$RC out=$OUT)"
+done
+OUT=$(RR3190 r-needle.md -L "$N3190/brief.txt"); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "agent-tool" ] \
+  && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "needle-receipt" ]; } \
+  && ok "#3190 AC-3: executor + L plan (size_models, zero strikes) + --brief with the needle row -> needle-receipt wins over size-L-zai" || bad "#3190 AC-3 L (rc=$RC out=$OUT)"
+
+# ---- AC-4: every non-matching shape refuses (effective stays subprocess-zai) ----
+for spec in "r-none.md:no row" "r-other-task.md:other task" "r-wrong-id.md:different brief fingerprint" "r-drill.md:drill row" "r-stale.md:row outside the window (before a recorded close)"; do
+  f="${spec%%:*}"; lab="${spec#*:}"
+  OUT=$(RR3190 "$f" -S "$N3190/brief.txt"); RC=$?
+  { [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "size-SM" ]; } \
+    && ok "#3190 AC-4: $lab -> subprocess-zai size-SM (not admitted)" || bad "#3190 AC-4 $lab (rc=$RC out=$OUT)"
+done
+OUT=$(RR3190 r-needle.md -S "$N3190/no-such-brief.txt"); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q '^BRIEF-UNRESOLVABLE'; } \
+  && ok "#3190 AC-4(vi): --brief naming a nonexistent file -> exit 2, BRIEF-UNRESOLVABLE on stdout" || bad "#3190 AC-4(vi) ghost brief (rc=$RC out=$OUT)"
+OUT=$(CC_ROUTES_JSON="$N3190/routes.json" CC_ROLES_ENV="$N3190/roles.env" OPENROUTER_DISPATCH_RECEIPT_FILE="$N3190/r-needle.md" node "$LED" resolve-route --seat plan-review --plan "$N3190/.ai-workspace/plans/2026-10-03-777-plan-S.md" --task 777 --brief "$N3190/brief.txt" --json 2>/dev/null); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#3190 held-out: --brief on the plan-review seat is inert metadata (never admits)" || bad "#3190 plan-review --brief (rc=$RC out=$OUT)"
+
+# ---- AC-5: the L / strike paths are unchanged ----
+OUT=$(RR3190 r-strikes2.md -L "$N3190/brief.txt"); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "zai-strikes" ] && [ "$(printf '%s' "$OUT" | J3190 zai_strikes)" = "2" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "agent-tool" ]; } \
+  && ok "#3190 AC-5: L plan + 2 strikes + needle row -> route_reason=zai-strikes unchanged (precedence)" || bad "#3190 AC-5 strikes precedence (rc=$RC out=$OUT)"
+OUT=$(RR3190 r-none.md -L "-"); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "size-L-zai" ] && [ "$(printf '%s' "$OUT" | J3190 effective_model)" = "glm-5.3" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#3190 AC-5: L plan + no strikes + no needle row -> route_reason=size-L-zai effective_model=glm-5.3 (unchanged)" || bad "#3190 AC-5 L-zai (rc=$RC out=$OUT)"
+OUT=$(RR3190 r-needle.md -L "-"); RC=$?
+{ [ "$RC" = "0" ] && [ "$(printf '%s' "$OUT" | J3190 route_reason)" = "size-L-zai" ] && [ "$(printf '%s' "$OUT" | J3190 effective_dispatch)" = "subprocess-zai" ]; } \
+  && ok "#3190 AC-5: L plan + needle row but NO --brief -> size-L-zai (a receipt is never consulted without the brief)" || bad "#3190 AC-5 row-without-brief (rc=$RC out=$OUT)"
+
+# ---- AC-11: the check advisory prints ROUTE-NEEDLE instead of ROUTE-BYPASS for a needle-admitted close ----
+N3190CHK="$TMP/n3190chk"; mkdir -p "$N3190CHK/ledger" "$N3190CHK/artifacts"
+printf '## ELI5\na plan\n### Binary AC\n- AC1\n' > "$N3190CHK/artifacts/planner-plan.md"
+n3190chk() {  # $1=session -- four satisfied roles, executor closed via Agent-tool (no subprocess stamp)
+  mk_sub "$1" n3190-P; mk_sub "$1" n3190-E; mk_sub "$1" n3190-V; mk_sub "$1" n3190-PR
+  printf '## Review\nverdict: PASS\n' > "$N3190CHK/artifacts/pr-$1.md"
+  printf 'Decision: PASS\n' > "$N3190CHK/artifacts/er-$1.md"
+  node "$LED" append --session "$1" --task 777 --role planner --agent n3190-P --artifact "$N3190CHK/artifacts/planner-plan.md" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role plan-review --agent n3190-PR --artifact "$N3190CHK/artifacts/pr-$1.md" --verdict PASS --reviewed-plan "$N3190/.ai-workspace/plans/2026-10-03-777-plan-S.md" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role executor --agent n3190-E --artifact "PR #777" >/dev/null
+  node "$LED" append --session "$1" --task 777 --role execution-review --oracle "$N3190CHK/artifacts/er-$1.md" >/dev/null
+}
+n3190check() {  # $1=session $2=receipt fixture -> sets COUT/CRC
+  COUT=$(THREE_ROLE_LEDGER_DIR="$N3190CHK/ledger" CC_ROUTES_JSON="$N3190/routes.json" CC_ROLES_ENV="$N3190/roles.env" \
+    OPENROUTER_DISPATCH_RECEIPT_FILE="$N3190/$2" node "$LED" check --session "$1" --task 777 2>&1); CRC=$?; }
+( export THREE_ROLE_LEDGER_DIR="$N3190CHK/ledger"; export CC_ROUTES_JSON="$N3190/routes.json"; export CC_ROLES_ENV="$N3190/roles.env"
+  n3190chk n3190a; n3190chk n3190b )
+n3190check n3190a r-needle.md; rc_a=$CRC; out_a="$COUT"
+n3190check n3190b r-none.md; rc_b=$CRC; out_b="$COUT"
+{ [ "$rc_a" = "0" ] && [ "$(printf '%s' "$out_a" | grep -c '^ROUTE-NEEDLE: role=executor')" = "1" ] && [ "$(printf '%s' "$out_a" | grep -c '^ROUTE-BYPASS: role=executor')" = "0" ]; } \
+  && ok "#3190 AC-11: needle-receipt window -> exactly one ROUTE-NEEDLE: role=executor, zero ROUTE-BYPASS: role=executor" || bad "#3190 AC-11 needle (rc=$rc_a out=$out_a)"
+{ [ "$rc_b" = "0" ] && printf '%s' "$out_b" | grep -q '^ROUTE-BYPASS: role=executor' && ! printf '%s' "$out_b" | grep -q '^ROUTE-NEEDLE:'; } \
+  && ok "#3190 AC-11: same fixture WITHOUT the row -> ROUTE-BYPASS unchanged, exit code identical" || bad "#3190 AC-11 bypass (rc=$rc_b out=$out_b)"
+[ "$rc_a" = "$rc_b" ] && ok "#3190 AC-11: the advisory is exit-code neutral (rc=$rc_a both runs)" || bad "#3190 AC-11 exit codes differ ($rc_a vs $rc_b)"
+
 # ============================================================================================================
 # #3145 leg 1 — plan-review routes by plan size (flash for S/M) + fold-only re-reviews on flash. D1
 # resolver (`plan-review-route`) on brief TEXT, D5 checker branch in checkSubprocessProvenance (with the
