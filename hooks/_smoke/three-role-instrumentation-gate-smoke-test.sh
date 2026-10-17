@@ -1686,8 +1686,14 @@ sz_gate_case() {
 }
 sz_gate_run() { # <task> : run the gate copy from the repo, completion payload citing the perf card
   local t="$1" s="sS$1"
+  # CLAUDE_PLUGIN_ROOT pins the gate copy's helper resolution at the fixture repo (#3154 R2-F1): the
+  # plugin copy of this gate prefers ${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs, and the plugin's CI
+  # runs this smoke with CLAUDE_PLUGIN_ROOT at the plugin checkout -- unpinned, that copy reads the
+  # PLUGIN's refs (never the fixture's refs/remotes/origin/<task>-fixture) and the must-pass arms go
+  # plan-unresolvable. The fixture repo carries its own bin/ copy (sz_mk_repo), so pinning gives the
+  # SAME result in ai-brain (the canonical gate ignores the var) and in the plugin checkout.
   CAP=$(cd "$SZ_REPO" && printf '%s' '{"session_id":"'"$s"'","tool_input":{"taskId":"'"$t"'","status":"completed","metadata":{"model_run":"r","model_perf_log":"'"$TMP"'/perf-s3154.md","outcome_eval":"achieved","outcome_evidence":"'"$OEV"'"}}}' \
-    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" THREE_ROLE_PLANS_DIR="$SZ_PLANS" CLAUDE_PROJECT_DIR="$SZ_REPO" bash "$SZ_REPO/hooks/three-role-instrumentation-gate.sh" 2>&1 >/dev/null); RC=$?
+    | env THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" THREE_ROLE_PLANS_DIR="$SZ_PLANS" CLAUDE_PROJECT_DIR="$SZ_REPO" CLAUDE_PLUGIN_ROOT="$SZ_REPO" bash "$SZ_REPO/hooks/three-role-instrumentation-gate.sh" 2>&1 >/dev/null); RC=$?
 }
 sz_gate_case 93001 S "$LED"; sz_gate_run 93001
 { [ "$RC" = "0" ] && echo "$CAP" | grep -q '4b: waived size-s'; } \

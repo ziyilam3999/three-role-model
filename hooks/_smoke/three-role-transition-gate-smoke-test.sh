@@ -715,8 +715,23 @@ sz_case() {
 }
 # gate through the helper copy in the fixture repo, from the repo cwd (plan not on disk there)
 sz_gate() { sz_run "$SZ_REPO/hooks/3role-ledger.mjs" "$SZ_REPO" gate-plan-review --session "$SZS" --task "$1"; }
-# the REAL hook, executor spawn payload, from the fixture repo
-sz_hook() { CAP=$(cd "$SZ_REPO" && printf '%s' "$(agent "3ROLE_TASK:$1 ROLE:executor -- implement it" "$SZS")" | bash "$SZ_REPO/hooks/three-role-transition-gate.sh" 2>&1 >/dev/null); RC=$?; }
+# the REAL hook, executor spawn payload, from the fixture repo. CLAUDE_PLUGIN_ROOT pins the hook's
+# helper resolution at the fixture repo (#3154 R2-F1): the plugin copy of this hook prefers
+# ${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs, and the plugin's CI runs this smoke with
+# CLAUDE_PLUGIN_ROOT at the plugin checkout -- unpinned, that copy reads the PLUGIN's refs (never the
+# fixture's refs/remotes/origin/<task>-fixture) and every must-pass arm goes plan-unresolvable. The
+# fixture repo carries its own bin/ copy (sz_mk_repo), so pinning gives the SAME result in ai-brain
+# (the canonical hook ignores the var) and in the plugin checkout.
+sz_hook() { CAP=$(cd "$SZ_REPO" && printf '%s' "$(agent "3ROLE_TASK:$1 ROLE:executor -- implement it" "$SZS")" | CLAUDE_PLUGIN_ROOT="$SZ_REPO" bash "$SZ_REPO/hooks/three-role-transition-gate.sh" 2>&1 >/dev/null); RC=$?; }
+# sz_hook_env <plugin-root|-> <task> : the REAL hook under an EXPLICIT CLAUDE_PLUGIN_ROOT ("-" = unset)
+# -- the seam the R2-F1 held-out arms drive (a stand-in shaped like a plugin checkout, or the pin).
+sz_hook_env() {
+  if [ "$1" = "-" ]; then
+    CAP=$(cd "$SZ_REPO" && printf '%s' "$(agent "3ROLE_TASK:$2 ROLE:executor -- implement it" "$SZS")" | env -u CLAUDE_PLUGIN_ROOT bash "$SZ_REPO/hooks/three-role-transition-gate.sh" 2>&1 >/dev/null); RC=$?
+  else
+    CAP=$(cd "$SZ_REPO" && printf '%s' "$(agent "3ROLE_TASK:$2 ROLE:executor -- implement it" "$SZS")" | CLAUDE_PLUGIN_ROOT="$1" bash "$SZ_REPO/hooks/three-role-transition-gate.sh" 2>&1 >/dev/null); RC=$?
+  fi
+}
 
 # size-s-01 (case 1): RED on the snapshot, GREEN on the new helper, GREEN through the real hook
 sz_case 01 92001 S S
@@ -775,5 +790,27 @@ sz_case 12 92012 S twosize; sz_gate 92012
 { [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: plan-size-ambiguous'; } && ok "size-s-12 ok: plan with two flush-left size: lines -> BLOCK 'size-s: plan-size-ambiguous'" || bad "size-s-12 (rc=$SZ_RC out=$SZ_OUT)"
 sz_case 13 92013 S S; printf 'this line is not json\n' >> "$LEDGERDIR/$SZS/92013.jsonl"; sz_gate 92013
 { [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ledger-junk'; } && ok "size-s-13 ok: ledger with trailing junk after the planner row -> BLOCK 'size-s: ledger-junk'" || bad "size-s-13 (rc=$SZ_RC out=$SZ_OUT)"
+
+# size-s-ho1..ho4 (R2-F1 held-out arms, BOTH directions, invented for this fix round -- none taken from
+# any review round). SZ_PLUG is a stand-in shaped like a plugin checkout: its own throw-away git repo
+# carrying bin/3role-ledger.mjs (sz_mk_repo layout) whose refs hold NO fixture plan, so a hook that
+# resolves its helper there reads the stand-in's refs, never the fixture's.
+SZ_PLUG="$TMP/s3154-plugin-standin"; sz_mk_repo "$SZ_PLUG" "$LED" 92020 "-"
+# ho1 MUST-fire: S ticket, plan blob absent everywhere, hook UNPINNED under the stand-in -> BLOCK
+sz_case ho1 92021 S -; sz_hook_env "$SZ_PLUG" 92021
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | command grep -q 'plan-unresolvable'; } \
+  && ok "size-s-ho1 ok: S ticket with the plan missing, hook under a foreign CLAUDE_PLUGIN_ROOT -> BLOCK plan-unresolvable (fails closed, never waived)" || bad "size-s-ho1 (rc=$RC out=$CAP)"
+# ho2 MUST-fire: M ticket (live stamp), S plan, no plan-review, hook UNPINNED under the stand-in -> BLOCK
+sz_case ho2 92022 M S; sz_hook_env "$SZ_PLUG" 92022
+{ [ "$RC" = "2" ] && printf '%s' "$CAP" | command grep -q 'size-s: ticket-size-M'; } \
+  && ok "size-s-ho2 ok: M ticket with no plan-review under a foreign CLAUDE_PLUGIN_ROOT -> BLOCK ticket-size-M (the live stamp decides before any plan lookup)" || bad "size-s-ho2 (rc=$RC out=$CAP)"
+# ho3 MUST-NOT-fire: correctly stamped S ticket + S plan, hook PINNED to the fixture repo (the plugin-CI shape)
+sz_case ho3 92023 S S; sz_hook_env "$SZ_REPO" 92023
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "size-s-ho3 ok: S + plan with CLAUDE_PLUGIN_ROOT at the fixture repo -> ALLOW silent (same result in both layouts)" || bad "size-s-ho3 (rc=$RC out=$CAP)"
+# ho4 MUST-NOT-fire: the same shape with CLAUDE_PLUGIN_ROOT unset (the ai-brain layout)
+sz_case ho4 92024 S S; sz_hook_env - 92024
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
+  && ok "size-s-ho4 ok: S + plan with CLAUDE_PLUGIN_ROOT unset -> ALLOW silent (the ../bin fallback lands on the fixture copy)" || bad "size-s-ho4 (rc=$RC out=$CAP)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
