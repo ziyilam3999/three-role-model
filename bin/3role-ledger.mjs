@@ -2034,7 +2034,20 @@ function seatDispatchIsSubprocess(role) {
   const routesLoaded = loadRoutesConfig();
   if (!routesLoaded.ok) return { ok: false, seat: null };
   const seat = (routesLoaded.routes.seats || {})[role];
-  if (!seat || !isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
+  if (!seat) return { ok: false, seat: null };
+  // #3218 D4 site 3 — a valid ROUTE pin is honoured HERE, the single most important site: this is the
+  // admissibility decision behind the completion gate (`check`), the transition gate (gate-plan-review)
+  // and lane liveness. A role route-pinned onto a subprocess provider is admissible exactly as if its
+  // SSOT row declared the dispatch (today a planner row carrying dispatch=subprocess-zai is IGNORED here
+  // and falls to the agentId arm, which blocks); a role route-pinned onto anthropic is NOT a subprocess
+  // seat — the marker falls through to the ordinary agentId arm. Same silent-overlay discipline as the
+  // slug pin below (resolve-route/resolve-role-model surface the SEAT-PIN-HONORED/REFUSED notes at the
+  // one place an operator watches).
+  const routePin = resolveRoutePin(role, routesLoaded.routes);
+  if (routePin.pinned) {
+    return isSubprocessDispatch(routePin.seat.dispatch) ? { ok: true, seat: routePin.seat } : { ok: false, seat: null };
+  }
+  if (!isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
   // #1918 n2 (execution-review hand-off) — overlay a valid SLUG pin HERE, where the OBSERVED-model
   // comparison actually bites for a subprocess seat: checkSubprocessProvenance's `info.servedModel !==
   // decl.seat.model` check below (the operative provenance gate for a dispatch=subprocess-openrouter row).
@@ -5154,9 +5167,24 @@ function cmdCheck(o) {
           // BYTE-IDENTICAL to the pre-#1640 comparison for every role whose seat is not SSOT-declared non-
           // Anthropic (expectedSide.tier === legacyExpected in that case).
           let expected = roleModelFromCfg(cfg, role);
+          // #3218 D4 site 4 — ROUTE pin overlay, resolved FIRST (before the size overlay and the tier pin
+          // below): a valid route pin sets the completion gate's expected tier from the SAME D3 effective
+          // row every other reader consumes (its agent_tool_fallback — the pinned model's tier_equivalent
+          // for a pin onto anthropic; the seat's own SSOT tier for a subprocess pin), and suppresses both
+          // the size overlay and the tier pin (one role, one effective pin; a pin wins over the size rule).
+          const rSeatPin = routesLoaded.ok ? resolveRoutePin(role, routesLoaded.routes) : { pinned: false, present: false };
+          if (rSeatPin.refusalNote) process.stderr.write(rSeatPin.refusalNote + '\n');
+          if (rSeatPin.pinned) {
+            process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' completion-gate expected tier pinned via route to "' +
+              rSeatPin.value + '" (tier ' + rSeatPin.seat.agent_tool_fallback + ')' +
+              (rSeatPin.reason ? ' reason="' + rSeatPin.reason + '"' : '') +
+              (rSeatPin.set_at ? ' set_at=' + rSeatPin.set_at : '') + '\n');
+            expected = rSeatPin.seat.agent_tool_fallback;
+          }
           // #3140 Leg 2 -- planner size overlay on the completion gate's expected side (same function as the
           // resolver: plannerSizeOverlay). Applied BEFORE the seat pin below, so a pin still wins.
-          const sizeOv = plannerSizeOverlay(routesLoaded, role, session, task, o['tasks-dir']);
+          const sizeOv = rSeatPin.pinned ? { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' }
+            : plannerSizeOverlay(routesLoaded, role, session, task, o['tasks-dir']);
           if (sizeOv.applies) expected = sizeOv.tier;
           // #1918 D2/AC3/AC4(b)/AC5(b) — TIER pin overlay on the completion gate's OWN tier-mismatch
           // comparison (the actual gate this role's Anthropic-observed transcript is judged against).
@@ -5164,7 +5192,7 @@ function cmdCheck(o) {
           // resolveTierPin() independently self-excludes CC_ROUTES_JSON too (seatPinBlind(), D3b), so this
           // stays pin-blind under BOTH terminal test seams (AC6) and never reachable before the clean-SSOT
           // resolve above (D3c/n4). A malformed/off-vocabulary pin resolves `expected` UNCHANGED (AC4/AC5).
-          const seatPin = routesLoaded.ok ? resolveTierPin(role) : { pinned: false };
+          const seatPin = (routesLoaded.ok && !rSeatPin.pinned) ? resolveTierPin(role) : { pinned: false };
           if (seatPin.refusalNote) process.stderr.write(seatPin.refusalNote + '\n');
           if (seatPin.pinned) {
             process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' completion-gate expected tier pinned to "' +
@@ -7111,12 +7139,29 @@ function cmdResolveRoleModel(o) {
 
   // Step 3 — SSOT present + valid + no override: the real SSOT-first path (S6).
   if (routesLoaded.ok) {
-    const seat = (routesLoaded.routes.seats || {})[role];
+    let seat = (routesLoaded.routes.seats || {})[role];
     if (!seat) {
       process.stderr.write('ROUTE-ROLE-MISSING: routes.seats.' + role + ' not declared in ' + routesLoaded.configPath +
         ' -- falling back to opus fail-safe (this role only).\n');
       printRoleModel('opus', '', 'opus', withEffort, withVersion);
       return;
+    }
+    // #3218 D3/D4 site 1 — ROUTE pin overlay, AFTER the clean-SSOT lookup (same #2401/#1918 ordering
+    // discipline as the tier pin below: a pin can never mask a config/ sparse-omission or rescue a broken
+    // SSOT). A valid route pin swaps in the D3 effective row wholesale: its agent_tool_fallback always
+    // carries the tier this resolver must answer with (the pinned model's tier_equivalent for a pin onto
+    // anthropic, R4; the seat's own SSOT Anthropic tier for a pin onto a subprocess provider — an
+    // accidental Agent-tool spawn of a z.ai-pinned planner lands on Opus, never Fable). A refused route
+    // entry resolves UNPINNED with a SEAT-PIN-REFUSED note; it also suppresses the tier pin (one role,
+    // one effective pin, D1) and the planner size overlay (size_models is dropped from the effective row
+    // — a pin wins over the size rule, R2).
+    announceSeatPinFileProblem();
+    const routePin = resolveRoutePin(role, routesLoaded.routes);
+    if (routePin.refusalNote) process.stderr.write(routePin.refusalNote + '\n');
+    if (routePin.pinned) {
+      process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' route pinned to "' + routePin.value + '"' +
+        (routePin.reason ? ' reason="' + routePin.reason + '"' : '') + (routePin.set_at ? ' set_at=' + routePin.set_at : '') + '\n');
+      seat = routePin.seat;
     }
     // #1947 AC-2/M3 -- a seat carrying an explicit `agent_tool_fallback` tier (the two subprocess-dispatched
     // seats, plan-review/executor) resolves to THAT tier here, NEVER to model_vocabulary's tier_equivalent.
@@ -7142,18 +7187,20 @@ function cmdResolveRoleModel(o) {
     }
     let tier = ident.tierEquivalent;
     // #3140 Leg 2 -- size overlay (planner only): L ticket -> size_models.L tier. Applied BEFORE the seat pin so
-    // an operator seat pin still wins (D3 confirmation, "pin wins").
+    // an operator seat pin still wins (D3 confirmation, "pin wins"). #3218: suppressed entirely under a
+    // route pin (the effective row drops size_models — a route pin wins over the size rule too, R2).
     let sizeModel = '';
-    const sov = plannerSizeOverlay(routesLoaded, role, o.session, o.task, o['tasks-dir']);
+    const sov = routePin.pinned ? { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' }
+      : plannerSizeOverlay(routesLoaded, role, o.session, o.task, o['tasks-dir']);
     if (sov.applies) { tier = sov.tier; sizeModel = sov.model; }
     else if (sov.eligible && !sov.size) process.stderr.write('SIZE-TIER-DEFAULT: planner size=' + sov.shown + ' -> ' + tier + '\n');
     // #1918 D2/D3(c) — TIER pin overlay, AFTER the clean-SSOT resolve above (D3c) and AFTER the #2401
     // sparse-omission guard at the top of this function — a pin can never mask a config/ sparse-omission or
     // rescue a broken SSOT, it only overlays an ALREADY-clean resolve. resolveTierPin() is itself seam-blind
     // (D3b) and fails safe to `false` on a malformed/off-vocabulary pin, so `tier` only ever changes here to
-    // an already-declared value.
+    // an already-declared value. #3218 D1: suppressed under a route pin (one role, one effective pin).
     announceSeatPinFileProblem();
-    const pin = resolveTierPin(role);
+    const pin = routePin.pinned ? { pinned: false } : resolveTierPin(role);
     if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
     if (pin.pinned) {
       process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' tier pinned to "' + pin.tier + '"' +
@@ -7660,14 +7707,28 @@ function resolveRoute(routes, seatKey) {
   // C-3 gate an unpinned slug would be — never a bypass. Diagnostics go to STDERR ONLY (never stdout — the
   // caller may be `--json`, and tools/openrouter-role-dispatch.sh forwards this function's stderr separately
   // from the JSON payload it parses; mixing them would corrupt that JSON.parse).
+  // #3218 D2/D3 — the ROUTE pin overlay sits at the SAME place and is consulted FIRST: a valid route pin
+  // replaces the whole effective row (provider/model/dispatch/agent_tool_fallback, size_models dropped) and
+  // the C-2/C-3 guards below then judge that EFFECTIVE row, so a cross-provider pin can never bypass them.
+  // A refused route entry resolves UNPINNED (byte-identical to no-pin stdout) with SEAT-PIN-REFUSED on
+  // stderr; a route entry (honored or refused) suppresses the slug overlay — one role, one effective pin.
   announceSeatPinFileProblem();
-  const pin = resolveSlugPin(seatKey, routes, seatRow);
-  if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
   let effectiveSeat = seatRow;
-  if (pin.pinned) {
-    effectiveSeat = Object.assign({}, seatRow, { model: pin.slug });
-    process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' slug pinned to "' + pin.slug + '"' +
-      (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+  const routePin = resolveRoutePin(seatKey, routes);
+  if (routePin.refusalNote) process.stderr.write(routePin.refusalNote + '\n');
+  if (routePin.pinned) {
+    effectiveSeat = routePin.seat;
+    process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' route pinned to "' + routePin.value + '"' +
+      (routePin.reason ? ' reason="' + routePin.reason + '"' : '') + (routePin.set_at ? ' set_at=' + routePin.set_at : '') + '\n');
+  }
+  if (!routePin.present) {
+    const pin = resolveSlugPin(seatKey, routes, seatRow);
+    if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
+    if (pin.pinned) {
+      effectiveSeat = Object.assign({}, seatRow, { model: pin.slug });
+      process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' slug pinned to "' + pin.slug + '"' +
+        (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+    }
   }
   const cap = checkCapability(routes, effectiveSeat);
   if (!cap.ok) return { ok: false, reason: cap.reason };
@@ -7854,8 +7915,15 @@ function cmdPlanReviewRoute(opts) {
   const seatRow = (loaded.routes.seats || {})['plan-review'];
   if (!seatRow) { console.log('ROUTE-SEAT-NOT-FOUND: no seat "plan-review" in the SSOT'); process.exit(2); }
   let seat = seatRow;
-  const pin = resolveSlugPin('plan-review', loaded.routes, seatRow);
-  if (pin.pinned) seat = Object.assign({}, seatRow, { model: pin.slug });
+  // #3218 D4 site 5 — the SAME shared pin-overlay helpers, never a third copy: a valid ROUTE pin on
+  // plan-review swaps in the D3 effective row wholesale (this is what routes a plan-review brief onto
+  // anthropic or another z.ai model); the slug pin applies only when no route entry exists.
+  const routePin = resolveRoutePin('plan-review', loaded.routes);
+  if (routePin.pinned) seat = routePin.seat;
+  else {
+    const pin = resolveSlugPin('plan-review', loaded.routes, seatRow);
+    if (pin.pinned) seat = Object.assign({}, seatRow, { model: pin.slug });
+  }
   const task = ('task' in opts && opts.task) ? opts.task : undefined;
   const route = planReviewRouteFromBrief(text, task, seat, undefined);
   if ('json' in opts) console.log(JSON.stringify(route));
@@ -8530,7 +8598,8 @@ function cmdLintRoutes(opts) {
 // in this file — `cmdResolveRoleModel` (spawn decision + spawn-time gate), `resolveExpectedSide`/
 // `roleModelFromCfg`'s completion-gate call sites, and `resolveRoute`/`checkSubprocessProvenance` (subprocess
 // dispatch + its provenance check) are three separate code paths that never call each other. Every one of them
-// consults the SAME two functions below (`resolveTierPin` / `resolveSlugPin`) so honor / refuse / fail-safe /
+// consults the SAME functions below (`resolveTierPin` / `resolveSlugPin`, and since #3218 `resolveRoutePin`
+// for the cross-provider route kind) so honor / refuse / fail-safe /
 // seam-blind behavior cannot diverge across paths (plan-review B1's fix; #1918 plan D2/AC3-AC7). Per execution-
 // review hand-off n2, the SLUG pin is wired at `checkSubprocessProvenance`'s OWN served-model comparison (the
 // path the OBSERVED-model check actually bites for a subprocess seat), never at `resolveExpectedSide`'s
@@ -8675,21 +8744,151 @@ function resolveSlugPin(role, routes, seatRow) {
     reason: field.reason ? String(field.reason) : '', set_at: field.set_at ? String(field.set_at) : '' };
 }
 
+// #3218 — ROUTE pin: the cross-provider seat move. Value grammar "<provider>/<model>", split at the FIRST
+// '/' (D2 amendment F4): provider = the text before the first '/', model = the WHOLE remainder (so
+// `openrouter/z-ai/glm-5.2` is provider `openrouter`, model `z-ai/glm-5.2`; a value with no '/' — or an
+// empty side — is malformed). Valid only when (a) the provider is declared in the SSOT, (b) the model is
+// in that provider's model_vocabulary, (c) the SSOT already declares the dispatch route somewhere (some
+// seat declares `dispatch: subprocess-<provider>` for a non-anthropic provider; the Agent-tool route — a
+// seat with no `dispatch` field — exists for anthropic), and (d) the role is in the closed route-pinnable
+// list planner|plan-review|executor|research (execution-review excluded by the operator's 2026-10-17
+// "keep Opus final review" decision). The SAME validator runs at SET time (cmdSetSeatPin, loud BLOCK
+// naming the failing rule) and at RESOLVE time (resolveRoutePin, SEAT-PIN-REFUSED + resolve UNPINNED) —
+// one grammar, never two copies.
+const ROUTE_PIN_ROLES = ['planner', 'plan-review', 'executor', 'research'];
+function validateRoutePinValue(routes, role, value) {
+  const refuse = (rule, note) => ({ ok: false, rule, note });
+  if (!ROUTE_PIN_ROLES.includes(role)) {
+    return refuse('role', 'role "' + role + '" is not route-pinnable (closed list ' + ROUTE_PIN_ROLES.join('|') +
+      '; execution-review is excluded by the operator\'s 2026-10-17 "keep Opus final review" decision)');
+  }
+  if (typeof value !== 'string') {
+    return refuse('malformed', 'route value is not a string');
+  }
+  const slash = value.indexOf('/');
+  if (slash < 1 || slash === value.length - 1) {
+    return refuse('malformed', '"' + value + '" is not a <provider>/<model> value (split at the FIRST "/"; no "/" — or an empty side — is malformed)');
+  }
+  const provider = value.slice(0, slash);
+  const model = value.slice(slash + 1);
+  const providers = (routes && routes.providers) || {};
+  if (!Object.prototype.hasOwnProperty.call(providers, provider)) {
+    return refuse('provider', 'provider "' + provider + '" is not declared in the routes SSOT');
+  }
+  const vocab = (providers[provider] || {}).model_vocabulary;
+  if (!vocab || typeof vocab !== 'object' || Array.isArray(vocab) || !Object.prototype.hasOwnProperty.call(vocab, model)) {
+    return refuse('vocabulary', '"' + model + '" is not in provider "' + provider + '"\'s declared model_vocabulary');
+  }
+  const seats = (routes && routes.seats) || {};
+  if (provider === 'anthropic') {
+    // rule (c), anthropic arm: the Agent-tool route (a seat with no dispatch field) must exist in the SSOT.
+    const agentToolRouteExists = Object.values(seats).some((s) => s && typeof s === 'object' && !s.dispatch);
+    if (!agentToolRouteExists) {
+      return refuse('declared-route', 'no seat declares the Agent-tool route (a seat with no dispatch field) for provider "anthropic"');
+    }
+  } else {
+    // rule (c), subprocess arm: some seat must already declare dispatch=subprocess-<provider>.
+    const marker = 'subprocess-' + provider;
+    const declared = Object.values(seats).some((s) => s && typeof s === 'object' && s.dispatch === marker);
+    if (!declared) {
+      return refuse('declared-route', 'no seat declares dispatch="' + marker + '" anywhere in the SSOT — a pin never invents a route');
+    }
+  }
+  return { ok: true, provider, model };
+}
+
+// The seat's OWN SSOT Anthropic tier — the landing value an accidental Agent-tool spawn of a
+// subprocess-pinned seat resolves to (#3218 D3, the #1947 AC-2/M3 rule): the row's explicit
+// agent_tool_fallback when it declares a valid one, else the tier_equivalent of the row's own model,
+// else the opus fail-safe.
+function seatOwnAnthropicTier(seatRow, routes) {
+  if (seatRow && seatRow.agent_tool_fallback && ROLE_MODELS.includes(seatRow.agent_tool_fallback)) {
+    return seatRow.agent_tool_fallback;
+  }
+  const ident = seatRow ? identifyModel(routes, seatRow.model) : { ok: false };
+  return (ident.ok && ROLE_MODELS.includes(ident.tierEquivalent)) ? ident.tierEquivalent : 'opus';
+}
+
+// The #3218 D3 EFFECTIVE seat row under a valid route pin: provider+model from the pin; dispatch =
+// `subprocess-<provider>` (non-anthropic) or ABSENT (anthropic); agent_tool_fallback = the pinned
+// model's tier_equivalent for a pin onto anthropic (so resolve-role-model answers with it, R4), or the
+// seat's own SSOT Anthropic tier for a pin onto a subprocess provider (a z.ai-pinned planner's accidental
+// Agent-tool spawn lands on Opus, never Fable); effort and every guard-bearing field (task_class,
+// data_sensitivity) carried from the SSOT row so C-2/C-3 still run on the EFFECTIVE row; size_models
+// DROPPED (a pin wins over the size rule, #3140 D3 / #3218 R2).
+function routePinnedSeatRow(seatRow, routes, provider, model) {
+  const next = Object.assign({}, seatRow);
+  delete next.size_models;
+  next.provider = provider;
+  next.model = model;
+  if (provider === 'anthropic') {
+    delete next.dispatch;
+    const pinnedTier = identifyModel(routes, model).tierEquivalent;
+    next.agent_tool_fallback = (ROLE_MODELS.includes(pinnedTier)) ? pinnedTier : seatOwnAnthropicTier(seatRow, routes);
+  } else {
+    next.dispatch = 'subprocess-' + provider;
+    next.agent_tool_fallback = seatOwnAnthropicTier(seatRow, routes);
+  }
+  return next;
+}
+
+// ROUTE pin resolve (the #3218 sibling of resolveTierPin/resolveSlugPin, same contract shape). `routes`
+// must already be a loaded, valid SSOT object. Returns:
+//   { pinned:false, present:false }                      -- no route entry for this role (the normal case).
+//   { pinned:false, present:true, refused, refusalNote } -- an entry exists but fails a rule -> resolve
+//     UNPINNED; refusalNote is stderr text naming the key and the failing rule.
+//   { pinned:true, present:true, value, provider, model, seat, reason, set_at } -- a VALID pin; `seat` is
+//     the D3 effective row every caller overlays wholesale (never a second hand-built copy).
+// `present` lets resolveRoute/cmdPlanReviewRoute skip the slug pin when a route entry exists (one role,
+// one effective pin, #3218 D1 — set-time replacement makes coexistence hand-planted-only, and a refused
+// route entry never silently falls back to a coexisting slug).
+function resolveRoutePin(role, routes) {
+  if (seatPinBlind()) return { pinned: false, present: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false, present: false };
+  const roleEntry = loaded.pins[role];
+  if (!roleEntry || typeof roleEntry !== 'object' || Array.isArray(roleEntry) || !('route' in roleEntry)) {
+    return { pinned: false, present: false };
+  }
+  const field = roleEntry.route;
+  const value = (field && typeof field === 'object' && !Array.isArray(field) && field.value != null) ? String(field.value) : null;
+  if (value === null) {
+    return { pinned: false, present: true, refused: '<malformed entry>', refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path +
+      ' role ' + role + '.route entry is not a {value,reason,set_at} object -- resolving UNPINNED (fail-safe, #3218 D2 rule malformed)' };
+  }
+  const v = validateRoutePinValue(routes, role, value);
+  if (!v.ok) {
+    return { pinned: false, present: true, refused: value, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.route "' + value + '" fails rule (' + v.rule + '): ' + v.note + ' -- resolving UNPINNED (fail-safe, #3218 D2)' };
+  }
+  const seatRow = ((routes && routes.seats) || {})[role];
+  if (!seatRow) return { pinned: false, present: true, refused: value, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path +
+    ' role ' + role + '.route "' + value + '" has no SSOT seat row to overlay -- resolving UNPINNED (fail-safe, #3218 D2)' };
+  return { pinned: true, present: true, value, provider: v.provider, model: v.model,
+    seat: routePinnedSeatRow(seatRow, routes, v.provider, v.model),
+    reason: (field.reason != null) ? String(field.reason) : '', set_at: (field.set_at != null) ? String(field.set_at) : '' };
+}
+
 // set-seat-pin --role <role> (--tier <t> | --slug <s>) --reason "<text>" [--task T]
 // #2189-style discipline (D5): --reason is REQUIRED on every write — a reason-less flip is refused BEFORE the
 // pin file is read or touched (mirrors cmdSetMode's #2189 AC-1(c) fix). Validates the value against the SAME
 // declared vocabulary the resolvers themselves enforce, so a bad pin is refused loudly AT SET-TIME too, not
 // only silently ignored later at resolve-time. Merges into (never replaces) the role's existing entry, so
-// setting `slug` never drops a pre-existing `tier` pin for the same role and vice versa. Atomic write
+// setting `slug` never drops a pre-existing `tier` pin for the same role and vice versa. #3218 D1: a ROUTE
+// pin is the ONE exception to that merge — setting it REPLACES the role's tier+slug entries (one role, one
+// effective pin, no precedence puzzle), and setting a tier/slug replaces a route entry for the same reason;
+// the OK line says so on stdout whenever a replacement happened. Atomic write
 // (temp-file-plus-rename in the pin's own directory) mirrors cmdSetMode's AC-19 discipline.
 function cmdSetSeatPin(o) {
   const role = o.role;
   if (!role) { console.log('BLOCK: set-seat-pin requires --role <role>'); process.exit(2); }
   const hasTier = ('tier' in o) && o.tier;
   const hasSlug = ('slug' in o) && o.slug;
-  if (!hasTier && !hasSlug) { console.log('BLOCK: set-seat-pin requires --tier <t> or --slug <s>'); process.exit(2); }
-  if (hasTier && hasSlug) {
-    console.log('BLOCK: set-seat-pin: pass exactly one of --tier or --slug per call (they merge into the same role entry across separate calls)');
+  const hasRoute = ('route' in o) && o.route;
+  if (!hasTier && !hasSlug && !hasRoute) { console.log('BLOCK: set-seat-pin requires --tier <t>, --slug <s> or --route <provider/model>'); process.exit(2); }
+  const kindCount = (hasTier ? 1 : 0) + (hasSlug ? 1 : 0) + (hasRoute ? 1 : 0);
+  if (kindCount > 1) {
+    console.log('BLOCK: set-seat-pin: pass exactly one of --tier, --slug or --route per call (tier/slug merge into the same role entry across separate calls; a route pin replaces them, #3218 D1)');
     process.exit(2);
   }
   if (!o.reason) {
@@ -8720,6 +8919,28 @@ function cmdSetSeatPin(o) {
     }
     slugIdent = ident;
   }
+  if (hasRoute) {
+    if (!routesLoaded.ok) {
+      console.log('BLOCK: set-seat-pin: cannot validate --route -- ' + routesLoaded.error);
+      process.exit(2);
+    }
+    const v = validateRoutePinValue(routesLoaded.routes, role, String(o.route));
+    if (!v.ok) {
+      console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails rule (' + v.rule + '): ' + v.note);
+      process.exit(2);
+    }
+    // #3218 R5 — pre-check the C-2/C-3 resolve-time guards on the EFFECTIVE row, so a guard refusal is
+    // loud AT SET TIME too (the same guards run again on every resolve; this never widens them).
+    const seatRow = (routesLoaded.routes.seats || {})[role];
+    const eff = routePinnedSeatRow(seatRow, routesLoaded.routes, v.provider, v.model);
+    const cap = checkCapability(routesLoaded.routes, eff);
+    if (!cap.ok) { console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails the capability guard: ' + cap.reason); process.exit(2); }
+    const sens = checkDataSensitivity(routesLoaded.routes, eff);
+    if (!sens.ok) {
+      const acc = checkAcceptance(routesLoaded.routes, eff);
+      if (!acc.ok) { console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails the data-sensitivity guard: ' + sens.reason); process.exit(2); }
+    }
+  }
 
   const pinPath = resolveSeatPinPath();
   let existingRaw;
@@ -8727,10 +8948,18 @@ function cmdSetSeatPin(o) {
   let existing = {};
   if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- overwrite cleanly below */ } }
   const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
+  // #3218 D1 — one role, one effective pin: a route set replaces tier+slug; a tier/slug set replaces route.
+  const replaced = [];
+  if (hasRoute) {
+    for (const k of ['tier', 'slug']) if (k in roleEntry) { delete roleEntry[k]; replaced.push(k); }
+  } else if ('route' in roleEntry) {
+    delete roleEntry.route;
+    replaced.push('route');
+  }
   const nowIso = new Date().toISOString();
-  const fieldObj = { value: hasTier ? String(o.tier) : String(o.slug), reason: String(o.reason), set_at: nowIso };
+  const fieldObj = { value: hasTier ? String(o.tier) : (hasSlug ? String(o.slug) : String(o.route)), reason: String(o.reason), set_at: nowIso };
   if (o.task) fieldObj.task = String(o.task);
-  if (hasTier) roleEntry.tier = fieldObj; else roleEntry.slug = fieldObj;
+  if (hasTier) roleEntry.tier = fieldObj; else if (hasSlug) roleEntry.slug = fieldObj; else roleEntry.route = fieldObj;
   const next = Object.assign({}, existing, { [role]: roleEntry });
 
   const dir = path.dirname(pinPath);
@@ -8748,12 +8977,63 @@ function cmdSetSeatPin(o) {
     writeBypassLog('3role-ledger-set-seat-pin', 'CC_SEAT_PIN', 'PERMIT',
       { task: sanitize(o.task || ''), role, provider: slugIdent ? slugIdent.provider : '' });
   } catch (e) { /* best-effort -- audit failure must never un-do an already-committed pin write */ }
-  console.log('OK: seat pin set -- role=' + role + ' ' + (hasTier ? 'tier=' + o.tier : 'slug=' + o.slug) + ' reason="' + o.reason + '"');
+  console.log('OK: seat pin set -- role=' + role + ' ' + (hasTier ? 'tier=' + o.tier : (hasSlug ? 'slug=' + o.slug : 'route=' + o.route)) +
+    ' reason="' + o.reason + '"' + (replaced.length ? ' (replaced this role\'s existing ' + replaced.join('+') + ' pin entr' + (replaced.length > 1 ? 'ies' : 'y') + ' — one role, one effective pin, #3218 D1)' : ''));
   process.exit(0);
 }
 
-// clear-seat-pin --role <role> [--tier] [--slug] --reason "<text>"  -- neither --tier nor --slug clears BOTH
-// keys for the role. --reason required (D5, same discipline as the set verb).
+// clear-seat-pin --role <role> [--tier] [--slug] [--route] --reason "<text>"  -- none of --tier/--slug/
+// --route clears ALL keys for the role. --reason required (D5, same discipline as the set verb).
+// #3218 D5/R1: clearing a ROUTE pin warns (never refuses) when the ledger holds an OPEN row for this role
+// whose dispatch marker only the pin made admissible — that row turns into an agentId-arm block at the next
+// check until the pin is re-set or the chain closes; the honest recovery is to re-set the pin.
+function seatPinOrphanedOpenRows(role) {
+  // INPUT-BOUND: at most 500 ledger files, 512 KiB read per file. Past either bound the scan STOPS and the
+  // caller still warns about what it found (over-warn, never silent) plus a truncation note — this scan can
+  // never loop, balloon, or fail open on an oversized store.
+  const found = [];
+  let truncated = false;
+  const routesLoaded = loadRoutesConfig();
+  const ssotDispatch = routesLoaded.ok ? (((routesLoaded.routes.seats || {})[role] || {}).dispatch || '') : '';
+  let files = [];
+  try {
+    for (const sess of fs.readdirSync(LEDGER_DIR)) {
+      const sessDir = path.join(LEDGER_DIR, sess);
+      let st; try { st = fs.statSync(sessDir); } catch (e) { continue; }
+      if (!st.isDirectory()) continue;
+      for (const f of fs.readdirSync(sessDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        if (files.length >= 500) { truncated = true; break; }
+        files.push(path.join(sessDir, f));
+      }
+      if (truncated) break;
+    }
+  } catch (e) { return { found, truncated }; }
+  for (const file of files) {
+    let raw;
+    try {
+      const fd = fs.openSync(file, 'r');
+      try {
+        const size = Math.min(fs.fstatSync(fd).size, 512 * 1024);
+        const buf = Buffer.alloc(size);
+        fs.readSync(fd, buf, 0, size, 0);
+        raw = buf.toString('utf8');
+      } finally { fs.closeSync(fd); }
+    } catch (e) { continue; }
+    const lines = raw.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i].trim();
+      if (!ln) continue;
+      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+      if (!j || j.role !== role || j.closedAt || !isSubprocessDispatch(j.dispatch)) continue;
+      // "only the pin made it admissible": the SSOT-without-pin does not declare this dispatch for the seat.
+      if (ssotDispatch === j.dispatch) continue;
+      found.push(path.relative(LEDGER_DIR, file) + ':' + (i + 1) + ' dispatch=' + j.dispatch);
+    }
+  }
+  return { found, truncated };
+}
+
 function cmdClearSeatPin(o) {
   const role = o.role;
   if (!role) { console.log('BLOCK: clear-seat-pin requires --role <role>'); process.exit(2); }
@@ -8763,14 +9043,26 @@ function cmdClearSeatPin(o) {
   }
   const clearTier = ('tier' in o);
   const clearSlug = ('slug' in o);
+  const clearRoute = ('route' in o);
   const pinPath = resolveSeatPinPath();
   let existingRaw;
   try { existingRaw = fs.readFileSync(pinPath, 'utf8'); } catch (e) { existingRaw = ''; }
   let existing = {};
   if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- clear writes a clean file below */ } }
   const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
-  if (clearTier || (!clearTier && !clearSlug)) delete roleEntry.tier;
-  if (clearSlug || (!clearTier && !clearSlug)) delete roleEntry.slug;
+  // #3218 D5/R1 — the open-row warning fires only when a route pin is ACTUALLY being cleared now.
+  if ((clearRoute || (!clearTier && !clearSlug)) && roleEntry.route) {
+    const scan = seatPinOrphanedOpenRows(role);
+    if (scan.found.length) {
+      const shown = scan.found.slice(0, 3).join(', ') + (scan.found.length > 3 ? ', … (' + scan.found.length + ' total)' : '');
+      process.stderr.write('SEAT-PIN-CLEAR-WARN: ' + scan.found.length + ' open ' + role + ' row(s) whose dispatch only this route pin made ' +
+        'admissible — they will block on the agentId arm at the next check until the pin is re-set (R1, #3218 D5; honest recovery: re-set the pin)' +
+        ': ' + shown + (scan.truncated ? ' (scan truncated at the 500-file/512KiB input bound — over-warn, never silent)' : '') + '\n');
+    }
+  }
+  if (clearTier || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.tier;
+  if (clearSlug || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.slug;
+  if (clearRoute || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.route;
   const next = Object.assign({}, existing);
   if (Object.keys(roleEntry).length) next[role] = roleEntry; else delete next[role];
 
@@ -8786,13 +9078,16 @@ function cmdClearSeatPin(o) {
     process.exit(2);
   }
   try { writeBypassLog('3role-ledger-clear-seat-pin', 'CC_SEAT_PIN', 'PERMIT', { task: sanitize(o.task || ''), role }); } catch (e) { /* best-effort */ }
-  console.log('OK: seat pin cleared -- role=' + role + (clearTier ? ' tier' : '') + (clearSlug ? ' slug' : '') +
-    (!clearTier && !clearSlug ? ' (all keys)' : ''));
+  console.log('OK: seat pin cleared -- role=' + role + (clearTier ? ' tier' : '') + (clearSlug ? ' slug' : '') + (clearRoute ? ' route' : '') +
+    (!clearTier && !clearSlug && !clearRoute ? ' (all keys)' : ''));
   process.exit(0);
 }
 
-// list-seat-pins [--json] -- D5 standing visibility: role, value, reason, and AGE for every active pin, so a
-// silent permanent shadow pin is impossible. Never fails -- a broken pin file is reported, not crashed on.
+// list-seat-pins [--json] [--one-line] -- D5 standing visibility: role, value, reason, and AGE for every
+// active pin, so a silent permanent shadow pin is impossible. Never fails -- a broken pin file is reported,
+// not crashed on. #3218 D6: `route` rows list like tier/slug rows, and --one-line prints EXACTLY one line,
+// `SEAT-PINS: <role>=<kind>:<value> ...` (roles in the pin file's own order) or `SEAT-PINS: none` -- the
+// shape render-route-views follow-ups and one-glance operator checks consume.
 function cmdListSeatPins(o) {
   const loaded = loadSeatPinsFile();
   if (!loaded.ok) {
@@ -8803,7 +9098,7 @@ function cmdListSeatPins(o) {
   const nowMs = Date.now();
   for (const [role, entry] of Object.entries(loaded.pins || {})) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-    for (const key of ['tier', 'slug']) {
+    for (const key of ['tier', 'slug', 'route']) {
       const field = entry[key];
       if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) continue;
       const setAt = field.set_at ? String(field.set_at) : '';
@@ -8818,6 +9113,9 @@ function cmdListSeatPins(o) {
   }
   if ('json' in o) {
     console.log(JSON.stringify({ path: loaded.path, absent: !!loaded.absent, pins: rows }));
+  } else if ('one-line' in o) {
+    if (!rows.length) console.log('SEAT-PINS: none');
+    else console.log('SEAT-PINS: ' + rows.map((r) => r.role + '=' + r.key + ':' + r.value).join(' '));
   } else if (!rows.length) {
     console.log('OK: no active seat pins (' + loaded.path + (loaded.absent ? ' absent' : '') + ')');
   } else {
@@ -9260,9 +9558,9 @@ try {
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
       '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
       '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
-      '[--role R (--tier T | --slug S) --reason "..." [--task T] (set-seat-pin, #1918)] ' +
-      '[--role R [--tier] [--slug] --reason "..." (clear-seat-pin, #1918)] ' +
-      '[[--json] (list-seat-pins, #1918)]' +
+      '[--role R (--tier T | --slug S | --route <provider/model>) --reason "..." [--task T] (set-seat-pin, #1918/#3218)] ' +
+      '[--role R [--tier] [--slug] [--route] --reason "..." (clear-seat-pin, #1918/#3218)] ' +
+      '[[--json] [--one-line] (list-seat-pins, #1918/#3218)]' +
       ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]' +
       ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]' +
       ' [--session S [--task T] [--dry-run] (repair-subprocess-models, #2782 — rewrites modelVersion/modelTier/provider on subprocess-provenance rows ONLY, from each row\'s own transcript_path; backed up, idempotent, dry-run first)]' +
