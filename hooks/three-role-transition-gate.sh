@@ -47,6 +47,8 @@
 # (planner has no precondition; reviewer spawns must be free to run). Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1,
 # SHIP_PIPELINE=1. Fail-open on any missing/unparseable state. No `set -e` (a non-block non-zero must not be
 # read as a permission decision — #749 fail-closed-smoke lesson).
+# #3154: a size-S ticket (ticket metadata.size S AND the plan's `size: S`, no plan-review row) is admitted by the SAME
+# gate-plan-review evaluator (its size-s-exempt arm) -- this hook stays a thin caller and the block text names the S rule.
 # PORT-NOTE: cites `parent-claude.md Invariant #2` (ai-brain doctrine); plugin ships doctrine as 3-role-model.md
 #   (Leg 4). Comment/advisory only — nothing reads the file; safe forward-ref.
 # Reference: parent-claude.md Invariant #2 ("the plan is reviewed by a STATELESS reviewer before execution"),
@@ -142,6 +144,9 @@ fi
   echo "    node \"\${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs\" inherit-plan-review --session ${SESSION} --task ${TASKID} --parent <parentTaskId>"
   echo "  then re-spawn the executor. There is NO skip path for plan-review at this gate (operator decision) —"
   echo "  a deliberate skip cannot satisfy this precondition, however specific the reason."
+  echo "  The ONE exemption is size-S (#3154): a ticket whose metadata.size is S AND whose plan says \`size: S\`, with no"
+  echo "    plan-review row yet, is admitted without a plan-review. The \`size-s: <reason>\` text above says why #${TASKID}"
+  echo "    is NOT size-S here (a ticket stamped M/L, a plan saying anything but S, an unresolvable plan, or an existing review row)."
   echo "  Honest limitation: an UNTAGGED spawn dodges this gate (it can't be classified) — the completion gate"
   echo "    (three-role-instrumentation-gate.sh) is the backstop. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1 (or SHIP_PIPELINE=1)."
 } >&2
