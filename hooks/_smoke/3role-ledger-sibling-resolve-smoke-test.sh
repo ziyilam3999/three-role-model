@@ -256,4 +256,52 @@ OUT=$(cd "$AC6REPO" && node "$LED6" check --session "$SID" --task "$T_AC6B" --me
   || bad "AC-6(b) FAILED (rc=$RC out=$OUT)"
 rm -rf "$AC6REPO"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3154 (M1) -- the sibling resolver judges a sibling's size-S waiver on the SIBLING'S OWN session + task id
+# (taken from its ledger path), never the caller's. Real shape: the sibling's plan lives only at
+# refs/remotes/origin/<sibling-task>-fixture; its execution-review is ADDED by the merge head.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+export PROGRESS_TASKS_DIR="$TMP/s3154-tasks" RULE12_LOG="$TMP/s3154-r12.log"
+export THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1
+. "$DIR/_fixtures/size-s-fixture-lib.sh"
+# sz_sib_case <bare-task> <sibling-task> <ticket-size|->  -> sets SZ_OUT / SZ_RC of the bare-token merge-head check
+sz_sib_case() {
+  local bare="$1" sib="$2" tsize="$3" repo rev head
+  repo="$(mktemp -d)"
+  sz_mk_repo "$repo" "$LED" "$sib" S
+  rev=".ai-workspace/reviews/${sib}-execreview.md"
+  mkdir -p "$repo/.ai-workspace/reviews"; printf '## Review\nDecision: PASS\n' > "$repo/$rev"
+  git -C "$repo" add "$rev"
+  git -C "$repo" commit -q -m "fixture: sibling adds its own review"
+  head="$(git -C "$repo" rev-parse HEAD)"
+  rm -f "$repo/$rev"
+  sz_ticket "$SID" "$sib" "$tsize"
+  # bare-token stub (planner only) + the sibling's chain WITHOUT a plan-review row
+  sz_sub "$SID" "sb$bare"
+  node "$repo/hooks/3role-ledger.mjs" append --session "$SID" --task "$bare" --role planner --agent "sb$bare" --artifact "$TMP/plan.md" >/dev/null 2>&1
+  sz_planner "$repo/hooks/3role-ledger.mjs" "$SID" "$sib"
+  sz_sub "$SID" "sv$sib"
+  node "$repo/hooks/3role-ledger.mjs" append --session "$SID" --task "$sib" --role executor --agent "szp$sib" --artifact "PR #$bare" >/dev/null 2>&1
+  node "$repo/hooks/3role-ledger.mjs" append --session "$SID" --task "$sib" --role execution-review --agent "sv$sib" --artifact "$rev" --verdict PASS >/dev/null 2>&1
+  sz_run "$repo/hooks/3role-ledger.mjs" "$repo" check --session "$SID" --task "$bare" --merge-head "$head"
+  SZ_REPO_USED="$repo"
+}
+sz_sib_case 9301 9301-scanner-build S
+{ [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q 'SIBLING-RESOLVE' && printf '%s' "$SZ_OUT" | command grep -qF '9301-scanner-build'; } \
+  && ok "size-s-sibling-ok ok: sibling for an S task with no plan-review row (plan at ref only) qualifies -> SIBLING-RESOLVE exit 0" \
+  || bad "size-s-sibling-ok (rc=$SZ_RC out=$SZ_OUT)"
+# RED-first: the same shape on the pre-#3154 snapshot must NOT resolve
+sz_run "$DIR/_fixtures/3role-ledger-pre3154-size-s-snapshot.mjs" "$SZ_REPO_USED" check --session "$SID" --task 9301 --merge-head "$(git -C "$SZ_REPO_USED" rev-parse HEAD)"
+{ [ "$SZ_RC" = "2" ]; } && ok "size-s-sibling-red ok: same S sibling on the pre-#3154 snapshot -> BLOCK (no SIBLING-RESOLVE)" || bad "size-s-sibling-red (rc=$SZ_RC out=$SZ_OUT)"
+rm -rf "$SZ_REPO_USED"
+sz_sib_case 9302 9302-scanner-build M
+{ [ "$SZ_RC" = "2" ] && ! printf '%s' "$SZ_OUT" | command grep -q 'SIBLING-RESOLVE'; } \
+  && ok "size-s-sibling-m-no ok: the same sibling stamped ticket M does NOT qualify -> BLOCK" || bad "size-s-sibling-m-no (rc=$SZ_RC out=$SZ_OUT)"
+rm -rf "$SZ_REPO_USED"
+sz_sib_case 9303 9303-scanner-build -
+{ [ "$SZ_RC" = "2" ] && ! printf '%s' "$SZ_OUT" | command grep -q 'SIBLING-RESOLVE'; } \
+  && ok "size-s-sibling-slug-no ok: a sibling task id with no ticket (slug id -> ticket-size-none) fails CLOSED -> BLOCK" || bad "size-s-sibling-slug-no (rc=$SZ_RC out=$SZ_OUT)"
+rm -rf "$SZ_REPO_USED"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

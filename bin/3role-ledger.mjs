@@ -317,7 +317,8 @@
 //     plan-review row must NOT already carry a verdict (leg terminality — a hand-me-down never papers over a
 //     completed per-leg review). The successful plan-review write now ALSO carries the parent's verdict (the
 //     gate's universal screen reads it).
-//   gate-plan-review --session S --task T                            (#1575)
+//   gate-plan-review --session S --task T [--require-review]        (#1575; #3154 review-only mode)
+//   size-s-exempt --session S --task T                               (#3154; exit 0 EXEMPT / 1 NOT-EXEMPT <reason>)
 //     The TRANSITION GATE's entire plan-review-ADMISSION decision (hooks/three-role-transition-gate.sh shells
 //     out to this instead of re-implementing the contract). Evaluates the LAST PARSEABLE plan-review line in
 //     the task's ledger (last-match, not first-match — #1580-safe); fail-closed on any UNPARSEABLE line
@@ -3419,7 +3420,12 @@ function siblingQualifies(siblingFile, session, task, checkOpts) {
     byRole[j.role] = j;                                   // last-row-wins, for the three non-execution-review roles.
     if (j.role === 'execution-review') execReviewRows.push(j);
   }
-  for (const role of ['planner', 'plan-review', 'executor']) {
+  // #3154 D3 -- the sibling's OWN session + task id (taken from its ledger path), never the caller's: the
+  // size-S waiver for a sibling is judged on the sibling's ticket and plan. A slug sibling has no ticket -> none -> closed.
+  const sibSession = path.basename(path.dirname(siblingFile));
+  const sibTask = path.basename(siblingFile, '.jsonl');
+  const sibRoles = sizeSExempt(sibSession, sibTask).exempt ? ['planner', 'executor'] : ['planner', 'plan-review', 'executor'];
+  for (const role of sibRoles) {
     const e = byRole[role];
     if (!e) return null;
     if (checkRole(role, e, session, checkOpts, task)) return null;
@@ -4691,6 +4697,67 @@ function cmdInherit(o) {
   process.exit(0);
 }
 
+// #3154 -- the ONE size-S plan-review waiver predicate. EVERY checker that used to demand a plan-review row
+// (the transition gate's admission, `check`'s required-role loop, the sibling resolver, the edit-path hook, the
+// instrumentation gate's leg 4b, the goal-driver laundering check) asks THIS function, never a private copy.
+// exempt === true ONLY when ALL hold: (a) the TICKET says size S (live read, `readTicketSize`); (b) the planner
+// row's plan, read FROM THE TASK'S PUBLISHED REFS (`candidateTaskRefs` + `readBlobAtRef`, zero network I/O;
+// the cwd's disk is NEVER consulted) says `size: S` and is bound to the task; (c) the ledger holds NO
+// plan-review row at all (once any review has started, the review governs -- a negative review is never
+// "waived" by the size); (d) the ledger parses to the end. Anything else is { exempt:false, reason } with
+// `reason` from a closed list, so a stranded S ticket is diagnosable, never silent. Fails toward REVIEW.
+// INPUT-BOUND: ticket file <= 4 MiB (readTicketSize), plan blob <= PLAN_MAX_BYTES, ledger read once.
+function sizeSExempt(session, task) {
+  const no = (reason, detail) => ({ exempt: false, reason, detail: detail || '' });
+  const tr = readTicketSize(undefined, session, task);
+  if (tr.size === 'M' || tr.size === 'L') return no('ticket-size-' + tr.size);
+  if (tr.size !== 'S') {
+    if (tr.shown === 'none') {
+      return no('ticket-size-none', 'looked up ticket store <tasks-root>/<session>/<task>.json for session=' +
+        sanitize(session) + ' task=' + sanitize(task) + ' (absent, unreadable, or no metadata.size)');
+    }
+    return no('ticket-size-invalid', 'ticket metadata.size is "' + tr.shown + '" (valid: S, M, L)');
+  }
+  let raw;
+  try { raw = fs.readFileSync(ledgerFile(session, task), 'utf8'); } catch (e) { return no('no-planner-row', 'no ledger file'); }
+  const rows = [];
+  for (const ln of raw.split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { return no('ledger-junk', 'an unparseable ledger line was found'); }
+    rows.push(j);
+  }
+  if (rows.some((j) => j && j.role === 'plan-review')) return no('review-row-present');
+  let plannerRow = null;
+  for (const j of rows) { if (j && j.role === 'planner') plannerRow = j; }
+  if (!plannerRow || typeof plannerRow.artifact_path !== 'string' || !plannerRow.artifact_path.trim()) return no('no-planner-row');
+  const home = aiBrainToplevel();
+  const rel = home ? repoRelativeCandidate(plannerRow.artifact_path, home) : '';
+  if (!rel || rel.indexOf('.ai-workspace/plans/') !== 0) {
+    return no('plan-unresolvable', 'planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
+  }
+  const refs = candidateTaskRefs(home, task);
+  let text = null;
+  for (const ref of refs) {
+    const t = readBlobAtRef(home, ref, rel);
+    if (t !== null) { text = t; break; }
+  }
+  if (text === null || text.length > PLAN_MAX_BYTES) {
+    return no('plan-unresolvable', 'plan ' + rel + ' not found (or too large) at refs consulted: ' + refs.join(', '));
+  }
+  if (!planBoundToTask(path.join('/', rel), text, task)) return no('plan-unbound');
+  const sz = parsePlanSize(text);
+  if (!sz.ok) return no('plan-size-' + sz.source);
+  if (sz.size !== 'S') return no('plan-size-' + sz.size);
+  return { exempt: true, reason: 'ticket=S plan=S', detail: '', plan: rel };
+}
+
+// #3154 -- the required-role list for ONE task: REQUIRED_ROLES minus plan-review iff the size-S waiver applies.
+// `check` and the sibling resolver iterate THIS; cmdRefreshModels deliberately keeps iterating REQUIRED_ROLES.
+function requiredRolesFor(session, task) {
+  const sz = sizeSExempt(session, task);
+  return { roles: sz.exempt ? REQUIRED_ROLES.filter((r) => r !== 'plan-review') : REQUIRED_ROLES, sizeS: sz };
+}
+
 // #1575 Lane 1b — the transition gate's plan-review ADMISSION decision, as a single reusable function. The
 // bash gate (three-role-transition-gate.sh) shells out to the `gate-plan-review` CLI below instead of
 // re-implementing this contract in a second language — ONE evaluator, exercised directly by node-level
@@ -4699,6 +4766,15 @@ function cmdInherit(o) {
 //   not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent /
 //   deliberate-skip-closed / junk-line / subprocess-unverified
 function evaluatePlanReviewGate(session, task) {
+  // #3154 D2 -- the size-S waiver arm is consulted FIRST. It never admits a skip_reason row (that arm stays
+  // closed); on non-exempt every existing block class is unchanged and `detail` appends why S did not apply.
+  const sz = sizeSExempt(session, task);
+  if (sz.exempt) return { allow: true, class: 'size-s-exempt', detail: 'size-S waiver (' + sz.reason + ') plan=' + sz.plan, plan: sz.plan };
+  const r = evaluatePlanReviewGateCore(session, task);
+  if (!r.allow) r.detail = r.detail + ' | size-s: ' + sz.reason + (sz.detail ? ' (' + sz.detail + ')' : '');
+  return r;
+}
+function evaluatePlanReviewGateCore(session, task) {
   const file = ledgerFile(session, task);
   let raw;
   try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
@@ -4814,9 +4890,32 @@ function cmdGatePlanReview(o) {
   if (!session || !task) { console.error('gate-plan-review: --session and --task are required'); process.exit(2); }
   enforceSessionShape(session, task, 'gate-plan-review', 2);
   const r = evaluatePlanReviewGate(session, task);
+  if (r.allow && r.class === 'size-s-exempt') {
+    // #3154 D2c -- review-only mode: --require-review answers "does an AFFIRMATIVE REVIEW exist?" and so
+    // refuses the waiver class (exit 2, NO audit line). Flagless = admission: the waiver is allowed and audited.
+    if ('require-review' in o) {
+      console.error('BLOCK:size-s-exempt-not-a-review|' + r.detail);
+      process.exit(2);
+    }
+    writeBypassLog('3role-ledger-size-s-exempt', 'SIZE-S-SKIP', 'PERMIT', { task: sanitize(task), plan: r.plan, ticket_size: 'S' });
+    process.exit(0);
+  }
   if (r.allow) { process.exit(0); }
   console.error('BLOCK:' + r.class + '|' + r.detail);
   process.exit(2);
+}
+
+// #3154 D4: size-s-exempt --session S --task T -> exit 0 + `EXEMPT ...` | exit 1 + `NOT-EXEMPT <reason>` | exit 2 usage.
+// The single shared predicate exposed to non-node callers (the edit-path hook, instrumentation gate leg 4b,
+// goal-driver laundering-check). Silent on the audit log: the audited uses are the transition and completion arms.
+function cmdSizeSExempt(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task) { console.error('size-s-exempt: --session and --task are required'); process.exit(2); }
+  enforceSessionShape(session, task, 'size-s-exempt', 2);
+  const r = sizeSExempt(session, task);
+  if (r.exempt) { console.log('EXEMPT ' + r.reason + ' plan=' + r.plan); process.exit(0); }
+  console.log('NOT-EXEMPT ' + r.reason + (r.detail ? ' -- ' + r.detail : ''));
+  process.exit(1);
 }
 
 // ── #1936 — read-side history lanes (STRICTLY ADDITIVE; `byRole` selection, checkRole, and the ENTIRE
@@ -5043,9 +5142,16 @@ function cmdCheck(o) {
   // from an ordinary harness-signed pass. Collected here and printed unconditionally (success or not, so it
   // is visible even when other roles still have problems) — see the DISPATCH: print near the end.
   const dispatchLabels = [];
-  for (const role of REQUIRED_ROLES) {
+  // #3154 D3 -- the required chain for THIS task: plan-review is waived iff the shared size-S predicate says so.
+  const reqFor = requiredRolesFor(session, task);
+  const sizeSCheck = reqFor.sizeS;
+  for (const role of reqFor.roles) {
     const e = byRole[role];
-    if (!e) { const m = 'missing ' + role + ' ledger line'; problems.push(m); missingRoleProblems.push(m); continue; }
+    if (!e) {
+      const m = 'missing ' + role + ' ledger line' + (role === 'plan-review' ? '; size-s: ' + sizeSCheck.reason +
+        (sizeSCheck.detail ? ' (' + sizeSCheck.detail + ')' : '') : '');
+      problems.push(m); missingRoleProblems.push(m); continue;
+    }
     const r = checkRole(role, e, session, checkOpts, task);
     if (r) { problems.push(r); continue; }
     // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
@@ -5571,6 +5677,14 @@ function cmdCheck(o) {
       ' observed=' + observedCount + ' assigned=' + assignedCount + ' unattributed=' + unattributedCount +
       ' (planner=' + perRoleLabel.planner + ', plan-review=' + perRoleLabel['plan-review'] +
       ', executor=' + perRoleLabel.executor + ', execution-review=' + perRoleLabel['execution-review'] + ')');
+  }
+  if (sizeSCheck.exempt) {
+    // #3154 D3/D5 -- the waived OK line KEEPS the `OK: role-ledger complete` prefix (oracles.mjs matches it) and
+    // names the waiver; one audit line per allowing evaluation.
+    writeBypassLog('3role-ledger-size-s-exempt', 'SIZE-S-SKIP', 'PERMIT', { task: sanitize(task), plan: sizeSCheck.plan, ticket_size: 'S' });
+    console.log('OK: role-ledger complete for task ' + sanitize(task) +
+      ' (planner, executor, execution-review resolved; plan-review: WAIVED size-s (ticket=S plan=S))');
+    process.exit(0);
   }
   console.log('OK: role-ledger complete for task ' + sanitize(task) +
     ' (planner, plan-review, executor, execution-review all resolved)');
@@ -7303,6 +7417,9 @@ function writeBypassLog(hookName, varName, decision, extra) {
       if (extra.role) record.role = sanitize(extra.role);
       if (extra.provider) record.provider = sanitize(extra.provider);
       if (extra.route_config) record.route_config = String(extra.route_config);
+      // #3154 D5 -- additive allowlist widening for the SIZE-S-SKIP audit line (plan path sanitized, size S/M/L only).
+      if (extra.plan) record.plan = String(extra.plan).replace(/[^0-9A-Za-z._\/-]/g, '');
+      if (extra.ticket_size && /^[SML]$/.test(String(extra.ticket_size))) record.ticket_size = String(extra.ticket_size);
     }
     const logPath = rule12LogPath();
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
@@ -9228,6 +9345,7 @@ try {
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
+  else if (cmd === 'size-s-exempt') cmdSizeSExempt(opts);
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
   else if (cmd === 'plan-size') cmdPlanSize(opts);
@@ -9244,7 +9362,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +

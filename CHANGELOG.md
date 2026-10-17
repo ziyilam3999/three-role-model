@@ -1,3 +1,19 @@
+## [0.17.0] - 2026-10-17
+
+### Changed
+- **sync (#3154): size-S tickets skip the plan-review seat.** Regenerated
+  `bin/3role-ledger.mjs`, `hooks/three-role-instrumentation-gate.sh`,
+  `hooks/three-role-transition-gate.sh` and their `_smoke` copies, plus
+  `hooks/_smoke/3role-ledger-sibling-resolve-smoke-test.sh` and the new fixtures
+  `hooks/_smoke/_fixtures/3role-ledger-pre3154-size-s-snapshot.mjs` /
+  `hooks/_smoke/_fixtures/size-s-fixture-lib.sh` from the ai-brain branch via
+  `scripts/sync-three-role-plugin.mjs write` (never hand-edited). One shared predicate
+  (`sizeSExempt`) admits planner -> executor -> execution-review for a size-S ticket
+  (ticket `metadata.size` S AND the plan's flush-left `size: S`, read from the task's
+  git refs, no plan-review row); anything else fails closed to today's behaviour. The
+  size-S test is the plan's wording: S = one file or config-only, no new smoke;
+  `.ai-workspace/` artifacts excluded. Version bump per ai-brain plan D8 (review F4).
+
 ## [0.16.0] - 2026-10-16
 
 ### Changed

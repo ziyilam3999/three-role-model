@@ -7428,4 +7428,92 @@ OUT=$(CC_ROLES_ENV="$MFAB" node "$LED" check --session ms3149A10 --task 9962 --e
   && printf '%s' "$OUT" | command grep -q 'CC_ROLE_EXECUTOR_MODEL in cc-roles.env'; } \
   && ok "3149-A10: non-overlay mismatch (executor sonnet vs fable) -> master wording incl. CC_ROLE_EXECUTOR_MODEL in cc-roles.env" || bad "3149-A10 (rc=$RC out=$OUT)"
 
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3154 -- size-S plan-review waiver (helper-level, REAL shape): the plan lives ONLY at
+# refs/remotes/origin/<task>-fixture of a throw-away repo (never on the cwd's disk), the helper copy lives in
+# that repo, and every must-pass is first shown FAILING against the pre-#3154 snapshot (RED-first).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+export PROGRESS_TASKS_DIR="$TMP/s3154-tasks"
+. "$DIR/_fixtures/size-s-fixture-lib.sh"
+SZ_SNAP="$DIR/_fixtures/3role-ledger-pre3154-size-s-snapshot.mjs"
+printf '## Review\nverdict: PASS\n' > "$TMP/s3154-rev.md"
+SZ_SID="sess-3154"
+
+# --- size-s-red: the must-pass shapes (case 1 gate+check, case 14 ref-only, case 19) FAIL on the snapshot ---
+SZR="$TMP/s3154-red"; sz_mk_repo "$SZR" "$LED" 91501 S
+sz_ticket "$SZ_SID" 91501 S; sz_planner "$SZR/hooks/3role-ledger.mjs" "$SZ_SID" 91501; sz_chain_tail "$SZR/hooks/3role-ledger.mjs" "$SZ_SID" 91501 "$TMP/s3154-rev.md"
+sz_run "$SZ_SNAP" "$SZR" check --session "$SZ_SID" --task 91501; RED_CHECK_RC=$SZ_RC; RED_CHECK_OUT=$SZ_OUT
+sz_run "$SZ_SNAP" "$SZR" gate-plan-review --session "$SZ_SID" --task 91501; RED_GATE_RC=$SZ_RC; RED_GATE_OUT=$SZ_OUT
+sz_run "$SZ_SNAP" "$SZR" size-s-exempt --session "$SZ_SID" --task 91501; RED_EX_RC=$SZ_RC; RED_EX_OUT=$SZ_OUT
+{ [ "$RED_CHECK_RC" != "0" ] && [ "$RED_GATE_RC" != "0" ] && [ "$RED_EX_RC" != "0" ] \
+  && ! printf '%s\n%s\n%s' "$RED_CHECK_OUT" "$RED_GATE_OUT" "$RED_EX_OUT" | command grep -Eq 'EXEMPT|WAIVED'; } \
+  && ok "size-s-red ok: case 1/14/19 must-pass shapes FAIL against the pre-#3154 snapshot (check=$RED_CHECK_RC gate=$RED_GATE_RC exempt=$RED_EX_RC, no EXEMPT/WAIVED token)" \
+  || bad "size-s-red (check=$RED_CHECK_RC gate=$RED_GATE_RC exempt=$RED_EX_RC out=$RED_CHECK_OUT$RED_GATE_OUT$RED_EX_OUT)"
+# the plan is NOT on the cwd's disk (B1 real shape)
+{ [ ! -e "$SZR/.ai-workspace/plans/2026-10-16-91501-size-s-fixture.md" ]; } && ok "size-s-fixture: plan absent from the cwd's disk" || bad "size-s-fixture: plan unexpectedly on disk"
+
+# --- GREEN on the new helper: check waives + names the waiver; audit line carries plan + ticket_size ---
+: > "$RULE12_LOG"
+sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" check --session "$SZ_SID" --task 91501
+{ [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q 'plan-review: WAIVED size-s' && printf '%s' "$SZ_OUT" | command grep -q '^OK: role-ledger complete'; } \
+  && ok "size-s-check-waived ok: check exits 0, prints OK prefix + 'plan-review: WAIVED size-s'" || bad "size-s-check-waived (rc=$SZ_RC out=$SZ_OUT)"
+AUD=$(command grep 'SIZE-S-SKIP' "$RULE12_LOG" | tail -1)
+{ printf '%s' "$AUD" | node -e 'const j=JSON.parse(require("fs").readFileSync(0,"utf8")); process.exit(j.plan && j.ticket_size==="S" && j.task==="91501" && j.decision==="PERMIT" ? 0 : 1)'; } \
+  && ok "size-s-audit ok: SIZE-S-SKIP PERMIT line carries plan + ticket_size S + task" || bad "size-s-audit (line=$AUD)"
+
+# --- size-s-ref-only (AC 14): ref deleted -> plan-unresolvable; disk-only plan (no ref) -> plan-unresolvable ---
+sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" size-s-exempt --session "$SZ_SID" --task 91501
+R1_RC=$SZ_RC; R1_OUT=$SZ_OUT
+git -C "$SZR" update-ref -d refs/remotes/origin/91501-fixture
+sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" size-s-exempt --session "$SZ_SID" --task 91501
+R2_RC=$SZ_RC; R2_OUT=$SZ_OUT
+mkdir -p "$SZR/.ai-workspace/plans"; sz_plan_text 91501 S > "$SZR/.ai-workspace/plans/2026-10-16-91501-size-s-fixture.md"
+sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" size-s-exempt --session "$SZ_SID" --task 91501
+R3_RC=$SZ_RC; R3_OUT=$SZ_OUT
+{ [ "$R1_RC" = "0" ] && printf '%s' "$R1_OUT" | command grep -q '^EXEMPT' \
+  && [ "$R2_RC" = "1" ] && printf '%s' "$R2_OUT" | command grep -q '^NOT-EXEMPT plan-unresolvable' \
+  && [ "$R3_RC" = "1" ] && printf '%s' "$R3_OUT" | command grep -q '^NOT-EXEMPT plan-unresolvable'; } \
+  && ok "size-s-ref-only ok: ref-only plan -> EXEMPT; ref deleted -> plan-unresolvable; plan on disk but at no ref -> plan-unresolvable" \
+  || bad "size-s-ref-only (r1=$R1_RC/$R1_OUT r2=$R2_RC/$R2_OUT r3=$R3_RC/$R3_OUT)"
+
+# --- check blocks, naming the reason, when the ticket is M (AC 4 shape at check) ---
+SZM="$TMP/s3154-m"; sz_mk_repo "$SZM" "$LED" 91502 S
+sz_ticket "$SZ_SID" 91502 M; sz_planner "$SZM/hooks/3role-ledger.mjs" "$SZ_SID" 91502; sz_chain_tail "$SZM/hooks/3role-ledger.mjs" "$SZ_SID" 91502 "$TMP/s3154-rev.md"
+sz_run "$SZM/hooks/3role-ledger.mjs" "$SZM" check --session "$SZ_SID" --task 91502
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -q 'missing plan-review ledger line' && printf '%s' "$SZ_OUT" | command grep -q 'size-s: ticket-size-M'; } \
+  && ok "size-s-check-m-block ok: ticket M, no plan-review -> check exit 2 naming 'size-s: ticket-size-M'" || bad "size-s-check-m-block (rc=$SZ_RC out=$SZ_OUT)"
+
+# --- size-s-require-review (AC 24): flagless = admission, --require-review = affirmative review only ---
+: > "$RULE12_LOG"
+SZQ="$TMP/s3154-q"; sz_mk_repo "$SZQ" "$LED" 91503 S
+sz_ticket "$SZ_SID" 91503 S; sz_planner "$SZQ/hooks/3role-ledger.mjs" "$SZ_SID" 91503
+sz_run "$SZQ/hooks/3role-ledger.mjs" "$SZQ" gate-plan-review --session "$SZ_SID" --task 91503; Q1=$SZ_RC
+N_BEFORE=$(command grep -c 'SIZE-S-SKIP' "$RULE12_LOG")
+sz_run "$SZQ/hooks/3role-ledger.mjs" "$SZQ" gate-plan-review --session "$SZ_SID" --task 91503 --require-review; Q2=$SZ_RC; Q2_OUT=$SZ_OUT
+N_AFTER=$(command grep -c 'SIZE-S-SKIP' "$RULE12_LOG")
+# real affirmative review row: both forms exit 0
+SZQ2="$TMP/s3154-q2"; sz_mk_repo "$SZQ2" "$LED" 91504 S
+sz_ticket "$SZ_SID" 91504 S; sz_planner "$SZQ2/hooks/3role-ledger.mjs" "$SZ_SID" 91504; sz_review_row "$SZQ2/hooks/3role-ledger.mjs" "$SZ_SID" 91504 "$TMP/s3154-rev.md" PASS
+sz_run "$SZQ2/hooks/3role-ledger.mjs" "$SZQ2" gate-plan-review --session "$SZ_SID" --task 91504; Q3=$SZ_RC
+sz_run "$SZQ2/hooks/3role-ledger.mjs" "$SZQ2" gate-plan-review --session "$SZ_SID" --task 91504 --require-review; Q4=$SZ_RC
+# ticket M, no review: both exit 2
+sz_ticket "$SZ_SID" 91505 M; sz_planner "$SZQ/hooks/3role-ledger.mjs" "$SZ_SID" 91505
+sz_run "$SZQ/hooks/3role-ledger.mjs" "$SZQ" gate-plan-review --session "$SZ_SID" --task 91505; Q5=$SZ_RC
+sz_run "$SZQ/hooks/3role-ledger.mjs" "$SZQ" gate-plan-review --session "$SZ_SID" --task 91505 --require-review; Q6=$SZ_RC
+{ [ "$Q1" = "0" ] && [ "$Q2" = "2" ] && printf '%s' "$Q2_OUT" | command grep -q 'BLOCK:size-s-exempt-not-a-review' && [ "$N_BEFORE" = "$N_AFTER" ] \
+  && [ "$Q3" = "0" ] && [ "$Q4" = "0" ] && [ "$Q5" = "2" ] && [ "$Q6" = "2" ]; } \
+  && ok "size-s-require-review ok: S flagless 0 / flagged 2 (no audit line); real review both 0; ticket M both 2" \
+  || bad "size-s-require-review (q1=$Q1 q2=$Q2 audit $N_BEFORE/$N_AFTER q3=$Q3 q4=$Q4 q5=$Q5 q6=$Q6 out=$Q2_OUT)"
+
+# --- refresh-models-four-roles (AC 22): the refresh path was NOT rerouted through the waiver ---
+# cmdRefreshModels refreshes rows (it never gates), so its role list must stay the full REQUIRED_ROLES: assert the
+# function body iterates REQUIRED_ROLES and never calls requiredRolesFor, and that it still runs clean on the waived fixture.
+RM_BODY=$(awk '/^function cmdRefreshModels\(/{f=1} f{print} f&&/^}/{exit}' "$LED")
+sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" refresh-models --session "$SZ_SID"
+{ printf '%s' "$RM_BODY" | command grep -q 'for (const role of REQUIRED_ROLES)' && ! printf '%s' "$RM_BODY" | command grep -q 'requiredRolesFor' \
+  && [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q '^OK refresh-models'; } \
+  && ok "refresh-models-four-roles ok: cmdRefreshModels still iterates all four REQUIRED_ROLES (no waiver reroute) and runs clean on the waived fixture" \
+  || bad "refresh-models-four-roles (rc=$SZ_RC out=$SZ_OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
