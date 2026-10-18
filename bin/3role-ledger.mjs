@@ -486,6 +486,52 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 // appends (138 THREE_ROLE_LEDGER_DIR redirects measured) keep passing with zero fixture edits, and a
 // redirected caller never writes a bypass-audit line. Read ONCE, at module scope, same discipline as
 // LEDGER_DIR above.
+// ── 3role-ledger-append-flag-shape (#3258 D4, merges three always-loaded memory lines into
+// code: "ledger task id is the ticket number, never the branch slug" / "ledger session flag is the
+// UUID, never the attribution-url fragment" / "ledger closed-at takes an ISO timestamp, never
+// 'now'"). The --session clause is enforced by enforceSessionShape() below (SESSION_UUID_RE, same
+// arming); these two predicates cover --task and --closed-at for cmdAppend's guard.
+// A ticket id is valid in EITHER shape the ticket store uses (#3258 fix1: the digits-only refusal
+// broke every slug-id ticket — 119 were open at review). All digits is the legacy numeric shape,
+// accepted with NO existence lookup (historic numeric rows and numeric tickets with no file still
+// land). A slug-shaped token is accepted ONLY when a ticket file of that name exists in the task
+// store — the provably-wrong case is a branch slug that names no ticket ("3258-memory-trim" when
+// ticket 3258 exists). INPUT-BOUND: shape and a 200-char ceiling are checked BEFORE any lookup, and
+// the lookup is one stat of one named file under the shape-validated session dir — never a walk.
+const TASK_NUMERIC_RE = /^\d+$/;
+const TASK_SLUG_RE = /^[0-9A-Za-z][0-9A-Za-z._-]{0,199}$/;
+function taskIdentityProblem(session, task, role) {
+  const t = String(task == null ? '' : task);
+  if (!t) return 'empty';
+  if (t.length > 200) return 'oversize';
+  if (/[/\\]/.test(t) || t.includes('..')) return 'path';
+  if (TASK_NUMERIC_RE.test(t)) return '';
+  if (!TASK_SLUG_RE.test(t)) return 'shape';
+  // #3262 item 5: a research row is ad-hoc work with no ticket by design (task ids like
+  // adhoc-research-x); it keeps every SHAPE check above but skips the ticket-existence lookup.
+  // Every other role keeps the existence check.
+  if (role === 'research') return '';
+  const root = process.env.PROGRESS_TASKS_DIR || path.join(HOME, '.claude', 'tasks');
+  const sd = String(session == null ? '' : session);
+  if (!/^[0-9A-Za-z._-]{1,128}$/.test(sd)) return 'session-token';
+  try { if (fs.statSync(path.join(root, sd, t + '.json')).isFile()) return ''; } catch (e) { /* missing => unknown */ }
+  return 'unknown';
+}
+// ISO 8601 date or datetime, Z or numeric offset; a bare keyword ("now"), a relative stamp, or a
+// locale-format date never matches. The Date roundtrip below additionally rejects impossible
+// calendar dates (2026-02-31) that some lenient parsers would roll over.
+const CLOSED_AT_ISO_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+function isIsoTimestamp(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!CLOSED_AT_ISO_RE.test(s)) return false;
+  const t = Date.parse(s.includes(' ') && !s.includes('T') ? s.replace(' ', 'T') : s);
+  if (!Number.isFinite(t)) return false;
+  const d = new Date(t);
+  return d.getUTCFullYear() === Number(s.slice(0, 4))
+    && d.getUTCMonth() === Number(s.slice(5, 7)) - 1
+    && d.getUTCDate() === Number(s.slice(8, 10));
+}
+
 const SESSION_SHAPE_GUARD_ARMED = !process.env.THREE_ROLE_LEDGER_DIR;
 
 // D6 — one audited kill-switch, same discipline as THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF below.
@@ -4078,6 +4124,31 @@ function cmdAppend(o) {
   const session = o.session, task = o.task, role = o.role;
   if (!session || !task || !role) { console.error('append: --session, --task, --role are required'); process.exit(2); }
   enforceSessionShape(session, task, role, 2);
+  // #3258 D4 — append-time FLAG-SHAPE refusal (fail-closed: exit 2, distinct BLOCK token, BEFORE
+  // any ledger file read/write or row write). Armed on the SAME default-store predicate as the
+  // session-shape guard above (SESSION_SHAPE_GUARD_ARMED): a THREE_ROLE_LEDGER_DIR-redirected
+  // store is a smoke fixture, not the asset (dozens of sibling suites append synthetic
+  // non-numeric tasks under redirect — measured), while every production append lands in the
+  // default store with a real ticket number, a real session UUID, and — when closing — a real ISO
+  // timestamp. --session itself is the session-shape guard's own clause (one line above).
+  if (SESSION_SHAPE_GUARD_ARMED) {
+    if (taskIdentityProblem(session, task, role)) {
+      console.error('BLOCK (3role-ledger append-flag-shape): --task "' + String(task == null ? '' : task)
+        + '" is not a ticket id the ticket store knows (all digits, or a slug id with a ticket file — '
+        + 'never a branch slug like "3258-memory-trim" that names no ticket). Read the ticket id from '
+        + 'the brief and re-append with it. Nothing was written.');
+      process.exit(2);
+    }
+    if ('closed-at' in o) {
+      const closedAtRaw = String(o['closed-at'] == null ? '' : o['closed-at']);
+      if (!isIsoTimestamp(closedAtRaw)) {
+        console.error('BLOCK (3role-ledger append-flag-shape): --closed-at "' + closedAtRaw
+          + '" is not an ISO 8601 timestamp (e.g. 2026-10-18T12:00:00.000Z — never "now" or any '
+          + 'relative wording). Pass the real close-time instant. Nothing was written.');
+        process.exit(2);
+      }
+    }
+  }
   if (!RECORDABLE_ROLES.includes(role)) { console.error('append: --role must be one of ' + RECORDABLE_ROLES.join(', ')); process.exit(2); }
   // 3role-ledger-append-should-reject-unknown-flags — UNKNOWN-FLAG REFUSAL, fail-closed. Runs BEFORE any
   // ledger file read/write and BEFORE every state-dependent guard below (fix-A ambiguity, #1769 warn,

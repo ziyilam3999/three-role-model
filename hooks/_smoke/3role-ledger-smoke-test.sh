@@ -7259,10 +7259,12 @@ rs3140 "$S3140/routes-bad.json" 9001
 OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3140/routes-bad.json" node "$LED" lint-routes 2>&1); RC=$?
 { [ "$RC" != "0" ] && printf '%s' "$OUT" | command grep -q 'SIZE-MODEL-UNDECLARED'; } && ok "#3140 AC-2.4: lint-routes rejects size_models.L=not-a-model (SIZE-MODEL-UNDECLARED)" || bad "#3140 AC-2.4 lint-routes (rc=$RC)"
 # Live-config arms (skip cleanly where config/cc-routes.json is not bundled, i.e. the plugin copy).
+# #3262 item 4: CC_SEAT_PINS_FILE is pinned to a sandbox path that holds no pin, so neither the caller's
+# exported pin file nor the operator's real seat-pin file can reach these two arms.
 if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
-  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
   [ "$OUT" = "fable medium claude-fable-5-1" ] && ok "#3140 AC-2.1 (live config): 9001 -> 'fable medium claude-fable-5-1'" || bad "#3140 AC-2.1 live config (got: $OUT)"
-  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" resolve-role-model --role planner --task 9002 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9002 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
   [ "$OUT" = "opus medium claude-opus-5-5" ] && ok "#3140 AC-2.1 (live config): 9002 -> 'opus medium claude-opus-5-5'" || bad "#3140 AC-2.1 live config 9002 (got: $OUT)"
   # AC-2.5: an operator seat pin wins over the size rule, and clearing it restores fable.
   export CC_SEAT_PINS_FILE="$S3140/pins.json"
@@ -7515,5 +7517,93 @@ sz_run "$SZR/hooks/3role-ledger.mjs" "$SZR" refresh-models --session "$SZ_SID"
   && [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q '^OK refresh-models'; } \
   && ok "refresh-models-four-roles ok: cmdRefreshModels still iterates all four REQUIRED_ROLES (no waiver reroute) and runs clean on the waived fixture" \
   || bad "refresh-models-four-roles (rc=$SZ_RC out=$SZ_OUT)"
+
+# --- #3258 D4: append refuses malformed --task / --session / --closed-at (flag-shape, armed store) ---
+# The append flag-shape guards arm only on the DEFAULT ledger store (the SAME predicate as the
+# session-shape guard -- a THREE_ROLE_LEDGER_DIR-redirected store is a smoke fixture, not the
+# asset), so each call below runs with THREE_ROLE_LEDGER_DIR unset for the child (env -u) and an
+# isolated HOME: the default store then resolves under the scratch HOME, never the operator's.
+# RED-first: pre-D4, the malformed --task and --closed-at appends SUCCEED and mint rows (the
+# malformed --session call was already refused by the session-shape guard under the same arming).
+# fix2: PROGRESS_TASKS_DIR is also PINNED for the child, because the s3154 block above exports it and
+# an export never un-exports itself -- an arm that relied on the default task-store root would resolve
+# the store to whatever earlier arms left behind (its result would depend on which arms ran before it).
+D4H="$TMP/d4-home"; mkdir -p "$D4H"
+D4SID="00000000-0000-4000-8000-000000000325"
+d4run(){ env -u THREE_ROLE_LEDGER_DIR HOME="$D4H" PROGRESS_TASKS_DIR="$D4H/.claude/tasks" node "$LED" "$@"; }
+
+OUT=$(d4run append --session "$D4SID" --task 3258-memory-trim --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape" && [ ! -f "$D4H/.claude/3role-ledger/$D4SID/3258-memory-trim.jsonl" ]; } \
+  && ok "d4 malformed --task (branch slug) refused, no row written" || bad "d4 malformed --task (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task 3258 --role planner --artifact "$TMP/plan.md" --closed-at now 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape" && [ ! -f "$D4H/.claude/3role-ledger/$D4SID/3258.jsonl" ]; } \
+  && ok "d4 malformed --closed-at ('now') refused, no row written" || bad "d4 malformed --closed-at (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session sess-fragment --task 3258 --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "session-shape" && [ ! -e "$D4H/.claude/3role-ledger/sess-fragment" ]; } \
+  && ok "d4 malformed --session refused (session-shape guard, same arming), no dir minted" || bad "d4 malformed --session (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task 3258 --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ -f "$D4H/.claude/3role-ledger/$D4SID/3258.jsonl" ]; } \
+  && ok "d4 well-formed append still lands" || bad "d4 well-formed append (rc=$RC out=$OUT)"
+
+# --- #3258 fix1 (execution-review finding 1): --task accepts BOTH ticket-id shapes the store uses ---
+# Numeric ids land unconditionally (legacy shape, no existence lookup); a slug id lands ONLY when a
+# ticket file of that name exists in the task store (the same <root>/<session>/<task>.json layout
+# readTicketSize reads; d4run PINS PROGRESS_TASKS_DIR to $D4H/.claude/tasks, so the fixture store is
+# the one the arms read no matter what earlier blocks exported, and never the operator's store).
+# RED-first on the pre-fix head: the slug-with-ticket arm below exited 2 (append-flag-shape block, no
+# row minted) under the digits-only TASK_TICKET_RE.
+D4TK="$D4H/.claude/tasks/$D4SID"; mkdir -p "$D4TK"
+printf '{"metadata":{"size":"M"}}' > "$D4TK/1660-zai-rollout-slug.json"
+printf '{"metadata":{"size":"S"}}' > "$D4TK/2075-ledger-sib.json"
+
+OUT=$(d4run append --session "$D4SID" --task 1660-zai-rollout-slug --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ -f "$D4H/.claude/3role-ledger/$D4SID/1660-zai-rollout-slug.jsonl" ]; } \
+  && ok "fix1 must-not-fire: slug task id WITH a fixture ticket file lands" || bad "fix1 slug-with-ticket (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task 2075-ledger-sib --role executor --artifact "$TMP/pr.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ -f "$D4H/.claude/3role-ledger/$D4SID/2075-ledger-sib.jsonl" ]; } \
+  && ok "fix1 must-not-fire: digit-leading slug id with a fixture ticket file lands" || bad "fix1 digit-leading slug (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task 2075 --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ -f "$D4H/.claude/3role-ledger/$D4SID/2075.jsonl" ]; } \
+  && ok "fix1 must-not-fire: numeric id with NO ticket file (legacy numeric shape) lands" || bad "fix1 numeric-no-file (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task 3258-no-such-ticket --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape" && [ ! -f "$D4H/.claude/3role-ledger/$D4SID/3258-no-such-ticket.jsonl" ]; } \
+  && ok "fix1 must-fire: slug with NO ticket file refused, no row written" || bad "fix1 unknown-slug (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task "" --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && [ ! -e "$D4H/.claude/3role-ledger/$D4SID/.jsonl" ]; } \
+  && ok "fix1 must-fire: empty --task refused (required-flag guard), no row written" || bad "fix1 empty task (rc=$RC out=$OUT)"
+
+OUT=$(d4run append --session "$D4SID" --task "../escape" --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape" && [ ! -e "$D4H/.claude/3role-ledger/escape.jsonl" ]; } \
+  && ok "fix1 must-fire: --task with a path separator refused before any lookup, no row anywhere" || bad "fix1 path-separator (rc=$RC out=$OUT)"
+
+D4LONG="$(dd if=/dev/zero bs=1 count=201 2>/dev/null | tr '\0' 'a')"
+OUT=$(d4run append --session "$D4SID" --task "$D4LONG" --role planner --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape"; } \
+  && ok "fix1 must-fire: 201-char --task refused before any lookup" || bad "fix1 oversize task (rc=$RC out=$OUT)"
+
+# --- #3262 item 5: a research append needs no ticket file; every other role keeps the check ---
+# Same isolation as the d4 arms above (armed default store, scratch HOME, pinned task store with NO
+# ticket file named adhoc-research-x). RED-first: on origin/master the research append is refused.
+OUT=$(d4run append --session "$D4SID" --task adhoc-research-x --role research --artifact "$TMP/plan.md" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && [ -f "$D4H/.claude/3role-ledger/$D4SID/adhoc-research-x.jsonl" ] \
+  && command grep -q '"role":"research"' "$D4H/.claude/3role-ledger/$D4SID/adhoc-research-x.jsonl"; } \
+  && ok "b3 research append with a task that has no ticket file lands (row stored under the task-named file)" || bad "b3 research no-ticket (rc=$RC out=$OUT)"
+for R3 in planner executor execution-review; do
+  OUT=$(d4run append --session "$D4SID" --task adhoc-research-x --role "$R3" --artifact "$TMP/plan.md" 2>&1); RC=$?
+  { [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape"; } \
+    && ok "b3 $R3 append with the same no-ticket task is still refused" || bad "b3 $R3 no-ticket must refuse (rc=$RC out=$OUT)"
+done
+for BADT in "../escape" "a/b" "bad shape!" "$D4LONG"; do
+  OUT=$(d4run append --session "$D4SID" --task "$BADT" --role research --artifact "$TMP/plan.md" 2>&1); RC=$?
+  { [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q "append-flag-shape"; } \
+    && ok "b3 research append with a bad task shape is still refused (${#BADT} chars)" || bad "b3 research bad shape (rc=$RC out=$OUT)"
+done
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
