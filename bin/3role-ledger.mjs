@@ -8939,16 +8939,18 @@ function resolveSlugPin(role, routes, seatRow) {
 // in that provider's model_vocabulary, (c) the SSOT already declares the dispatch route somewhere (some
 // seat declares `dispatch: subprocess-<provider>` for a non-anthropic provider; the Agent-tool route — a
 // seat with no `dispatch` field — exists for anthropic), and (d) the role is in the closed route-pinnable
-// list planner|plan-review|executor|research (execution-review excluded by the operator's 2026-10-17
+// list planner|plan-review|executor|research|ship-tail (execution-review excluded by the operator's 2026-10-17
 // "keep Opus final review" decision). The SAME validator runs at SET time (cmdSetSeatPin, loud BLOCK
 // naming the failing rule) and at RESOLVE time (resolveRoutePin, SEAT-PIN-REFUSED + resolve UNPINNED) —
-// one grammar, never two copies.
-const ROUTE_PIN_ROLES = ['planner', 'plan-review', 'executor', 'research'];
+// one grammar, never two copies. #3249 (operator 2026-10-17): ship-tail joins the closed route-pinnable
+// list — the 5th operational seat, moved by the same operator cost lever (merges stop spending Claude
+// usage; still never a REQUIRED_ROLE). The list stays CLOSED: the next seat needs its own operator sign-off.
+const ROUTE_PIN_ROLES = ['planner', 'plan-review', 'executor', 'research', 'ship-tail'];
 function validateRoutePinValue(routes, role, value) {
   const refuse = (rule, note) => ({ ok: false, rule, note });
   if (!ROUTE_PIN_ROLES.includes(role)) {
     return refuse('role', 'role "' + role + '" is not route-pinnable (closed list ' + ROUTE_PIN_ROLES.join('|') +
-      '; execution-review is excluded by the operator\'s 2026-10-17 "keep Opus final review" decision)');
+      '; execution-review is excluded by the operator\'s 2026-10-17 "keep Opus final review" decision; ship-tail was added by the operator\'s 2026-10-17 #3249 cost choice)');
   }
   if (typeof value !== 'string') {
     return refuse('malformed', 'route value is not a string');
