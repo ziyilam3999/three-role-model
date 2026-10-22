@@ -317,6 +317,7 @@
 //     plan-review row must NOT already carry a verdict (leg terminality — a hand-me-down never papers over a
 //     completed per-leg review). The successful plan-review write now ALSO carries the parent's verdict (the
 //     gate's universal screen reads it).
+//   spawn-ticket --session S --task T [--plan P] [--worktrees W]     (#3344; prints execution=<v> + plan=<abs>)
 //   gate-plan-review --session S --task T [--require-review]        (#1575; #3154 review-only mode)
 //   size-s-exempt --session S --task T                               (#3154; exit 0 EXEMPT / 1 NOT-EXEMPT <reason>)
 //     The TRANSITION GATE's entire plan-review-ADMISSION decision (hooks/three-role-transition-gate.sh shells
@@ -8441,8 +8442,10 @@ function planBoundToTask(abs, text, task) {
 
 // Plan facts for `seatKey`. { unresolvable:true, why } | { size, size_source, data_class, bound }.
 // With no `task` the binding step is skipped (callers that cannot know the task); every real consumer passes it.
-function resolvePlanFacts(planArg, task) {
-  const lp = loadPlanFile(planArg, true);
+function resolvePlanFacts(planArg, task, xrepo) {
+  // #3344: a relative plan absent under the cwd is looked up in the ticket's own repo set (xrepoResolveRel).
+  const xr = xrepo ? xrepoResolveRel(planArg, xrepo.session, task, xrepo.hints, true) : '';
+  const lp = loadPlanFile(xr || planArg, true);
   if (!lp.ok) return { unresolvable: true, why: lp.why };
   const bound = task === undefined ? true : planBoundToTask(lp.abs, lp.text, task);
   const sz = parsePlanSize(lp.text);
@@ -8451,6 +8454,109 @@ function resolvePlanFacts(planArg, task) {
   if (!bound) size_source = 'task-mismatch';
   else size_source = sz.ok ? 'plan' : sz.source;
   return { size: sz.ok ? sz.size : '', size_source, data_class: dc, bound, abs: lp.abs, task: task === undefined ? '' : String(task) };
+}
+
+// #3344 -- CROSS-REPO PLAN/BRIEF RESOLUTION for a spawn's OWN ticket. Before #3344 a relative PLAN:/BRIEF: path
+// resolved ONLY against the process cwd (the ai-brain primary), so a ticket living in another repo (monday-bot,
+// agent-kanban) could never be resolved by the route gate (SIZE-PLAN-UNRESOLVABLE on #3323) nor by the
+// plan-review hook. The BOUNDED base set, consulted ONLY when the relative path does not exist under the cwd:
+//   1. the ticket's own repo primary   <projects-root>/<metadata.repo>          (readTicketRepo; never a scan)
+//   2. worktrees the spawn prompt names <projects-root>/<repo>/.claude/worktrees/<slug> (<= 3 hints; when the
+//      ticket names a repo, the hint's <repo> must equal it)
+//   3. the ticket repo's own worktrees  <projects-root>/<metadata.repo>/.claude/worktrees/<task>[-*] (<= 8)
+// <projects-root> = the parent of the ai-brain primary (the SAME construction ticketRepoDirFor uses);
+// CC_XREPO_PROJECTS_ROOT overrides it for hermetic fixtures only. The found file then passes the SAME checks
+// as a local one (regular file, <= PLAN_MAX_BYTES, plan under .ai-workspace/plans/, bound to the task) --
+// never-found fails CLOSED (unresolvable). INPUT-BOUND: <= 3 hints, <= 256 directory entries read per
+// worktrees dir, <= 12 bases, one stat per base.
+const XREPO_MAX_HINTS = 3;
+const XREPO_MAX_DIRENTS = 256;
+const XREPO_MAX_TASK_WT = 8;
+function xrepoProjectsRoot() {
+  const env = process.env.CC_XREPO_PROJECTS_ROOT;
+  if (typeof env === 'string' && env && path.isAbsolute(env)) return realpathNearest(env).replace(/\/+$/, '');
+  const home = aiBrainToplevel();
+  if (!home) return '';
+  return path.dirname(realpathNearest(primaryRootFor(home)).replace(/\/+$/, ''));
+}
+function isDir(p) { try { return fs.statSync(p).isDirectory(); } catch (e) { return false; } }
+function xrepoBases(session, task, hints) {
+  const root = xrepoProjectsRoot();
+  if (!root) return [];
+  const seg = /^[0-9A-Za-z._-]{1,128}$/;
+  const repo = (session && task) ? readTicketRepo(undefined, session, task).repo : '';
+  const out = [];
+  const add = (d) => { if (d && !out.includes(d) && out.length < 12 && isDir(d)) out.push(d); };
+  if (repo) add(path.join(root, repo));
+  const hl = (Array.isArray(hints) ? hints : String(hints || '').split('\n')).map((h) => String(h).trim()).filter(Boolean).slice(0, XREPO_MAX_HINTS);
+  for (const h of hl) {
+    if (!path.isAbsolute(h)) continue;
+    const real = realpathNearest(path.resolve(h)).replace(/\/+$/, '');
+    if (!real.startsWith(root + '/')) continue;
+    const parts = real.slice(root.length + 1).split('/');
+    if (parts.length !== 4 || parts[1] !== '.claude' || parts[2] !== 'worktrees') continue;
+    if (!seg.test(parts[0]) || !seg.test(parts[3]) || parts[0] === '..' || parts[3] === '..') continue;
+    if (repo && parts[0] !== repo) continue;
+    add(real);
+  }
+  if (repo && task && seg.test(String(task))) {
+    const wtDir = path.join(root, repo, '.claude', 'worktrees');
+    let ents = [];
+    try { ents = fs.readdirSync(wtDir).slice(0, XREPO_MAX_DIRENTS); } catch (e) { ents = []; }
+    let n = 0;
+    for (const e of ents.sort()) {
+      if (n >= XREPO_MAX_TASK_WT) break;
+      if (e === String(task) || e.startsWith(String(task) + '-')) { add(path.join(wtDir, e)); n++; }
+    }
+  }
+  return out;
+}
+// A RELATIVE path that does not exist under the cwd -> the first base holding it as a regular file, else ''.
+// Absolute paths and paths with a `..` segment are never rebased. requirePlansDir: the rel must be a
+// .ai-workspace/plans/ path (the PLAN: contract).
+function xrepoResolveRel(rel, session, task, hints, requirePlansDir) {
+  if (typeof rel !== 'string' || !rel || path.isAbsolute(rel) || rel.startsWith('~')) return '';
+  const norm = path.normalize(rel).split(path.sep).join('/');
+  if (rel.split(/[\\/]/).includes('..') || norm.split('/').includes('..')) return '';
+  if (requirePlansDir && norm.indexOf('.ai-workspace/plans/') !== 0) return '';
+  try { if (fs.statSync(path.resolve(rel)).isFile()) return ''; } catch (e) { /* not under cwd -> consult bases */ }
+  for (const b of xrepoBases(session, task, hints)) {
+    const cand = path.join(b, norm);
+    try { if (fs.statSync(cand).isFile()) return cand; } catch (e) { /* next base */ }
+  }
+  return '';
+}
+// The newest `YYYY-MM-DD-<task>-*.md` plan in the bases' .ai-workspace/plans/ (the plan-review hook's
+// cross-repo fallback when its own plans dir holds no plan for the task). '' when none.
+function xrepoTaskPlan(session, task, hints) {
+  if (!task || !/^[0-9A-Za-z._-]{1,128}$/.test(String(task))) return '';
+  const re = new RegExp('^\\d{4}-\\d{2}-\\d{2}-' + escapeRe(task) + '-.*\\.md$');
+  let best = ''; let bestM = -1;
+  for (const b of xrepoBases(session, task, hints)) {
+    const pd = path.join(b, '.ai-workspace', 'plans');
+    let ents = [];
+    try { ents = fs.readdirSync(pd); } catch (e) { continue; }
+    for (const e of ents.filter((x) => re.test(x)).slice(0, XREPO_MAX_DIRENTS)) {
+      try { const st = fs.statSync(path.join(pd, e)); if (st.isFile() && st.mtimeMs > bestM) { best = path.join(pd, e); bestM = st.mtimeMs; } } catch (err) { /* skip */ }
+    }
+  }
+  return best;
+}
+// The ticket's metadata.execution ('' unless a token-shaped string), same bounds as readTicketRepo.
+function readTicketExecution(session, task) {
+  const safe = /^[0-9A-Za-z._-]{1,128}$/;
+  const s = session == null ? '' : String(session);
+  const t = task == null ? '' : String(task);
+  if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return '';
+  const root = process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks');
+  try {
+    const p = path.join(root, s, t + '.json');
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) return '';
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const v = j && j.metadata && typeof j.metadata === 'object' ? j.metadata.execution : undefined;
+    return (typeof v === 'string' && safe.test(v)) ? v : '';
+  } catch (e) { return ''; }
 }
 
 // D3/D4/D8: the effective route. Leaving the declared subprocess route needs ALL of: the seat declares an
@@ -8563,6 +8669,27 @@ function cmdPlanReviewRoute(opts) {
   const route = planReviewRouteFromBrief(text, task, seat, undefined);
   if ('json' in opts) console.log(JSON.stringify(route));
   else console.log('model=' + route.model + ' size=' + route.size + ' round=' + route.round + ' fold_only=' + (route.fold_only ? 1 : 0) + ' route_reason=' + route.route_reason + ' data_class=' + (route.data_class || 'none'));
+  process.exit(0);
+}
+
+// #3344 spawn-ticket --session S --task T [--plan REL] [--worktrees W] : the plan-review hook's view of a spawn's
+// OWN ticket. Prints two lines: `execution=<metadata.execution or empty>` and `plan=<absolute plan path or empty>`.
+// plan = the --plan path (cwd first, then the cross-repo base set) when it resolves to a task-bound plan; else
+// the newest YYYY-MM-DD-<task>-*.md in the cross-repo base set (xrepoTaskPlan); else empty. Always exit 0 on
+// valid args (the hook treats empty as "nothing found" and keeps its own fail-toward-block behaviour).
+function cmdSpawnTicket(opts) {
+  const session = typeof opts.session === 'string' ? opts.session : '';
+  const task = typeof opts.task === 'string' ? opts.task : '';
+  if (!session || !task) { console.error('spawn-ticket: --session and --task are required'); process.exit(2); }
+  const hints = typeof opts.worktrees === 'string' ? opts.worktrees : '';
+  let plan = '';
+  if (typeof opts.plan === 'string' && opts.plan) {
+    const pf = resolvePlanFacts(opts.plan, task, { session, hints });
+    if (!pf.unresolvable && pf.bound) plan = pf.abs;
+  }
+  if (!plan) plan = xrepoTaskPlan(session, task, hints);
+  console.log('execution=' + readTicketExecution(session, task));
+  console.log('plan=' + plan);
   process.exit(0);
 }
 
@@ -9133,8 +9260,13 @@ function cmdResolveRoute(opts) {
   // plan refusal. The admission itself is executor-only and needs --task (a receipt bound to no task, or a
   // brief read with no task in scope, admits nothing); a --brief on any other seat is inert metadata.
   let needleAdmit = false;
+  // #3344: --session S [--worktrees W] turns on the cross-repo lookup (xrepoResolveRel) for a RELATIVE --plan /
+  // --brief that does not exist under the cwd. Without --session every answer is byte-identical to pre-#3344.
+  const xrepo = (typeof opts.session === 'string' && opts.session) ? { session: opts.session, hints: typeof opts.worktrees === 'string' ? opts.worktrees : '' } : null;
   if ('brief' in opts) {
-    const bArg = opts.brief;
+    const bArgIn = opts.brief;
+    const bX = xrepo ? xrepoResolveRel(bArgIn, xrepo.session, opts.task, xrepo.hints, false) : '';
+    const bArg = bX || bArgIn;
     let bst = null;
     if (typeof bArg === 'string' && bArg) { try { bst = fs.statSync(bArg); } catch (e) { bst = null; } }
     if (!bst || !bst.isFile()) {
@@ -9155,7 +9287,7 @@ function cmdResolveRoute(opts) {
   }
   let planFacts = null;
   if ('plan' in opts) {
-    planFacts = resolvePlanFacts(opts.plan, opts.task);
+    planFacts = resolvePlanFacts(opts.plan, opts.task, xrepo);
     if (planFacts.unresolvable) {
       console.log('SIZE-PLAN-UNRESOLVABLE: --plan ' + (typeof opts.plan === 'string' ? opts.plan : '<none>') + ' is unresolvable (' + planFacts.why + ')');
       process.exit(2);
@@ -10168,6 +10300,7 @@ try {
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
   else if (cmd === 'plan-size') cmdPlanSize(opts);
+  else if (cmd === 'spawn-ticket') cmdSpawnTicket(opts);
   else if (cmd === 'plan-review-route') cmdPlanReviewRoute(opts);
   else if (cmd === 'zai-strikes') cmdZaiStrikes(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
@@ -10181,7 +10314,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +

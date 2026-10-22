@@ -575,4 +575,91 @@ g2985 "$P" OPENROUTER_DISPATCH_RECEIPT_FILE="$RN3190"; rc1=$RC; o1="$CAP"; g2985
 { [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$o1" | grep -q "ZAI-FIRST"; } \
   && ok "#3190 AC-7(vii): plan-review + BRIEF: line -> ZAI-FIRST repeat-block, the BRIEF: line is ignored for that seat" || bad "#3190 AC-7(vii) plan-review (rc1=$rc1 rc2=$rc2 out=$o1)"
 fi
+echo "== SECTION 6: #3344 — cross-repo PLAN:/BRIEF: resolve against the spawn ticket's own repo =="
+# Self-contained fixture (works in ai-brain AND the plugin): a fixture projects root (CC_XREPO_PROJECTS_ROOT),
+# a fixture ticket store (PROGRESS_TASKS_DIR), a fixture HOME, and a cwd that holds NO plans (the ai-brain
+# primary stand-in) -- so every resolution below can only come from the cross-repo base set.
+X3344="$TMP/x3344"; XP="$X3344/proj"; XT="$X3344/tasks/s3344"; XCWD="$X3344/primary"; XH="$X3344/home"
+mkdir -p "$XT" "$XCWD" "$XH" "$X3344/elsewhere/.claude/worktrees/9344-x/.ai-workspace/plans"
+WTA="$XP/mb/.claude/worktrees/9344-x"; mkdir -p "$WTA/.ai-workspace/plans" "$WTA/tmp" "$XP/mb2/.ai-workspace/plans" "$XP/mb/.claude/worktrees/9347-y/.ai-workspace/plans"
+printf 'Ticket: #9344\nsize: S\n' > "$WTA/.ai-workspace/plans/2026-10-22-9344-x.md"
+printf 'brief\n' > "$WTA/tmp/brief-9344.md"
+printf 'Ticket: #9347\nsize: S\n' > "$XP/mb/.claude/worktrees/9347-y/.ai-workspace/plans/2026-10-22-9347-y.md"
+printf 'Ticket: #9345\nsize: S\n' > "$XP/mb2/.ai-workspace/plans/2026-10-22-9345-z.md"
+printf 'Ticket: #9345\nsize: S\n' > "$WTA/.ai-workspace/plans/2026-10-22-9345-z-only-in-mb.md"
+printf 'Ticket: #9348\nsize: S\n' > "$X3344/elsewhere/.claude/worktrees/9344-x/.ai-workspace/plans/2026-10-22-9348-out.md"
+printf '{"metadata":{"size":"S","repo":"mb"}}' > "$XT/9344.json"
+printf '{"metadata":{"size":"S","repo":"mb2"}}' > "$XT/9345.json"
+printf '{"metadata":{"size":"S"}}' > "$XT/9346.json"
+printf '{"metadata":{"size":"S"}}' > "$XT/9348.json"
+: > "$X3344/receipts.md"
+ST3344="$TMP/state3344"
+gx() {
+  local payload="$1"; shift
+  CAP=$(cd "$XCWD" && printf '%s' "$payload" | env HOME="$XH" CC_ROUTES_JSON="$ROUTES_SUBPROC_ZAI" CC_MODE_FILE="$HYB_PIN" \
+    CC_XREPO_PROJECTS_ROOT="$XP" PROGRESS_TASKS_DIR="$X3344/tasks" OPENROUTER_DISPATCH_RECEIPT_FILE="$X3344/receipts.md" \
+    "$@" CC_ROUTE_DISPATCH_STATE_DIR="$ST3344" RULE12_LOG="$TMP/rule12-3344.log" bash "$HOOK" 2>&1); RC=$?
+}
+mkx() { node -e 'console.log(JSON.stringify({session_id:"s3344",tool_input:{prompt:process.argv[1]}}))' "$1"; }
+# twice <label> <payload>: rc1/rc2/o1 from two identical issues on a fresh state dir.
+twice() { rm -rf "$ST3344"; mkdir -p "$ST3344"; gx "$2"; rc1=$RC; o1="$CAP"; gx "$2"; rc2=$RC; }
+admits() { [ "$rc1" = "2" ] && [ "$rc2" = "0" ] && ! printf '%s' "$o1" | grep -q "UNRESOLVABLE"; }
+# --- must-pass (resolved -> today's S/M block-once: first issue nudges, the re-issue is ADMITTED) ---
+twice p1 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-x.md
+Worktree: $WTA
+implement")"
+admits && ok "#3344 A-P1: relative PLAN: found in the worktree the prompt names (ticket repo mb) -> block-once, re-issue admitted" || bad "#3344 A-P1 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice p2 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-x.md
+implement")"
+admits && ok "#3344 A-P2: no worktree named -> found in the ticket repo's own 9344-* worktree -> block-once, admitted" || bad "#3344 A-P2 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice p3 "$(mkx "3ROLE_TASK:9345 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9345-z.md
+implement")"
+admits && ok "#3344 A-P3: relative PLAN: found in the ticket's metadata.repo primary (mb2) -> block-once, admitted" || bad "#3344 A-P3 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice p4 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-x.md
+BRIEF: tmp/brief-9344.md
+Worktree: $WTA
+implement")"
+admits && ok "#3344 A-P4: relative BRIEF: found in the named worktree (no receipt) -> not BRIEF-UNRESOLVABLE; block-once, admitted" || bad "#3344 A-P4 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice p5 "$(mkx "3ROLE_TASK:9346 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-x.md
+Worktree: $WTA
+implement")"
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$o1" | grep -q "SIZE-TASK-MISMATCH"; } \
+  && ok "#3344 A-P5: ticket with no metadata.repo + named worktree -> plan FOUND (binding check then runs: task-mismatch)" || bad "#3344 A-P5 (rc1=$rc1 rc2=$rc2 out=$o1)"
+# --- must-block (fail closed: repeat-block, no marker) ---
+unres() { [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && printf '%s' "$o1" | grep -q "$1" && ! printf '%s' "$o1" | grep -q "/Users/"; }
+twice b1 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-ghost.md
+Worktree: $WTA
+implement")"
+unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B1: plan absent from every base -> SIZE-PLAN-UNRESOLVABLE twice (fail closed)" || bad "#3344 A-B1 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice b2 "$(mkx "3ROLE_TASK:9345 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9345-z-only-in-mb.md
+Worktree: $WTA
+implement")"
+unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B2: named worktree belongs to ANOTHER repo than the ticket's metadata.repo -> not consulted, UNRESOLVABLE" || bad "#3344 A-B2 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice b3 "$(mkx "3ROLE_TASK:9348 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9348-out.md
+Worktree: $X3344/elsewhere/.claude/worktrees/9344-x
+implement")"
+unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B3: named worktree outside the projects root -> not consulted, UNRESOLVABLE" || bad "#3344 A-B3 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice b4 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9347-y.md
+implement")"
+unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B4: another task's worktree (9347-*) is not in 9344's base set -> UNRESOLVABLE" || bad "#3344 A-B4 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice b5 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/2026-10-22-9344-x.md
+BRIEF: tmp/no-such-brief.md
+Worktree: $WTA
+implement")"
+unres BRIEF-UNRESOLVABLE && ok "#3344 A-B5: relative BRIEF: absent from every base -> BRIEF-UNRESOLVABLE twice" || bad "#3344 A-B5 (rc1=$rc1 rc2=$rc2 out=$o1)"
+twice b6 "$(mkx "3ROLE_TASK:9344 ROLE:executor
+PLAN: .ai-workspace/plans/../plans/2026-10-22-9344-x.md
+Worktree: $WTA
+implement")"
+unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B6: a .. segment is never rebased -> UNRESOLVABLE" || bad "#3344 A-B6 (rc1=$rc1 rc2=$rc2 out=$o1)"
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
