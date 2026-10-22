@@ -7594,6 +7594,24 @@ function configDirSparseOmissionProblem(repoRoot) {
     ' -- refusing to silently fall back to opus. Restore config/ in this worktree, or set CC_ROLES_ENV explicitly.';
 }
 
+// #3350 — ALIAS-AWARE ticket lookup for every ticket-metadata reader (readTicketSize / readTicketRepo /
+// readTicketExecution). A chat session is often an ALIAS of the session that holds the ticket JSON
+// (`.session-alias/<sid>`, #1942), so a reader that looked only under <tasks>/<session>/ answered "no
+// metadata" (spawn-ticket printed `execution=` from the chat while the ledger session printed fast-track, so
+// the #3344 FAST-TRACK exemption never fired). Order: <tasks>/<session>/<task>.json first (byte-identical
+// pre-#3350 answer when present), then each alias session in file order, via the ONE #3342 alias reader
+// (sessionAliases3342: <= 8 lines, <= 4 KiB, token-safe ids naming real ledger session dirs). Returns the
+// first path that is a regular file, else the session's own path (callers' stat then fails -> '' as before).
+function ticketJsonPath3350(root, s, t) {
+  const own = path.join(root, s, t + '.json');
+  try { if (fs.statSync(own).isFile()) return own; } catch (e) { /* not under the session -> try aliases */ }
+  for (const a of sessionAliases3342(s)) {
+    const cand = path.join(root, a, t + '.json');
+    try { if (fs.statSync(cand).isFile()) return cand; } catch (e) { /* next alias */ }
+  }
+  return own;
+}
+
 // #3140 Leg 2 -- size-aware PLANNER tier. ONE implementation, three callers (cmdResolveRoleModel, the
 // `check --enforce-role-models` expected side, and -- via resolve-role-model -- the spawn gate): #2434 single-
 // generator discipline. The size comes from the TICKET (`<tasks-root>/<session>/<task>.json` .metadata.size),
@@ -7610,7 +7628,7 @@ function readTicketSize(tasksDirOpt, session, task) {
   const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
     : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
   try {
-    const p = path.join(root, s, t + '.json');
+    const p = ticketJsonPath3350(root, s, t);
     const st = fs.statSync(p);
     if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
     const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -7638,7 +7656,7 @@ function readTicketRepo(tasksDirOpt, session, task) {
   const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
     : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
   try {
-    const p = path.join(root, s, t + '.json');
+    const p = ticketJsonPath3350(root, s, t);
     const st = fs.statSync(p);
     if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
     const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -8550,7 +8568,7 @@ function readTicketExecution(session, task) {
   if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return '';
   const root = process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks');
   try {
-    const p = path.join(root, s, t + '.json');
+    const p = ticketJsonPath3350(root, s, t);
     const st = fs.statSync(p);
     if (!st.isFile() || st.size > 4 * 1024 * 1024) return '';
     const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -8708,12 +8726,25 @@ function cmdPlanSize(opts) {
 
 // The dispatch helper's receipt file (OPENROUTER_DISPATCH_RECEIPT_FILE honoured), read through the STRIKE_TAIL_BYTES
 // cap. '' when absent/unreadable (every caller then counts 0 -- an undercount fails toward z.ai).
+// #3349 — ONE receipt store for every copy. The default receipt was derived from `<this file's dir>/..`, so a
+// worktree copy of the dispatcher wrote strikes into `<worktree>/.ai-workspace/status/...` while the gate (this
+// ledger, realpath = the primary) read the primary's file: 2 real strikes read as 0. Every default-path site
+// (this ledger, tools/openrouter-role-dispatch.sh, tools/zai-window.sh, tools/size-l-measure.mjs) now strips a
+// trailing `/.claude/worktrees/<one segment>` from its checkout root when the primary's .ai-workspace/status
+// exists, so writer and reader share the primary's receipt. OPENROUTER_DISPATCH_RECEIPT_FILE still wins.
+function receiptStoreRoot(root) {
+  const r = String(root).replace(/\/+$/, '');
+  const m = /^(.+)\/\.claude\/worktrees\/[^/]+$/.exec(r);
+  if (m && isDir(path.join(m[1], '.ai-workspace', 'status'))) return m[1];
+  return r;
+}
+function defaultReceiptFile() {
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  return path.join(receiptStoreRoot(path.resolve(selfDir, '..')), '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+}
 function readReceiptTail() {
   let file = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
-  if (!file) {
-    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
-    file = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
-  }
+  if (!file) file = defaultReceiptFile();
   try {
     const fd = fs.openSync(file, 'r');
     try {
@@ -8750,8 +8781,7 @@ const evBasename = (v) => (v == null ? '' : String(v).split('/').pop());
 // unset or resolves to the default the dispatcher writes (the P6 seam guard's own doctrine): a receipt
 // redirected anywhere else is fixture ground, where a seam-made line is the sanctioned proof.
 function receiptIsDefaultStore() {
-  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
-  const def = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const def = defaultReceiptFile();
   const rf = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
   return !rf || path.resolve(rf) === path.resolve(def);
 }
@@ -8952,9 +8982,8 @@ function cmdRepairStrikeProgress(o) {
   // The receipt file resolves exactly as readReceiptTail does; the default is recomputed here so the P6 seam
   // guard can compare the override against it WITHOUT ever running a seam against the live store.
   const receiptFileEnv = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
-  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
-  const defaultReceiptFile = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
-  const receiptFile = receiptFileEnv || defaultReceiptFile;
+  const defaultReceipt = defaultReceiptFile();
+  const receiptFile = receiptFileEnv || defaultReceipt;
 
   // ── P6 seam guard + seam arming — the ONLY block in this file where the events-file override is consulted
   //    (AC-10 pins that by grep). The seam is armed ONLY when the receipt is redirected to a NON-default file
@@ -8962,7 +8991,7 @@ function cmdRepairStrikeProgress(o) {
   let seamEventsFile = null;
   {
     const ef = process.env.THREE_ROLE_GH_EVENTS_FILE;
-    if (ef && !(receiptFileEnv && path.resolve(receiptFileEnv) !== path.resolve(defaultReceiptFile))) {
+    if (ef && !(receiptFileEnv && path.resolve(receiptFileEnv) !== path.resolve(defaultReceipt))) {
       console.error('BLOCK (3role-ledger repair-strike-progress P6): the events-file seam is set while the ' +
         'receipt resolves to its DEFAULT location — a fixture seam must never touch the live store ' +
         '(#3093 D2 arming doctrine). Nothing written.');
@@ -9238,6 +9267,51 @@ function cmdZaiStrikes(opts) {
     n++;
   }
   console.log(String(n));
+  process.exit(0);
+}
+
+// #3350 session-aliases --session S : the ONE #3342 alias reader as a CLI, one alias session per line (<= 8,
+// token-safe, each a real ledger session dir; file <= 4 KiB). For the merge guard's ledger leg and leg-1c, which
+// retry the SAME bound check under each alias of the payload session (the #2537 merge: the chat session held a
+// partial ledger AND the carried key, the complete chain lived under the alias session). Exit 0 always on a
+// valid --session (no aliases -> no output); exit 2 on a missing one.
+function cmdSessionAliases(opts) {
+  const s = typeof opts.session === 'string' ? opts.session : '';
+  if (!s) { console.error('session-aliases: --session <sid> is required'); process.exit(2); }
+  const out = sessionAliases3342(s);
+  if (out.length) console.log(out.join('\n'));
+  process.exit(0);
+}
+
+// #3349 zai-window-admit --role R : may a z.ai seat take its first-class Claude fallback with ZERO strikes
+// because the z.ai quota window is CLOSED? (#2785 refuses every z.ai role before spend with zero strikes, so
+// the 2-strike rule could never be earned while the window is closed.) The answer comes from the ONE window
+// implementation, tools/zai-window.sh `check` (same receipt source + reset parsing as the dispatcher's
+// pre-flight; located beside this file's realpath; OPENROUTER_DISPATCH_RECEIPT_FILE passes through, unset ->
+// the shared default store above). Prints exactly one line, always exit 0 on valid args:
+//   admit=1 state=CLOSED reset=<epoch|unknown> until=<epoch>   (strict parse, until in the future)
+//   admit=0 state=<OPEN|NEAR|UNKNOWN>                          (anything else — fail CLOSED: no admission)
+// UNKNOWN covers a missing CLI (a plugin install ships no tools/), a crash, a timeout and an unparseable
+// verdict. INPUT-BOUND: the CLI output is capped at 4 KiB and only its first line is parsed; 10 s timeout.
+function cmdZaiWindowAdmit(opts) {
+  const role = opts.role;
+  if (typeof role !== 'string' || !/^[a-z][a-z.-]{0,40}$/.test(role)) { console.error('zai-window-admit: --role <seat> is required'); process.exit(2); }
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const cli = path.join(selfDir, '..', 'tools', 'zai-window.sh');
+  let line = '';
+  try {
+    if (fs.statSync(cli).isFile()) {
+      const env = Object.assign({}, process.env);
+      if (!env.OPENROUTER_DISPATCH_RECEIPT_FILE) env.OPENROUTER_DISPATCH_RECEIPT_FILE = defaultReceiptFile();
+      const res = spawnSync('bash', [cli, 'check', '--role', role], { encoding: 'utf8', timeout: 10000, maxBuffer: 4096, env, stdio: ['ignore', 'pipe', 'ignore'] });
+      if (res.status === 0) line = String(res.stdout || '').slice(0, 4096).split('\n')[0];
+    }
+  } catch (e) { line = ''; }
+  const now = Math.floor(Date.now() / 1000);
+  const m = /^state=CLOSED reset=([0-9]{1,12}|unknown) until=([0-9]{1,12}) tier=[a-z0-9-]+$/.exec(line);
+  if (m && Number(m[2]) > now) { console.log('admit=1 state=CLOSED reset=' + m[1] + ' until=' + m[2]); process.exit(0); }
+  const st = /^state=(OPEN|NEAR) /.exec(line);
+  console.log('admit=0 state=' + (st ? st[1] : 'UNKNOWN'));
   process.exit(0);
 }
 
@@ -10303,6 +10377,8 @@ try {
   else if (cmd === 'spawn-ticket') cmdSpawnTicket(opts);
   else if (cmd === 'plan-review-route') cmdPlanReviewRoute(opts);
   else if (cmd === 'zai-strikes') cmdZaiStrikes(opts);
+  else if (cmd === 'zai-window-admit') cmdZaiWindowAdmit(opts);
+  else if (cmd === 'session-aliases') cmdSessionAliases(opts);
   else if (cmd === 'identify-model') cmdIdentifyModel(opts);
   else if (cmd === 'lint-routes') cmdLintRoutes(opts);
   else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
@@ -10314,7 +10390,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +

@@ -662,4 +662,65 @@ PLAN: .ai-workspace/plans/../plans/2026-10-22-9344-x.md
 Worktree: $WTA
 implement")"
 unres SIZE-PLAN-UNRESOLVABLE && ok "#3344 A-B6: a .. segment is never rebased -> UNRESOLVABLE" || bad "#3344 A-B6 (rc1=$rc1 rc2=$rc2 out=$o1)"
+echo "== SECTION 3349: a CLOSED z.ai quota window admits the first-class Claude fallback with 0 strikes =="
+# Both ends: the must-fire arms (W1-W3) are RED on origin/master (the gate never read the window, so a CLOSED window
+# still repeat-blocked plan-review and block-onced the executor) and GREEN at head; the must-not-fire arms (W4-W8)
+# are GREEN on both ends. Receipts are synthesized per arm under $TMP with the dispatcher's own row grammar;
+# ZAI_TIER_STATE_FILE points at a scratch path so the NEAR arm never reads the machine's real tier.
+if [ ! -d "$FX2985/.ai-workspace/plans" ]; then
+  echo "SKIP: #3349 gate arms: fixture dir '$FX2985' absent (plugin install) — section not run"
+else
+NOW3349=$(date +%s)
+RW_CLOSED="$TMP/rw-closed.md"; RW_PAST="$TMP/rw-past.md"; RW_NEAR="$TMP/rw-near.md"; RW_BAD="$TMP/rw-bad.md"
+RESET3349=$(( NOW3349 + 7200 ))
+printf 'OR-ZAI-WINDOW-CLOSE ts=%s reset=%s role=plan-review task=777 session=none\n' "$NOW3349" "$RESET3349" > "$RW_CLOSED"
+printf 'OR-ZAI-WINDOW-CLOSE ts=%s reset=%s role=plan-review task=777 session=none\n' "$(( NOW3349 - 21600 ))" "$(( NOW3349 - 3600 ))" > "$RW_PAST"
+printf 'OR-SEAT-SMOKE role=executor task=1 verdict=PASS drill=0 zai_credits_est=7000 ts=%s\n' "$(( NOW3349 - 60 ))" > "$RW_NEAR"
+printf 'OR-ZAI-WINDOW-CLOSE ts=notanumber reset=%s role=plan-review task=777 session=none\n' "$RESET3349" > "$RW_BAD"
+TIER3349="$TMP/no-tier-3349.json"
+w3349() { g2985 "$1" OPENROUTER_DISPATCH_RECEIPT_FILE="$2" ZAI_TIER_STATE_FILE="$TIER3349"; }
+prw() { mk2985 "$1" "3ROLE_TASK:777 ROLE:plan-review $2\nROUND: 1\nplan .ai-workspace/plans/$PLD-S.md under review"; }
+exw() { mk2985 "$1" "3ROLE_TASK:777 ROLE:executor\nPLAN: .ai-workspace/plans/$PLD-S.md\nimplement"; }
+# W1 must-fire: plan-review, NO token, 0 strikes, CLOSED -> exit 0 on the FIRST call, reason names window + reset.
+rm -rf "$ST2985"; mkdir -p "$ST2985"; rm -f "$LOG2985"
+w3349 "$(prw w1 "")" "$RW_CLOSED"
+{ [ "$RC" = "0" ] && printf '%s' "$CAP" | grep -q "quota window CLOSED (reset=$RESET3349 until=$RESET3349)" \
+    && printf '%s' "$CAP" | grep -q '"additionalContext"' && printf '%s' "$CAP" | grep -q 'model:opus' && [ "$(nmark)" = "0" ] && rowsok 0; } \
+  && ok "#3349 W1: plan-review, 0 strikes, no token, CLOSED window -> exit 0 first call, says window+reset, model:opus, no marker" \
+  || bad "#3349 W1 (rc=$RC markers=$(nmark) out=$CAP)"
+# W2 must-fire: plan-review WITH the token at 0 strikes, CLOSED -> exit 0 (the token is no longer needed, never refused).
+w3349 "$(prw w2 "$TK")" "$RW_CLOSED"
+{ [ "$RC" = "0" ] && printf '%s' "$CAP" | grep -q 'CLOSED'; } \
+  && ok "#3349 W2: plan-review + token at 0 strikes, CLOSED -> exit 0 (not FALLBACK-NOT-ADMITTED)" || bad "#3349 W2 (rc=$RC out=$CAP)"
+# W3 must-fire: executor S plan, CLOSED -> exit 0 on the FIRST call (Sonnet fallback, no block-once marker).
+w3349 "$(exw w3)" "$RW_CLOSED"
+{ [ "$RC" = "0" ] && printf '%s' "$CAP" | grep -q 'model:sonnet' && printf '%s' "$CAP" | grep -q "reset=$RESET3349" && [ "$(nmark)" = "0" ]; } \
+  && ok "#3349 W3: executor S plan, CLOSED -> exit 0 first call, model:sonnet, names reset, no marker" || bad "#3349 W3 (rc=$RC markers=$(nmark) out=$CAP)"
+# W4 must-not-fire: OPEN window (no rows) -> plan-review repeat-block, executor block-once (the 2-strike rule stays).
+w3349 "$(prw w4 "")" "$FX2985/receipts-0.md"; rc1=$RC; w3349 "$(prw w4 "")" "$FX2985/receipts-0.md"; rc2=$RC
+w3349 "$(exw w4e)" "$FX2985/receipts-0.md"; rc3=$RC; out3="$CAP"
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && [ "$rc3" = "2" ] && ! printf '%s' "$out3" | grep -q '#3349'; } \
+  && ok "#3349 W4: OPEN window -> plan-review exit 2 twice, executor exit 2 (block-once), no #3349 admission" || bad "#3349 W4 (rc1=$rc1 rc2=$rc2 rc3=$rc3 out=$out3)"
+# W5 must-not-fire: the window REOPENED (reset passed) -> z.ai-first again.
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+w3349 "$(prw w5 "")" "$RW_PAST"; rc1=$RC; w3349 "$(exw w5e)" "$RW_PAST"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ]; } && ok "#3349 W5: reset passed (window reopened) -> plan-review and executor are z.ai-first again (exit 2)" || bad "#3349 W5 (rc1=$rc1 rc2=$rc2 out=$CAP)"
+# W6 must-not-fire: NEAR window (pro tier, raw 7000 x 1.78 >= 99% of 12000) -> no admission, the 2-strike rule stays.
+rm -rf "$ST2985"; mkdir -p "$ST2985"
+w3349 "$(prw w6 "")" "$RW_NEAR"; rc1=$RC; w3349 "$(exw w6e)" "$RW_NEAR"; rc2=$RC; out2="$CAP"
+{ [ "$rc1" = "2" ] && [ "$rc2" = "2" ] && ! printf '%s' "$out2" | grep -q '#3349'; } \
+  && ok "#3349 W6: NEAR window -> plan-review and executor keep the 2-strike rule (exit 2, no #3349 admission)" || bad "#3349 W6 (rc1=$rc1 rc2=$rc2 out=$out2)"
+# W7 must-not-fire: an unparseable CLOSE row (ts not a number) -> the window CLI ignores it (OPEN) -> no admission.
+w3349 "$(prw w7 "")" "$RW_BAD"
+{ [ "$RC" = "2" ]; } && ok "#3349 W7: unparseable CLOSE row -> no admission (fail closed, exit 2)" || bad "#3349 W7 (rc=$RC out=$CAP)"
+# W8 must-not-fire: the strike rule itself is unchanged at OPEN (2 same-round strikes + token -> exit 0; no token -> 2).
+w3349 "$(prw w8 "$TK")" "$FX2985/receipts-2.md"; rc1=$RC; w3349 "$(prw w8b "")" "$FX2985/receipts-2.md"; rc2=$RC
+{ [ "$rc1" = "0" ] && [ "$rc2" = "2" ]; } && ok "#3349 W8: OPEN window, 2 strikes -> token honoured (0), no token still blocks (2): the #2985 rule unchanged" || bad "#3349 W8 (rc1=$rc1 rc2=$rc2)"
+# W9 verb pins: zai-window-admit answers admit=1 only for the CLOSED receipt.
+A1=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$RW_CLOSED" node "$LED" zai-window-admit --role executor 2>&1)
+A2=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$RW_PAST" node "$LED" zai-window-admit --role executor 2>&1)
+A3=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$RW_NEAR" ZAI_TIER_STATE_FILE="$TIER3349" node "$LED" zai-window-admit --role executor 2>&1)
+{ [ "$A1" = "admit=1 state=CLOSED reset=$RESET3349 until=$RESET3349" ] && [ "$A2" = "admit=0 state=OPEN" ] && [ "$A3" = "admit=0 state=NEAR" ]; } \
+  && ok "#3349 W9: zai-window-admit -> CLOSED admit=1 / OPEN admit=0 / NEAR admit=0" || bad "#3349 W9 (a1=$A1 a2=$A2 a3=$A3)"
+fi
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

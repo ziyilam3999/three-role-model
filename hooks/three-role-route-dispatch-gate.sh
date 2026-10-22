@@ -221,6 +221,28 @@ MODE_VAL="$(printf '%s\n' "$MODE_RESOLVE_OUT" | command grep -m1 '^mode=' | cut 
 AXIS_VAL="$(printf '%s\n' "$MODE_RESOLVE_OUT" | command grep -m1 "^${PROVIDER}_dispatch=" | cut -d= -f2)"
 [ "$AXIS_VAL" = "permitted" ] || fail_open
 
+# --- #3349: a CLOSED z.ai quota window admits the seat's FIRST-CLASS Claude fallback with ZERO strikes ---------
+# #2785 refuses every z.ai role before spend while the window is CLOSED and writes zero strikes, so the 2-strike
+# rule below could never be earned: the seat could neither run nor fall back until the reset. The window verdict
+# comes from the ledger's zai-window-admit verb (the ONE window CLI, tools/zai-window.sh, same receipt + reset
+# parsing as the dispatcher's pre-flight). admit=1 -> exit 0 for ANY z.ai seat (plan-review with or without the
+# token, executor of any size, research, a pinned planner), no marker, no bypass row (a first-class route, like
+# the #2985 L route), and the reason (window + reset + until) goes back to the orchestrator as PreToolUse
+# additionalContext. admit=0 (OPEN, NEAR, an unanswerable or unparseable window) -> fall through to the
+# unchanged rules below (fail closed). A reopened window answers OPEN, so z.ai-first resumes by itself.
+if [ "$PROVIDER" = "zai" ]; then
+  WIN_LINE="$(node "$LEDGER_HELPER" zai-window-admit --role "$ROLE" 2>/dev/null | head -1)"
+  case "$WIN_LINE" in
+    "admit=1 state=CLOSED reset="*" until="*)
+      WIN_RESET="$(printf '%s' "$WIN_LINE" | sed -n 's/.* reset=\([0-9a-z]*\) until=.*/\1/p')"
+      WIN_UNTIL="$(printf '%s' "$WIN_LINE" | sed -n 's/.* until=\([0-9]*\)$/\1/p')"
+      case "$ROLE" in plan-review) WIN_MODEL="opus" ;; *) WIN_MODEL="sonnet" ;; esac
+      WIN_MSG="THREE-ROLE ROUTE-DISPATCH GATE (#3349): z.ai quota window CLOSED (reset=${WIN_RESET} until=${WIN_UNTIL}) -- ROLE:${ROLE} for 3ROLE_TASK:${TASKID} takes its first-class Claude fallback (model:${WIN_MODEL}) with 0 strikes; the 2-strike rule is skipped because every z.ai dispatch is refused before spend until the window reopens (tools/zai-window.sh status). z.ai-first resumes by itself when the window reopens."
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"%s"}}\n' "$WIN_MSG"
+      exit 0 ;;
+  esac
+fi
+
 # --- #2985: z.ai seats are routed by the plan (executor) / the strike rule (plan-review) -----------------------
 # emit_repeat_block TOKEN DETAIL: exit 2 on EVERY call (the predicate is deterministic and re-checkable, so no
 # marker is written -- a marker would turn a fail-closed refusal into a one-time nudge). No home path in stderr.
