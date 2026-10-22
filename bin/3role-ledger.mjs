@@ -2559,6 +2559,50 @@ function overlaySeatDispatchIsSubprocess(role) {
   return { ok: true, seat: primary };
 }
 
+// #3337 — ROUTE AT RUN. A PAST subprocess row is judged by the route in force WHEN IT RAN, never by today's
+// seat pin. Before this, every "judge a past row" site read seatDispatchIsSubprocess() (the LIVE route pin +
+// SSOT), so a planner row dispatched on z.ai while the planner seat was route-pinned there flipped to BLOCK
+// (agentId "" arm) the moment the pin was removed or moved to anthropic — same row, same receipt, new verdict.
+//
+// rowSeatDeclAtRun(role, row) is the ONE seat declaration every past-row site uses:
+//   1. subprocess-local            -> the conservative_seat_map overlay (unchanged, D7).
+//   2. live seat declares THIS row's dispatch class -> the live declaration (unchanged: the slug pin and the
+//      #3085/#3145 size routes keep judging same-class rows exactly as before).
+//   3. otherwise (the live route moved the seat off this row's class, or no pin exists any more) -> the
+//      row's OWN route-at-run, admitted only when it is a value a ROUTE PIN could legally have held: the
+//      SAME validateRoutePinValue() a set-seat-pin call runs (role is route-pinnable — execution-review never
+//      is; provider declared; model in that provider's model_vocabulary; the SSOT declares that dispatch
+//      route), built into the SAME effective row routePinnedSeatRow() gives a pin. provider comes from the
+//      row's dispatch class (and must agree with the row's own `provider` field when present), model from
+//      the row's own `modelVersion`. This is only a CLAIM: checkSubprocessProvenance still demands the full
+//      receipt — transcript on disk, first record bound to 3ROLE_TASK:<task> ROLE:<role> AND this nonce,
+//      served model == the claimed model, artifact carrying the nonce. No receipt -> BLOCK (fail closed).
+//   4. nothing admissible -> the live declaration (ok:false -> ordinary agentId arm, today's behaviour).
+// "Route a NEW dispatch" sites (resolve-route, the R-C write clause, ROUTES-STALE, ROUTE-BYPASS advisory,
+// the spawn-time route gate) keep the live pin by design — the pin is exactly what should steer new work.
+function routeAtRunDecl(role, row) {
+  const no = { ok: false, seat: null };
+  if (!row || !isSubprocessDispatch(row.dispatch) || row.dispatch === 'subprocess-local') return no;
+  const provider = String(row.dispatch).slice('subprocess-'.length);
+  const model = row.modelVersion == null ? '' : String(row.modelVersion);
+  if (!provider || provider === 'anthropic' || !model) return no;
+  if (row.provider != null && String(row.provider) !== provider) return no;
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok) return no;
+  const v = validateRoutePinValue(routesLoaded.routes, role, provider + '/' + model);
+  if (!v.ok) return no;
+  const seatRow = (routesLoaded.routes.seats || {})[role];
+  if (!seatRow) return no;
+  return { ok: true, atRun: true, seat: routePinnedSeatRow(seatRow, routesLoaded.routes, v.provider, v.model) };
+}
+function rowSeatDeclAtRun(role, row) {
+  if (row && row.dispatch === 'subprocess-local') return overlaySeatDispatchIsSubprocess(role);
+  const live = seatDispatchIsSubprocess(role);
+  if (live.ok && live.seat && row && live.seat.dispatch === row.dispatch) return live;
+  const atRun = routeAtRunDecl(role, row);
+  return atRun.ok ? atRun : live;
+}
+
 // The full subprocess-openrouter/subprocess-local provenance arm for one role's ledger row. Returns:
 //   null  -> NOT admissible (SSOT doesn't declare this seat subprocess-dispatched, or the row carries no
 //            dispatch marker) -> checkRole must fall through to the ordinary agentId arm UNCHANGED.
@@ -2574,7 +2618,7 @@ function overlaySeatDispatchIsSubprocess(role) {
 // way, only WHERE `decl.seat` comes from differs).
 function checkSubprocessProvenance(role, e, session, task) {
   if (!e || !isSubprocessDispatch(e.dispatch)) return null;
-  const decl = e.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+  const decl = rowSeatDeclAtRun(role, e);
   if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
 
   // #1947 M-A (execution-review round-2 FAIL) — a harness-signed, RESOLVING agentId on the SAME row must
@@ -2605,7 +2649,7 @@ function checkSubprocessProvenance(role, e, session, task) {
   // strictly AFTER the tag+nonce binding above (an unbound transcript never steers resolution) and AT the
   // served-model comparison; every earlier check, and every OTHER dispatch class (plan-review, research,
   // subprocess-local, subprocess-openrouter) keeps today's byte-identical seat-model comparison (D4).
-  if (role === 'executor' && e.dispatch === 'subprocess-zai') {
+  if (role === 'executor' && e.dispatch === 'subprocess-zai' && !decl.atRun) {
     const route = zaiExecutorRouteExpected(e, info, task, decl);
     if (route.block) {
       return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
@@ -2792,7 +2836,7 @@ function computeVerifiedKindForProtection(role, row, session, task) {
     // protection-scoped admissibility must resolve against the conservative_seat_map OVERLAY, never
     // `seats[role]` (which for `research` carries no subprocess-* dispatch at all, and for `executor`
     // carries a DIFFERENT provider's declaration — either would silently misjudge decl.ok here).
-    const decl = row.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+    const decl = rowSeatDeclAtRun(role, row);
     if (decl.ok) {
       const info = subprocessTranscriptInfo(row.transcript_path);
       if (info.exists && subprocessFirstRecordBound(info.firstText, task, role, row.nonce)) return 'E2';
@@ -5517,7 +5561,7 @@ function cmdCheck(o) {
       // D7: label from the SAME source checkSubprocessProvenance itself just verified against — a
       // subprocess-local row's model lives on the OVERLAY, never `seats[role]` (#2075 AC-3: label the row's
       // actual dispatch value + the model it was actually verified against, never a mismatched re-derivation).
-      const decl = e.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+      const decl = rowSeatDeclAtRun(role, e);
       dispatchLabels.push('role=' + role + ' dispatch=' + e.dispatch + ' model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
     }
   }
