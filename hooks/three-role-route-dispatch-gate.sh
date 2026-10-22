@@ -161,7 +161,9 @@ read -r ROLE SESSION TASKID BYPASS SIG ROUNDV < <(
 [ -n "$SIG" ] || exit 0
 # Inline bypass -> exit 0 (deliberate sanctioned fallback), LOGGED (N1 — never silent, unlike the cited precedent).
 # #2985: a TAGGED plan-review spawn defers the token decision (strike rule below); every other spawn is unchanged.
-log_inline_token() { type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-route-dispatch-gate" "INLINE_TOKEN" "PERMIT" "${INPUT:-}"; }
+# #3357: the 5th arg names the spawn target so override-used counts one permit per task+role (a retried
+# spawn logs one row per attempt; an untagged spawn keys as "-:-").
+log_inline_token() { type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-route-dispatch-gate" "INLINE_TOKEN" "PERMIT" "${INPUT:-}" "${TASKID:--}:${ROLE:--}"; }
 # fail_open: the silent exit-0 of every "not in scope" case; a deferred plan-review token still gets its audit row.
 fail_open() { [ "$BYPASS" = "1" ] && log_inline_token; exit 0; }
 if [ "$BYPASS" = "1" ] && ! { [ "$ROLE" = "plan-review" ] && [ "$TASKID" != "-" ]; }; then
