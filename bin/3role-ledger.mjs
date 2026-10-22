@@ -3839,6 +3839,71 @@ function printSessionScanResolveAllow(task, cand) {
 // carriedKeyHasPlanner is ONE bounded read (<= 256 KiB) of ONE session/task ledger file — past the
 // bound it answers false (fail-closed: no upgrade decision is ever made from oversized input, and
 // the record keeps its current value).
+// #3342 — ALIAS-CARRIED SESSION REDIRECT. A ticket's ledger is carried under ONE session key (the
+// .task-session-key record, #3326/#3325), but the chat session that spawns its Agent-tool seats is often a
+// DIFFERENT session, linked to it by `.session-alias/<sid>` (#1942: one line per alias session). Pre-#3342
+// the SubagentStop recorder (the one writer holding the seat's real agentId) and any re-append from the
+// chat session wrote under the CHAT session — a second, partial ledger: the carried ledger's seat row kept
+// agentId "" (check BLOCKs until a hand re-pin), and the partial ledger could capture the carried key under
+// PLANNER-HOLDING-WINS (merge guard then read the partial ledger). Rule: an explicit append under session S
+// for task T writes to the carried session C instead, ONLY when ALL hold — (a) a valid carried-key record
+// names C != S; (b) S and C are alias-linked (either side's alias file lists the other, each line a
+// token-safe session id that is a real ledger session dir); (c) C already holds T's ledger file (non-empty).
+// Any miss -> S unchanged (no alias file = byte-identical pre-#3342 behaviour). Never consulted by `check`
+// (a forged agentId still fails agentResolves wherever it lands). INPUT-BOUND: alias file <= 4 KiB and
+// <= SESSION_ALIAS_MAX_3342 lines read; carried-key record <= 256 bytes — past a bound, no redirect.
+const SESSION_ALIAS_MAX_3342 = 8;
+const SESSION_ID_RE_3342 = /^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/;
+function isLedgerSessionDir3342(sid) {
+  if (!SESSION_ID_RE_3342.test(sid)) return false;
+  try { return fs.statSync(path.join(LEDGER_DIR, sid)).isDirectory(); } catch (e) { return false; }
+}
+function sessionAliases3342(session) {
+  const s = sanitize(session);
+  if (!s || !SESSION_ID_RE_3342.test(s)) return [];
+  const out = [];
+  try {
+    const f = path.join(LEDGER_DIR, '.session-alias', s);
+    const st = fs.statSync(f);
+    if (!st.isFile() || st.size <= 0 || st.size > 4096) return [];   // INPUT-BOUND: fail closed (no aliases)
+    const lines = fs.readFileSync(f, 'utf8').split('\n');
+    for (let i = 0; i < lines.length && i < SESSION_ALIAS_MAX_3342; i++) {
+      const a = lines[i].trim();
+      if (!a || a === s || a !== sanitize(a)) continue;   // a line that is not a clean session token is ignored
+      if (!isLedgerSessionDir3342(a)) continue;           // ...and so is one naming no real ledger session
+      if (!out.includes(a)) out.push(a);
+    }
+  } catch (e) { return []; }
+  return out;
+}
+function sessionsAliasLinked3342(a, b) {
+  const sa = sanitize(a), sb = sanitize(b);
+  if (!sa || !sb || sa === sb) return false;
+  return sessionAliases3342(sa).includes(sb) || sessionAliases3342(sb).includes(sa);
+}
+function readCarriedKey3342(task) {
+  const t = sanitize(task);
+  if (!t) return '';
+  try {
+    const f = path.join(LEDGER_DIR, '.task-session-key', t);
+    const st = fs.statSync(f);
+    if (st.isFile() && st.size > 0 && st.size <= 256) return sanitize(fs.readFileSync(f, 'utf8').trim());
+  } catch (e) { /* no record */ }
+  return '';
+}
+function carriedAliasTarget3342(session, task) {
+  const s = sanitize(session), t = sanitize(task);
+  if (!s || !t) return session;
+  const c = readCarriedKey3342(t);
+  if (!c || c === s) return session;
+  if (!sessionsAliasLinked3342(s, c)) return session;
+  try {
+    const st = fs.statSync(ledgerFile(c, t));
+    if (!st.isFile() || st.size <= 0) return session;
+  } catch (e) { return session; }
+  return c;
+}
+
 function carriedKeyHasPlanner(session, task) {
   try {
     const f3326 = ledgerFile(session, task);
@@ -3869,6 +3934,9 @@ function carriedKeySeed(session, task) {
     const cur3326 = sanitize(existing3326.trim());
     if (cur3326 === sKey3326) return;   // the record already names this session — nothing to do
     if (cur3326) {
+      // #3342 — the record never moves to a session ALIAS-LINKED to its current holder: an alias is the
+      // same ticket's second (partial) view, never a more complete one (the 3319 capture).
+      if (sessionsAliasLinked3342(sKey3326, cur3326)) return;
       // planner-holding-wins: a record whose holder HAS the planner row is terminal; only a
       // planner-row-holding writer may replace a record whose holder does NOT (R2-1).
       if (!carriedKeyHasPlanner(sKey3326, tKey3326) || carriedKeyHasPlanner(cur3326, tKey3326)) return;
@@ -4392,9 +4460,17 @@ const APPEND_KNOWN_FLAGS = [
 ];
 
 function cmdAppend(o) {
-  const session = o.session, task = o.task, role = o.role;
-  if (!session || !task || !role) { console.error('append: --session, --task, --role are required'); process.exit(2); }
-  enforceSessionShape(session, task, role, 2);
+  const spawnSession = o.session, task = o.task, role = o.role;
+  if (!spawnSession || !task || !role) { console.error('append: --session, --task, --role are required'); process.exit(2); }
+  enforceSessionShape(spawnSession, task, role, 2);
+  // #3342 — every LEDGER read/write below keys on `session`: the ticket's carried session when the given
+  // session is an alias of it (see carriedAliasTarget3342), else the given session unchanged. Transcript
+  // lookups (model capture, usage at close) keep `spawnSession` — the seat's transcript lives there.
+  const session = carriedAliasTarget3342(spawnSession, task);
+  if (sanitize(session) !== sanitize(spawnSession)) {
+    console.error('NOTE (3role-ledger #3342): session ' + sanitize(spawnSession) + ' is an alias of task ' +
+      sanitize(task) + "'s carried ledger session " + sanitize(session) + ' — writing there (one ledger per ticket).');
+  }
   // #3258 D4 — append-time FLAG-SHAPE refusal (fail-closed: exit 2, distinct BLOCK token, BEFORE
   // any ledger file read/write or row write). Armed on the SAME default-store predicate as the
   // session-shape guard above (SESSION_SHAPE_GUARD_ARMED): a THREE_ROLE_LEDGER_DIR-redirected
@@ -4637,7 +4713,7 @@ function cmdAppend(o) {
     const explicitAgent = ('agent' in o && o.agent) ? o.agent : '';
     const subProcGated2782 = !explicitAgent && appendBoundToSubprocess2782(session, task, role, fields);
     if (!subProcGated2782) {
-      const modelFields = resolveModelFields(session, task, role, explicitAgent);
+      const modelFields = resolveModelFields(spawnSession, task, role, explicitAgent);
       if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
       if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
     }
@@ -4866,8 +4942,8 @@ function cmdAppend(o) {
   if ('closed-at' in o) {
     try {
       const explicitAgentForUsage = ('agent' in o && o.agent) ? o.agent : '';
-      const agentIdForUsage = explicitAgentForUsage || resolveAgent(session, task, role);
-      captureUsageAtClose(session, agentIdForUsage);
+      const agentIdForUsage = explicitAgentForUsage || resolveAgent(spawnSession, task, role);
+      captureUsageAtClose(spawnSession, agentIdForUsage);
     } catch (e) { /* fail-open — see comment above; the ledger row and rc are already committed */ }
   }
   console.log('OK appended role=' + role + ' -> ' + file);
@@ -5044,8 +5120,9 @@ function cmdInherit(o) {
   // (clause 1/2) inside overlayAppend runs here too as a defense-in-depth BACKSTOP — unreachable in the
   // sanctioned flow given precondition 3 above, but never bypassed.
   try {
-    overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) }, { carriedKeySeed: true });
-    overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict }, { carriedKeySeed: true });
+    const wSession3342 = carriedAliasTarget3342(session, task);   // #3342 — alias session writes to the carried ledger
+    overlayAppend(wSession3342, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) }, { carriedKeySeed: true });
+    overlayAppend(wSession3342, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict }, { carriedKeySeed: true });
   } catch (e) {
     if (e instanceof GuardRejection) blockPrecond(e.message);
     throw e;
