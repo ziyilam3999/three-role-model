@@ -813,4 +813,34 @@ sz_case ho4 92024 S S; sz_hook_env - 92024
 { [ "$RC" = "0" ] && [ -z "$CAP" ]; } \
   && ok "size-s-ho4 ok: S + plan with CLAUDE_PLUGIN_ROOT unset -> ALLOW silent (the ../bin fallback lands on the fixture copy)" || bad "size-s-ho4 (rc=$RC out=$CAP)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3333 — session alias: the plan-review lives under the OTHER ledger session this chat works for.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+SA="s-alias-chat"; SB="s-alias-ledger"; TA="3333-task"
+add_planreview "$SB" "$TA"
+# al1 MUST-NOT-fire (pre-alias answer kept): no alias file -> the executor spawn under SA still BLOCKs.
+run "$(agent "3ROLE_TASK:$TA ROLE:executor" "$SA")"
+[ "$RC" = "2" ] && ok "alias-1 no alias file -> plan-review under another session does not admit -> BLOCK" || bad "alias-1 (rc=$RC out=$CAP)"
+# al2 MUST-fire: alias SA -> SB, the same spawn is admitted by SB's real completed PASS.
+mkdir -p "$LEDGERDIR/.session-alias"; printf '%s\n' "$SB" > "$LEDGERDIR/.session-alias/$SA"
+run "$(agent "3ROLE_TASK:$TA ROLE:executor" "$SA")"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "alias-2 alias SA->SB + completed PASS under SB -> ALLOW" || bad "alias-2 (rc=$RC out=$CAP)"
+# al3 MUST-NOT-fire: the alias session holds a PASS for a DIFFERENT task only -> BLOCK.
+run "$(agent "3ROLE_TASK:3333-other ROLE:executor" "$SA")"
+[ "$RC" = "2" ] && ok "alias-3 alias session has a PASS for a different task only -> BLOCK" || bad "alias-3 (rc=$RC out=$CAP)"
+# al4 MUST-NOT-fire: the alias session's plan-review is NOT finished (no closedAt) -> BLOCK.
+TA4="3333-open"; mk_bound "$SB" "agOpen" "$TA4" "plan-review"
+appendL --session "$SB" --task "$TA4" --role plan-review --agent "agOpen" --artifact "$TMP/rev.md"
+run "$(agent "3ROLE_TASK:$TA4 ROLE:executor" "$SA")"
+[ "$RC" = "2" ] && ok "alias-4 alias session's plan-review unfinished -> BLOCK" || bad "alias-4 (rc=$RC out=$CAP)"
+# al5 MUST-fire: the admitting alias is the 2nd line (a dead alias first) -> ALLOW.
+printf 's-alias-dead\n%s\n' "$SB" > "$LEDGERDIR/.session-alias/$SA"
+run "$(agent "3ROLE_TASK:$TA ROLE:executor" "$SA")"
+{ [ "$RC" = "0" ] && [ -z "$CAP" ]; } && ok "alias-5 admitting alias on line 2 -> ALLOW" || bad "alias-5 (rc=$RC out=$CAP)"
+# al6 MUST-NOT-fire: the admitting alias sits past the 8-alias bound -> not read -> BLOCK.
+{ for i in 1 2 3 4 5 6 7 8; do echo "s-alias-dead$i"; done; echo "$SB"; } > "$LEDGERDIR/.session-alias/$SA"
+run "$(agent "3ROLE_TASK:$TA ROLE:executor" "$SA")"
+[ "$RC" = "2" ] && ok "alias-6 admitting alias past the 8-line bound -> BLOCK" || bad "alias-6 (rc=$RC out=$CAP)"
+mv "$LEDGERDIR/.session-alias/$SA" "$TMP/alias-$SA.bak"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
