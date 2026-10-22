@@ -118,6 +118,26 @@ if [ "$GATE_RC" = "0" ]; then
   exit 0
 fi
 
+# #3333 (2026-10-22): one chat can own a ticket's rows under more than one ledger session (z.ai dispatches
+# under the carried ledger session, Agent-tool seats under the chat's own). `<ledger>/.session-alias/<session>`
+# lists those other sessions (same file + bound as hooks/sole_lane_math.py session_aliases). Re-run the SAME
+# gate-plan-review under each alias: only a real COMPLETED, AFFIRMATIVE plan-review for THIS task, passing every
+# check that evaluator applies, admits. Missing/unreadable alias file -> no retry (the pre-alias answer).
+ALIAS_FILE="${THREE_ROLE_LEDGER_DIR:-$HOME/.claude/3role-ledger}/.session-alias/${SESSION}"
+if [ -f "$ALIAS_FILE" ] && [ -r "$ALIAS_FILE" ]; then
+  ALIAS_N=0
+  while IFS= read -r ALIAS_SID || [ -n "$ALIAS_SID" ]; do
+    ALIAS_SID="$(printf '%s' "$ALIAS_SID" | tr -cd '0-9A-Za-z._-')"
+    [ -n "$ALIAS_SID" ] && [ "$ALIAS_SID" != "$SESSION" ] || continue
+    ALIAS_N=$((ALIAS_N + 1))
+    [ "$ALIAS_N" -le 8 ] || break
+    if node "$LED_HELPER" gate-plan-review --session "$ALIAS_SID" --task "$TASKID" >/dev/null 2>&1; then
+      exit 0
+    fi
+    GATE_STDERR="${GATE_STDERR} | alias session ${ALIAS_SID}: no admitting plan-review either"
+  done < "$ALIAS_FILE"
+fi
+
 # BLOCK: the ledger has no COMPLETED, AFFIRMATIVE plan-review for this task yet. $GATE_STDERR names the
 # specific evidence class that failed (not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn /
 # inherited-row-unbound-to-parent / deliberate-skip-closed / junk-line / subprocess-unverified) plus the
