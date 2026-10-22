@@ -139,7 +139,8 @@ fi
 # Emits "<role|-> <session|-> <taskId|-> <bypass 0|1> <sig>" or "" on a fatal parse error (-> fail-open).
 # Reads the joined prompt+description+message field set (same bypass-form coverage as the model-policy gate).
 ROLE=""; SESSION=""; TASKID=""; BYPASS=""; SIG=""; ROUNDV="-"
-read -r ROLE SESSION TASKID BYPASS SIG ROUNDV < <(
+PHASH="-"
+read -r ROLE SESSION TASKID BYPASS SIG ROUNDV PHASH < <(
   HOOK_INPUT="$INPUT" node -e '
     const crypto=require("crypto");
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){ process.exit(0); }
@@ -153,7 +154,8 @@ read -r ROLE SESSION TASKID BYPASS SIG ROUNDV < <(
     const bypass = /\[route-dispatch-fallback-ok\]/i.test(prompt) ? "1" : "0";
     const sig=crypto.createHash("sha1").update((session||"-")+":"+(taskId||"-")+":"+role).digest("hex");
     const mRound=prompt.slice(0,1048576).match(/^ROUND: ([0-9]{1,6})[ \t]*$/m);
-    process.stdout.write([role, (session||"-"), taskId, bypass, sig, mRound ? mRound[1] : "-"].join(" ") + "\n");
+    const phash=crypto.createHash("sha1").update(prompt).digest("hex").slice(0,12);
+    process.stdout.write([role, (session||"-"), taskId, bypass, sig, mRound ? mRound[1] : "-", phash].join(" ") + "\n");
   ' 2>/dev/null
 )
 
@@ -161,9 +163,13 @@ read -r ROLE SESSION TASKID BYPASS SIG ROUNDV < <(
 [ -n "$SIG" ] || exit 0
 # Inline bypass -> exit 0 (deliberate sanctioned fallback), LOGGED (N1 — never silent, unlike the cited precedent).
 # #2985: a TAGGED plan-review spawn defers the token decision (strike rule below); every other spawn is unchanged.
-# #3357: the 5th arg names the spawn target so override-used counts one permit per task+role (a retried
-# spawn logs one row per attempt; an untagged spawn keys as "-:-").
-log_inline_token() { type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-route-dispatch-gate" "INLINE_TOKEN" "PERMIT" "${INPUT:-}" "${TASKID:--}:${ROLE:--}"; }
+# #3357: the 5th arg names the spawn target so override-used counts one permit per spawn (a retried spawn
+# logs one row per attempt). Tagged -> "<task>:<role>"; untagged -> "u:<12-hex hash of the spawn text>" so
+# DIFFERENT untagged spawns stay distinct while an identical retry still collapses (review F2).
+_rd_spawn_key() {
+  if [ "${TASKID:--}" != "-" ] && [ "${ROLE:--}" != "-" ]; then printf '%s:%s' "$TASKID" "$ROLE"; else printf 'u:%s' "${PHASH:--}"; fi
+}
+log_inline_token() { type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-route-dispatch-gate" "INLINE_TOKEN" "PERMIT" "${INPUT:-}" "$(_rd_spawn_key)"; }
 # fail_open: the silent exit-0 of every "not in scope" case; a deferred plan-review token still gets its audit row.
 fail_open() { [ "$BYPASS" = "1" ] && log_inline_token; exit 0; }
 if [ "$BYPASS" = "1" ] && ! { [ "$ROLE" = "plan-review" ] && [ "$TASKID" != "-" ]; }; then
