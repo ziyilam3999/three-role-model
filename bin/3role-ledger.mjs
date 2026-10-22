@@ -1296,7 +1296,116 @@ function agentResolves(session, agentId) {
     const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
     if (fileExists(f)) return true;
   }
-  return false;
+  // #3326 — the pinned session holds no transcript for this agentId: the seat may have been spawned in
+  // a DIFFERENT Claude session than the ledger key (the key is carried across compactions/sessions by a
+  // handoff card; agent ids are unique, so the transcript IS findable). Bounded, deterministic cross-
+  // session sweep; budget exceeded fails CLOSED (no resolve).
+  const x3326 = xsessionFirstTranscript(aid);
+  return !!x3326.path;
+}
+
+// ── #3326 cross-session agent binding (3325 leg 2) ─────────────────────────────────────────────────
+// The ledger session key can differ from the Claude session that SPAWNED an Agent-tool seat (the key is
+// carried across compactions/sessions by a handoff card), but the seat's transcript lands under the
+// SPAWNING session's dir — and agent ids are unique, so the transcript IS findable, just not under the
+// key the pre-#3326 predicates consult. Every resolution predicate below therefore keeps its byte-identical
+// SAME-SESSION arm as the first, authoritative pass (AC-20: a transcript under the ledger key's OWN
+// session dir decides exactly as before — including a pinned-session transcript that exists but does NOT
+// bind, which still decides "no bind", never rescued by a cross-session sibling) and only falls back to
+// the bounded cross-session sweep here when that arm found NOTHING under the pinned session. The sweep is
+// DETERMINISTIC (candidates enumerated in ascending (slug, session) order — the FIRST existing transcript
+// decides a binding, mirroring the W27 discipline already documented on agentBoundToTag: never let a
+// sibling transcript steal another row's decision) and BOUNDED (XSESSION_MAX_SESSION_DIRS session dirs and
+// XSESSION_MAX_FILE_READS transcript opens per predicate call); when a budget is exceeded the sweep FAILS
+// CLOSED — the predicate reports not-found/no-bind/'', never a partial or order-dependent verdict (plan-
+// review r3 finding 1's deterministic-collision rule and finding 2's bounded-read discipline; the
+// fail-closed-past-the-bound arm is in the 3325 smoke).
+// Fix cycle 1 (execution-review finding 1): the bounds are SIZED FROM THE MEASURED LIVE POPULATION
+// (names only, no transcript content read; method + numbers recorded in the executor close note):
+// 3,629 session dirs / 3,471 subagent transcripts under the live projects root (1,891 slugs),
+// largest single subagents dir 1,817 transcripts — the leg-2 constants (512/2048) sat BELOW that
+// population, so the sweep failed closed on the live machine exactly where #3326 needed it to
+// resolve. Powers of two with ~4.5x headroom on BOTH axes, so the live shape resolves with room to
+// grow; a hit is never silent (see xsessionLoudExhaustion just below).
+const XSESSION_MAX_SESSION_DIRS = 16384;
+const XSESSION_MAX_FILE_READS = 16384;
+// Fix cycle 1: a budget hit fails LOUDLY with a named reason — pre-fix it was an empty exit-1 miss,
+// indistinguishable from "no transcript exists". Emitted to stderr at most once per process, from
+// whichever sweep first exhausts a bound; stdout is never touched (resolve-agent's contract prints
+// only the agentId there).
+let xsessionExhaustionLogged = false;
+function xsessionLoudExhaustion(bound) {
+  if (xsessionExhaustionLogged) return;
+  xsessionExhaustionLogged = true;
+  console.error('3role-ledger: xsession-budget-exhausted: the #3326 cross-session transcript sweep hit its ' +
+    bound + ' bound before finding any transcript — FAILING CLOSED (no result, never a partial or guessed ' +
+    'winner). The population under the projects root exceeds the built-in budget; the bounds live in ' +
+    'hooks/3role-ledger.mjs (XSESSION_MAX_SESSION_DIRS / XSESSION_MAX_FILE_READS, sized from the measured ' +
+    'live population with headroom) and may only be raised, never removed.');
+}
+
+// Bounded, deterministic enumeration of session dirs (slug asc, session asc) holding a transcript for
+// agentId. Stops at the FIRST hit — the deciding transcript — so 'exhausted' is only ever true when the
+// budget ran out with NO transcript found: callers treat that as not-found, fail-closed. One stat per
+// session dir, zero file reads.
+function xsessionFirstTranscript(agentId) {
+  const out = { path: '', exhausted: false };
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return out;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return out; }
+  slugs.sort();
+  let dirBudget = XSESSION_MAX_SESSION_DIRS;
+  for (const slug of slugs) {
+    let sess = [];
+    try { sess = fs.readdirSync(path.join(PROJECTS_ROOT, slug)); } catch (e) { continue; }
+    sess.sort();
+    for (const s of sess) {
+      if (--dirBudget < 0) { out.exhausted = true; xsessionLoudExhaustion('XSESSION_MAX_SESSION_DIRS=' + XSESSION_MAX_SESSION_DIRS); return out; }
+      const f = path.join(PROJECTS_ROOT, slug, s, 'subagents', 'agent-' + aid + '.jsonl');
+      if (fileExists(f)) { out.path = f; return out; }
+    }
+  }
+  return out;
+}
+
+// The resolveAgent() twin for the cross-session fallback: newest-mtime WINNER over every session dir's
+// subagents/ (the same winner semantics its same-session arm already has, widened across sessions),
+// bounded by BOTH budgets and reading only each candidate's FIRST record via the bounded
+// readFirstNonEmptyLine() path (never a whole-file readFileSync — r3 finding 2). Either budget exceeded
+// -> '' (fail-closed, never a partial winner).
+function xsessionTaggedWinner(task, role) {
+  const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  slugs.sort();
+  let winner = null;
+  let dirBudget = XSESSION_MAX_SESSION_DIRS;
+  let readBudget = XSESSION_MAX_FILE_READS;
+  for (const slug of slugs) {
+    let sess = [];
+    try { sess = fs.readdirSync(path.join(PROJECTS_ROOT, slug)); } catch (e) { continue; }
+    sess.sort();
+    for (const s of sess) {
+      if (--dirBudget < 0) { xsessionLoudExhaustion('XSESSION_MAX_SESSION_DIRS=' + XSESSION_MAX_SESSION_DIRS); return ''; }
+      const dir = path.join(PROJECTS_ROOT, slug, s, 'subagents');
+      let files = [];
+      try { files = fs.readdirSync(dir); } catch (e) { continue; }
+      files.sort();
+      for (const fn of files) {
+        const m = fn.match(/^agent-(.+)[.]jsonl$/);
+        if (!m) continue;
+        if (--readBudget < 0) { xsessionLoudExhaustion('XSESSION_MAX_FILE_READS=' + XSESSION_MAX_FILE_READS); return ''; }
+        const f = path.join(dir, fn);
+        let st;
+        try { st = fs.statSync(f); } catch (e) { continue; }
+        if (!st.isFile()) continue;
+        if (!firstRecordTextFromLine(readFirstNonEmptyLine(f)).includes(tag)) continue;
+        if (!winner || st.mtimeMs > winner.mtimeMs) winner = { agentId: m[1], mtimeMs: st.mtimeMs };
+      }
+    }
+  }
+  return winner ? winner.agentId : '';
 }
 
 // #1575 Lane 1c — extract the plain TEXT of a subagent transcript's FIRST record (the initial spawn-prompt
@@ -1484,7 +1593,11 @@ function resolveAgent(session, task, role) {
       if (!best || st.mtimeMs > best.mtimeMs) best = { agentId: m[1], mtimeMs: st.mtimeMs };
     }
   }
-  return best ? best.agentId : '';
+  if (best) return best.agentId;
+  // #3326 — no same-session transcript carries the tag: bounded cross-session sweep (the seat's
+  // transcript may live under the SPAWNING session, not the ledger key). Same newest-mtime winner
+  // semantics, same first-record-only tag predicate; budget exceeded fails CLOSED ('').
+  return xsessionTaggedWinner(task, role);
 }
 
 // #1575 — test whether ONE SPECIFIC cited agentId is bound to (task, role): open exactly THAT agent's own
@@ -1499,11 +1612,21 @@ function agentBoundToTag(session, agentId, task, role) {
   const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
   let slugs = [];
   try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return false; }
+  let sawPinned3326 = false;
   for (const slug of slugs) {
     const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
     let content;
     try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    sawPinned3326 = true;
     if (firstRecordText(content).includes(tag)) return true;
+  }
+  // #3326 — a readable transcript EXISTS under the pinned session (sawPinned3326): it decides, bound or
+  // not — a cross-session sibling never rescues or overrides it (the W27 discipline this function's own
+  // doc comment already names). Only when NO pinned-session transcript exists at all does the bounded,
+  // deterministic cross-session sweep run, and its FIRST hit (slug asc, session asc) decides.
+  if (!sawPinned3326) {
+    const x3326 = xsessionFirstTranscript(aid);
+    if (x3326.path) return firstRecordTextFromLine(readFirstNonEmptyLine(x3326.path)).includes(tag);
   }
   return false;
 }
@@ -1569,25 +1692,42 @@ function priorAgentTranscriptProves(prior, task, role, verdict) {
     const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
     let content;
     try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
-    let proves = false;
-    for (const ln of content.split('\n')) {
-      if (!ln.trim()) continue;
-      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
-      const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
-      if (!isAsst) continue;
-      const c = j.message && j.message.content;
-      if (!Array.isArray(c)) continue;
-      for (const blk of c) {
-        if (!blk || blk.type !== 'tool_use') continue;
-        if (String(blk.name || '').toLowerCase() !== 'bash') continue;
-        const cmd = String((blk.input && blk.input.command) || '');
-        if (commandProvesLedgerAppend(cmd, task, role, verdict)) { proves = true; break; }
-      }
-      if (proves) break;
-    }
-    return { found: true, proves, path: f };
+    const proves3326 = transcriptRecordsAppend(content, task, role, verdict);
+    return { found: true, proves: proves3326, path: f };
+  }
+  // #3326 — the row's own session_id holds no transcript for this agentId (the seat was spawned in a
+  // DIFFERENT session than the key the row is filed under; agent ids are unique): resolve the agent's
+  // transcript via the bounded cross-session sweep and run the EXACT SAME scan on it — never a second,
+  // potentially diverging parser (the factored helper below), never a caller claim.
+  const x3326 = xsessionFirstTranscript(aid);
+  if (x3326.path) {
+    let xcontent;
+    try { xcontent = fs.readFileSync(x3326.path, 'utf8'); } catch (e) { return empty; }
+    return { found: true, proves: transcriptRecordsAppend(xcontent, task, role, verdict), path: x3326.path };
   }
   return empty;
+}
+
+// #3326 — the per-transcript scan body of priorAgentTranscriptProves(), factored OUT so the pinned-session
+// arm above and its cross-session fallback run the EXACT SAME scan over a transcript's every Bash
+// tool_use command (commandProvesLedgerAppend at command position). Pure: content -> boolean; identical
+// semantics to the loop it replaced (break-on-first-proof both nestings).
+function transcriptRecordsAppend(content, task, role, verdict) {
+  for (const ln of String(content == null ? '' : content).split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+    if (!isAsst) continue;
+    const c = j.message && j.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const blk of c) {
+      if (!blk || blk.type !== 'tool_use') continue;
+      if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+      const cmd = String((blk.input && blk.input.command) || '');
+      if (commandProvesLedgerAppend(cmd, task, role, verdict)) return true;
+    }
+  }
+  return false;
 }
 
 // #2701 D4 P5 — fail-closed on ANY ledger-CLI append mention the command-position parser cannot read
@@ -2775,7 +2915,7 @@ function checkRole(role, e, session, opts, task) {
     // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
     // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
     {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
@@ -2824,7 +2964,7 @@ function checkRole(role, e, session, opts, task) {
     // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
     // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
     {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && PLAN_RE.test(content)) return null;
@@ -2845,7 +2985,7 @@ function checkRole(role, e, session, opts, task) {
     // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
     // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
     {
-      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task);
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         if (content !== null && hasRefArmAffirmative(content)) return null;
@@ -3154,7 +3294,12 @@ function candidateTaskRefs(repoDir, task) {
 // under #2088 — candidateTaskRefs() never reads it). Returns {ref, repoDir, relPath} for the FIRST candidate
 // whose blob exists, or null (no candidate resolves — the caller falls through to its existing "not found"
 // problem). No ref outside this bounded set is ever consulted.
-function resolveArtifactAtRef(rawPath, mergeHead, task) {
+// #3325: container (2)'s repo set widens to the SAME bounded pair sizeSExempt uses when a caller that knows
+// the ledger session passes it (optional 4th arg — every pre-#3325 call shape keeps today's exact
+// behavior): the home repo (first, unchanged) plus the TICKET'S OWN repo (ticketRepoDirFor(session, task) —
+// exactly one named sibling, never a scan), each at its own task-bound ref set. Without a session the
+// consulted set is the home repo alone, byte-identical to pre-#3325.
+function resolveArtifactAtRef(rawPath, mergeHead, task, session) {
   if (!rawPath) return null;
   if (mergeHead) {
     const cwdRepo = process.cwd();
@@ -3164,12 +3309,16 @@ function resolveArtifactAtRef(rawPath, mergeHead, task) {
     }
   }
   const homeRepo = aiBrainToplevel();
-  if (homeRepo) {
-    const homeRel = repoRelativeCandidate(rawPath, homeRepo);
-    if (homeRel) {
-      for (const ref of candidateTaskRefs(homeRepo, task)) {
-        if (refHasBlob(homeRepo, ref, homeRel)) return { ref, repoDir: homeRepo, relPath: homeRel };
-      }
+  const homeReal = homeRepo ? realpathNearest(homeRepo).replace(/\/+$/, '') : '';
+  const tRepo = session !== undefined ? ticketRepoDirFor(session, task) : '';
+  const repos = [];
+  if (homeRepo) repos.push(homeRepo);
+  if (tRepo && tRepo !== homeRepo && tRepo !== homeReal) repos.push(tRepo);
+  for (const repo of repos) {
+    const rel = repoRelativeCandidate(rawPath, repo);
+    if (!rel) continue;
+    for (const ref of candidateTaskRefs(repo, task)) {
+      if (refHasBlob(repo, ref, rel)) return { ref, repoDir: repo, relPath: rel };
     }
   }
   return null;
@@ -3622,7 +3771,71 @@ function printSessionScanResolveAllow(task, cand) {
 // "provided" signal — an absent key PERSISTS the prior value; role / session_id / ts always refresh), applies
 // the same mutual-exclusion guard, writes back. Recognized `fields` keys: agentId, artifact_path, skip_reason,
 // oracle, inherited_from. Returns the ledger file path.
-function overlayAppend(session, task, role, fields) {
+// #3326 fix cycle 1 — seed the task→carried-key record (.task-session-key/<task>, under a dot-directory
+// the *.jsonl task-file glob never sees). FIRST-CARRIED-KEY-WINS: if a valid record already exists
+// (regular file, 0 < size <= 256 bytes, token-safe non-empty content — the same shape cmdCarriedKey
+// reads), it is NEVER rewritten, by any writer; only an absent/invalid record is seeded. Called ONLY
+// from the explicit append/inherit command paths (overlayAppend's opts.carriedKeySeed), so a
+// reconcile-spawns or refresh-models write under the SPAWNING session can never redirect the merge
+// gate away from the carried key's complete ledger (the execution-review finding-2 repro: planner row
+// under key K, then reconcile-spawns under the new session N -> the pre-fix record flipped to N and
+// leg-3c checked N's partial ledger, order-dependently). One bounded read + one bounded write keyed by
+// the task; never a session-dir enumeration.
+// #3325 fix cycle 2 (R2-1) — PLANNER-HOLDING-WINS replaces bare first-wins among explicit writers.
+// The record must name a session that actually holds THIS task's ledger rows: fix cycle 1's rule
+// locked the record to the FIRST explicit append even when that session never lands the planner row
+// (a research row filed early under a stray session), and the record could then never move to the
+// session that does hold it. Rule chosen: (a) the SEED write is exclusive-create ('wx') — two racing
+// first appends each fail-closed unless they are the single winner, so nothing is ever overwritten
+// mid-write; (b) an existing VALID record naming a session that HOLDS this task's planner row is
+// never rewritten (still never touched by the inferred writers); (c) the ONLY replacement allowed is
+// a later explicit append from a session that DOES hold the planner row over a record whose holder
+// does NOT — the one upgrade that moves the record toward completeness, never away from it (two
+// racing upgrades both hold the planner row, so last-writer-wins among them can't break (b)).
+// carriedKeyHasPlanner is ONE bounded read (<= 256 KiB) of ONE session/task ledger file — past the
+// bound it answers false (fail-closed: no upgrade decision is ever made from oversized input, and
+// the record keeps its current value).
+function carriedKeyHasPlanner(session, task) {
+  try {
+    const f3326 = ledgerFile(session, task);
+    const st3326 = fs.statSync(f3326);
+    if (!st3326.isFile() || st3326.size <= 0 || st3326.size > 262144) return false;   // INPUT-BOUND: fail closed past 256 KiB
+    const lines3326 = fs.readFileSync(f3326, 'utf8').split('\n');
+    for (const ln3326 of lines3326) {
+      let j3326; try { j3326 = JSON.parse(ln3326); } catch (e) { continue; }
+      if (j3326 && j3326.role === 'planner') return true;
+    }
+  } catch (e) { return false; }
+  return false;
+}
+function carriedKeySeed(session, task) {
+  const tKey3326 = sanitize(task), sKey3326 = sanitize(session);
+  if (!tKey3326 || !sKey3326) return;
+  try {
+    const idxDir3326 = path.join(LEDGER_DIR, '.task-session-key');
+    const idxFile3326 = path.join(idxDir3326, tKey3326);
+    let recExists3326 = false, existing3326 = '';
+    try {
+      const st3326 = fs.statSync(idxFile3326);
+      if (st3326.isFile()) {
+        recExists3326 = true;
+        if (st3326.size > 0 && st3326.size <= 256) existing3326 = fs.readFileSync(idxFile3326, 'utf8');
+      }
+    } catch (e) { /* no record yet — seed below */ }
+    const cur3326 = sanitize(existing3326.trim());
+    if (cur3326 === sKey3326) return;   // the record already names this session — nothing to do
+    if (cur3326) {
+      // planner-holding-wins: a record whose holder HAS the planner row is terminal; only a
+      // planner-row-holding writer may replace a record whose holder does NOT (R2-1).
+      if (!carriedKeyHasPlanner(sKey3326, tKey3326) || carriedKeyHasPlanner(cur3326, tKey3326)) return;
+    }
+    fs.mkdirSync(idxDir3326, { recursive: true });
+    if (recExists3326) fs.writeFileSync(idxFile3326, sKey3326 + '\n');   // the one sanctioned upgrade, or an INVALID record re-seeded
+    else fs.writeFileSync(idxFile3326, sKey3326 + '\n', { flag: 'wx' }); // exclusive create-only seed — a racing seeder fails closed (EEXIST), never overwrites
+  } catch (e) { /* best-effort — see overlayAppend's record block */ }
+}
+
+function overlayAppend(session, task, role, fields, opts) {
   const file = ledgerFile(session, task);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   let lines = [];
@@ -4101,6 +4314,20 @@ function overlayAppend(session, task, role, fields) {
   }
   kept.push(JSON.stringify(entry));
   fs.writeFileSync(file, kept.join('\n') + '\n');
+  // #3326 — durable task→carried-key record: after the row lands, remember (under a dot-directory the
+  // *.jsonl task-file glob never sees) WHICH session key this task's rows are filed under, so the merge-
+  // side review gate (enforce-review-or-lfah.sh leg-3c) can find the ticket's ledger under the CARRIED
+  // key when the merging orchestrator runs in a NEW session. Fix cycle 1 (execution-review finding 2):
+  // the record is now FIRST-CARRIED-KEY-WINS and is seeded ONLY from the explicit append/inherit command
+  // paths (the opts.carriedKeySeed flag below) — NEVER by the inferred background writers
+  // (reconcile-spawns under the SPAWNING session, refresh-models), whose spawn-record partial ledgers
+  // used to overwrite the key last-writer-wins and made the merge-gate admit order-dependent. The FIRST
+  // explicit append's key is the task's one carried key (the handoff card hands ONE key across
+  // sessions); a later explicit append under a different session never displaces it, and neither does
+  // any inferred write, in any order. Best-effort and SILENT by design: an unwritable index only
+  // removes the merge-side widening (the gate falls back to today's behavior, fail-closed) and must
+  // never change append's own output or success.
+  if (opts && opts.carriedKeySeed) carriedKeySeed(session, task);
   return file;
 }
 
@@ -4579,7 +4806,9 @@ function cmdAppend(o) {
   }
   let file;
   try {
-    file = overlayAppend(session, task, role, fields);
+    // #3326 fix cycle 1 — the explicit append path seeds the task->carried-key record (inferred
+    // writers never do; see carriedKeySeed).
+    file = overlayAppend(session, task, role, fields, { carriedKeySeed: true });
   } catch (e) {
     if (e instanceof GuardRejection) { console.error('BLOCK: ' + e.message); process.exit(2); }
     throw e;
@@ -4771,14 +5000,30 @@ function cmdInherit(o) {
   // (clause 1/2) inside overlayAppend runs here too as a defense-in-depth BACKSTOP — unreachable in the
   // sanctioned flow given precondition 3 above, but never bypassed.
   try {
-    overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) });
-    overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict });
+    overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) }, { carriedKeySeed: true });
+    overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict }, { carriedKeySeed: true });
   } catch (e) {
     if (e instanceof GuardRejection) blockPrecond(e.message);
     throw e;
   }
   console.log('OK inherited plan-review from parent ' + sanitize(parent) + ' -> task ' + sanitize(task));
   process.exit(0);
+}
+
+// #3325 -- the TICKET'S OWN repo, resolved as exactly ONE sibling directory: the parent of the ai-brain
+// primary root (the projects folder) joined with the ticket-named repo name (readTicketRepo) -- the SAME
+// parent+name construction repoRelativeCandidate's bucket-3 sibling arm uses. NEVER a scan, glob or
+// enumeration of the projects folder: a ticket with absent/invalid metadata.repo resolves '' here and the
+// waiver consults the ai-brain toplevel ONLY (today's behaviour, fail-closed). A ticket naming ai-brain
+// itself resolves the primary root (deduped against home/home-real by the caller, so those tickets stay
+// byte-identical to the pre-#3325 helper).
+function ticketRepoDirFor(session, task) {
+  const home = aiBrainToplevel();
+  if (!home) return '';
+  const name = readTicketRepo(undefined, session, task).repo;
+  if (!name) return '';
+  const primaryReal = realpathNearest(primaryRootFor(home)).replace(/\/+$/, '');
+  return path.join(path.dirname(primaryReal), name);
 }
 
 // #3154 -- the ONE size-S plan-review waiver predicate. EVERY checker that used to demand a plan-review row
@@ -4790,7 +5035,15 @@ function cmdInherit(o) {
 // plan-review row at all (once any review has started, the review governs -- a negative review is never
 // "waived" by the size); (d) the ledger parses to the end. Anything else is { exempt:false, reason } with
 // `reason` from a closed list, so a stranded S ticket is diagnosable, never silent. Fails toward REVIEW.
-// INPUT-BOUND: ticket file <= 4 MiB (readTicketSize), plan blob <= PLAN_MAX_BYTES, ledger read once.
+// #3325 widened (b)'s WHERE, never its conditions: the plan is looked for in the BOUNDED repo set -- the
+// ai-brain toplevel (unchanged, first) plus the TICKET'S OWN repo (ticketRepoDirFor) -- at the SAME
+// task-bound ref set in each (candidateTaskRefs). A plan in ANY other repo (any sibling the ticket does
+// not name) is out of the set: plan-unresolvable, review stays demanded. For ai-brain tickets (no
+// metadata.repo, or one naming ai-brain itself) the consulted set, verdict, reason and detail are
+// byte-identical to the pre-#3325 helper (hooks/_fixtures/3role-ledger-pre3325-xrepo-snapshot.mjs).
+// INPUT-BOUND: ticket file <= 4 MiB (readTicketSize/readTicketRepo), plan blob <= PLAN_MAX_BYTES per
+// candidate ref, ledger read once, the repo set is exactly the <= 2 named dirs above (never a scan --
+// an oversized or invalid metadata.repo resolves '' and the set collapses to 1, fail-closed).
 function sizeSExempt(session, task) {
   const no = (reason, detail) => ({ exempt: false, reason, detail: detail || '' });
   const tr = readTicketSize(undefined, session, task);
@@ -4814,19 +5067,37 @@ function sizeSExempt(session, task) {
   let plannerRow = null;
   for (const j of rows) { if (j && j.role === 'planner') plannerRow = j; }
   if (!plannerRow || typeof plannerRow.artifact_path !== 'string' || !plannerRow.artifact_path.trim()) return no('no-planner-row');
+  // #3325 -- the bounded repo set: the ai-brain toplevel (unchanged, first) plus the TICKET'S OWN repo
+  // when the ticket names one (exactly one sibling dir -- ticketRepoDirFor; never a scan). Each repo is
+  // consulted at its own task-bound ref set with the SAME per-repo bars; the FIRST repo whose ref holds
+  // the blob wins. The per-repo problem strings reproduce the pre-#3325 wording verbatim, so an
+  // ai-brain-only consultation renders a byte-identical detail (single-element join).
   const home = aiBrainToplevel();
-  const rel = home ? repoRelativeCandidate(plannerRow.artifact_path, home) : '';
-  if (!rel || rel.indexOf('.ai-workspace/plans/') !== 0) {
-    return no('plan-unresolvable', 'planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
-  }
-  const refs = candidateTaskRefs(home, task);
+  const homeReal = home ? realpathNearest(home).replace(/\/+$/, '') : '';
+  const tRepo = ticketRepoDirFor(session, task);
+  const repos = [];
+  if (home) repos.push(home);
+  if (tRepo && tRepo !== home && tRepo !== homeReal) repos.push(tRepo);
+  const probs = [];
   let text = null;
-  for (const ref of refs) {
-    const t = readBlobAtRef(home, ref, rel);
-    if (t !== null) { text = t; break; }
+  let rel = '';
+  for (const repo of repos) {
+    const r = repoRelativeCandidate(plannerRow.artifact_path, repo);
+    if (!r || r.indexOf('.ai-workspace/plans/') !== 0) {
+      probs.push('planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
+      continue;
+    }
+    const refs = candidateTaskRefs(repo, task);
+    for (const ref of refs) {
+      const t = readBlobAtRef(repo, ref, r);
+      if (t !== null) { text = t; rel = r; break; }
+    }
+    if (text !== null) break;
+    probs.push('plan ' + r + ' not found (or too large) at refs consulted: ' + refs.join(', '));
   }
+  if (!repos.length) probs.push('planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
   if (text === null || text.length > PLAN_MAX_BYTES) {
-    return no('plan-unresolvable', 'plan ' + rel + ' not found (or too large) at refs consulted: ' + refs.join(', '));
+    return no('plan-unresolvable', probs.join('; '));
   }
   if (!planBoundToTask(path.join('/', rel), text, task)) return no('plan-unbound');
   const sz = parsePlanSize(text);
@@ -5790,6 +6061,35 @@ function cmdCheck(o) {
   process.exit(0);
 }
 
+// #3326 — carried-key --task T -> the session key this task's ledger rows are carried under (the
+// first explicit append's key under PLANNER-HOLDING-WINS — never rewritten by any inferred writer,
+// and only ever replaced when a session that HOLDS this task's planner row supersedes a record whose
+// holder does not; see carriedKeySeed), on
+// stdout. The merge-side gate's leg-3c uses this to retry its bound `check` under the CARRIED key when the
+// payload session is a NEW session. ONE bounded read of ONE task-keyed file (<= 256 bytes, token-safe
+// content) under LEDGER_DIR/.task-session-key/ — NEVER an enumeration of session dirs, so a ledger that
+// was never appended through this helper (no index entry) is invisible here exactly as before the
+// widening (fail-closed: exit 1, no output). The record itself is seeded by carriedKeySeed from the
+// explicit append path's own --session/--task only (see there) — a merge payload's command text can
+// never influence it, and no inferred writer ever rewrites it.
+function cmdCarriedKey(o) {
+  const task = o.task;
+  if (!task) { console.error('carried-key: --task is required'); process.exit(2); }
+  const t = sanitize(task);
+  let raw = '';
+  if (t) {
+    try {
+      const f = path.join(LEDGER_DIR, '.task-session-key', t);
+      const st = fs.statSync(f);
+      if (st.isFile() && st.size > 0 && st.size <= 256) raw = fs.readFileSync(f, 'utf8');
+    } catch (e) { /* no record — fail closed below */ }
+  }
+  const key = sanitize(raw.trim());
+  if (!key) process.exit(1);   // no derivable carried key — nothing printed, never a guess or a scan.
+  console.log(key);
+  process.exit(0);
+}
+
 // #860: resolve-agent --session S --task T --role R -> newest-mtime tagged transcript's agentId on stdout.
 function cmdResolveAgent(o) {
   const session = o.session, task = o.task, role = o.role;
@@ -5877,7 +6177,7 @@ function cmdResolveArtifactsForTask(o) {
         console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? 'disk' : 'disk-content-fail', at: disk }));
         continue;
       }
-      const hit = resolveArtifactAtRef(rawRef, mergeHead, task);
+      const hit = resolveArtifactAtRef(rawRef, mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
       if (hit) {
         const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
         const ok = content !== null && (role === 'planner' ? PLAN_RE.test(content) : hasRefArmAffirmative(content));
@@ -5950,7 +6250,7 @@ function cmdResolvePublishedVerdict(o) {
     console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
     process.exit(0);
   }
-  const hit = resolveArtifactAtRef(rawRef, mergeHead, task);
+  const hit = resolveArtifactAtRef(rawRef, mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
   if (!hit) {
     console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
     process.exit(0);
@@ -7197,6 +7497,32 @@ function readTicketSize(tasksDirOpt, session, task) {
     if (typeof v === 'string' && /^[A-Za-z0-9]{1,8}$/.test(v)) out.shown = v;
     else if (v !== undefined && v !== null) out.shown = 'invalid';
   } catch (e) { /* unreadable / missing / bad JSON => no size */ }
+  return out;
+}
+
+// #3325 -- the ticket's OWN repo name, read from the SAME ticket record readTicketSize reads
+// (<tasks-root>/<session>/<task>.json .metadata.repo — present on real monday-bot tickets, measured
+// 2026-10-22: a bare SIBLING DIRECTORY NAME like "monday-bot", never a path). The exact same input
+// bounds as readTicketSize (session/task token-safe [0-9A-Za-z._-]{1,128}, no "..", regular file
+// <= 4 MiB, loads ONLY metadata.repo and never any other field). Returns { repo } with repo '' on
+// absent/invalid/non-token-shaped values (".." and "." refuse too — a name, never a traversal) --
+// every caller treats '' as "the ticket names no repo", never an error, never a scan.
+function readTicketRepo(tasksDirOpt, session, task) {
+  const out = { repo: '' };
+  const safe = /^[0-9A-Za-z._-]{1,128}$/;
+  const s = session == null ? '' : String(session);
+  const t = task == null ? '' : String(task);
+  if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return out;
+  const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
+    : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
+  try {
+    const p = path.join(root, s, t + '.json');
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const v = j && j.metadata && typeof j.metadata === 'object' ? j.metadata.repo : undefined;
+    if (typeof v === 'string' && safe.test(v) && v !== '.' && v !== '..' && !v.includes('..')) out.repo = v;
+  } catch (e) { /* unreadable / missing / bad JSON => no repo named */ }
   return out;
 }
 
@@ -9709,6 +10035,7 @@ try {
   else if (cmd === 'repair-strike-progress') cmdRepairStrikeProgress(opts);
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
+  else if (cmd === 'carried-key') cmdCarriedKey(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
   else if (cmd === 'resolve-published-verdict') cmdResolvePublishedVerdict(opts);
@@ -9733,7 +10060,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +

@@ -67,6 +67,51 @@ sz_ticket() {
   printf '{"id":"%s","status":"pending","metadata":{"size":"%s"}}\n' "$2" "$3" > "$dir/$2.json"
 }
 
+# ── #3325 cross-repo builders ──────────────────────────────────────────────────────────────────────
+# The waiver's repo set is pinned by the TICKET's own metadata.repo (a bare sibling directory NAME,
+# the real monday-bot shape); sz_ticket_repo writes that field, sz_mk_plan_repo builds a repo holding
+# ONLY the plan blob at a plumbing-written ref (no helper copy, never checked out). Fixture repo dir
+# names deliberately avoid "home"/"Users" segments and key-shaped values (FIXTURE RULE).
+
+# sz_ticket_repo <session> <task> <size> <repo-name>: the ticket names size AND its OWN repo.
+sz_ticket_repo() {
+  local dir="$PROGRESS_TASKS_DIR/$1"
+  mkdir -p "$dir"
+  printf '{"id":"%s","status":"pending","metadata":{"size":"%s","repo":"%s"}}\n' "$2" "$3" "$4" > "$dir/$2.json"
+}
+
+# sz_mk_plan_repo <repo-dir> <task> <variant> [ref-kind] [plan-relative-path]
+# ref-kind: tasked (default) = refs/remotes/origin/<task>-fixture; exact = refs/remotes/origin/<task>
+# (the #2497 task-exact shape, cross-repo). variant "-" = no plan blob anywhere.
+sz_mk_plan_repo() {
+  local repo="$1" task="$2" variant="$3" kind="${4:-tasked}" rel="${5:-}"
+  [ -n "$rel" ] || rel="$(sz_plan_name "$task")"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email "fixture-bot"
+  git -C "$repo" config user.name fixture
+  git -C "$repo" commit -q --allow-empty -m seed
+  local seed; seed="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" update-ref refs/remotes/origin/master "$seed"
+  if [ "$variant" != "-" ]; then
+    local tmpf blob t_file t_plans t_ws c base ref
+    tmpf="$(mktemp)"
+    sz_plan_text "$task" "$variant" > "$tmpf"
+    blob="$(git -C "$repo" hash-object -w "$tmpf")"
+    rm -f "$tmpf"
+    base="$(basename "$rel")"
+    t_file="$(printf '100644 blob %s\t%s\n' "$blob" "$base" | git -C "$repo" mktree)"
+    t_plans="$(printf '040000 tree %s\tplans\n' "$t_file" | git -C "$repo" mktree)"
+    t_ws="$(printf '040000 tree %s\t.ai-workspace\n' "$t_plans" | git -C "$repo" mktree)"
+    c="$(git -C "$repo" commit-tree "$t_ws" -p "$seed" -m "fixture plan")"
+    case "$kind" in
+      exact) ref="refs/remotes/origin/$task" ;;
+      *)     ref="refs/remotes/origin/${task}-fixture" ;;
+    esac
+    git -C "$repo" update-ref "$ref" "$c"
+  fi
+}
+
 # sz_sub <session> <agentId>: a resolvable subagent transcript under the fixture projects root
 sz_sub() {
   mkdir -p "$THREE_ROLE_PROJECTS_ROOT/proj/$1/subagents"

@@ -1,0 +1,10058 @@
+#!/usr/bin/env node
+// hooks/3role-ledger.mjs — #851 role-LEDGER helper (PR1, Phase 1+2).
+//
+// A tiny CLI that records WHICH 3-role roles actually ran for a task and verifies them against the
+// forgery-resistant signal the harness already produces: one transcript file per real subagent spawn
+// (`~/.claude/projects/*/<session>/subagents/agent-<agentId>.jsonl`). The orchestrator cannot create
+// that file without actually spawning, so binding a per-task role ledger to those files turns "I claim
+// the planner ran" into a checkable boolean — the leg #850 needed.
+//
+// FLAT file (NOT under hooks/lib/) because setup.sh only symlinks flat hook files (a subdir is skipped);
+// the gate finds it as a sibling via `dirname "${BASH_SOURCE[0]}"` whether run from the repo or the
+// ~/.claude/hooks/ symlink.
+//
+// Subcommands:
+//   append --session S --task T --role R [--agent A] [--artifact P] [--skip-reason "..."] [--oracle P]
+//                                        [--verdict V] [--self-authored]
+//                                        [--effort E] [--model-version V] [--model-tier T]      (#1466)
+//                                        [--provider P]   (#2782 — SSOT-validated provider stamp)
+//                                        [--effort-source assigned|observed]                     (#1528)
+//                                        [--closed-at ISO]                                       (#1516)
+//                                        [--dispatch-nonce TOK] [--receipt TOK]        (#2169 slice 5, AC-34)
+//                                        [--reviewed-plan P]              (review-round-counter-per-plan)
+//     --reviewed-plan is an ordinary own-key overlay field (normalizeArtifact()'d like --artifact): the
+//     plan-review round's PLAN identity, resolved from the DISPATCH context (never from the reviewer's own
+//     artifact_path — that stays the reviewer's OWN artifact per #861). Written by three writers: the spawn
+//     edge (three-role-spawn-ledger.sh), the subprocess dispatch helper (tools/openrouter-role-dispatch.sh),
+//     and cmdReconcileSpawns (add-only-when-missing, textual extraction with NO existence check — see
+//     findPlanPathTextual below). hooks/review-round-state.mjs's sweepLedger consumes it as the L0 tier of
+//     its plan-identity read ladder. Optional + additive (check/checkRole never reference it).
+//     --closed-at is an EXPLICIT overlay flag, written ONLY by three-role-subagent-ledger.sh (the sole
+//     writer that fires exclusively at SubagentStop/close) — never inferred, never defaulted. It is the
+//     research seat's punch-out signal for the agent-kanban board: a research row WITHOUT it is in-flight,
+//     WITH it is done. Optional + additive on every role (check/checkRole never reference it).
+//     Writes one JSONL line to <ledger-dir>/<S>/<T>.jsonl. Idempotent PER ROLE — re-appending the same
+//     role UPDATES the line (drops the prior one), never duplicates. A role agent self-recording its OWN
+//     line passes --artifact (and --verdict for review-roles) with NO --agent; the SubagentStop hook later
+//     overlay-merges the harness-captured --agent (#855) and stamps --self-authored (#1100 item 3).
+//     #1465 — EVERY append also best-effort resolves + overlays two OPTIONAL model-provenance fields:
+//     modelVersion (transcriptModel() over the resolved agentId — --agent when given, else
+//     resolveAgent(session, task, role)) and modelTier (modelIdToTier(modelVersion)). Fail-open + back-compat:
+//     absent inputs simply omit the fields; check/checkRole never reference them. Centralizing this in
+//     cmdAppend means the SubagentStop hook's EXISTING stop-time `append --agent`
+//     (three-role-subagent-ledger.sh) automatically re-resolves the model against the by-then-COMPLETE
+//     transcript with zero hook edit — the free backfill for a self-append that ran too early to see
+//     `message.model`. This transcript auto-capture is OBSERVED and always wins when a message.model line
+//     exists yet (i.e. it overwrites an --model-version/--model-tier passed on the SAME call, in the rare case
+//     both are present) — normally the two never co-occur (see below).
+//     #1466 — `--effort`/`--model-version`/`--model-tier` are EXPLICIT overlay flags, the ONLY way any of the
+//     three provenance fields get written now (the #1465 ambient `process.env.CLAUDE_EFFORT` auto-capture is
+//     REMOVED — it stamped the ORCHESTRATOR's session effort on every append, including a close-out with no
+//     effort opinion of its own, clobbering a role's real per-role effort the instant the orchestrator's own
+//     effort differed). Two callers use them: the spawn-time hook (three-role-spawn-ledger.sh) passes all
+//     three as the role's ASSIGNED {tier, version, effort} (resolved from config/cc-roles.env, known up front);
+//     the close-time hook (three-role-subagent-ledger.sh) passes ONLY --effort as the OBSERVED
+//     `effort.level` from its SubagentStop payload (modelVersion/modelTier at close stay on the transcript
+//     auto-capture path above, unchanged). Every OTHER append (self-record, close-out --artifact) passes NONE
+//     of the three, so overlayAppend's per-key "provided" discipline (#855) PRESERVES whatever a role's real
+//     line already carries — an orchestrator's --artifact-only close-out can never clobber a role's effort.
+//     #1528 — `--effort-source assigned|observed` is the PROVENANCE tag for whichever value `--effort`
+//     carries on THIS append: the spawn-time hook stamps `assigned` (the policy default it just resolved),
+//     the close-time hook stamps `observed` (the harness's real per-run SubagentStop value) ONLY when it
+//     actually received one. The two numbers land in the SAME `effort` box; without this tag a row equal to
+//     policy is indistinguishable from a row nobody ever measured — both are evidentially VOID. The ONE
+//     downstream rule: a row is effort-INFORMATIVE iff `effort_source === "observed"`; `assigned` and an
+//     absent key (every pre-#1528 row, or any `--effort` written without a source) are both void. Fail-safe
+//     by construction: `--effort-source` REQUIRES `--effort` on the SAME call (a provenance claim with no
+//     value to attribute is refused), and an `--effort` call that OMITS `--effort-source` DELETES any prior
+//     tag on that row rather than let it survive attached to a new, unattributed value — provenance can
+//     never be inherited across a value change. `check` reports how many of the four required roles are
+//     effort-informative via its `EFFORT-PROVENANCE:` advisory line.
+//     #2169 slice 5 (design decision 4, AC-34 delivery-receipt guard) — --dispatch-nonce/--receipt.
+//     --dispatch-nonce TOK is the MINTING flag: the spawn edge (three-role-spawn-ledger.sh today; the
+//     subprocess dispatch helper too, slice 6) passes the raw token it saw on a genuine
+//     DISPATCH-NONCE:<token> DEDICATED line (never a mere prose mention — mint discipline, S5-AC5). This
+//     CLI layer hashes it (hashDispatchNonce, one-way) before it ever reaches overlayAppend — the stored
+//     row NEVER carries the plaintext. A row carrying this field is "STAMPED". --receipt TOK is the PROOF
+//     flag: any append that carries --verdict AND lands on a stamped row must supply the matching raw
+//     token here (hashed at comparison time) or the append is REFUSED — a stamped row's guard requires
+//     genuine delivery proof, never a bare claim. Echoing the row's own STORED (already-hashed) value back
+//     as --receipt can never satisfy this (hashing an already-hashed value never reproduces it — S5-AC6
+//     harvest ban). A row with no dispatch_nonce (every legacy row) is completely unaffected (S5-AC4).
+//   check --session S --task T [--require-provenance]
+//     Exit 0 (+ "OK ...") iff all four required roles (planner, plan-review, executor, execution-review)
+//     are present AND satisfied; otherwise exit 2 (+ "BLOCK: <reason>"). A role is satisfied by EITHER
+//     (a) an agentId that resolves to a real subagent transcript AND a well-shaped artifact, OR (b) an
+//     explicit, SPECIFIC inline-skip reason. execution-review is NEVER inline-skippable — it needs a real
+//     reviewer agentId OR a test-oracle path that exists with a PASS/verdict token. A real-spawn role line
+//     lacking the self_authored stamp is SURFACED as a "PROVENANCE:" flag (still exit 0); --require-provenance
+//     promotes a missing stamp to a BLOCK.
+//   check --session S --task T [--require-published-review]                    (2026-08-29, additive)
+//     execution-review-ONLY: skip the disk-artifact arm even with NO --merge-head (widens the same gate
+//     --merge-head already widens). Lets the complete-4-role-ledger proof resolve via the ALREADY
+//     default-on published origin/<task> ref arm (#2462) when the PR head cannot be resolved (a
+//     cross-repo / degraded-gh merge) — without accepting a merge-head-gated candidate, since no merge
+//     head is supplied. A disk-only execution-review artifact still fails under this flag (by design —
+//     "published" is the whole point). Absent, behavior is byte-identical to today.
+//   check --session S --task T [--merge-head <ref-or-sha>]                            (#2088, default-on #2462)
+//     Check-time-ONLY ref-scoped resolution arm — DEFAULT-ON as of #2462 (was opt-in-behind---merge-head
+//     under #2088; that gate was measured to leave master permanently unable to prove a branch-only role
+//     artifact, since the completion gate and the merge gates' ledger leg never pass --merge-head — #2462
+//     AC-1). A planner/plan-review/execution-review artifact_path that fails the ordinary filesystem
+//     resolution now ALWAYS gets one more chance — committed git evidence at a BOUNDED candidate-ref set:
+//     (1) the passed --merge-head ref (when one was given), read in the repo `check` runs from — "does this
+//     artifact ship with the thing being merged?"; (2) refs/remotes/origin/<task>-* (the LOCAL MIRROR
+//     namespace — refs/heads/ is never consulted) plus origin/master, in the RUNNING HELPER's own home repo
+//     (aiBrainToplevel()) — consulted UNCONDITIONALLY, independent of whether --merge-head was passed (P5a:
+//     this candidate set never depended on --merge-head's value even under #2088). Content is read AT THE
+//     REF (never disk); planner still needs PLAN_RE, but a plan-review/execution-review artifact resolved
+//     via this arm needs the STRICTER W3 bar (hasRefArmAffirmative) — a flush-left affirmative
+//     Decision:/verdict line in CHECK_LANE_AFFIRMATIVE (now also tolerating one optional column-0 ATX
+//     heading prefix, #2462 AC-1b) — never the legacy VERDICT_RE substring match. No other ref is ever
+//     consulted. See the #2088 plan for the full honesty contract (this arm is no weaker than the disk arm
+//     — never "harder to fool"); see the #2462 plan for the default-on rationale + monotonicity proof.
+//     Plain `check` (no flags at all) is THEREFORE NO LONGER byte-identical to the pre-#2088 baseline — it
+//     now additionally consults refs/remotes/origin/<task>-* + origin/master with zero network I/O. The
+//     pinned `2088-AC7` byte-identity fixture is superseded explicitly for this reason (#2462 AC-5).
+//   check --session S --task T --enforce-tracked-artifacts                                    (#1509)
+//     Leg A — TRACKED, not merely present. Opt-in (base `check` stays existence-only — ~29% of the real
+//     .ai-workspace/plans+reviews backlog is present-but-untracked today, so making this the DEFAULT would
+//     brick most closes; only the completion-time instrumentation gate passes this flag). For the THREE
+//     disk-path roles (planner, plan-review, execution-review) whose base check already resolved a real
+//     on-disk artifact (or oracle) path: HARD-BLOCKs (a "TRACKED:" problem, => exit 2) when that path exists
+//     on disk but is NOT git-tracked (`git ls-files --error-unmatch` over the file's own containing repo —
+//     exit 0/staged = tracked, exit 1 = untracked => BLOCK, any other exit e.g. 128/no-repo => can't-tell =>
+//     fail-open, never a false block on an environment hiccup). executor is EXEMPT from Leg A, keyed on
+//     ROLE (its legitimate artifact is a PR URL / sha / branch, never existence/tracked-checked) — but when
+//     the executor row resolves to an EXISTING disk path anyway (the #1494 shape: a PR-ref-shaped role citing
+//     a plan file), that is SURFACED as a "NOTE-EXECUTOR:" line (never a block — a 62/246-task measured-false
+//     invariant means artifact_path alone cannot distinguish #1494's mis-citation from 62 shipped conventions;
+//     kind/authorship discrimination is #1532). No grace/bypass flag on this leg by design (a `*_OFF` here
+//     would reopen the #1509 leak); the ONLY escapes are (a) `git add`+commit the cited artifact, or (b) the
+//     pre-existing master THREE_ROLE_INSTRUMENT_OFF=1 that already disables the whole gate family.
+//   check --session S --task T --enforce-tracked-artifacts --perf-log P                        (#1544)
+//     Perf-log tracked-check, riding the SAME Leg A flag (git-only, always-on — NOT the privacy leg, so
+//     THREE_ROLE_ARTIFACT_PRIVACY_OFF=1 cannot erase it — monotonicity, #1590). JURISDICTION-KEYED (the fix
+//     for the #1544 false-blocker BLOCKER): a "TRACKED:" problem fires ONLY when P resolves to a file whose
+//     containing-repo toplevel EQUALS the ai-brain toplevel (derived from this ledger file's own resolved
+//     location, symlink-aware) AND that file is untracked. Any other outcome fails OPEN (exit 0, no
+//     problem): a different real git repo (a legitimate perf-log home outside ai-brain), a non-repo path (the
+//     template's real home, `~/.claude/agent-working-memory/...`, is NOT a git worktree), or an unresolvable
+//     path (nothing to check). This is deliberate — the gate has no jurisdiction over a file it cannot prove
+//     is a shipped ai-brain artifact. No grace/bypass flag by design (mirrors Leg A above); the only escapes
+//     are (a) `git add`+commit the cited perf-log (when it does live in ai-brain), or (b) the master
+//     THREE_ROLE_INSTRUMENT_OFF=1.
+//   check --session S --task T --enforce-artifact-role-kind                                    (#1532)
+//     Executor artifact-KIND leg — the #1494 fix. Opt-in (only the instrumentation gate passes this flag on
+//     the tagged completion path). Catches an executor row whose artifact_path resolves to the PLANNER's
+//     plan-kind document instead of a real ship reference (PR URL / commit sha / branch) — #1494's exact
+//     shape, previously only a silently-dropped "NOTE-EXECUTOR:" line (#1509). HARD CONSTRAINT: engages ONLY
+//     when the executor artifact_path resolves to an EXISTING DISK PATH (resolveArtifact) — a PR-URL/commit/
+//     branch never resolves to disk, so it short-circuits out before either predicate below runs; this leg
+//     can never existence- or git-check a legitimate ship-reference executor row. Among disk-resolving
+//     executor rows, "plan-kind" (=> a "KIND:" problem, exit 2) is evidenced by EITHER (a) the resolved path
+//     equals THIS task's planner row's resolved path (the exact #1494 shape), OR (b) the resolved path lies
+//     on a `/.ai-workspace/plans/` segment (any other plan-kind document). A disk-resolving executor artifact
+//     satisfying NEITHER (e.g. a genuinely executor-authored SKILL.md/.mjs off any plans/ path) is NOT
+//     plan-kind and passes — guards against an over-broad "block any disk path" regression. Deliberately does
+//     NOT implement "no two roles may cite the same path" (rejected on measured evidence: 43+ legitimate
+//     planner==plan-review collisions — the doctrine-sanctioned reviewer-writes-into-the-plan-file pattern).
+//     Same no-new-bypass-token discipline as Leg A above: THREE_ROLE_INSTRUMENT_OFF=1 is the only escape.
+//   resolve-agent --session S --task T --role R
+//     Prints the agentId (basename of the `agent-<id>.jsonl` transcript) of the NEWEST-mtime subagent
+//     transcript under <projects-root>/*/<S>/subagents/ whose content carries the literal spawn tag
+//     `3ROLE_TASK:<T> ROLE:<R>` (#860). Exit 0 with the agentId on stdout when a match exists; prints
+//     nothing + exits non-zero when no transcript carries the tag. Newest-mtime (not first-match) because a
+//     tag can repeat across transcripts (an earlier probe/retry reusing a role tag), so the most recent
+//     write is the real role spawn — a bare first-match/head -1 can grab a stale probe.
+//   resolve-artifact --session S --task T --role R                  (#1303)
+//     Prints the existence-checked ABSOLUTE artifact_path for ONE role of ONE task on stdout, then exit 0.
+//     Reuses ledgerFile() + resolveArtifact() (the SAME parse cmdCheck/cmdInherit use — last line per role
+//     wins). Exits NON-ZERO (printing nothing) on EVERY "no usable artifact" branch: no ledger file, no line
+//     for the role, an absent/empty/whitespace artifact_path (e.g. an inline-skip line), or a dangling path
+//     that does not resolve on disk. The instrumentation gate calls this to resolve the planner / plan-review
+//     docs (cairn legs 4a/4b) LEDGER-FIRST — the non-zero exit is the "ledger has no usable artifact_path ->
+//     fall back to the convention dir" contract (#1266 wrong-dir + stale-newest fix). A `verdict:` field on
+//     the line is ignored; only artifact_path is read.
+//   heartbeat --session S --task T                                 (#1350)
+//     LEADING-EDGE lane liveness: bump the <task>.jsonl file MTIME to ~now so agent-kanban's swimlane
+//     liveness counter (which stats <ledgerDir>/<session>/<task>.jsonl mtime via ledgerMtimeByTaskId →
+//     updatedAt = max(mtimeMs, ledgerMtimeMs) → computeActiveIds secondary-window test) sees the lane as
+//     LIVE the instant a role is SPAWNED — not only when a role COMPLETES (the trailing-edge append).
+//     Writes NO JSONL line: if <task>.jsonl exists it is utimes-touched in place (content untouched); if
+//     absent it is created as a ZERO-byte file. Because no line is written there is nothing for
+//     overlayAppend to merge/drop/clobber, so a subsequent real append/check/resolve-artifact reads the
+//     file byte-correctly — AC-4 (no overlay/close corruption) is true BY CONSTRUCTION. ALWAYS exits 0
+//     (fail-open) — a heartbeat error must NEVER wedge the spawn it instruments.
+//   refresh-models --session S                                     (#1481)
+//     IN-FLIGHT model backfill: the missing TRIGGER the #1481 root-cause identified (cmdAppend's model
+//     capture already exists and is green today; there was simply no event that RE-INVOKED it between a
+//     background role spawn and SubagentStop). Walks every task ledger under <LEDGER_DIR>/<S>/*.jsonl and,
+//     for each REQUIRED-role line that (a) is not inline-skipped, (b) LACKS a modelVersion yet, and (c)
+//     resolves an agentId (its own --agent, else resolveAgent(session, task, role) by tag), re-resolves the
+//     model via the SAME resolveModelFields() helper cmdAppend uses (reuse, not a re-implementation) and
+//     overlay-appends ONLY {modelVersion[, modelTier]} — agentId/artifact_path/effort/verdict/self_authored
+//     are left untouched (overlayAppend's per-key "provided" discipline, #855). Idempotent, absent->present
+//     ONLY: a role that already carries a modelVersion is never re-touched. Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, and ONLY when >=1 role actually flipped
+//     absent->present (no-change scans never resync — bounds the extra board-upload cost). ALWAYS exits 0
+//     (fail-open) — a refresh error must never wedge its caller (a backgrounded hook trigger).
+//   reconcile-spawns --session S                                    (#1229, incremental rewrite #1851)
+//     MISSING-ROW backfill for the dropped-harness-event gap: for a meaningful fraction of background Agent
+//     dispatches, NEITHER the spawn-ledger hook (PostToolUse) NOR the SubagentStop ledger hook fires, even
+//     though the subagent's own transcript genuinely exists at <PROJECTS_ROOT>/*/<S>/subagents/agent-<id>.jsonl
+//     and its spawn record carries a `3ROLE_TASK:<task> ROLE:<role>` tag — so the ledger row is ABSENT
+//     entirely (refresh-models cannot help; it only touches EXISTING rows, see cmdRefreshModels above).
+//     #1851 — the ORIGINAL implementation called resolveAgent() (a full corpus re-scan) ONCE PER (task, role)
+//     GROUP, making the sweep O(G x corpus) (~1,006 groups x 979 MB ~= 1 TB decoded, ~24.5 min CPU on a
+//     marathon session — measured). The coarse watermark below never engaged on a live session (some
+//     transcript is always advancing), so a runaway sweep pinned a CPU core essentially continuously. This
+//     rewrite collapses that to O(corpus), by construction, via three changes (D1/D2/D3 of
+//     .ai-workspace/plans/2026-07-27-1851-reconcile-spawns-incremental.md):
+//       D1 (hoist) — the discovery pass below extracts EVERY transcript's spawn-tag facts ONCE (not once per
+//         group): a DISCOVERY tag (the loose first-match rule the old code used to populate `groups`) and every
+//         WINNER-candidate tag (re-verified as a literal substring of the sanitize()-reconstructed tag string,
+//         reproducing resolveAgent()'s `.includes()` semantics exactly — including its two documented seams: a
+//         task id containing a sanitize()-stripped character correctly fails to bind, and a first record naming
+//         TWO tags correctly binds to BOTH groups). The group loop then does a Map lookup, never a corpus scan.
+//       D2 (bounded read) — `readFirstNonEmptyLine()` reads only up to the transcript's first NON-EMPTY line
+//         (matching firstRecordText()'s own `.find(l => l.trim())` predicate exactly, never a looser "read line
+//         1"), growing its read window until it finds that line or hits EOF — never a fixed cap that silently
+//         truncates a transcript out of the mapping (D2's "single worst regression" this fix could cause).
+//       D3 (per-file checkpoint) — a per-session sidecar (`.reconcile-checkpoint.json`, dotted so invisible to
+//         the `.jsonl` glob cmdRefreshModels/cmdCheck use) caches each transcript's derived tag facts keyed on
+//         file IDENTITY (dev+ino) + size-at-derive-time; unchanged-or-grown files reuse the cache (D2's read
+//         never happens again), a REPLACED (new identity) or SHRUNK (possible truncation/rewrite) file is
+//         re-derived. Rests on the load-bearing, Rule-18-gated assumption that a subagent transcript's first
+//         record never changes once written (append-only) — degraded safely by a MANDATORY periodic full
+//         re-derivation (every RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N runs, or when the last full derive is
+//         older than RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS) that ignores the cache outright.
+//     D4/D6 correctness: the group -> row loop still evaluates EVERY known group EVERY run (no transcript is
+//     ever "too old" to enter the mapping; a cold start or a corrupt/unreadable/schema-mismatched sidecar —
+//     schema-versioned — is treated as a full re-derivation, never "nothing to do"). `modelVersion` resolution
+//     is now GATED on `!prior.modelVersion` (previously unconditional — a fixed bug: an already-stamped row paid
+//     a full transcript re-parse on every sweep forever); `self_authored` keeps its existing `!prior.self_authored`
+//     gate. Both gates are the POSITIVE-side skip only — a row that legitimately never earns a field is
+//     re-attempted every run it's still missing (a known, bounded, OBSERVABLE residual cost — see
+//     `laterRecordRederives` in the log line below — never a WRONG ledger value, since the row is either still
+//     unstamped or is correctly stamped once the fact becomes available). Root-cause fix (AC2(ii)): when EITHER
+//     field is missing, `deriveLaterRecordFacts()` derives BOTH from a SINGLE read+parse of the winner's
+//     transcript (using its path already known from the corpus pass) instead of two independent full re-reads
+//     (resolveModelFields->transcriptModel, then transcriptSelfAuthored) — halving the per-group residual cost,
+//     which is what made it scale visibly with GROUP COUNT on a cold sweep (measured under CPU throttling; see
+//     deriveLaterRecordFacts's own header comment). D4(c): the coarse watermark now
+//     advances ONLY after a sweep that completed with nothing truncated or row-failed (previously unconditional
+//     — a real bug: a failed row was never retried unless some transcript's mtime happened to advance).
+//     D5 bounded worst case: a wall-clock budget (RECONCILE_SPAWNS_BUDGET_MS) bounds the WHOLE sweep (both the
+//     tag-derivation pass, run OLDEST-transcript-first for strict forward progress, and the group loop);
+//     exceeding it STOPS the sweep, PERSISTS every per-file checkpoint already earned, does NOT advance the
+//     coarse watermark, and still exits 0 — the union of a truncated run plus its successors equals one
+//     unbounded run (transcripts/groups a truncated run didn't reach are simply left for the next invocation,
+//     which resumes cheaply from the persisted cache).
+//     Every per-row overlayAppend call is individually wrapped — one row's failure is logged-and-skipped, never
+//     fatal (and marks the sweep as row-failed for the D4(c) watermark rule above). Fires kanban-resync.sh
+//     (backgrounded, fail-open) exactly ONCE per invocation, ONLY when >=1 row actually changed. Idempotent: a
+//     group with nothing left to add makes NO overlayAppend call at all (byte-identical ledger on a no-op run).
+//     Never stamps `closedAt` or `artifact_path` (unchanged from the original design — a transcript existing on
+//     disk does not prove the subagent stopped, and a swept row must never be able to launder a completion).
+//     Prints one structured completion line prefixed `OK reconcile-spawns: session=... scanned=... changed=...`
+//     (the original prefix, kept — verified zero consumers outside this file via `git grep`, so extending it is
+//     safe) followed by: transcripts=<N> firstRecordsRead=<R> firstRecordsCached=<C> groupsKnown=<G>
+//     groupsEvaluated=<E> laterRecordRederives=<count> elapsedMs=<ms> truncated=<bool> coldStart=<bool>
+//     fullRederive=<bool>. ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides
+//     (hooks/lane-heartbeat.sh, piggybacked on the SAME throttled touch-branch refresh-models already uses).
+//   resolve-role-model --role R [--with-effort] [--with-version]    (#1448, --with-version #1466)
+//     Prints the configured model TIER for role R (opus|sonnet|haiku|fable) from config/cc-roles.env — the
+//     single command the orchestrator and both model hooks consume. Fail-SAFE: a missing/malformed config OR
+//     an invalid per-role value => opus (never fail-open-to-cheap). --with-effort ALONE prints "<model>
+//     <effort>" (or bare "<model>" if no effort is configured — UNCHANGED #1448 shape, back-compat). --with-
+//     version ALONE prints "<model> <version>" (the role's ASSIGNED concrete pin — roleVersionFromCfg's
+//     CC_TIER_<TIER>_VERSION, falling back to the tier alias itself when no pin is configured, so this token
+//     is NEVER empty). BOTH together print "<model> <effort-or-'-'> <version>" (a `-` sentinel fills a
+//     genuinely-unset effort so a plain `read -r A B C` always gets exactly 3 well-formed tokens — the
+//     spawn-time badge stamp is the caller). Lints the config on read (loud INVALID-MODEL / Fable stderr
+//     warnings). Always exits 0.
+//   check --session S --task T --enforce-role-models               (#1448 + #1458)
+//     The --enforce-role-models flag (opt-in; only the instrumentation gate passes it) adds a per-role
+//     MODEL-POLICY leg: for each role that resolves to a real transcript, compare its ACTUAL model
+//     (message.model, forgery-resistant) to cc-roles.env's tier; a mismatch => exit 2. No config => skip
+//     (fail-safe). Fable->Opus silent reroute is OK. Kill-switch CC_ROLE_MODEL_GATE_OFF=1.
+//     #1458 MODEL-VERSION sub-leg (assert-latest / fail-on-drift): when a role's tier matches AND a concrete
+//     version pin is configured for that tier/role (CC_TIER_<TIER>_VERSION or the CC_ROLE_<ROLE>_MODEL_VERSION
+//     override), the ACTUAL transcript model id is compared to the pin — a mismatch pushes a `MODEL-VERSION:`
+//     problem (=> exit 2). No pin configured => the version sub-leg is DORMANT for that role (tier leg alone
+//     still enforces). Fail-CLOSED on can't-tell (unreadable/unparseable transcript model) ONLY when a pin is
+//     present. Dedicated kill-switch CC_ROLE_VERSION_GATE_OFF=1 (skips ONLY the version sub-leg;
+//     CC_ROLE_MODEL_GATE_OFF=1 still disables the whole model+version leg). Completion-time ONLY — the
+//     leading-edge spawn gate sees a tier ALIAS, never a concrete version, so it cannot check this.
+//   resolve-effective-tier --model M --subagent-type T --transcript P [--session S] [--agents-dir D]
+//                          [--projects-root R]                      (#1494)
+//     The EFFECTIVE-TIER SENSOR: resolves the tier a spawn will ACTUALLY run on, by reading the current
+//     session's OWN transcript tail — never by assuming a hardcoded default. Fixes the leading-edge gate's
+//     bug (a badge-less spawn's effective tier was hardcoded to "opus", so under a Fable session it silently
+//     satisfied the opus seats' policy check while all four roles actually ran Fable). Precedence: (1) an
+//     explicit --model wins outright; (2) else the last `isSidechain:false` assistant message.model in
+//     --transcript (a bounded, grow-with-cap reverse-tail read via lastAssistantModelFromFile — never reads
+//     the whole transcript file); (3) else tier='unknown'. Agent-def frontmatter (--subagent-type +
+//     --agents-dir) is reported as provenance (`agentdefTier`) but NEVER decides `tier` (UNVERIFIED whether
+//     it overrides session inheritance). Prints "<tier> <source> agentdef=<tier|none>" on stdout, ALWAYS
+//     exits 0 (like resolve-role-model — a resolver error must never wedge the caller; it fails CLOSED to
+//     tier=unknown internally, which is the CALLER's cue to block). `tier ∈ {opus,sonnet,haiku,fable,unknown}`;
+//     the caller (three-role-model-policy-gate.sh) treats `unknown` as a named BLOCK arm — it does NOT
+//     default to opus (the fail-safe direction the #1448 leading-edge gate got backwards for Fable sessions).
+//     Exported (`resolveEffectiveTier`, `lastAssistantModelFromFile`) for #1497's Key-1 role-eligibility
+//     check to consume directly instead of re-parsing spawn payloads.
+//   inherit-plan-review --session S --task T --parent P            (#881)
+//     Inherit the PARENT (P) planner + plan-review ledger lines onto the LEG (T) — but ONLY if the parent
+//     genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (same checkRole `check` uses; an
+//     inline-skipped parent entry is rejected because the session-bound carve-out does not transfer to a leg).
+//     Verify-then-write, fail-closed: a missing / forged / inline-skipped parent review prints
+//     "BLOCK: cannot inherit ..." to stderr, exits 3, and writes NOTHING. On success appends both parent
+//     entries (verbatim agentId + artifact_path, plus `inherited_from: P`) through the overlay-merge path so a
+//     later real per-leg review overwrites cleanly; prints "OK inherited ..." and exits 0.
+//     #1575 — THREE additional fail-closed preconditions (verify-then-write, before EITHER overlayAppend
+//     write): (1) the parent's PLANNER artifact must NAME the leg task id (parent-leg relation); (2) the
+//     parent's plan-review verdict must be AFFIRMATIVE (PASS|APPROVE|APPROVE-WITH-NOTES); (3) the LEG's own
+//     plan-review row must NOT already carry a verdict (leg terminality — a hand-me-down never papers over a
+//     completed per-leg review). The successful plan-review write now ALSO carries the parent's verdict (the
+//     gate's universal screen reads it).
+//   gate-plan-review --session S --task T [--require-review]        (#1575; #3154 review-only mode)
+//   size-s-exempt --session S --task T                               (#3154; exit 0 EXEMPT / 1 NOT-EXEMPT <reason>)
+//     The TRANSITION GATE's entire plan-review-ADMISSION decision (hooks/three-role-transition-gate.sh shells
+//     out to this instead of re-implementing the contract). Evaluates the LAST PARSEABLE plan-review line in
+//     the task's ledger (last-match, not first-match — #1580-safe); fail-closed on any UNPARSEABLE line
+//     trailing it (junk-line class); runs a universal verdict ALLOWLIST screen (PASS|APPROVE|
+//     APPROVE-WITH-NOTES, never a denylist) FIRST, on every arm; then two sanctioned arms — (1) completed-
+//     review: affirmative verdict + closedAt + an agentId SPAWN-RECORD-bound (agentBoundToTag(), never
+//     resolveAgent()/newest-mtime) to `3ROLE_TASK:<task> ROLE:plan-review`; (2) inherited-review: the same
+//     binding test keyed on the row's own `inherited_from`. There is NO skip arm (operator decision — a
+//     deliberate skip never satisfies this gate). Exit 0 (ALLOW, silent) or exit 2 (BLOCK, stderr
+//     "BLOCK:<class>|<ledger-file-and-line>" naming one of seven classes: not-finished / no-verdict /
+//     negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent / deliberate-skip-closed /
+//     junk-line).
+//   provenance-kind --session S --task T --role R                    (#2075 Phase 1, AC-1)
+//     Prints exactly one of E1|E2|E3|none (optionally " legacy"-suffixed) on stdout, exit 0, for the LAST
+//     line recorded for this role — including a missing row, which prints 'none'. This is D1's REPORTING
+//     construction ONLY (min(stored run_kind, verified kind)) — no gate in this file consults it; every
+//     write-side guard reads VERIFIED kind directly (recomputed fresh from the row's own evidence every
+//     time), so a stored `run_kind` label can only ever make this command's OWN output read lower than the
+//     evidence supports, never higher (AC-24's anti-forgery power test).
+//   append ... --run-kind witnessed|bound|inferred [--run-id ID] [--run-source S]     (#2075 Phase 1, D1)
+//     OPTIONAL provenance-kind fields — written ONLY by the writer that obtained the identity (never
+//     re-derived by a reader): `run_id` is the run's own identity (agentId for E1, nonce for E2, absent for
+//     E3); `run_kind` is WRITE-ONCE / monotone-non-decreasing under overlayAppend (witnessed(3) > bound(2) >
+//     inferred(1) — an incoming write whose rank is <= the row's current stored rank is a no-op on this
+//     field alone; the append itself still exits 0 and every OTHER field still merges normally); `run_source`
+//     names which writer stamped it, diagnostic only, never consulted by a gate.
+//
+// Env overrides (mirror DOGFOOD_GATE_STORE so a smoke can point at a fixture tree):
+//   THREE_ROLE_LEDGER_DIR    (default ~/.claude/3role-ledger; empty is treated the same as unset)
+//   THREE_ROLE_PROJECTS_ROOT (default ~/.claude/projects)
+//   THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE=1 (#2309) — documented operator escape for overlayAppend's clause 3
+//                            (the bound-but-verdict-less terminal-evidence guard, see its own comment block
+//                            above the clause): skips the can't-tell rejection when the target row's own
+//                            transcript could not be read/does not prove the incoming verdict AND the write
+//                            is not eligible for round 5's dead-row diversion (an identity-claiming write —
+//                            arm (m) — always needs this or a real self-append; never printed in the
+//                            rejection's own stderr text — an integrity gate names the remedy CLASS, never a
+//                            runnable defeat token). On-use: audited to stderr AND the internal bypass log.
+//   THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1 (exec-review-ledger-append-reject-absolute-scratchpad-
+//                            artifact-path-must-be-repo-relative) — documented operator escape for cmdAppend's
+//                            execution-review-only repo-relative `--artifact` shape guard (D1 reject: absolute/
+//                            home-tilde/`..`-segment paths; D2 verbatim-store of the raw repo-relative string).
+//                            Restores BOTH D1 and D2 to their pre-fix behavior (the shape reject is skipped AND
+//                            the stored form goes back through normalizeArtifact()'s cwd-absolutizing path) —
+//                            for legacy smoke fixtures that assert the absolutized stored form of an
+//                            execution-review row with a machine-local mktemp fixture path. Never printed in
+//                            the rejection's own stderr text (same integrity-gate-names-the-remedy-class
+//                            discipline as CLAUSE3_OVERRIDE above). On-use: audited to stderr AND the internal
+//                            bypass log via writeBypassLog().
+//   CC_ROLES_ENV             (#1448) — explicit per-role-model config path. When SET it is AUTHORITATIVE +
+//                            TERMINAL (never falls through to ~/.config / plugin / repo defaults), so a smoke
+//                            sets CC_ROLES_ENV=/nonexistent to simulate "no config" (=> every role opus).
+//   CC_ROLE_MODEL_GATE_OFF=1 (#1448) — skip the --enforce-role-models MODEL-POLICY leg (feature kill-switch).
+//   CC_ROLE_VERSION_GATE_OFF=1 (#1458) — skip ONLY the version-pin (assert-latest) sub-leg of
+//                            --enforce-role-models; CC_ROLE_MODEL_GATE_OFF=1 still disables the whole leg.
+//   CC_TIER_SENSOR_TAIL_BYTES (#1494) — lastAssistantModelFromFile()'s initial reverse-tail read window
+//                            (default 4MB — big enough to fit a single ~0.8MB transcript record with margin).
+//   CC_TIER_SENSOR_CAP_BYTES (#1494) — the grow-with-cap ceiling (default 64MB); exceeding it without a
+//                            parseable last-assistant record resolves tier='unknown' (fail-closed).
+//   RECONCILE_SPAWNS_BUDGET_MS (#1851) — wall-clock budget bounding a WHOLE reconcile-spawns sweep (default
+//                            20000 = 20s — a large safety margin over the ~seconds cold-start the D1/D2 hoist
+//                            achieves BY CONSTRUCTION on today's ~2,000-transcript/979MB corpus; this is a
+//                            safety net for a corpus far larger than today's, not the primary mechanism). `0`
+//                            is a valid value (truncate before processing anything — used by the AC6 smoke to
+//                            force truncation deterministically); only an unset/non-numeric/negative value
+//                            falls back to the 20s default.
+//                            Exceeding it stops the sweep, persists every per-file checkpoint already earned,
+//                            and does NOT advance the coarse watermark (D5).
+//   RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N (#1851) — every Nth reconcile-spawns run for a session ignores the
+//                            per-file checkpoint cache outright and re-derives every transcript's tag facts
+//                            fresh (default 20). Belt-and-braces against the D3 append-only assumption ever
+//                            being silently violated (AC5). 0 or unset/invalid disables the count-based trigger
+//                            (the age-based trigger below still applies).
+//   RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS (#1851) — force a full re-derivation when the last one is older
+//                            than this many ms (default 21600000 = 6h), independent of the run-count trigger
+//                            above. A cold start (no sidecar yet) always counts as "due".
+//   LANE_TRANSCRIPT_FRESH_MS (live-pool-members-undercounts-long-running-lanes) — refresh-lane-intents'
+//                            freshness window: a task's winning pool-mapped transcript must be written-to
+//                            within this many ms of "now" to be considered LIVE. Explicit override is
+//                            AUTHORITATIVE and UNCLAMPED. Unset -> resolved from the committed measurement
+//                            artifact (.ai-workspace/measurements/2026-08-30-lane-transcript-fresh-window/
+//                            measurement.json)'s p99MaxGapMs, clamped to [900000 (15 min), 1800000 (30 min)]
+//                            — see resolveLaneTranscriptFreshMs() and scripts/lane-transcript-fresh-window-
+//                            measure.mjs for the full derivation. Artifact missing/corrupt -> fails SAFE to
+//                            the 30-min cap (the generous end — an unknown window being wrong-permissive is
+//                            safer than wrong-restrictive, which is this ticket's own undercount bug).
+//   LANE_CLOSED_ACTIVITY_SLACK_MS (stall-check-liveness-window-shorter-than-long-executor-runtime) —
+//                            refresh-lane-intents' RESUMED-lane predicate: a ledger row's `closedAt` is
+//                            TERMINAL (genuinely closed — reap-eligible / never refreshed) only when the
+//                            bound agentId's own transcript mtime is <= closedAt + this slack. A transcript
+//                            written AFTER closedAt + slack means the SAME agent was resumed (SendMessage
+//                            continuation after a turn-boundary SubagentStop stamp) and is treated exactly
+//                            like a never-closed lane (marker kept alive / recreated, never DEAD-unlinked).
+//                            Default 5000 (5s) — clears the measured genuinely-closed stamp-skew p99 (0.951s
+//                            over n=2215, close to the planner's own 0.98s/n=1057 measurement) with wide
+//                            margin (the (2s,60s] delta bucket is EMPTY on this corpus — every real resume
+//                            measured 110.9s+), picked at the LOW end per plan-review note N2 so genuine
+//                            reaping stays fast. See resolveLaneClosedActivitySlackMs() and
+//                            .ai-workspace/plans/2026-09-04-stall-check-liveness-window-vs-executor-runtime.md.
+//                            EXTENDED (autonomous-stall-check-undercounts-sendmessage-resumed-lanes,
+//                            2026-09-10): this same slack governs BOTH positive-evidence ending stamps, not
+//                            just closedAt — a bound agentId's isApiErrorMessage:true crash record is also
+//                            TERMINAL (reap-eligible) only when the transcript's mtime is <= that record's
+//                            own timestamp + this slack; a transcript written later means the SendMessage
+//                            429-recovery flow resumed the lane after the crash. See crashRecordIsTerminal()
+//                            and .ai-workspace/plans/2026-09-10-autonomous-stall-check-undercounts-
+//                            sendmessage-resumed-lanes.md.
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
+
+const HOME = os.homedir();
+const LEDGER_DIR = process.env.THREE_ROLE_LEDGER_DIR || path.join(HOME, '.claude', '3role-ledger');
+const PROJECTS_ROOT = process.env.THREE_ROLE_PROJECTS_ROOT || path.join(HOME, '.claude', 'projects');
+
+const REQUIRED_ROLES = ['planner', 'plan-review', 'executor', 'execution-review'];
+// #1495 — RECORDABLE_ROLES is a STRICT SUPERSET used ONLY by cmdAppend's role guard, so ad-hoc
+// operational seats (research, ship-tail) can be ledger-visible (recorded) without ever becoming a
+// required/gating role. Every completion-time loop (cmdCheck, --enforce-role-models, provenance,
+// cmdRefreshModels) MUST keep iterating REQUIRED_ROLES, never this superset — that is what keeps a
+// research OR ship-tail row non-gating (G1). cc-ship-tail-lane (2026-08-23) added 'ship-tail' here
+// ONLY — never to REQUIRED_ROLES, which would brick every completion gate lacking a ship-tail row.
+const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research', 'ship-tail'];
+// A plan is recognized by a MARKDOWN HEADING (2-4 `#`) naming an acceptance-criteria / ELI5 section.
+// Anchored to a heading-line start (`^#{2,4}` + `m` flag) so prose that merely contains the word
+// "acceptance" ("we await acceptance from QA") can NEVER match — only a real heading does. Accepts the
+// natural variants planners actually write: `## ELI5`, `### Binary AC`, `## Binary acceptance criteria`,
+// `### Acceptance criteria`, `## Acceptance`, `## AC`. The `ac\b` boundary keeps the second arm from
+// half-matching the "Ac" of "Acceptance" — it falls through to the `acceptance` arm (#855).
+const PLAN_RE = /^#{2,4}[ \t]*(eli5|(binary[ \t]+)?ac\b|(binary[ \t]+)?acceptance([ \t]+criteria)?\b)/im;
+const VERDICT_RE = /(PASS|FAIL|APPROVE|verdict|##\s*Review)/i;
+// Non-specific / placeholder skip reasons that are NOT acceptable (the carve-out is for genuinely
+// inseparable-from-session-state work; "ran it inline myself" is not a valid skip — documented in the
+// block message). Keep permissive: only empty/whitespace + a tiny denylist of obvious non-reasons.
+const NONSPECIFIC_RE = /^(n\/?a|skip(ped)?|none|null|tbd|inline|-+|\.+)$/i;
+
+function sanitize(s) { return String(s == null ? '' : s).replace(/[^0-9A-Za-z._-]/g, ''); }
+function ledgerFile(session, task) {
+  return path.join(LEDGER_DIR, sanitize(session), sanitize(task) + '.jsonl');
+}
+
+// ── 3role-ledger-accepts-attribution-url-fragment-as-session-creating-stray-dirs (2026-09-10) ────────────
+// D1 — REJECT a non-canonical --session instead of sanitize()-ing it into a stray ledger dir. sanitize()
+// above only strips characters outside [0-9A-Za-z._-] — it never checks SHAPE, so a truncated id, an
+// UPPERCASE copy, or the `session_<fragment>` attribution token (this ticket's exact incident) passes
+// through byte-unchanged and mkdirSync's a brand-new drawer under the real store. Canonical = the
+// 8-4-4-4-12 lowercase hexadecimal shape every real session directory on a live host and
+// $CLAUDE_CODE_SESSION_ID carry — measured in the plan's premise probe (36/36 real dirs match it).
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// D2 — ARMED only when the ledger store resolves to its DEFAULT location — THREE_ROLE_LEDGER_DIR unset
+// OR empty, the SAME truthiness test the :422 store resolution's own `||` already uses (empty string is
+// falsy in JS, so `'' || default` already fell through to the default store pre-fix; this predicate now
+// agrees with that instead of asking the DIFFERENT question "is the key present in process.env", which an
+// empty-string assignment answers "yes" — session-id-reject-followups-cr1-drill-and-empty-ledger-dir-seam
+// F2: a caller that sets THREE_ROLE_LEDGER_DIR="" used to write into the REAL default store with the
+// guard silently DISARMED and no audit line — an unaudited disarm at the asset this guard protects, not a
+// redirect away from it.
+// No production caller sets that env var non-empty (measured) — a store deliberately redirected to a
+// scratch location is not the asset this guard protects, so the hundreds of synthetic-id smoke-fixture
+// appends (138 THREE_ROLE_LEDGER_DIR redirects measured) keep passing with zero fixture edits, and a
+// redirected caller never writes a bypass-audit line. Read ONCE, at module scope, same discipline as
+// LEDGER_DIR above.
+// ── 3role-ledger-append-flag-shape (#3258 D4, merges three always-loaded memory lines into
+// code: "ledger task id is the ticket number, never the branch slug" / "ledger session flag is the
+// UUID, never the attribution-url fragment" / "ledger closed-at takes an ISO timestamp, never
+// 'now'"). The --session clause is enforced by enforceSessionShape() below (SESSION_UUID_RE, same
+// arming); these two predicates cover --task and --closed-at for cmdAppend's guard.
+// A ticket id is valid in EITHER shape the ticket store uses (#3258 fix1: the digits-only refusal
+// broke every slug-id ticket — 119 were open at review). All digits is the legacy numeric shape,
+// accepted with NO existence lookup (historic numeric rows and numeric tickets with no file still
+// land). A slug-shaped token is accepted ONLY when a ticket file of that name exists in the task
+// store — the provably-wrong case is a branch slug that names no ticket ("3258-memory-trim" when
+// ticket 3258 exists). INPUT-BOUND: shape and a 200-char ceiling are checked BEFORE any lookup, and
+// the lookup is one stat of one named file under the shape-validated session dir — never a walk.
+const TASK_NUMERIC_RE = /^\d+$/;
+const TASK_SLUG_RE = /^[0-9A-Za-z][0-9A-Za-z._-]{0,199}$/;
+function taskIdentityProblem(session, task, role) {
+  const t = String(task == null ? '' : task);
+  if (!t) return 'empty';
+  if (t.length > 200) return 'oversize';
+  if (/[/\\]/.test(t) || t.includes('..')) return 'path';
+  if (TASK_NUMERIC_RE.test(t)) return '';
+  if (!TASK_SLUG_RE.test(t)) return 'shape';
+  // #3262 item 5: a research row is ad-hoc work with no ticket by design (task ids like
+  // adhoc-research-x); it keeps every SHAPE check above but skips the ticket-existence lookup.
+  // Every other role keeps the existence check.
+  if (role === 'research') return '';
+  const root = process.env.PROGRESS_TASKS_DIR || path.join(HOME, '.claude', 'tasks');
+  const sd = String(session == null ? '' : session);
+  if (!/^[0-9A-Za-z._-]{1,128}$/.test(sd)) return 'session-token';
+  try { if (fs.statSync(path.join(root, sd, t + '.json')).isFile()) return ''; } catch (e) { /* missing => unknown */ }
+  return 'unknown';
+}
+// ISO 8601 date or datetime, Z or numeric offset; a bare keyword ("now"), a relative stamp, or a
+// locale-format date never matches. The Date roundtrip below additionally rejects impossible
+// calendar dates (2026-02-31) that some lenient parsers would roll over.
+const CLOSED_AT_ISO_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+function isIsoTimestamp(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!CLOSED_AT_ISO_RE.test(s)) return false;
+  const t = Date.parse(s.includes(' ') && !s.includes('T') ? s.replace(' ', 'T') : s);
+  if (!Number.isFinite(t)) return false;
+  const d = new Date(t);
+  return d.getUTCFullYear() === Number(s.slice(0, 4))
+    && d.getUTCMonth() === Number(s.slice(5, 7)) - 1
+    && d.getUTCDate() === Number(s.slice(8, 10));
+}
+
+const SESSION_SHAPE_GUARD_ARMED = !process.env.THREE_ROLE_LEDGER_DIR;
+
+// D6 — one audited kill-switch, same discipline as THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF below.
+function sessionShapeGuardOff() { return process.env.THREE_ROLE_LEDGER_SESSION_SHAPE_OFF === '1'; }
+
+// D5 — the refusal is actionable and carries NO defeat token: it names the offending value verbatim, the
+// canonical shape, $CLAUDE_CODE_SESSION_ID as where to read the real id, and states that the
+// `session_<fragment>` token in the commit-attribution reminder is NOT a session id. It NEVER names the
+// kill-switch or THREE_ROLE_LEDGER_DIR — a gate's own block message must not carry its own defeat token
+// (mirrors the execreview-artifact-shape precedent a few hundred lines below).
+function sessionShapeBlockMessage(session) {
+  return 'BLOCK (3role-ledger session-shape): --session "' + String(session == null ? '' : session) +
+    '" is not a canonical Claude Code session id. The canonical shape is 8-4-4-4-12 lowercase ' +
+    'hexadecimal (e.g. 6bae4820-a911-4659-b95f-f7058c3071d1) — the same shape every real session ' +
+    'directory under the ledger store and $CLAUDE_CODE_SESSION_ID carry. Read your real session id ' +
+    'from $CLAUDE_CODE_SESSION_ID. The "session_<fragment>" token that appears in a commit-attribution ' +
+    'reminder (e.g. "Claude-Session: https://claude.ai/code/session_...") is NOT a session id — it must ' +
+    'never be passed here. Nothing was written.';
+}
+
+// D3/D4 — the ONE shared predicate every subcommand that turns --session into a path calls, at the very
+// top of its handler, before ANY file or directory is touched (a read-only ledgerFile() lookup included —
+// cmdCheck's own bogus-session BLOCK message further down this file recommends the exact stray-minting
+// `append --session <sid>`, so this must run before that message is ever reached too). `label` is the
+// role for append/provenance-kind/resolve-agent/resolve-artifact, else the subcommand name — used only
+// for the bypass-audit log, never for the block message itself. `exitCode` is the CALLER's OWN existing
+// contract class (2 for the eight subcommands that already exit 2 on bad input, 0 for the five
+// fail-open sweeps that must never wedge a backgrounded sweep or a spawn-edge heartbeat) — never a new
+// exit code invented by this guard. Returns nothing: either blocks (process.exit) or returns silently so
+// the caller proceeds exactly as it did before this guard existed.
+function enforceSessionShape(session, task, label, exitCode) {
+  if (!SESSION_SHAPE_GUARD_ARMED) return;                 // D2 — a redirected store is not the asset.
+  const s = String(session == null ? '' : session);
+  if (SESSION_UUID_RE.test(s)) return;                     // canonical — proceed unchanged.
+  if (sessionShapeGuardOff()) {
+    console.error('AUDIT: session-shape guard bypassed via documented operator override (session=' + s +
+      (label ? ' label=' + label : '') + ')');
+    writeBypassLog('3role-ledger-session-shape', 'THREE_ROLE_LEDGER_SESSION_SHAPE_OFF', 'PERMIT',
+      { task: task ? sanitize(task) : '', role: label || '' });
+    return;                                                // D6 — kill-switch makes the refusal inert.
+  }
+  console.error(sessionShapeBlockMessage(s));
+  process.exit(exitCode);
+}
+
+// #2169 slice 5 (S5-AC6, design decision 4) — the delivery-receipt HASH. A row is stamped with a ONE-WAY
+// hash of the raw `DISPATCH-NONCE:<token>` value the spawn edge (or the subprocess dispatch helper, slice
+// 6) saw delivered — NEVER the plaintext token itself. This is what makes "harvest the value STORED on the
+// row and echo it straight back as --receipt" structurally fail the delivery-receipt guard below: hashing
+// an already-hashed value never reproduces the original hash, so a caller who only ever read the ledger
+// (never the genuine DISPATCH-NONCE: line delivered to ITS OWN dispatch) cannot construct a valid receipt.
+// A fixed, namespaced prefix (never itself secret) just keeps this hash's domain distinct from any other
+// hash this file might someday mint — it adds no security value on its own.
+function hashDispatchNonce(raw) {
+  const s = String(raw == null ? '' : raw);
+  return crypto.createHash('sha256').update('3role-dispatch-nonce:' + s).digest('hex');
+}
+function fileExists(p) { try { return fs.statSync(p).isFile(); } catch (e) { return false; } }
+function fileHas(p, re) { try { return re.test(fs.readFileSync(p, 'utf8')); } catch (e) { return false; } }
+
+// ── #1448 per-role MODEL POLICY (config resolution + transcript-model read + lint) ─────────────────────
+// The interactive 4-role chain staffs every seat with Opus by default (a spawn today carries model=(none), so
+// each role inherits the session model). config/cc-roles.env maps each role -> a model TIER; this block reads
+// it (fail-SAFE to opus), reads the FORGERY-RESISTANT actual model from the role's subagent transcript
+// (message.model), and lints the config. MODEL is the only mechanically-enforced dimension (effort is not
+// recorded in the transcript). See .ai-workspace/plans/2026-07-03-1448-per-role-model-policy.md.
+const ROLE_MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
+
+// #1503 — the single machine-readable EFFORT vocabulary V, defined ONCE (sibling of ROLE_MODELS above).
+// Both the validity test (roleEffortFromCfg) and the lint's printed list (lintRoleConfig) are DERIVED from
+// this array — never a second typed copy (AC-7's structural grep proves it: exactly one definition site).
+const ROLE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+// Ledger role -> config-key STEM (hyphen->underscore, upper): plan-review -> PLAN_REVIEW, execution-review ->
+// EXECUTION_REVIEW, executor -> EXECUTOR. ORCHESTRATOR has a policy/lint entry but is NOT transcript-enforced.
+function roleKeyStem(role) { return String(role == null ? '' : role).toUpperCase().replace(/-/g, '_'); }
+
+// Resolve the cc-roles.env config file path. First hit wins across the chain, with ONE override rule:
+//   CC_ROLES_ENV, when SET, is AUTHORITATIVE + TERMINAL — it selects EXACTLY that file and NEVER falls through
+//   to the machine/plugin/repo defaults. So a smoke simulates "no config" with CC_ROLES_ENV=/nonexistent (or
+//   /dev/null) and gets the fail-safe all-opus path without leaking the repo's own config/cc-roles.env
+//   (AC-3 / green-gate: CC_ROLES_ENV=/dev/null => opus for every role).
+//   Unset CC_ROLES_ENV: ~/.config/cc-roles.env -> ${CLAUDE_PLUGIN_ROOT}/config/cc-roles.env -> the
+//   realpath-resolved repo config -> none => '' (=> every role opus).
+// The fs.realpathSync step is LOAD-BEARING (defect-1b): setup.sh installs THIS helper as a SYMLINK at
+// ~/.claude/hooks/3role-ledger.mjs -> the repo file. A naive import.meta.url join resolves ../config to
+// ~/.claude/config (does NOT exist) -> silent all-opus on every real invocation while passing every
+// worktree-run smoke. realpathSync walks THROUGH the symlink to the real repo file FIRST, so ../config lands
+// in the repo. AC-4 exercises this via the installed symlink from a cwd outside the repo.
+function resolveConfigPath() {
+  if ('CC_ROLES_ENV' in process.env) {
+    const p = process.env.CC_ROLES_ENV;
+    return (p && fileExists(p)) ? p : '';
+  }
+  const cands = [path.join(HOME, '.config', 'cc-roles.env')];
+  if (process.env.CLAUDE_PLUGIN_ROOT) cands.push(path.join(process.env.CLAUDE_PLUGIN_ROOT, 'config', 'cc-roles.env'));
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  cands.push(path.join(selfDir, '..', 'config', 'cc-roles.env'));
+  for (const c of cands) { if (c && fileExists(c)) return c; }
+  return '';
+}
+
+// Parse a shell-env KEY=VALUE file into a plain object (# comments + blanks dropped; optional surrounding
+// quotes stripped). Never throws — an unreadable file returns {}.
+function parseEnvFile(filePath) {
+  const out = {};
+  let raw;
+  try { raw = fs.readFileSync(filePath, 'utf8'); } catch (e) { return out; }
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s || s.charAt(0) === '#') continue;
+    const eq = s.indexOf('=');
+    if (eq < 0) continue;
+    const k = s.slice(0, eq).trim();
+    let v = s.slice(eq + 1).trim();
+    if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) v = v.slice(1, -1);
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+// Load the config ONCE per command invocation. { found, cfg, configPath }. found=false => no config resolved.
+function loadRoleConfig() {
+  const configPath = resolveConfigPath();
+  if (!configPath) return { found: false, cfg: {}, configPath: '' };
+  return { found: true, cfg: parseEnvFile(configPath), configPath };
+}
+
+// Resolve a role's model TIER from an already-parsed cfg, fail-SAFE to opus (missing OR invalid => opus).
+function roleModelFromCfg(cfg, role) {
+  const raw = cfg['CC_ROLE_' + roleKeyStem(role) + '_MODEL'];
+  return ROLE_MODELS.includes(raw) ? raw : 'opus';
+}
+// #1503 — fails safe to the highest live-proven effort (xhigh) the way roleModelFromCfg fails safe to opus.
+// PRESENCE-gated, not `v == null`: an ABSENT key (no line at all -> `key in cfg` is false) stays the frozen
+// #1448 back-compat shape (bare passthrough, no lint). A PRESENT value that is not exact, case-sensitive
+// membership in ROLE_EFFORTS -- including the empty string `KEY=` -- is invalid: it falls back to `xhigh`
+// (lintRoleConfig emits the INVALID-EFFORT warning for it, per-key, on every config read). This is genuine
+// SET-MEMBERSHIP against V, not an enumeration of any particular test fixture's off-vocab words.
+function roleEffortFromCfg(cfg, role) {
+  const key = 'CC_ROLE_' + roleKeyStem(role) + '_EFFORT';
+  if (!(key in cfg)) return '';
+  const v = String(cfg[key]);
+  return ROLE_EFFORTS.includes(v) ? v : 'xhigh';
+}
+
+// #1458 — Resolve a role's VERSION PIN from an already-parsed cfg: a per-ROLE override
+// (CC_ROLE_<ROLE>_MODEL_VERSION) wins when present; else the per-TIER pin (CC_TIER_<TIER>_VERSION) for the
+// role's expected tier; else '' (NO PIN => the version sub-leg is DORMANT for that role — the tier leg alone
+// still enforces). This is an ASSERTION knob (validate against a concrete claude-* id), never a SELECTION
+// knob — the spawn alias cannot choose an old version, so there is nothing to "select" here.
+function roleVersionFromCfg(cfg, role, expectedTier) {
+  const roleOverride = cfg['CC_ROLE_' + roleKeyStem(role) + '_MODEL_VERSION'];
+  if (roleOverride) return roleOverride;
+  const tierPin = cfg['CC_TIER_' + String(expectedTier || '').toUpperCase() + '_VERSION'];
+  return tierPin || '';
+}
+
+// Config LINT (defect-3 + Fable guards) — emits stderr warnings; the pass/fail is unaffected (the gate's
+// `expected` fails SAFE to opus, so a garbage value collapses to opus at the gate and CANNOT be caught there —
+// VISIBILITY is entirely the lint's job). Fires on EVERY config read (every resolve-role-model + every enforce
+// check + every spawn-hook call). Call ONCE per invocation (loud, not 5x). THREE warn classes:
+//   1. INVALID-MODEL — a present *_MODEL whose value is not a known tier (typo / empty). The silent-overpay guard.
+//   2. FABLE-ON-ORCHESTRATOR — the always-on seat pinned to fable (never-pin; refuse/warn).
+//   3. FABLE-CAP-BUDGET — any VALID *_MODEL=fable (cap-budget reminder: up to 50% of the weekly limit, not a
+//      deadline — see the "Planner" comment block in cc-roles.env for the full corrected framing).
+// #1640 S8(b) — OPTIONAL 2nd param `routes` (an already-loaded SSOT object, or null/undefined). Every EXISTING
+// call site passes ONE arg (routes===undefined), so vocabHint stays '' and the INVALID-MODEL message is
+// BYTE-IDENTICAL to before (the frozen `resolve-role-model` contract never passes a 2nd arg — see its own call
+// sites below, unchanged). ONLY the completion gate's `--enforce-role-models` leg passes a loaded SSOT, so an
+// inexpressible/typo legacy value ALSO names the SSOT-declared vocabulary the author may have meant, instead of
+// a typo silently reading as "no such thing as a declared switch exists."
+function lintRoleConfig(cfg, routes) {
+  let vocabHint = '';
+  if (routes && typeof routes === 'object' && routes.providers) {
+    const tokens = [];
+    for (const [pid, row] of Object.entries(routes.providers)) {
+      const vocab = (row && row.model_vocabulary) || {};
+      for (const [mid, entry] of Object.entries(vocab)) {
+        tokens.push(pid + '/' + mid + ' (' + ((entry && entry.tier_equivalent) || '?') + ')');
+      }
+    }
+    if (tokens.length) vocabHint = ' SSOT-declared provider vocabulary you may have meant (config/cc-routes.json): ' + tokens.join(', ') + '.';
+  }
+  for (const k of Object.keys(cfg)) {
+    const m = k.match(/^CC_ROLE_(.+)_MODEL$/);
+    if (!m) continue;
+    const val = cfg[k];
+    if (!ROLE_MODELS.includes(val)) {
+      process.stderr.write('INVALID-MODEL cc-roles.env: ' + k + '="' + val + '" is not a known tier ' +
+        '(opus|sonnet|haiku|fable) — falling back to opus (you are paying OPUS rates while thinking you set "' +
+        val + '").' + vocabHint + '\n');
+      continue;   // an invalid value is not also a fable warning.
+    }
+    if (val === 'fable') {
+      if (m[1] === 'ORCHESTRATOR') {
+        process.stderr.write('FABLE-ON-ORCHESTRATOR cc-roles.env: ' + k + '=fable — refusing to pin the ' +
+          'always-on orchestrator seat to Fable (2x Opus API-billing rate, high-frequency; burns the weekly ' +
+          'cap fast). The orchestrator is documented opus-only.\n');
+      }
+      process.stderr.write('FABLE-CAP-BUDGET cc-roles.env: ' + k + '=fable — Fable is a capped seat: up to ' +
+        '50% of the weekly limit, not a deadline (no expiry — the previously-claimed one was voided). Budget ' +
+        'it for the highest-leverage work (design, hard research), never a high-volume grunt seat. The ' +
+        '~2x-Opus-per-token figure applies to API/usage-credit billing only, not Max-plan-included usage.\n');
+    }
+  }
+  // #1503 INVALID-EFFORT — a present CC_ROLE_*_EFFORT whose value is not exact, case-sensitive membership in
+  // ROLE_EFFORTS (typo / case variant / empty). Same shape + same doctrine as INVALID-MODEL above: visibility
+  // is entirely this lint's job (roleEffortFromCfg's own fail-safe to xhigh cannot be caught at the gate).
+  // Per-key over the WHOLE config (like INVALID-MODEL), not only the currently-requested role's key — so one
+  // lint pass surfaces every off-vocabulary EFFORT key in the file, symmetric with AC-9's per-key E=2.
+  for (const k of Object.keys(cfg)) {
+    const m = k.match(/^CC_ROLE_(.+)_EFFORT$/);
+    if (!m) continue;
+    const val = cfg[k];
+    if (!ROLE_EFFORTS.includes(val)) {
+      process.stderr.write('INVALID-EFFORT cc-roles.env: ' + k + '="' + val + '" is not a known effort ' +
+        '(' + ROLE_EFFORTS.join('|') + ') — falling back to xhigh (a safe high effort, never a silently ' +
+        'weaker one, in place of "' + val + '").\n');
+    }
+  }
+  // #1458 INVALID-VERSION — a present CC_TIER_*_VERSION or CC_ROLE_*_MODEL_VERSION pin whose non-empty value
+  // does not look like a concrete claude-* model id. Visibility-only (mirrors INVALID-MODEL's doctrine): the
+  // version leg will treat the malformed value as a literal pin and will very likely FAIL every run against it.
+  for (const k of Object.keys(cfg)) {
+    const isVersionKey = /^CC_TIER_[A-Z]+_VERSION$/.test(k) || /^CC_ROLE_.+_MODEL_VERSION$/.test(k);
+    if (!isVersionKey) continue;
+    const val = cfg[k];
+    if (val && !/^claude-/.test(val)) {
+      process.stderr.write('INVALID-VERSION cc-roles.env: ' + k + '="' + val + '" does not look like a concrete ' +
+        'claude-* model id — the version leg will treat it as a literal pin and likely FAIL every run.\n');
+    }
+  }
+}
+
+// claude model-id -> our tier. Unknown/absent => '' (can't-tell => the caller fails OPEN for that role).
+function modelIdToTier(modelId) {
+  const s = String(modelId == null ? '' : modelId).toLowerCase();
+  if (/^claude-opus-/.test(s)) return 'opus';
+  if (/^claude-sonnet-/.test(s)) return 'sonnet';
+  if (/^claude-haiku-/.test(s)) return 'haiku';
+  if (/^claude-fable-/.test(s)) return 'fable';
+  return '';
+}
+
+// FORGERY-RESISTANT actual-model read: the LAST `type:"assistant"` line's message.model in the role's subagent
+// transcript (the model that produced the closing tokens — the harness writes it, the orchestrator cannot forge
+// it). Same glob as agentResolves(). Returns the model-id string or '' when no assistant model line exists
+// (=> can't-tell => caller fails OPEN for that role — mirrors the gate's existing ERR->allow residual).
+function transcriptModel(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let last = '';
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (j && j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+        last = j.message.model;
+      }
+    }
+    if (last) return last;
+  }
+  return '';
+}
+
+// #2782 AC-8 — the same last-assistant-`message.model` read as transcriptModel() above, but against an
+// EXPLICIT transcript path (a subprocess dispatch row's own `transcript_path`, stored by the dispatch
+// helper — there is no agentId to glob for). Returns '' on a missing/unreadable file or when no assistant
+// model line exists (the caller treats '' as unreadable: the row's value is not known blind -> untouched).
+function transcriptModelFromPath(p) {
+  let f = String(p == null ? '' : p);
+  if (!f) return '';
+  // Rows store transcript paths in the ledger's PORTABLE home-tilde form (`~/...`, see the home-tilde
+  // store rule ~:1863) whenever the path sits under $HOME — the same shape the real subprocess rows
+  // carry. Expand before reading, exactly like every other read-side consumer (:1672, :2101, :2777);
+  // an absolute path (the dispatcher's own runtime resolution) passes through unchanged.
+  if (f.startsWith('~/')) f = path.join(HOME, f.slice(2));
+  let content;
+  try { content = fs.readFileSync(f, 'utf8'); } catch (e) { return ''; }
+  let last = '';
+  for (const ln of content.split('\n')) {
+    const s = ln.trim();
+    if (!s) continue;
+    let j; try { j = JSON.parse(s); } catch (e) { continue; }
+    if (j && j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+      last = j.message.model;
+    }
+  }
+  return last;
+}
+
+// ── #1709 W1/W2 — PER-JOB TOKEN CAPTURE (sibling usage store, §2 of the plan) ────────────────────────────
+// The usage store is a FLAT directory of <agentId>.json files, a SIBLING of LEDGER_DIR (never inside a
+// session dir — cmdCheck's task-file glob at :2898-2903-equivalent reads every "*.jsonl" there, so a
+// sidecar in that tree would be misread as a task file, B3). Resolve via path.resolve() so a
+// THREE_ROLE_LEDGER_DIR carrying a trailing slash does not put "-usage" INSIDE the ledger tree
+// (plan-review round-2 note). THREE_ROLE_USAGE_DIR, when set, overrides the derived default outright — the
+// same isolation discipline the smokes already rely on for THREE_ROLE_LEDGER_DIR.
+function usageStoreDir() {
+  return process.env.THREE_ROLE_USAGE_DIR || (path.resolve(LEDGER_DIR) + '-usage');
+}
+function usageStoreFile(agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  return path.join(usageStoreDir(), aid + '.json');
+}
+
+// Locate a specific agent's own transcript / meta.json file (same glob as transcriptModel()/agentResolves()
+// — PROJECTS_ROOT/<slug>/<session>/subagents/agent-<agentId>.<ext>). Returns '' on no match (fail-open).
+function findAgentTranscriptFile(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    if (fileExists(f)) return f;
+  }
+  return '';
+}
+function findAgentMetaFile(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return '';
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.meta.json');
+    if (fileExists(f)) return f;
+  }
+  return '';
+}
+
+// F2 fail-open counter readers. A CORE counter (the four named in §2.2) that is present-but-non-numeric
+// THROWS — the caller aborts the WHOLE stamp (never a partial/coerced record, plan §2.2/F2). A missing
+// `cache_creation` sub-object, or a non-numeric value inside it, degrades its two ephemeral sub-counters to
+// 0 rather than aborting (the softer AC-3(d) "four counters intact" arm).
+function readCoreCounter(v) {
+  const n = (v === undefined || v === null) ? 0 : Number(v);
+  if (!Number.isFinite(n)) throw new Error('#1709 usage capture: non-numeric usage counter');
+  return n;
+}
+function readEphemeralCounter(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Derive the §2.2 usage object from ONE agent's OWN transcript, applying the B1 fork-boundary rule and the
+// §1 message.id LAST-writer-wins dedupe rule. Returns null when there is nothing usage-bearing to stamp (no
+// assistant usage record at all, or every record is model "<synthetic>", or an isFork:true transcript whose
+// boundary record cannot be found — "can't tell" never becomes an over-count). THROWS on a malformed core
+// counter (F2) — the caller (captureUsageAtClose / cmdBackfill) never catches this itself, by design: it
+// propagates to whichever caller's own try/catch decides "no file written" (fail-open at the OUTER edge,
+// never a partial write from inside this function).
+function deriveUsageFromTranscript(transcriptPath, metaPath) {
+  const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n');
+
+  // B1 fork boundary: locate the record holding a tool_use content block whose id equals the meta's
+  // toolUseId. Only records AFTER that record are the fork child's own (§2.2's boundary rule, verified by
+  // plan-review against 6 real forks — the boundary is always one record past the last record shared with
+  // the parent). Keyed strictly on isFork:true, never on toolUseId presence alone (a non-fork meta also
+  // carries a toolUseId — measured; that must NOT trigger this rule).
+  let startIdx = 0;
+  if (metaPath) {
+    let meta = null;
+    try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (e) { meta = null; }
+    if (meta && meta.isFork === true) {
+      const toolUseId = meta.toolUseId;
+      let boundaryIdx = -1;
+      if (toolUseId) {
+        for (let i = 0; i < lines.length; i++) {
+          const s = lines[i].trim();
+          if (!s) continue;
+          let j; try { j = JSON.parse(s); } catch (e) { continue; }
+          const blocks = (j && j.message && Array.isArray(j.message.content)) ? j.message.content : [];
+          if (blocks.some((c) => c && c.type === 'tool_use' && c.id === toolUseId)) { boundaryIdx = i; break; }
+        }
+      }
+      if (boundaryIdx === -1) return null;   // isFork with no resolvable boundary -> can't tell -> no stamp.
+      startIdx = boundaryIdx + 1;
+    }
+  }
+
+  // message.id -> { model, usage }, LAST occurrence wins (a streamed reply repeats usage across several
+  // records sharing one message.id — the last block carries the final output_tokens, §1).
+  const byMessageId = new Map();
+  for (let i = startIdx; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s) continue;
+    let j;
+    try { j = JSON.parse(s); } catch (e) { continue; }   // truncated trailing line -> ignored (F2).
+    if (!j || j.type !== 'assistant' || !j.message) continue;
+    const msg = j.message;
+    if (typeof msg.model !== 'string' || !msg.model) continue;
+    if (typeof msg.id !== 'string' || !msg.id) continue;
+    if (!msg.usage || typeof msg.usage !== 'object') continue;
+    byMessageId.set(msg.id, { model: msg.model, usage: msg.usage });
+  }
+  if (byMessageId.size === 0) return null;   // no usage-bearing assistant record (AC-3(c)).
+
+  const byModel = {};
+  let apiCalls = 0;
+  for (const { model, usage } of byMessageId.values()) {
+    if (model === '<synthetic>') continue;   // harness-fabricated, never a real API call (§2.2).
+    const cc = (usage.cache_creation && typeof usage.cache_creation === 'object') ? usage.cache_creation : null;
+    const inputTokens = readCoreCounter(usage.input_tokens);
+    const outputTokens = readCoreCounter(usage.output_tokens);
+    const cacheReadTokens = readCoreCounter(usage.cache_read_input_tokens);
+    const cacheCreationTokens = readCoreCounter(usage.cache_creation_input_tokens);
+    const cache5m = readEphemeralCounter(cc ? cc.ephemeral_5m_input_tokens : 0);
+    const cache1h = readEphemeralCounter(cc ? cc.ephemeral_1h_input_tokens : 0);
+    if (!byModel[model]) {
+      byModel[model] = {
+        api_calls: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0, cache_creation_5m_input_tokens: 0, cache_creation_1h_input_tokens: 0,
+      };
+    }
+    const b = byModel[model];
+    b.api_calls += 1;
+    b.input_tokens += inputTokens;
+    b.output_tokens += outputTokens;
+    b.cache_read_input_tokens += cacheReadTokens;
+    b.cache_creation_input_tokens += cacheCreationTokens;
+    b.cache_creation_5m_input_tokens += cache5m;
+    b.cache_creation_1h_input_tokens += cache1h;
+    apiCalls += 1;
+  }
+  if (apiCalls === 0) return null;   // every record was <synthetic> -> nothing real to stamp.
+
+  return { source: 'transcript', captured_at: new Date().toISOString(), api_calls: apiCalls, by_model: byModel };
+}
+
+// Whole-file atomic write (tmp + rename, §2.7) — the ONLY writer of a usage-store file. Overwriting an
+// existing file is intentional: a later close's transcript is always a superset (F3), and backfill only
+// ever calls this when no file exists yet (B3's "agents already stamped are never rewritten").
+function writeUsageStoreFile(agentId, usage) {
+  const dir = usageStoreDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = usageStoreFile(agentId);
+  const tmp = file + '.tmp-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  fs.writeFileSync(tmp, JSON.stringify({ agentId: agentId, usage: usage }));
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+// W1 — close-time capture entry point. Called ONLY when the triggering append carries --closed-at (the
+// same signal #1465's centralized model capture already keys on) — never a new append flag (§3, the 26/26
+// pin stands). Fail-open throughout (F2): ANY failure in this path (no transcript, no usage-bearing record,
+// an unresolvable fork boundary, a malformed counter) must never change the append's exit code or touch the
+// ledger row already written — the sole caller (cmdAppend) wraps this in its OWN try/catch for exactly that
+// reason, so this function is deliberately NOT self-guarding against deriveUsageFromTranscript's throw.
+function captureUsageAtClose(session, agentId) {
+  if (!agentId) return;
+  const transcriptPath = findAgentTranscriptFile(session, agentId);
+  if (!transcriptPath) return;   // no transcript -> no stamp (mirrors transcriptModel()'s own contract).
+  const metaPath = findAgentMetaFile(session, agentId);
+  const usage = deriveUsageFromTranscript(transcriptPath, metaPath);
+  if (!usage) return;
+  writeUsageStoreFile(agentId, usage);
+}
+
+// ── #1512 RESUME-BOUNDARY DETECTOR ───────────────────────────────────────────────────────────────────────
+// A SendMessage resume discards a role's spawn-time model pin (measured: `.ai-workspace/research/
+// 2026-07-10-1512-resume-hook-edge-probe.md`) — the resumed subagent silently re-inherits the SESSION model,
+// which can land on a MORE capable tier than the role's policy (e.g. an Opus-orchestrator resuming a sonnet
+// executor). The completion-time gate needs to tell that apart from a genuinely-wrong spawn. The harness marks
+// a resume delivery with an UNFORGEABLE shape in the role's OWN transcript: a `type:"user"` record with
+// `isMeta:true` and `origin.kind==="coordinator"` (verified on-disk against the real #1494 executor transcript,
+// record 540: "The coordinator sent a message while you were working: ..."). The orchestrator cannot fabricate
+// this record — it is authored by the harness at delivery time, the same trust boundary transcriptModel()
+// already relies on for `message.model`.
+//
+// Returns { hasResume, preResumeModel, lastModel }:
+//   hasResume       — true iff >=1 resume-delivery record exists anywhere in the transcript.
+//   preResumeModel  — the LAST assistant `message.model` seen strictly BEFORE the FIRST resume boundary (the
+//                     "what the role was actually running as before ANY rework tap" reading — multi-resume
+//                     sequences anchor here, per the plan's "compare final-observed against the spawn/
+//                     pre-first-resume model that matched policy" rule, not the model before the LAST resume).
+//   lastModel       — the same value transcriptModel() would return for this agentId (computed in the same
+//                     pass to avoid a second file read); '' if no assistant message.model line exists.
+// Fails open to { hasResume:false, preResumeModel:'', lastModel:'' } on any missing/unreadable file — mirrors
+// transcriptModel()'s can't-tell contract.
+function resumeBoundaryModels(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  const empty = { hasResume: false, preResumeModel: '', lastModel: '' };
+  if (!aid) return empty;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return empty; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let firstResumeSeen = false;
+    let preResumeModel = '';
+    let lastModel = '';
+    let sawAnyLine = false;
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (!j) continue;
+      sawAnyLine = true;
+      // #1512 AC-0 live probe (2026-07-10): a resume delivery's `origin.kind` varies by WHO issued the
+      // SendMessage — 'coordinator' for a top-level-orchestrator resume (the real #1494 shape, verified
+      // on-disk), 'peer' for an agent-to-agent resume (verified live this run, probe agent a4bd765511486c4ba
+      // record 7). Both are the SAME harness-authored resume-delivery shape (type:"user", isMeta:true, a
+      // non-empty origin.kind) — match on the SHAPE, not a single hardcoded kind, so a peer-issued resume is
+      // not silently invisible to this detector.
+      if (!firstResumeSeen && j.type === 'user' && j.isMeta === true && j.origin && typeof j.origin.kind === 'string' && j.origin.kind) {
+        firstResumeSeen = true;
+      }
+      if (j.type === 'assistant' && j.message && typeof j.message.model === 'string' && j.message.model) {
+        lastModel = j.message.model;
+        if (!firstResumeSeen) preResumeModel = j.message.model;
+      }
+    }
+    if (sawAnyLine) return { hasResume: firstResumeSeen, preResumeModel, lastModel };
+  }
+  return empty;
+}
+
+// #1512 CAPABILITY ordering (used ONLY to decide a STRICT quality up-tier for the resume-reroute arm below).
+// `fable` is deliberately EXCLUDED from this map (plan-review N4: fable is high-quality but NOT cost-monotonic
+// — ~2x Opus — so it must never be folded into a numeric rank other tiers get compared against). A resumed
+// role landing on `fable` is instead handled as an unconditional up-tier in isResumeUpTier() below, kept
+// syntactically SEPARATE from this ordering rather than assigned a rank inside it.
+const CAPABILITY_RANK = { haiku: 1, sonnet: 2, opus: 3 };
+
+// True iff `actual` is a STRICTLY more capable tier than `expected` — i.e. safe to allow-with-note when it
+// arises from a resume (never used to permit a non-resume mismatch; the caller only invokes this inside the
+// resume-boundary branch). `actual === 'fable'` is always true (see CAPABILITY_RANK comment above); otherwise
+// both tiers must be known ranks and actual's rank must exceed expected's.
+function isResumeUpTier(expected, actual) {
+  if (actual === 'fable') return true;
+  const er = CAPABILITY_RANK[expected];
+  const ar = CAPABILITY_RANK[actual];
+  return !!er && !!ar && ar > er;
+}
+
+// ── #1494 EFFECTIVE-TIER SENSOR ──────────────────────────────────────────────────────────────────────────
+// The leading-edge model-policy gate (three-role-model-policy-gate.sh) used to HARDCODE the effective tier of
+// a badge-less spawn to "opus" (the documented session default). Under an Opus session that's usually right;
+// under a Fable session it's WRONG — a badge-less spawn actually inherits Fable, and the hardcoded guess let
+// all four roles run Fable across 19 tasks in total silence (the gate computed effective=opus==expected=opus
+// and stayed quiet). ADD, do NOT refactor transcriptModel() (finding H) — that function is load-bearing for
+// the completion-time gate (transcriptModel() reads a role's OWN subagent transcript by agentId; this sensor
+// reads the MAIN SESSION transcript directly by path, a different shape of the same "read the transcript, do
+// not assume" idea) and stays byte-unchanged (AC-19).
+const TIER_SENSOR_DEFAULT_TAIL_BYTES = 4 * 1024 * 1024;    // >= a single ~0.8MB record with margin (measured).
+const TIER_SENSOR_DEFAULT_CAP_BYTES = 64 * 1024 * 1024;    // bounded — NEVER readFileSync the whole (281MB+) file.
+
+// Bounded REVERSE-TAIL read of the last `type:"assistant"` record in a growing JSONL transcript, filtered to
+// the MAIN session (isSidechain===false, so a subagent/sidechain record can never leak in as "the session
+// model" — finding C). Reads only the last `tailBytes` from EOF; if no matching record is found in that
+// window (trailing junk, or a record straddling the window edge), DOUBLES the window and retries, up to
+// `capBytes`. Exceeding the cap without a parseable last-assistant record returns null (caller fails CLOSED).
+// tailBytes/capBytes are configurable via opts OR env (CC_TIER_SENSOR_TAIL_BYTES / CC_TIER_SENSOR_CAP_BYTES,
+// Rule 16) so a smoke can force the grow-path and cap-path with SMALL fixtures instead of 200MB files.
+function lastAssistantModelFromFile(filePath, opts) {
+  opts = opts || {};
+  const envTail = Number(process.env.CC_TIER_SENSOR_TAIL_BYTES);
+  const envCap = Number(process.env.CC_TIER_SENSOR_CAP_BYTES);
+  const tailBytes = Number(opts.tailBytes) > 0 ? Number(opts.tailBytes)
+    : (envTail > 0 ? envTail : TIER_SENSOR_DEFAULT_TAIL_BYTES);
+  const capBytes = Number(opts.capBytes) > 0 ? Number(opts.capBytes)
+    : (envCap > 0 ? envCap : TIER_SENSOR_DEFAULT_CAP_BYTES);
+  const mainSessionOnly = opts.mainSessionOnly !== false;   // default true.
+
+  let fd;
+  let size;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    size = fs.fstatSync(fd).size;
+  } catch (e) { return null; }   // missing / unreadable -> can't-tell.
+
+  try {
+    let window = Math.max(1, Math.min(tailBytes, capBytes));
+    for (;;) {
+      const start = Math.max(0, size - window);
+      const length = size - start;
+      if (length > 0) {
+        const buf = Buffer.alloc(length);
+        let bytesRead = 0;
+        try { bytesRead = fs.readSync(fd, buf, 0, length, start); } catch (e) { bytesRead = 0; }
+        let text = buf.toString('utf8', 0, bytesRead);
+        // Drop the leading partial record (everything before the first \n), UNLESS this window covers byte 0
+        // (in which case there IS no leading partial record — the window starts at the true file start).
+        if (start > 0) {
+          const nl = text.indexOf('\n');
+          text = nl >= 0 ? text.slice(nl + 1) : '';
+        }
+        const lines = text.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const s = lines[i].trim();
+          if (!s) continue;
+          let j; try { j = JSON.parse(s); } catch (e) { continue; }
+          if (!j || j.type !== 'assistant') continue;
+          if (mainSessionOnly && j.isSidechain !== false) continue;   // require an EXPLICIT isSidechain:false.
+          const model = (j.message && typeof j.message.model === 'string') ? j.message.model : '';
+          if (model) return model;
+        }
+      }
+      if (start === 0) break;          // covered the whole file — nothing found, give up.
+      if (window >= capBytes) break;    // already at the cap — give up (fail-closed, never read past it).
+      window = Math.min(window * 2, capBytes);
+    }
+  } finally {
+    try { fs.closeSync(fd); } catch (e) { /* no-op */ }
+  }
+  return null;
+}
+
+// A `--model` value may be a bare TIER ALIAS (the normal spawn convention — "opus"/"sonnet"/"fable"/"haiku")
+// or, defensively, a concrete claude-* id. Returns '' when neither form resolves (caller treats as unknown).
+// #1640 S11 — WIDENED to also consult the SSOT vocabulary (identifyModelViaSSOT, defined in the M0 section
+// below — forward reference; hoisted `function` declarations make this safe) when the value is neither a
+// tier alias nor a claude-* id: a genuinely-declared non-Anthropic id (e.g. a qwen/gemma tag) now resolves to
+// its SSOT tier_equivalent instead of falling through to 'unknown'. STRICTLY ADDITIVE — a value that resolved
+// via the tier-alias or claude-* branch is UNCHANGED, and a value in NEITHER the alias list, NOR claude-*, NOR
+// any provider's declared vocabulary still correctly returns '' (unknown) exactly as before.
+function modelIdOrAliasToTier(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  if (ROLE_MODELS.includes(s)) return s;
+  const legacy = modelIdToTier(s);
+  if (legacy) return legacy;
+  return identifyModelViaSSOT(v);
+}
+
+// resolveEffectiveTier — the reusable "who is this really?" reader (#1494; #1497 Key-1 consumes this, does
+// NOT re-derive it). TOTAL function: never throws, always returns a well-shaped { tier, source, agentdefTier }.
+//
+// Tier-deciding precedence (ONLY these three terms decide `tier`):
+//   1. `model` non-empty -> tier = modelIdOrAliasToTier(model), source='requested'. Explicit badge wins,
+//      regardless of transcript. An unresolvable explicit value (never seen in practice) fails CLOSED to
+//      'unknown' rather than silently falling through to term 2 — an explicit-but-garbled badge must never
+//      resolve to a guess.
+//   2. else read the session transcript tail — `transcriptPath` (the PreToolUse(Agent) payload's own
+//      `transcript_path`, used DIRECTLY — this is proven always-present, so this is the live path in
+//      practice), else (ONLY when transcriptPath is absent) a defensive, dead-code-in-practice fallback:
+//      build the MAIN-session path shape `<projectsRoot>/*/<session>.jsonl` (session as the FILENAME — this
+//      is a NEW path shape, NOT the subagent-shape glob `.../<session>/subagents/agent-<id>.jsonl` that
+//      transcriptModel()/agentResolves() use). Last `isSidechain:false` assistant `message.model` ->
+//      modelIdToTier(...); non-empty -> that tier, source='session'.
+//   3. else -> tier='unknown', source='unknown'.
+//
+// Agent-def frontmatter (`subagentType` + `agentsDir`) is PROVENANCE-ONLY: reported as `agentdefTier` but
+// NEVER enters the precedence above and NEVER changes `tier` (whether frontmatter overrides session
+// inheritance is UNVERIFIED — see the plan's `## Unverified assumptions`). `tier=unknown` ALWAYS means the
+// caller must fail closed — never coerce it to a concrete tier (never resolve an opus seat's can't-tell to
+// "opus"; that is exactly the leak this sensor exists to close).
+function resolveEffectiveTier(o) {
+  o = o || {};
+  const out = { tier: 'unknown', source: 'unknown', agentdefTier: null };
+  try {
+    const modelRaw = (o.model == null ? '' : String(o.model)).trim();
+    if (modelRaw) {
+      const t = modelIdOrAliasToTier(modelRaw);
+      out.tier = t || 'unknown';
+      out.source = 'requested';
+    } else {
+      let txPath = (o.transcriptPath == null ? '' : String(o.transcriptPath)).trim();
+      if (!txPath) {
+        // Defensive fallback (finding K/L — dead-code-in-practice: transcript_path is byte-proven always
+        // present on the payload). Build the MAIN-session path shape directly; do NOT reuse the subagent glob.
+        const session = sanitize(o.session);
+        if (session) {
+          const projectsRoot = (o.projectsRoot && String(o.projectsRoot)) ||
+            process.env.THREE_ROLE_PROJECTS_ROOT || PROJECTS_ROOT;
+          try {
+            const slugs = fs.readdirSync(projectsRoot);
+            for (const slug of slugs) {
+              const cand = path.join(projectsRoot, slug, session + '.jsonl');
+              if (fileExists(cand)) { txPath = cand; break; }
+            }
+          } catch (e) { /* no derivable session path -> stays unknown/unknown */ }
+        }
+      }
+      if (txPath) {
+        const modelId = lastAssistantModelFromFile(txPath, { mainSessionOnly: true });
+        if (modelId) {
+          const t = modelIdToTier(modelId);
+          if (t) { out.tier = t; out.source = 'session'; }
+          else {
+            // #1640 S11 — widen: a session-inherited non-Anthropic model id (e.g. the whole session is running
+            // under a rerouted ANTHROPIC_BASE_URL gateway) resolves via the SSOT vocabulary instead of falling
+            // through to 'unknown'. A model id in NEITHER claude-* form NOR any declared provider vocabulary
+            // still correctly stays unknown/unknown below (can't-tell) — this only WIDENS what resolves.
+            const w = identifyModelViaSSOT(modelId);
+            if (w) { out.tier = w; out.source = 'session'; }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    out.tier = 'unknown'; out.source = 'unknown';   // total function: never throws to the caller.
+  }
+  // Agent-def is PROVENANCE-ONLY — resolved independently of the precedence above, and can never widen it.
+  try {
+    const subagentType = (o.subagentType == null ? '' : String(o.subagentType)).trim();
+    const agentsDir = o.agentsDir ? String(o.agentsDir) : '';
+    if (subagentType && agentsDir) {
+      const p = path.join(agentsDir, subagentType + '.md');
+      if (fileExists(p)) {
+        const content = fs.readFileSync(p, 'utf8');
+        const m = content.match(/^model:\s*([a-z]+)/im);
+        if (m && ROLE_MODELS.includes(m[1].toLowerCase())) out.agentdefTier = m[1].toLowerCase();
+      }
+    }
+  } catch (e) { /* provenance is best-effort; must never affect tier */ }
+  return out;
+}
+
+// Parse `--key value` flags. An empty next-arg ("") IS consumed (so `--skip-reason ""` records an
+// explicit empty reason → caught as a non-specific skip). A flag with no following value → "".
+//
+// #2189 D7 L1 (R9-B1/R11-B4/R13-B3) — AMBIGUOUS-FLAG REFUSAL lives HERE, in the shared parser every
+// subcommand and every flag transits, never in a per-flag or per-call-site check (a duplicate check
+// bolted onto one call site greens only the sampled flags and leaves every other flag — including one
+// invented at test time — last-wins). Any `--flag` NAME occurring more than once in argv is ambiguous
+// BY CONSTRUCTION (different values -> which one did the caller mean; identical values -> still two
+// independent occurrences a future edit could silently diverge) and is recorded on the non-enumerable
+// `__dupFlags` property so it never contaminates `Object.keys`/`JSON.stringify`/spread of the returned
+// options object for any existing caller. The dispatcher below refuses BEFORE any subcommand runs.
+function parseArgs(argv) {
+  const o = {};
+  const seenCount = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      seenCount[key] = (seenCount[key] || 0) + 1;
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) { o[key] = ''; }
+      else { o[key] = next; i++; }
+    }
+  }
+  const dupFlags = Object.keys(seenCount).filter((k) => seenCount[k] > 1);
+  Object.defineProperty(o, '__dupFlags', { value: dupFlags, enumerable: false });
+  return o;
+}
+
+// Phase 2 forgery-close: glob PROJECTS_ROOT/*/<session>/subagents/agent-<agentId>.jsonl ; ≥1 hit required.
+function agentResolves(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return false;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return false; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    if (fileExists(f)) return true;
+  }
+  // #3326 — the pinned session holds no transcript for this agentId: the seat may have been spawned in
+  // a DIFFERENT Claude session than the ledger key (the key is carried across compactions/sessions by a
+  // handoff card; agent ids are unique, so the transcript IS findable). Bounded, deterministic cross-
+  // session sweep; budget exceeded fails CLOSED (no resolve).
+  const x3326 = xsessionFirstTranscript(aid);
+  return !!x3326.path;
+}
+
+// ── #3326 cross-session agent binding (3325 leg 2) ─────────────────────────────────────────────────
+// The ledger session key can differ from the Claude session that SPAWNED an Agent-tool seat (the key is
+// carried across compactions/sessions by a handoff card), but the seat's transcript lands under the
+// SPAWNING session's dir — and agent ids are unique, so the transcript IS findable, just not under the
+// key the pre-#3326 predicates consult. Every resolution predicate below therefore keeps its byte-identical
+// SAME-SESSION arm as the first, authoritative pass (AC-20: a transcript under the ledger key's OWN
+// session dir decides exactly as before — including a pinned-session transcript that exists but does NOT
+// bind, which still decides "no bind", never rescued by a cross-session sibling) and only falls back to
+// the bounded cross-session sweep here when that arm found NOTHING under the pinned session. The sweep is
+// DETERMINISTIC (candidates enumerated in ascending (slug, session) order — the FIRST existing transcript
+// decides a binding, mirroring the W27 discipline already documented on agentBoundToTag: never let a
+// sibling transcript steal another row's decision) and BOUNDED (XSESSION_MAX_SESSION_DIRS session dirs and
+// XSESSION_MAX_FILE_READS transcript opens per predicate call); when a budget is exceeded the sweep FAILS
+// CLOSED — the predicate reports not-found/no-bind/'', never a partial or order-dependent verdict (plan-
+// review r3 finding 1's deterministic-collision rule and finding 2's bounded-read discipline; the
+// fail-closed-past-the-bound arm is in the 3325 smoke).
+// Fix cycle 1 (execution-review finding 1): the bounds are SIZED FROM THE MEASURED LIVE POPULATION
+// (names only, no transcript content read; method + numbers recorded in the executor close note):
+// 3,629 session dirs / 3,471 subagent transcripts under the live projects root (1,891 slugs),
+// largest single subagents dir 1,817 transcripts — the leg-2 constants (512/2048) sat BELOW that
+// population, so the sweep failed closed on the live machine exactly where #3326 needed it to
+// resolve. Powers of two with ~4.5x headroom on BOTH axes, so the live shape resolves with room to
+// grow; a hit is never silent (see xsessionLoudExhaustion just below).
+const XSESSION_MAX_SESSION_DIRS = 16384;
+const XSESSION_MAX_FILE_READS = 16384;
+// Fix cycle 1: a budget hit fails LOUDLY with a named reason — pre-fix it was an empty exit-1 miss,
+// indistinguishable from "no transcript exists". Emitted to stderr at most once per process, from
+// whichever sweep first exhausts a bound; stdout is never touched (resolve-agent's contract prints
+// only the agentId there).
+let xsessionExhaustionLogged = false;
+function xsessionLoudExhaustion(bound) {
+  if (xsessionExhaustionLogged) return;
+  xsessionExhaustionLogged = true;
+  console.error('3role-ledger: xsession-budget-exhausted: the #3326 cross-session transcript sweep hit its ' +
+    bound + ' bound before finding any transcript — FAILING CLOSED (no result, never a partial or guessed ' +
+    'winner). The population under the projects root exceeds the built-in budget; the bounds live in ' +
+    'hooks/3role-ledger.mjs (XSESSION_MAX_SESSION_DIRS / XSESSION_MAX_FILE_READS, sized from the measured ' +
+    'live population with headroom) and may only be raised, never removed.');
+}
+
+// Bounded, deterministic enumeration of session dirs (slug asc, session asc) holding a transcript for
+// agentId. Stops at the FIRST hit — the deciding transcript — so 'exhausted' is only ever true when the
+// budget ran out with NO transcript found: callers treat that as not-found, fail-closed. One stat per
+// session dir, zero file reads.
+function xsessionFirstTranscript(agentId) {
+  const out = { path: '', exhausted: false };
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return out;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return out; }
+  slugs.sort();
+  let dirBudget = XSESSION_MAX_SESSION_DIRS;
+  for (const slug of slugs) {
+    let sess = [];
+    try { sess = fs.readdirSync(path.join(PROJECTS_ROOT, slug)); } catch (e) { continue; }
+    sess.sort();
+    for (const s of sess) {
+      if (--dirBudget < 0) { out.exhausted = true; xsessionLoudExhaustion('XSESSION_MAX_SESSION_DIRS=' + XSESSION_MAX_SESSION_DIRS); return out; }
+      const f = path.join(PROJECTS_ROOT, slug, s, 'subagents', 'agent-' + aid + '.jsonl');
+      if (fileExists(f)) { out.path = f; return out; }
+    }
+  }
+  return out;
+}
+
+// The resolveAgent() twin for the cross-session fallback: newest-mtime WINNER over every session dir's
+// subagents/ (the same winner semantics its same-session arm already has, widened across sessions),
+// bounded by BOTH budgets and reading only each candidate's FIRST record via the bounded
+// readFirstNonEmptyLine() path (never a whole-file readFileSync — r3 finding 2). Either budget exceeded
+// -> '' (fail-closed, never a partial winner).
+function xsessionTaggedWinner(task, role) {
+  const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  slugs.sort();
+  let winner = null;
+  let dirBudget = XSESSION_MAX_SESSION_DIRS;
+  let readBudget = XSESSION_MAX_FILE_READS;
+  for (const slug of slugs) {
+    let sess = [];
+    try { sess = fs.readdirSync(path.join(PROJECTS_ROOT, slug)); } catch (e) { continue; }
+    sess.sort();
+    for (const s of sess) {
+      if (--dirBudget < 0) { xsessionLoudExhaustion('XSESSION_MAX_SESSION_DIRS=' + XSESSION_MAX_SESSION_DIRS); return ''; }
+      const dir = path.join(PROJECTS_ROOT, slug, s, 'subagents');
+      let files = [];
+      try { files = fs.readdirSync(dir); } catch (e) { continue; }
+      files.sort();
+      for (const fn of files) {
+        const m = fn.match(/^agent-(.+)[.]jsonl$/);
+        if (!m) continue;
+        if (--readBudget < 0) { xsessionLoudExhaustion('XSESSION_MAX_FILE_READS=' + XSESSION_MAX_FILE_READS); return ''; }
+        const f = path.join(dir, fn);
+        let st;
+        try { st = fs.statSync(f); } catch (e) { continue; }
+        if (!st.isFile()) continue;
+        if (!firstRecordTextFromLine(readFirstNonEmptyLine(f)).includes(tag)) continue;
+        if (!winner || st.mtimeMs > winner.mtimeMs) winner = { agentId: m[1], mtimeMs: st.mtimeMs };
+      }
+    }
+  }
+  return winner ? winner.agentId : '';
+}
+
+// #1575 Lane 1c — extract the plain TEXT of a subagent transcript's FIRST record (the initial spawn-prompt
+// message). This is the SPAWN RECORD, as opposed to any LATER record (a Read tool-result, a pasted brief, a
+// review byline) that can carry a 3ROLE_TASK tag as a MENTION rather than a spawn (round-3 D1: a real
+// planner transcript ingests the plan-review tag via its own '## Review' byline, measured 4-of-7 on a real
+// session). Every predicate in this file that decides "is agentId X bound to (task, role)" is re-scoped to
+// test ONLY this first-record text — never `content.includes(tag)` over the whole file — so there is exactly
+// ONE tag-binding predicate in the module (resolveAgent, agentBoundToTag, tagFromSubagentTranscript below all
+// call this). Returns '' on any missing/unreadable/unparseable first line (fails closed to "no match").
+function firstRecordText(content) {
+  const firstLine = String(content == null ? '' : content).split('\n').find((l) => l.trim());
+  return firstRecordTextFromLine(firstLine);
+}
+
+// #1851 D2 — the JSON-envelope-extraction body factored OUT of firstRecordText() so a caller that already
+// has the isolated first-non-empty-LINE (e.g. readFirstNonEmptyLine()'s bounded read below) can reuse the
+// EXACT SAME extraction, never a second, potentially-diverging parser. Fed a falsy/unparseable line, returns
+// '' (fails closed to "no match"), identical to firstRecordText()'s own contract.
+function firstRecordTextFromLine(firstLine) {
+  if (!firstLine) return '';
+  let rec;
+  try { rec = JSON.parse(firstLine); } catch (e) { return ''; }
+  const msg = (rec && rec.message) || {};
+  let text = '';
+  if (typeof msg.content === 'string') text = msg.content;
+  else if (Array.isArray(msg.content)) {
+    for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+  }
+  return text;
+}
+
+// #1851 D2 — bounded read of a transcript's FIRST NON-EMPTY line, cost proportional to THAT line's size, not
+// the whole file. Grows its read window (in RECONCILE_READ_CHUNK_BYTES steps) until it finds the
+// line-terminating newline or reaches EOF — never a fixed cap that gives up, which would silently truncate a
+// transcript out of the reconciliation mapping (D2: "the single worst regression this plan can cause").
+// Matches firstRecordText()'s own predicate exactly — the first NON-empty line (`.find(l => l.trim())`), not
+// literally byte-offset-0 line 1 — so a leading blank line degrades identically whether read via this bounded
+// path or the whole-file path (the F2 plan-review finding: a naive "read to the first \n" would diverge from
+// firstRecordText's actual "first non-empty line" semantics on such a file). Fails OPEN (returns '') on any
+// open/read error, mirroring firstRecordText()'s own unreadable-file contract.
+const RECONCILE_READ_CHUNK_BYTES = 8192;
+function readFirstNonEmptyLine(filePath) {
+  let fd;
+  try { fd = fs.openSync(filePath, 'r'); } catch (e) { return ''; }
+  try {
+    let buf = Buffer.alloc(0);
+    let pos = 0;
+    for (;;) {
+      // Drain every complete line already buffered before issuing another read — avoids a redundant syscall
+      // when the first non-empty line is already fully inside `buf` from a prior chunk.
+      for (;;) {
+        const nl = buf.indexOf(0x0a);
+        if (nl === -1) break;
+        const line = buf.subarray(0, nl).toString('utf8');
+        if (line.trim()) return line;
+        buf = buf.subarray(nl + 1);
+      }
+      const chunk = Buffer.alloc(RECONCILE_READ_CHUNK_BYTES);
+      let n;
+      try { n = fs.readSync(fd, chunk, 0, RECONCILE_READ_CHUNK_BYTES, pos); } catch (e) { break; }
+      if (n <= 0) break; // EOF
+      buf = buf.length ? Buffer.concat([buf, chunk.subarray(0, n)]) : chunk.subarray(0, n);
+      pos += n;
+    }
+    // EOF reached with no newline-terminated non-empty line found; the last (possibly unterminated) line in
+    // `buf` is still a valid candidate (mirrors String.split('\n') including a trailing unterminated segment).
+    const leftover = buf.toString('utf8');
+    return leftover.trim() ? leftover : '';
+  } finally {
+    try { fs.closeSync(fd); } catch (e) { /* ignore */ }
+  }
+}
+
+// #1851 D1 — extract BOTH tag facts a transcript's first-record TEXT carries, in ONE pass over that (small,
+// bounded-read) string:
+//   .discovery — the LOOSE, first-match rule the original cmdReconcileSpawns used to populate its `groups`
+//     Set: sanitize(task), the RAW captured role (RECORDABLE_ROLES-checked), no reconstructed-substring
+//     re-check. Only the FIRST occurrence in the text counts (mirrors the original non-global `.match()`).
+//   .winners — every occurrence, each individually re-verified as a literal substring of the
+//     SANITIZE()-RECONSTRUCTED tag string (`3ROLE_TASK:<sanitize(task)> ROLE:<role>`). This is the exact
+//     predicate resolveAgent()'s `.includes(tag)` test enforces, reproduced without re-scanning every OTHER
+//     transcript per group. Preserves both documented seams: (1) a task id containing a sanitize()-stripped
+//     character fails the reconstructed-substring check (the tag as WRITTEN in the raw text differs from the
+//     sanitized reconstruction) — that transcript never becomes a winner-candidate for that group, matching
+//     resolveAgent()'s own '' return for it; (2) a first record naming TWO tags contributes TWO winner
+//     candidates (one per occurrence), so it can bind to BOTH groups exactly as `.includes()` would find it
+//     from either tag's own reconstructed string, even though only the FIRST occurrence feeds `.discovery`.
+function extractTagsFromText(text) {
+  const result = { discovery: null, winners: [] };
+  if (!text) return result;
+  const re = /3ROLE_TASK:(\S+) ROLE:(\S+)/g;
+  let m;
+  let first = true;
+  const seen = new Set();
+  while ((m = re.exec(text))) {
+    const rawTask = m[1];
+    const rawRole = m[2];
+    if (first) {
+      first = false;
+      const dTask = sanitize(rawTask);
+      if (dTask && RECORDABLE_ROLES.includes(rawRole)) result.discovery = { task: dTask, role: rawRole };
+    }
+    const sTask = sanitize(rawTask);
+    if (sTask && RECORDABLE_ROLES.includes(rawRole)) {
+      const reconstructed = '3ROLE_TASK:' + sTask + ' ROLE:' + rawRole;
+      if (text.includes(reconstructed)) {
+        const key = sTask + ' ' + rawRole;
+        if (!seen.has(key)) { seen.add(key); result.winners.push({ task: sTask, role: rawRole }); }
+      }
+    }
+  }
+  return result;
+}
+
+// review-round-counter-per-plan — TEXTUAL plan-path extraction from a transcript's first-record text, for
+// the reconciler's `reviewed_plan` capture obligation. Same match shape as
+// hooks/review-round-state.mjs's findPlanPathIn, but deliberately carries NO fs.statSync existence check:
+// a historical plan file may have moved or been cleaned up since the round closed, and the plan identity
+// this field records is the BASENAME, not a live file (AC-11 — "including when the named plan file does
+// NOT exist on disk"). Returns '' on no match (fails closed to "nothing extracted", never a guess).
+function findPlanPathTextual(text) {
+  const m = String(text == null ? '' : text).match(/[.\w/-]*\.ai-workspace\/plans\/[^\s"'`)]+\.md/);
+  return m ? m[0] : '';
+}
+
+// #1851 D3/D6 — per-session INCREMENTAL CHECKPOINT sidecar for cmdReconcileSpawns. Dotted filename (hidden
+// from the `.jsonl` task-file glob cmdRefreshModels/cmdCheck use, same precedent as the existing
+// `.reconcile-watermark`). Schema-versioned: an unreadable, corrupt, or schema-mismatched file is treated as
+// a COLD START (returns the SAME empty shape a genuinely-first-ever run would see) — never as "nothing to
+// do" (D6).
+const RECONCILE_CHECKPOINT_SCHEMA = 1;
+function reconcileCheckpointFile(sess) { return path.join(LEDGER_DIR, sess, '.reconcile-checkpoint.json'); }
+function readReconcileCheckpoint(sess) {
+  const empty = { schemaVersion: RECONCILE_CHECKPOINT_SCHEMA, runCount: 0, lastFullDeriveTs: 0, files: {} };
+  let raw;
+  try { raw = fs.readFileSync(reconcileCheckpointFile(sess), 'utf8'); } catch (e) { return empty; }
+  let j;
+  try { j = JSON.parse(raw); } catch (e) { return empty; }
+  if (!j || j.schemaVersion !== RECONCILE_CHECKPOINT_SCHEMA || typeof j.files !== 'object' || !j.files) return empty;
+  return {
+    schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
+    runCount: Number.isFinite(j.runCount) ? j.runCount : 0,
+    lastFullDeriveTs: Number.isFinite(j.lastFullDeriveTs) ? j.lastFullDeriveTs : 0,
+    files: j.files,
+  };
+}
+function writeReconcileCheckpoint(sess, data) {
+  try {
+    const file = reconcileCheckpointFile(sess);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(data));
+  } catch (e) { /* best-effort — a checkpoint write failure never blocks the sweep (D5/D6 fail-open) */ }
+}
+
+// #860 / #1575 D1: resolve the agentId of the NEWEST-mtime subagent transcript whose SPAWN RECORD (first
+// record, `firstRecordText()`) carries the exact spawn tag `3ROLE_TASK:<task> ROLE:<role>`. Returns the
+// agentId string or '' when no transcript's spawn record carries the tag. Newest-mtime, not first-match: a
+// tag can repeat across transcripts (an earlier probe/retry reusing a role tag), so the most recent write is
+// the real role spawn. NOTE (round-4 D1 fix, at source): the predicate used to be a WHOLE-FILE
+// `content.includes(tag)` — that binds to MENTIONS (a later record quoting the tag), not spawns; re-scoped
+// to the spawn record only. This resolver remains a SEARCH-ACROSS-ALL-TRANSCRIPTS + newest-mtime-WINNER
+// function — it is NOT the right predicate for verifying one SPECIFIC cited agentId's binding (a
+// contaminated newer sibling can steal the "winner" slot, W27); that is what `agentBoundToTag()` below is for.
+function resolveAgent(session, task, role) {
+  const sess = sanitize(session);
+  const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return ''; }
+  let best = null;       // { agentId, mtimeMs }
+  for (const slug of slugs) {
+    const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch (e) { continue; }
+    for (const fn of files) {
+      const m = fn.match(/^agent-(.+)\.jsonl$/);
+      if (!m) continue;
+      const f = path.join(dir, fn);
+      let st;
+      try { st = fs.statSync(f); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      let content;
+      try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+      if (!firstRecordText(content).includes(tag)) continue;
+      if (!best || st.mtimeMs > best.mtimeMs) best = { agentId: m[1], mtimeMs: st.mtimeMs };
+    }
+  }
+  if (best) return best.agentId;
+  // #3326 — no same-session transcript carries the tag: bounded cross-session sweep (the seat's
+  // transcript may live under the SPAWNING session, not the ledger key). Same newest-mtime winner
+  // semantics, same first-record-only tag predicate; budget exceeded fails CLOSED ('').
+  return xsessionTaggedWinner(task, role);
+}
+
+// #1575 — test whether ONE SPECIFIC cited agentId is bound to (task, role): open exactly THAT agent's own
+// transcript and test its spawn record. Unlike resolveAgent() (which SEARCHES every transcript and returns a
+// newest-mtime WINNER), this never lets a contaminated, newer sibling transcript decide another row's
+// binding (the W27 failure mode) — the correct predicate for verifying a ROW'S own claim (gate arm (1)/(2)
+// and the 1a clause-2 supersede check all use this, per the Traps note: never resolveAgent/newest-mtime here).
+function agentBoundToTag(session, agentId, task, role) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return false;
+  const sess = sanitize(session);
+  const tag = '3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return false; }
+  let sawPinned3326 = false;
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    sawPinned3326 = true;
+    if (firstRecordText(content).includes(tag)) return true;
+  }
+  // #3326 — a readable transcript EXISTS under the pinned session (sawPinned3326): it decides, bound or
+  // not — a cross-session sibling never rescues or overrides it (the W27 discipline this function's own
+  // doc comment already names). Only when NO pinned-session transcript exists at all does the bounded,
+  // deterministic cross-session sweep run, and its FIRST hit (slug asc, session asc) decides.
+  if (!sawPinned3326) {
+    const x3326 = xsessionFirstTranscript(aid);
+    if (x3326.path) return firstRecordTextFromLine(readFirstNonEmptyLine(x3326.path)).includes(tag);
+  }
+  return false;
+}
+
+// #2309 (R3.1) — strip anything the transcript's own COMMAND could have used to merely PRINT rather than
+// EXECUTE the ledger invocation: single/double-quoted string bodies (an `echo "…"`/`printf '…'`/`node -e
+// "…"` argument) and heredoc bodies (`cat <<EOF … EOF`). What remains is tested for a COMMAND-POSITION
+// ledger-append invocation below — this is what makes a transcript that merely ECHO-MENTIONS the append
+// command (AC-9⁗ arm (c)) fail to prove: with the quoted/heredoc text removed, the mentioned invocation
+// vanishes from the text commandProvesLedgerAppend() ever sees.
+function stripQuotedAndHeredocBodies(cmd) {
+  let s = String(cmd == null ? '' : cmd);
+  // #2467 — the shell itself joins a backslash immediately followed by a newline into one
+  // logical line before tokenizing; do the same here first, or a continued invocation's four
+  // required tokens land in different \n-split segments below and can never co-occur.
+  s = s.replace(/\\\n/g, '');
+  s = s.replace(/<<[-~]?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[\s\S]*?\n\s*\2\b/g, '<<HEREDOC>>');
+  s = s.replace(/'[^']*'/g, "''");
+  s = s.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  return s;
+}
+
+// #2309 (R3.1) — does CMD EXECUTE `3role-ledger.mjs … append …` for this exact (task, role, verdict) at
+// COMMAND POSITION — i.e. all four tokens co-occur within ONE shell segment (env-assignment prefixes and
+// `&&`/`||`/`;`/`|`/newline separators are fine; a segment that is itself the argument of an echo/printf/
+// heredoc was already erased above, so it can never match here)? Nothing about the INCOMING write's own
+// flag shape matters — only what the TARGET's own transcript actually shows it ran.
+function commandProvesLedgerAppend(cmd, task, role, verdict) {
+  const stripped = stripQuotedAndHeredocBodies(cmd);
+  const segs = stripped.split(/&&|\|\||;|\||\n/);
+  const taskRe = new RegExp('--task[= ]["\']?' + escapeRegExp(String(task)) + '(["\'\\s]|$)');
+  const roleRe = new RegExp('--role[= ]["\']?' + escapeRegExp(String(role)) + '(["\'\\s]|$)');
+  const verdictRe = new RegExp('--verdict[= ]["\']?' + escapeRegExp(String(verdict)) + '(["\'\\s]|$)');
+  for (const seg of segs) {
+    const t = seg.trim();
+    if (!t) continue;
+    if (!/3role-ledger\.mjs/.test(t)) continue;
+    if (!/\bappend\b/.test(t)) continue;
+    if (!taskRe.test(t) || !roleRe.test(t) || !verdictRe.test(t)) continue;
+    return true;
+  }
+  return false;
+}
+
+// #2309 (R3.1/R4.1) — clause 3's PROOF leg: resolve the TARGET ROW's own agent's transcript (from
+// prior.agentId + prior.session_id — never from the incoming write's claim, never newest-mtime, mirroring
+// agentBoundToTag's doc comment above) and test whether it records an EXECUTED self-append of the given
+// verdict for (task, role) at command position. Returns {found, proves, path}: found=false is the
+// can't-tell case (no readable transcript at the expected location — missing/unreadable/no session_id);
+// found=true+proves=false is "the transcript exists but does not record the append" (a mention inside
+// echo/printf/heredoc/a quoted string does NOT count); proves=true is the honest self-append case. Fails
+// closed to `empty` on any read/parse trouble — never fabricates proof on a can't-tell path.
+function priorAgentTranscriptProves(prior, task, role, verdict) {
+  const empty = { found: false, proves: false, path: '' };
+  if (!prior || !prior.agentId) return empty;
+  const aid = String(prior.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return empty;
+  const sess = sanitize(prior.session_id || '');
+  if (!sess) return empty;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return empty; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    const proves3326 = transcriptRecordsAppend(content, task, role, verdict);
+    return { found: true, proves: proves3326, path: f };
+  }
+  // #3326 — the row's own session_id holds no transcript for this agentId (the seat was spawned in a
+  // DIFFERENT session than the key the row is filed under; agent ids are unique): resolve the agent's
+  // transcript via the bounded cross-session sweep and run the EXACT SAME scan on it — never a second,
+  // potentially diverging parser (the factored helper below), never a caller claim.
+  const x3326 = xsessionFirstTranscript(aid);
+  if (x3326.path) {
+    let xcontent;
+    try { xcontent = fs.readFileSync(x3326.path, 'utf8'); } catch (e) { return empty; }
+    return { found: true, proves: transcriptRecordsAppend(xcontent, task, role, verdict), path: x3326.path };
+  }
+  return empty;
+}
+
+// #3326 — the per-transcript scan body of priorAgentTranscriptProves(), factored OUT so the pinned-session
+// arm above and its cross-session fallback run the EXACT SAME scan over a transcript's every Bash
+// tool_use command (commandProvesLedgerAppend at command position). Pure: content -> boolean; identical
+// semantics to the loop it replaced (break-on-first-proof both nestings).
+function transcriptRecordsAppend(content, task, role, verdict) {
+  for (const ln of String(content == null ? '' : content).split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+    if (!isAsst) continue;
+    const c = j.message && j.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const blk of c) {
+      if (!blk || blk.type !== 'tool_use') continue;
+      if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+      const cmd = String((blk.input && blk.input.command) || '');
+      if (commandProvesLedgerAppend(cmd, task, role, verdict)) return true;
+    }
+  }
+  return false;
+}
+
+// #2701 D4 P5 — fail-closed on ANY ledger-CLI append mention the command-position parser cannot read
+// plainly. Scans the RAW (pre-stripQuotedAndHeredocBodies) text of every Bash tool_use command in the
+// LIFTED agent's own transcript (resolved from row.agentId + row.session_id, exactly as
+// priorAgentTranscriptProves resolves it above — never from a caller claim) for a literal mention of the
+// ledger CLI's append subcommand (recognized by its literal file name — nr11 residual: an aliased/globbed/
+// copied invocation is invisible here, out of scope; D1's one-identity-per-write refusal is the primary
+// protection going forward). For each raw mention: the STRIPPED text must place it at command position
+// with a literal --task and a literal --role for THIS (task, role) — a $V/"$T"-style value, a quoted or
+// heredoc-fed invocation, or a bash -c wrapper all strip to something that no longer matches, exactly the
+// nr9 laundering shapes — or the mention is UNRECOGNIZED and P5 fails. When --verdict is present at that
+// position it must likewise bind to a literal token or the mention is UNRECOGNIZED. A RECOGNIZED mention
+// whose literal verdict equals the ROW'S OWN verdict proves the agent executed a self-append of exactly
+// that verdict — P5 fails (lifting this agentId would let that verdict supersede its own earlier flip,
+// the exact shape 1a clause 2 already refuses live). A transcript with no mention at all, or every mention
+// recognized with no verdict or a verdict DIFFERENT from the row's own, passes P5.
+function priorAgentTranscriptP5(row, task, role) {
+  const pass = { ok: true, path: '' };
+  if (!row || !row.agentId) return pass;
+  const aid = String(row.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return pass;
+  const sess = sanitize(row.session_id || '');
+  if (!sess) return pass;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return pass; }
+  const taskRe = new RegExp('--task[= ]["\']?' + escapeRegExp(String(task)) + '(["\'\\s]|$)');
+  const roleRe = new RegExp('--role[= ]["\']?' + escapeRegExp(String(role)) + '(["\'\\s]|$)');
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    for (const ln of content.split('\n')) {
+      if (!ln.trim()) continue;
+      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+      const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+      if (!isAsst) continue;
+      const c = j.message && j.message.content;
+      if (!Array.isArray(c)) continue;
+      for (const blk of c) {
+        if (!blk || blk.type !== 'tool_use') continue;
+        if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+        const cmd = String((blk.input && blk.input.command) || '');
+        if (!/3role-ledger\.mjs['"]?\s+append\b/.test(cmd)) continue; // no raw mention -> this command is fine
+        const stripped = stripQuotedAndHeredocBodies(cmd);
+        const segs = stripped.split(/&&|\|\||;|\||\n/);
+        let matchedSeg = null;
+        for (const seg of segs) {
+          const t = seg.trim();
+          if (/3role-ledger\.mjs/.test(t) && /\bappend\b/.test(t)) { matchedSeg = t; break; }
+        }
+        if (!matchedSeg || !taskRe.test(matchedSeg) || !roleRe.test(matchedSeg)) {
+          return { ok: false, path: f, reason: 'an unrecognized ledger-append mention (the raw text mentions ' +
+            '3role-ledger.mjs append, but the command-position parse could not place a literal --task/--role ' +
+            'for this task/role — a quoted, heredoc-fed, bash -c, or $VAR-style invocation)' };
+        }
+        if (/--verdict\b/.test(matchedSeg)) {
+          const vm = matchedSeg.match(/--verdict[= ]([A-Za-z0-9_-]+)/);
+          if (!vm) {
+            return { ok: false, path: f, reason: 'an unrecognized ledger-append mention (--verdict is present ' +
+              'but does not bind to a literal token at command position)' };
+          }
+          if (row.verdict && vm[1] === String(row.verdict)) {
+            return { ok: false, path: f, reason: 'a recognized executed self-append of this row\'s own verdict "' +
+              row.verdict + '" at command position' };
+          }
+        }
+      }
+    }
+    return pass; // this agent's transcript file was found and fully scanned
+  }
+  return pass;
+}
+
+// #1575 §1b — the gate's universal verdict screen vocabulary, ONE allowlist shared by the gate (via
+// `gate-plan-review`) and `cmdInherit`'s parent-verdict precondition ("the gate's own allowlist, one
+// vocabulary, not two"). ALLOWLIST, never a denylist (D3): membership admits, everything else — BLOCK,
+// SHIP-WITH-FIXES, a typo, an empty string, any novel token — blocks.
+const AFFIRMATIVE_VERDICTS = new Set(['PASS', 'APPROVE', 'APPROVE-WITH-NOTES']);
+
+// #1575 1a — thrown by overlayAppend when the terminal-EVIDENCE guard (clause 1 or clause 2) rejects a
+// write. Callers (cmdAppend, cmdInherit) catch this, print the reason to stderr, write NOTHING, and exit
+// nonzero — the ledger file is untouched (the prior terminal row survives byte-for-byte).
+class GuardRejection extends Error {}
+
+// #1580 Fix A — TERMINAL-EVIDENCE PREDICATE, monotonic-by-construction. #1575 keyed its guard on
+// `prior.verdict` alone — correct for review roles (which are the only ones that ever carry a verdict) but
+// BLIND to a completed EXECUTOR row, which carries `agentId + artifact_path + closedAt + self_authored` and
+// NO verdict. This predicate is the full terminal-evidence CLASS #1575's one instance belonged to: verdict
+// OR closedAt OR self_authored OR oracle OR a completed-run (agentId AND artifact_path) pair — the last
+// disjunct is what catches the LEGACY orchestrator-writes-at-close shape (Invariant #6: `append --role
+// executor --artifact <path>` with no --closed-at/--self-authored, composing onto a spawn-time agentId via
+// #855 overlay — that row carries neither closedAt nor self_authored yet is fully "done"). Spawn-time
+// ASSIGNED provenance (modelVersion/modelTier/effort) is DELIBERATELY excluded (plan-review non-blocking
+// note 1) — a bare outcome-less spawn row (agentId + maybe assigned model/effort, nothing else) must remain
+// legitimately clearable by a skip; that is the AC-2 "upgrade survives" arm, not a downgrade.
+function priorHasTerminalEvidence(prior) {
+  if (!prior) return false;
+  if (prior.verdict) return true;
+  if (prior.closedAt) return true;
+  if (prior.self_authored) return true;
+  if (prior.oracle) return true;
+  if (prior.agentId && prior.artifact_path) return true;
+  // #1947 (generalized #2075 AC-2) — a completed subprocess dispatch has no agentId (no Agent-subagent
+  // transcript exists), so the disjunct above is blind to it; a completed run (dispatch marker +
+  // artifact_path) is the same terminal-evidence SHAPE one provenance kind over (mirrors the
+  // agentId+artifact_path disjunct exactly) — provider-agnostic via isSubprocessDispatch().
+  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) return true;
+  return false;
+}
+
+// Human-readable summary of WHICH terminal field(s) triggered the guard — generalizes #1575's message
+// (which hardcoded "carries a completed verdict") to name whichever evidence is actually present, since a
+// completed executor row triggers this with NO verdict at all.
+function terminalEvidenceSummary(prior) {
+  const parts = [];
+  if (prior.verdict) parts.push('verdict "' + prior.verdict + '"');
+  if (prior.closedAt) parts.push('closedAt "' + prior.closedAt + '"');
+  if (prior.self_authored) parts.push('self_authored');
+  if (prior.oracle) parts.push('oracle "' + prior.oracle + '"');
+  if (prior.agentId && prior.artifact_path) {
+    parts.push('a completed run (agentId "' + prior.agentId + '" + artifact_path "' + prior.artifact_path + '")');
+  }
+  if (isSubprocessDispatch(prior.dispatch) && prior.artifact_path) {
+    parts.push('a completed ' + prior.dispatch + ' run (artifact_path "' + prior.artifact_path + '")');
+  }
+  return parts.join(', ');
+}
+
+// Mirror the gate's resolve_path: absolute / ~ / CLAUDE_PROJECT_DIR / cwd / $HOME.
+function resolveArtifact(p) {
+  if (!p) return '';
+  const s = String(p);
+  if (s.startsWith('/')) return fileExists(s) ? s : '';
+  if (s.startsWith('~/')) { const q = path.join(HOME, s.slice(2)); return fileExists(q) ? q : ''; }
+  const cands = [];
+  if (process.env.CLAUDE_PROJECT_DIR) cands.push(path.join(process.env.CLAUDE_PROJECT_DIR, s));
+  cands.push(path.join(process.cwd(), s));
+  cands.push(path.join(HOME, s));
+  cands.push(s);
+  for (const c of cands) if (fileExists(c)) return c;
+  return '';
+}
+
+// #2023 diagnosis-speed prevention: a stored artifact_path pointing inside a git worktree subtree
+// resolves fine while that worktree exists, but DANGLES the moment it is quarantined/removed (Rule 14)
+// — the exact defect hit live on task #1981 (planner's self-append ran from inside the worktree,
+// storing a `.claude/worktrees/<slug>/...` path instead of the stable primary-clone path the other
+// two review roles used). Surface the likely cause immediately in the failure message instead of
+// forcing a manual trace through enforce-review-or-lfah.sh -> resolveArtifact -> normalizeArtifact,
+// as happened this session.
+function worktreeDangleHint(rawPath) {
+  const p = String(rawPath == null ? '' : rawPath);
+  if (!/(^|\/)\.claude\/worktrees\//.test(p)) return '';
+  return ' (HINT: this path points inside a git worktree subtree — if that worktree was quarantined/removed, ' +
+    're-point the ledger via `3role-ledger.mjs append --artifact <primary-clone-relative-path>` run FROM THE ' +
+    'PRIMARY CLONE, not from inside a worktree, after copying/committing the artifact to that stable path.)';
+}
+
+// #1481 — the SHARED model-resolution helper both cmdAppend AND cmdRefreshModels call (reuse, never a
+// second copy of the transcriptModel()->overlay-merge path). Given a role's explicitAgent (pass '' / falsy
+// to fall back to resolveAgent's tag search) returns {} when no model is resolvable yet (fail-open,
+// can't-tell), else {modelVersion[, modelTier]} (modelTier omitted only if the id doesn't map to a known
+// tier prefix — modelIdToTier's own fail-open contract).
+// #1640 S12 — the `modelTier` fallback WIDENS to the SSOT vocabulary (identifyModelViaSSOT) when the observed
+// id is not a claude-* id, so the badge-driving field carries the declared tier_equivalent (e.g. 'local-agentic')
+// for an in-vocabulary non-Anthropic model instead of staying ABSENT (the #1481/#1494 silent-misattribution
+// class the cairn stone names — a blank/lingering-Anthropic badge). `modelVersion` (the raw observed id) is
+// UNCHANGED — it was already recorded regardless of tier resolution.
+function resolveModelFields(session, task, role, explicitAgent) {
+  try {
+    const agentIdForModel = explicitAgent || resolveAgent(session, task, role);
+    if (!agentIdForModel) return {};
+    const modelId = transcriptModel(session, agentIdForModel);
+    if (!modelId) return {};
+    const fields = { modelVersion: modelId };
+    const tier = modelIdToTier(modelId) || identifyModelViaSSOT(modelId);
+    if (tier) fields.modelTier = tier;
+    return fields;
+  } catch (e) { return {}; }   // fail-open: a resolution error must never wedge the caller.
+}
+
+// #1481 — resolve the directory this file ACTUALLY lives in (symlink-aware, mirrors resolveConfigPath's
+// realpathSync trick — setup.sh installs this file as a SYMLINK at ~/.claude/hooks/3role-ledger.mjs, so a
+// naive import.meta.url dirname would miss a sibling like kanban-resync.sh living next to the REPO file).
+function selfDir() {
+  try { return path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { return path.dirname(fileURLToPath(import.meta.url)); }
+}
+
+// #1481 — fire the shared kanban-resync.sh launcher as a DETACHED background subprocess (never blocks,
+// never throws to the caller). Mirrors the existing bash callers' `bash kanban-resync.sh` contract (that
+// script itself backgrounds the REAL sync via nohup and always exits 0) — this just gets us from a node
+// caller to that same sibling script. Silently no-ops if the script is absent (ported/plugin copies that
+// don't carry this machine-local agent-kanban helper) or on any spawn error.
+function fireResyncBackground() {
+  try {
+    const script = path.join(selfDir(), 'kanban-resync.sh');
+    if (!fileExists(script)) return;
+    const child = spawn('bash', [script], { stdio: 'ignore', detached: true });
+    child.unref();
+  } catch (e) { /* fail-open */ }
+}
+
+function stripOraclePrefix(s) { return String(s == null ? '' : s).replace(/^oracle:/i, ''); }
+
+// #1276 — vacuous-oracle classifier (RE-AUTHORED from the design intent of the upstream spec-driven
+// harness's guardrails #9/#11 — see the Port-C "vacuous oracle" guard plan; no pattern was copied from
+// any external source). An execution-review oracle that EXISTS and carries a PASS/verdict token but
+// contains ZERO real assertions (all-trivially-true / bare-verdict / echo-only) proves nothing — "a PASS
+// that asserts nothing is not a PASS." This classifier returns true ONLY when the oracle is POSITIVELY
+// vacuous; ANY parse trouble / binary-ish content / unexpected shape returns false (FAIL-OPEN — never
+// fail-closed: a malformed-but-present oracle is ALLOWED, not blocked).
+//
+// Operate over CONTENT lines (blank + `#`-comment lines dropped). A line is REAL-EVIDENCE when it either
+// (R1) EXECUTES an assert command whose exit is the verdict, or (R2) carries a digit-bearing run-summary
+// count. The R1 discriminator is that a REAL command is EXECUTED at a COMMAND POSITION (start of an
+// `&&`-segment) — a command NAME quoted inside an echo/printf literal is printed TEXT, not run, so it does
+// NOT count. The oracle is VACUOUS iff it has ZERO real-evidence content lines.
+
+// R1 — does ONE `&&`-segment EXECUTE a real assert command (exit = verdict)?
+function segmentIsRealAssert(seg) {
+  const s = String(seg == null ? '' : seg).trim();
+  if (!s) return false;
+  // grep -q / -E / -F with an operand (the assert: search a file/stream, exit reflects a match).
+  if (/^grep\b[^\n]*\s-[A-Za-z]*[qEF][A-Za-z]*\b[^\n]*\s\S/.test(s)) return true;
+  // test / [ / [[ — REAL only with a $-var OR a filesystem-test flag (-e/-f/-d/-s/-r/-x) + operand; a
+  // constant-vs-constant bracket ([ 1 = 1 ], [[ 1 = 1 ]], test 1 = 1) asserts nothing -> NOT real.
+  if (/^(test\b|\[\[?)/.test(s)) {
+    if (/\$[A-Za-z_{]/.test(s)) return true;
+    if (/\s-[efdsrx]\s+\S/.test(s)) return true;
+    return false;
+  }
+  // arithmetic (( ... )) test.
+  if (/^\(\(.*\)\)/.test(s)) return true;
+  // diff / cmp of two operands.
+  if (/^(diff|cmp)\b\s+\S+\s+\S+/.test(s)) return true;
+  // smoke / program / test-runner invocations executed for their exit code.
+  if (/^bash\b[^\n]*smoke/i.test(s)) return true;
+  if (/^\.\//.test(s)) return true;
+  if (/^(pytest|jest|vitest)\b/.test(s)) return true;
+  if (/^go\s+test\b/.test(s)) return true;
+  if (/^npm\s+test\b/.test(s)) return true;
+  if (/^node\b[^\n]*\.mjs\b/.test(s)) return true;
+  return false;
+}
+
+// R2 — does ONE `&&`-segment carry a CAPTURED run-summary count (exit/output of a real run)? Mirrors R1's
+// command-position echo-trap: a count sitting INSIDE an echo/printf literal is printed TEXT, not captured
+// output, so a segment whose trimmed form STARTS with echo/printf is SKIPPED before the count regexes run.
+// A bare captured line (no echo/printf prefix) is a single segment that keeps its count -> stays REAL.
+function segmentIsCapturedCount(seg) {
+  const s = String(seg == null ? '' : seg).trim();
+  if (!s) return false;
+  if (/^(echo|printf)\b/.test(s)) return false;   // printed literal, not captured output -> NOT real.
+  if (/\b\d+\s+passed\b/i.test(s)) return true;
+  if (/\b\d+\s+failed\b/i.test(s)) return true;
+  if (/\bPASS=\d+\b[\s\S]*\bFAIL=\d+\b/i.test(s)) return true;
+  if (/\bran\s+\d+\b/i.test(s)) return true;
+  if (/\bOK\s*\(\d+/i.test(s)) return true;
+  if (/\b\d+\s+(tests?|assertions?|checks?)\b/i.test(s)) return true;
+  return false;
+}
+
+// Is ONE content line real-evidence (R1 OR R2 in any &&-segment)?
+function lineIsRealEvidence(line) {
+  const s = String(line == null ? '' : line);
+  // Evaluate EACH &&-segment so a real command/count on EITHER side of `&&` counts (the LEFT-of-`&&`
+  // realness is decided by the segment's command, NOT the bare presence of `&&`): `grep -q X f && echo
+  // PASS` is real (left segment asserts), `true && echo PASS` is vacuous (both segments trivial). R2
+  // counts are gated at COMMAND POSITION too (segmentIsCapturedCount skips echo/printf segments), so a
+  // count quoted inside `echo "12 passed, 0 failed"` is printed TEXT, not captured output -> NOT real.
+  const segs = s.split('&&');
+  for (const seg of segs) {
+    if (segmentIsRealAssert(seg)) return true;   // R1 — executed assert (exit = verdict).
+    if (segmentIsCapturedCount(seg)) return true; // R2 — captured run-summary count.
+  }
+  return false;
+}
+
+// Returns true iff the oracle file is POSITIVELY vacuous. Fail-OPEN (false) on any error / kill-switch /
+// binary-ish content.
+function isVacuousOracle(filePath) {
+  try {
+    if (process.env.VACUOUS_ORACLE_OFF === '1') {   // belt-and-suspenders kill-switch.
+      writeBypassLog('3role-ledger-isVacuousOracle', 'VACUOUS_ORACLE_OFF', 'PERMIT');
+      return false;
+    }
+    const raw = fs.readFileSync(filePath, 'utf8');
+    // Binary-ish / unparseable bytes (NUL present) -> cannot classify a script -> FAIL-OPEN.
+    if (raw.indexOf('\u0000') >= 0) return false;
+    let hasContent = false;
+    for (const ln of raw.split('\n')) {
+      const line = ln.trim();
+      if (!line) continue;
+      if (line.charAt(0) === '#') continue;   // comment line — drop.
+      hasContent = true;
+      if (lineIsRealEvidence(line)) return false;   // >= 1 real-evidence line -> NOT vacuous.
+    }
+    // Zero real-evidence lines among >=1 content line -> vacuous. No content lines at all -> can't-tell ->
+    // fail-open (not vacuous).
+    return hasContent;
+  } catch (e) {
+    return false;   // FAIL-OPEN — never fail-closed on a classifier error.
+  }
+}
+
+// #1199 Part B — normalize a PATH-SHAPED artifact value to a CWD-INDEPENDENT form AT WRITE TIME, so a
+// later `check` from any other cwd resolves it. A NON-path value (PR URL, branch name, commit sha,
+// "shipped") is stored VERBATIM — never mangled into a bogus absolute path.
+//
+// R3/R4 — the value-shape guard must NOT treat "any slash" as a path. Two common executor values contain a
+// slash but are NOT files: a branch (`feat/1199-x`) and a PR URL (`https://github.com/...`). So:
+//   - URL scheme (`http(s)://`, `git://`, `ssh://`, ...) → verbatim.
+//   - already a portable home-tilde path (`~/...`) → verbatim (no username, resolves from any cwd).
+//   - explicit path shape (`/`, `./`, `../`, `.claude/`, `.ai-workspace/`) → resolve to absolute ONLY if
+//     the resolved candidate EXISTS on disk (#1868 — the calling agent's cwd is not necessarily the
+//     artifact's own repo; a wrong-cwd resolution must not be stored as a plausible-looking-but-wrong
+//     absolute path). No file at the resolved candidate → store verbatim, deferring to resolveArtifact()'s
+//     cwd/CLAUDE_PROJECT_DIR/$HOME candidate chain at check-time (which may run from the right cwd).
+//   - an ambiguous slashed token (`src/llm/generate.ts` vs `feat/x`) → treat as a path ONLY if it resolves
+//     to a file that EXISTS on disk (a real executor SOURCE artifact does; a branch never does).
+//   - no slash (`PR #123`, a sha, `shipped`) → verbatim.
+//
+// R6 privacy — the ledger append fires a PostToolUse sync (kanban-sync-on-ledger-append.sh) that publishes
+// ledger state to the Vercel-hosted agent-kanban board. To keep a raw `/Users/<name>/...` home path off
+// both the at-rest ledger AND that publish surface, when the resolved absolute path is under $HOME we store
+// the HOME-RELATIVE TILDE form `~/<rest>` — it carries NO username and resolveArtifact()'s `~/` arm expands
+// it from ANY cwd. A path genuinely OUTSIDE $HOME is stored absolute (no home to leak).
+// ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R1, write end) — `opts.
+// repoRelative` is an explicit OPT-IN, default OFF, so every OTHER normalizeArtifact() caller
+// (`--reviewed-plan`, `--transcript`) keeps today's byte-for-byte absolutizing behaviour (the plan's
+// explicit "untouched" scope — round-identity + never-inside-a-repo reasons respectively). Only the
+// `--artifact` store site passes `{ repoRelative: true }`, and only for non-execution-review roles (D1/D2/
+// D3 there are already untouched by construction — see the call site). See the branch below for the
+// mechanism.
+function normalizeArtifact(raw, opts) {
+  const repoRelative = !!(opts && opts.repoRelative);
+  const v = String(raw == null ? '' : raw);
+  if (v === '') return v;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v;   // URL scheme → not a filesystem path.
+  if (v === '~' || v.startsWith('~/')) return v;        // already a portable home-tilde path.
+  let abs = '';
+  if (v.startsWith('/')) {
+    abs = v;
+  } else if (/^(\.\/|\.\.\/|\.claude\/|\.ai-workspace\/)/.test(v)) {
+    // #1868 — explicit relative shape still resolves against the CALLING agent's cwd, which is not
+    // necessarily the artifact's own repo (a role can be spawned with its Bash cwd in a different
+    // repo than the one it wrote into). Verify the resolved candidate is real before trusting it,
+    // mirroring the ambiguous-slash branch below — a wrong-repo resolution falls back to verbatim
+    // so a later `check` can re-resolve it from a cwd that actually matches (resolveArtifact()'s
+    // CLAUDE_PROJECT_DIR/cwd/$HOME candidate chain), instead of silently storing a plausible-looking
+    // absolute path that points into the wrong repo entirely.
+    const cand = path.resolve(process.cwd(), v);
+    if (fileExists(cand)) abs = cand;                   // resolves under this cwd — verify it's real.
+    else return v;                                      // cwd/repo mismatch → defer to check-time resolution.
+  } else if (v.includes('/')) {
+    const cand = path.resolve(process.cwd(), v);
+    if (fileExists(cand)) abs = cand;                   // real source artifact (exists on disk).
+    else return v;                                      // branch-shaped / non-file slashed token → verbatim.
+  } else {
+    return v;                                           // no slash → verbatim (PR #N, sha, "shipped").
+  }
+  abs = path.normalize(abs).replace(/\/+$/, '');
+
+  // R1 (repoRelative opt-in only) — `v` reached here through one of the two file-exists-verified relative
+  // branches above (never the `v.startsWith('/')` branch — an absolute/typed-absolute arg keeps today's
+  // behaviour byte-for-byte, the #1616 deferral stands). When `abs` lies under a checkout root git itself
+  // reports for THIS repo (the primary clone or ANY linked worktree of it — the SAME bounded set #1616's
+  // read end introduced via checkoutRootsFor), store the path REPO-ROOT-RELATIVE instead of collapsing it
+  // to `~/...` — durable across a worktree quarantine, cwd-independent for every worktree layout.
+  // Realpath-normalized on both sides (macOS mktemp symlink hazard, NR-3). Falls through to the existing
+  // tilde/absolute store below when `abs` is not inside any checkout of THIS repo (#1868 cross-repo cwd,
+  // untouched) or on any git spawn trouble (can't-tell -> today's behaviour, never a crash) — this is the
+  // #1199 D2 property, for every OTHER role, computed from git's root rather than stored verbatim.
+  //
+  // MOST-SPECIFIC (longest-prefix) root wins, never merely the FIRST one checkoutRootsFor happens to
+  // list: a NESTED worktree (`<primary>/.worktrees/<slug>` or `<primary>/.claude/worktrees/<slug>`) is
+  // itself a member of checkoutRootsFor(repoDir) whenever it's ALIVE (which it always is at append/write
+  // time — you can only write from a cwd that currently exists), but its path is ALSO a physical subtree
+  // of the primary's own path. Returning on the first (e.g. primary, listed first per git's documented
+  // ordering) match would silently store the WRONG, non-minimal tail (`.worktrees/<slug>/…` instead of
+  // the nested worktree's own repo-relative path) — caught live by this ticket's own AC-R1-0 WW/WN cells.
+  if (repoRelative && !v.startsWith('/')) {
+    const repoDir = repoToplevelFor(abs);
+    if (repoDir) {
+      const absReal = realpathNearest(abs);
+      let bestRel = null;
+      let bestLen = -1;
+      for (const root of checkoutRootsFor(repoDir)) {
+        const rootReal = realpathNearest(root).replace(/\/+$/, '') + '/';
+        if (absReal.startsWith(rootReal) && rootReal.length > bestLen) {
+          bestLen = rootReal.length;
+          bestRel = absReal.slice(rootReal.length);
+        }
+      }
+      if (bestRel !== null) return bestRel;
+    }
+  }
+
+  const homePrefix = HOME.replace(/\/+$/, '') + path.sep;
+  if (abs === HOME || abs.startsWith(homePrefix)) {     // R6: collapse $HOME prefix to `~` (no username).
+    const rest = abs === HOME ? '' : abs.slice(homePrefix.length);
+    return rest ? '~/' + rest : '~';
+  }
+  return abs;
+}
+
+// Returns {skip:false} when no skip was attempted; {skip:true, ok:true} for a valid reason;
+// {skip:true, err:"..."} for an empty/non-specific reason.
+function classifySkip(e) {
+  if (!('skip_reason' in e)) return { skip: false };
+  const t = String(e.skip_reason == null ? '' : e.skip_reason).trim();
+  if (t === '') return { skip: true, err: 'skip reason is empty/whitespace' };
+  if (NONSPECIFIC_RE.test(t)) return { skip: true, err: 'skip reason "' + t + '" is non-specific' };
+  return { skip: true, ok: true };
+}
+
+// #1947 D2/M1/M2 — the subprocess-openrouter provenance arm. A third provenance shape alongside today's
+// agentId (harness-signed Agent-subagent transcript) and inline-skip (a self-declared assertion): a role
+// dispatched by tools/openrouter-role-dispatch.sh as a hermetic `claude -p` subprocess, which has no
+// Agent-subagent transcript and no agentId an Agent-tool spawn would produce.
+//
+// M1 — admissibility is decided SOLELY by the SSOT, read FRESH at check time
+// (routes.seats[role].dispatch === 'subprocess-openrouter'), NEVER by the mere presence of the
+// `dispatch` marker on the ledger row itself (the row is orchestrator-writable; the SSOT field is not — a
+// forged row pointing at any transcript could otherwise satisfy even execution-review's
+// never-inline-skippable invariant). A role whose SSOT seat lacks that dispatch field falls through to
+// today's ordinary agentId arm UNCHANGED, even when the row carries the marker.
+//
+// M2 — the transcript is bound to (task, role, THIS dispatch) via a per-dispatch nonce: the helper mints the
+// nonce and renders it plus `3ROLE_TASK:<id> ROLE:<role>` into the brief's first line, so the transcript's
+// FIRST record (firstRecordText() — the SAME tag-binding predicate the rest of this file already uses,
+// never a whole-file scan) must carry BOTH. The same nonce must also appear in the named artifact — this is
+// what makes a REPLAYED transcript (any older gateway transcript already on disk, e.g. a prior smoke run)
+// inadmissible even when its served model happens to equal the SSOT slug.
+function escapeRegExp(s) { return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// #2075 D1/AC-2 — the ONE shared predicate for "is this a non-Agent-tool (subprocess) dispatch class?".
+// Replaces the ~5 per-site literal `dispatch === 'subprocess-openrouter'` comparisons the pre-#2075 file
+// re-derived at every call site (C2's diagnosis: the concept was re-implemented, never named once). A
+// prefix test rather than an enum: `subprocess-openrouter` is the only class that exists in production
+// today, but a future `subprocess-ollama` class (§D4) is recognized by every site that calls this with ZERO
+// further edits (AC-3's provider-agnosticism proof) — the class boundary is "not an Agent-tool spawn",
+// never a specific vendor name.
+function isSubprocessDispatch(v) { return typeof v === 'string' && v.indexOf('subprocess-') === 0; }
+
+// #2701 D2/D4 — a row "carries subprocess provenance" when ANY of its own nonce-derived fields say so,
+// independent of whether that provenance verifies: a run_id shaped OR-NONCE-* (the helper's own mint,
+// :645), a dispatch_nonce (the pre-launch stamp), or a dispatch value matching isSubprocessDispatch above
+// (before the #1947 clear-list erases it). Used by D2 (reconcile-spawns must never infer an identity onto
+// such a row, verified or not) and D4's P2 (the repair's cross-wire precondition).
+function rowHasSubprocessProvenance2701(row) {
+  if (!row) return false;
+  if (typeof row.run_id === 'string' && row.run_id.indexOf('OR-NONCE-') === 0) return true;
+  if (row.dispatch_nonce) return true;
+  if (isSubprocessDispatch(row.dispatch)) return true;
+  return false;
+}
+
+// #2782 intent 1 — decide whether THIS append call is subprocess-provenance, i.e. the row shape whose
+// model must never come from the blind resolveAgent() sibling search. TRUE when the call itself carries a
+// subprocess dispatch marker, a pre-launch dispatch nonce, or a --run-id shaped like the dispatch helper's
+// own mint (OR-NONCE-* — the same shape predicate rowHasSubprocessProvenance2701 uses, applied to the
+// INCOMING write so the gate holds even when the pending row this run-id will bind to is missing);
+// otherwise, when the call carries a plain --run-id, TRUE only when the same-role row already carrying
+// that run_id is itself a subprocess-provenance row (the #2701 D1 nonce-keyed binding, re-derived here
+// read-only). A call with an explicit --agent never reaches this predicate (cmdAppend gates on
+// !explicitAgent first) — an Agent-tool identity always keeps its own E1 capture.
+function appendBoundToSubprocess2782(session, task, role, fields) {
+  if (isSubprocessDispatch(fields.dispatch)) return true;
+  if (fields.dispatch_nonce) return true;
+  const rid = (fields.run_id == null) ? '' : String(fields.run_id);
+  if (!rid) return false;
+  if (rid.indexOf('OR-NONCE-') === 0) return true;
+  try {
+    const lines = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let j; try { j = JSON.parse(lines[i]); } catch (e) { continue; }
+      if (j && j.role === role && j.run_id === rid) return rowHasSubprocessProvenance2701(j);
+    }
+  } catch (e) { /* unreadable ledger -> nothing proves a subprocess binding */ }
+  return false;
+}
+
+// Fresh SSOT read: is this role's SEAT declared a subprocess (non-Agent-tool) dispatch right now? Returns
+// {ok:false} on ANY unresolvable SSOT (missing/corrupt file, missing seat, wrong dispatch value) — every one
+// of those cases must fall through to the ordinary agentId arm, never silently admit the weak arm.
+function seatDispatchIsSubprocess(role) {
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok) return { ok: false, seat: null };
+  const seat = (routesLoaded.routes.seats || {})[role];
+  if (!seat) return { ok: false, seat: null };
+  // #3218 D4 site 3 — a valid ROUTE pin is honoured HERE, the single most important site: this is the
+  // admissibility decision behind the completion gate (`check`), the transition gate (gate-plan-review)
+  // and lane liveness. A role route-pinned onto a subprocess provider is admissible exactly as if its
+  // SSOT row declared the dispatch (today a planner row carrying dispatch=subprocess-zai is IGNORED here
+  // and falls to the agentId arm, which blocks); a role route-pinned onto anthropic is NOT a subprocess
+  // seat — the marker falls through to the ordinary agentId arm. Same silent-overlay discipline as the
+  // slug pin below (resolve-route/resolve-role-model surface the SEAT-PIN-HONORED/REFUSED notes at the
+  // one place an operator watches).
+  const routePin = resolveRoutePin(role, routesLoaded.routes);
+  if (routePin.pinned) {
+    return isSubprocessDispatch(routePin.seat.dispatch) ? { ok: true, seat: routePin.seat } : { ok: false, seat: null };
+  }
+  if (!isSubprocessDispatch(seat.dispatch)) return { ok: false, seat: null };
+  // #1918 n2 (execution-review hand-off) — overlay a valid SLUG pin HERE, where the OBSERVED-model
+  // comparison actually bites for a subprocess seat: checkSubprocessProvenance's `info.servedModel !==
+  // decl.seat.model` check below (the operative provenance gate for a dispatch=subprocess-openrouter row).
+  // Deliberately NOT wired at resolveExpectedSide's tier_equivalent — the file's own #1947 AC-2/M3 comment
+  // explains why the completion-gate's tier leg never reads that field for these two seats in the first
+  // place (it reads `agent_tool_fallback` instead), so pinning it there would be inert AND would open a
+  // second, unrelated place a pin could silently diverge from what this function (and every one of its 4
+  // callers) actually sees. Silent overlay here — no stderr diagnostic from THIS shared helper (it fires on
+  // every plain `check`, not just a dispatch; resolve-route/resolveRoute already surfaces SEAT-PIN-HONORED/
+  // REFUSED at the one place — dispatch time — an operator actually watches).
+  const pin = resolveSlugPin(role, routesLoaded.routes, seat);
+  if (pin.pinned) return { ok: true, seat: Object.assign({}, seat, { model: pin.slug }) };
+  return { ok: true, seat };
+}
+
+// Read a NAMED subprocess transcript path (NOT a PROJECTS_ROOT/<slug>/<session>/subagents/agent-<id>.jsonl
+// harness-written file — a `claude -p` one-shot's own transcript, named explicitly on the ledger row).
+// Fails closed to the empty/false defaults on any missing/unreadable/unparseable file — mirrors every other
+// can't-tell residual in this module (never a false pass on a read error).
+// A `claude -p` subprocess's OWN top-level session transcript has a DIFFERENT first-record shape than an
+// Agent-subagent transcript: its first line is a `{"type":"queue-operation","operation":"enqueue",...,
+// "content":"<brief text>"}` record — the brief text (carrying the 3ROLE_TASK/ROLE tag + DISPATCH-NONCE line)
+// sits at the TOP LEVEL `content` field, never under `message.content` the way firstRecordText() (built for
+// the Agent-subagent transcript shape) expects. Reusing firstRecordText() here silently returned '' for
+// every real subprocess dispatch — measured live on session 27a10ef1-... (#1947 AC-5 live smoke) — so this
+// is a dedicated extractor, not a wrapper.
+// A leading `{"type":"ai-title",...}` bookkeeping record (an auto-generated conversation title) can sit
+// BEFORE the real `queue-operation`/`enqueue` spawn record on disk — measured live on session
+// bd8c0aec-... (#1947 AC-6 live smoke): the GLM transcript's line 0 was `ai-title`, line 1 the real enqueue.
+// An `ai-title` record structurally can NEVER carry the rendered brief (it has only an `aiTitle` string, no
+// `content`/`message` field), so it is the ONE narrowly-named type this scan skips past. Every other record
+// type ends the scan immediately (return whatever text it has, or '' if none) — this still never scans past
+// the first REAL turn, which is what defeats mention-vs-spawn confusion (M2); it only tolerates ONE specific,
+// content-free metadata record shape in front of it.
+function subprocessFirstRecordText(content) {
+  const lines = String(content == null ? '' : content).split('\n');
+  for (const raw of lines) {
+    if (!raw.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(raw); } catch (e) { return ''; }
+    if (rec && rec.type === 'ai-title') continue;
+    if (rec && typeof rec.content === 'string') return rec.content;
+    const msg = (rec && rec.message) || {};
+    if (typeof msg.content === 'string') return msg.content;
+    if (Array.isArray(msg.content)) {
+      let text = '';
+      for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+      return text;
+    }
+    return '';
+  }
+  return '';
+}
+
+// #2700 D1 — the dispatch's own vantage: the `cwd` recorded on the FIRST transcript record that carries
+// one. On the measured shape (R3) the bound record (record 1, `queue-operation`/`enqueue`) and record 2
+// (`queue-operation`/`dequeue`) carry no `cwd` at all — the first `user` record (record 3) is the first to
+// carry it. This is read from the SAME transcript that already passed the exists + tag&nonce binding checks
+// in checkSubprocessProvenance, and only consulted AFTER those checks (an unbound transcript never steers
+// resolution). Exposed as `dispatchCwd` (raw string as recorded — absolutizing/ignoring a non-absolute value
+// is the CALLER's job, per named risk 2700-pr1-relative-vantage-join: a non-absolute recorded cwd must be
+// ignored, never joined against process.cwd()/HOME).
+function subprocessTranscriptInfo(transcriptPath) {
+  const out = { exists: false, firstText: '', servedModel: '', dispatchCwd: '' };
+  let p = String(transcriptPath == null ? '' : transcriptPath);
+  // transcript_path is stored in portable home-tilde form by normalizeArtifact() (R6) — expand it back to
+  // an absolute path before touching the filesystem; fs.* never expands `~` the way a shell does, so a
+  // tilde-form path here previously read as "does not exist" even when the file was genuinely on disk.
+  if (p === '~') p = HOME;
+  else if (p.startsWith('~/')) p = path.join(HOME, p.slice(2));
+  if (!p || !fileExists(p)) return out;
+  out.exists = true;
+  try {
+    const content = fs.readFileSync(p, 'utf8');
+    out.firstText = subprocessFirstRecordText(content);
+    for (const ln of content.split('\n')) {
+      if (!ln.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(ln); } catch (e) { continue; }   // skip an unparsable line, keep scanning.
+      if (!out.servedModel) {
+        const m = rec && rec.message && rec.message.model;
+        if (m) out.servedModel = String(m);   // first served model line wins (the dispatch's own turn).
+      }
+      if (!out.dispatchCwd) {
+        const c = rec && rec.cwd;
+        if (typeof c === 'string' && c) out.dispatchCwd = c;   // first record that carries a `cwd` wins.
+      }
+      if (out.servedModel && out.dispatchCwd) break;
+    }
+  } catch (e) { /* fail closed to the empty defaults above */ }
+  return out;
+}
+
+// #2700 D2 — candidate list for a subprocess row's artifact_path: the dispatch's own vantage FIRST, then
+// today's chain, byte-for-byte. An absolute/`~/`-form artifact_path is unambiguous already (mirrors
+// resolveArtifact()) and never consults the vantage. For a relative path, the vantage candidate is added
+// ONLY when `dispatchCwd` is a genuinely ABSOLUTE recorded value — a missing, non-absolute (bare-relative or
+// `~/`-form) recorded cwd contributes NO candidate (2700-pr1-relative-vantage-join) and today's chain runs
+// exactly as it does at base.
+function artifactCandidatesWithVantage(p, dispatchCwd) {
+  const s = String(p == null ? '' : p);
+  if (!s) return [];
+  if (s.startsWith('/')) return [s];
+  if (s.startsWith('~/')) return [path.join(HOME, s.slice(2))];
+  const cands = [];
+  if (typeof dispatchCwd === 'string' && dispatchCwd.startsWith('/')) cands.push(path.join(dispatchCwd, s));
+  if (process.env.CLAUDE_PROJECT_DIR) cands.push(path.join(process.env.CLAUDE_PROJECT_DIR, s));
+  cands.push(path.join(process.cwd(), s));
+  cands.push(path.join(HOME, s));
+  cands.push(s);
+  return cands;
+}
+
+// #2700 D2 — the nonce chooses among the candidates, not mere existence: the FIRST candidate that both
+// EXISTS and carries `nonce` wins (`winner`); a same-named copy that only exists is the WEAKER signal and
+// must never erase a nonce-bound copy in EITHER direction (#1590 class) — it is only reported (`existing`,
+// the first EXISTING candidate, for the "does not contain nonce" message) when no candidate carries the
+// nonce. Both empty means "not found" on every candidate.
+function resolveArtifactVantage(p, dispatchCwd, nonce) {
+  const cands = artifactCandidatesWithVantage(p, dispatchCwd);
+  let existing = '';
+  const n = String(nonce == null ? '' : nonce);
+  for (const c of cands) {
+    if (!fileExists(c)) continue;
+    if (!existing) existing = c;
+    if (n && fileHas(c, new RegExp(escapeRegExp(n)))) return { winner: c, existing: existing };
+  }
+  return { winner: '', existing: existing };
+}
+
+// M2 — the transcript's FIRST record must carry BOTH the exact spawn tag and this dispatch's nonce. A bare
+// tag with no nonce (or a nonce belonging to a DIFFERENT dispatch) never binds — this is what defeats a
+// replayed/reused transcript sitting on disk from an earlier run.
+function subprocessFirstRecordBound(firstText, task, role, nonce) {
+  const n = String(nonce == null ? '' : nonce).trim();
+  if (!firstText || !n) return false;
+  const tagRe = new RegExp('3ROLE_TASK:' + escapeRegExp(task) + ' ROLE:' + escapeRegExp(role));
+  return tagRe.test(firstText) && firstText.indexOf(n) !== -1;
+}
+
+// #3085 D1 — the dispatcher's own plan-path extraction rule (the #3060 zai block in tools/openrouter-
+// role-dispatch.sh): every DISTINCT `.ai-workspace/plans/<...>.md` path in the brief text, at most 8.
+// Never a second hand-rolled regex — the checker re-derives the one path the dispatcher sized from, using
+// the dispatcher's own matcher, so the two sides can never disagree on what the brief named.
+// INPUT-BOUND: the scan is capped at the same 1 MiB the dispatcher reads, so an oversized transcript brief
+// cannot loop the matcher (a truncation only ever drops paths -> fail closed, never a silent default).
+function briefPlanPaths(text) {
+  const s = String(text == null ? '' : text).slice(0, 1048576);
+  const re = /[.\w/-]*\.ai-workspace\/plans\/[^\s"'`)]+\.md/g;
+  const seen = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (!seen.includes(m[0])) { seen.push(m[0]); if (seen.length >= 8) break; }
+  }
+  return seen;
+}
+
+// #3085 D2 — the expected served model for an executor subprocess-zai row: the model the dispatcher's own
+// effectiveRouteFor would have picked for the plan named in the row's OWN nonce-bound transcript first
+// record, re-derived through the SAME resolver the dispatcher called (resolvePlanFacts + executorSizeModel,
+// the #2434 single-generator discipline). Every outcome the dispatcher itself refuses pre-stamp (exit
+// 10/11: no/ambiguous plan path, unresolvable plan, size missing/ambiguous/invalid, task mismatch,
+// invalid data-class — #3078 retired exit 12, so post-#3078 an operator-private plan routes exactly like
+// a public one and #3122 mirrored that here (the PLAN_DATA_CLASSES allowlist); L-with-fallback-but-no-
+// size-model) is a BLOCK here — a z.ai row claiming
+// one is inadmissible (fail closed, never a silent seat-model default). Strikes are deliberately NOT
+// consulted (D3): zai_strikes is time-varying, and the row's existence already proves the route stayed on
+// z.ai at dispatch time, so reading strikes at check time could block a row correct when it closed.
+// The L branch mirrors effectiveRouteFor's own precondition exactly: the size model applies ONLY when the
+// seat also declares a valid agent_tool_fallback (a ROLE_MODELS member); with no valid fallback the
+// dispatcher never sizes and serves the seat model for L, so the checker expects the seat model too —
+// mirror, never stricter. Returns {block:true, reason} | {model, size}.
+function zaiExecutorRouteExpected(e, info, task, decl) {
+  const paths = briefPlanPaths(info.firstText);
+  if (paths.length === 0) return { block: true, reason: 'the brief text names no .ai-workspace/plans/<file>.md path' };
+  if (paths.length > 1) return { block: true, reason: 'the brief text names ' + paths.length + ' distinct plan paths' };
+  const rel = paths[0];
+  // D1 vantage-first resolution: the transcript's own recorded cwd (only an ABSOLUTE one — 2700-pr1), then
+  // today's chain exactly as `check` already resolves a plan-review row's reviewed_plan (cwd, then the repo
+  // holding this helper). A miss on every candidate is a BLOCK, never a silent pass.
+  const cands = [];
+  if (typeof info.dispatchCwd === 'string' && info.dispatchCwd.startsWith('/')) cands.push(path.join(info.dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    cands.push(path.join(selfDir, '..', rel));
+  }
+  let facts = null;
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) { facts = f; break; }
+  }
+  if (!facts) return { block: true, reason: 'plan "' + rel + '" is unresolvable from the transcript vantage or the checker chain' };
+  if (facts.size_source !== 'plan') return { block: true, reason: 'plan "' + rel + '" size_source=' + facts.size_source };
+  if (!PLAN_DATA_CLASSES.includes(facts.data_class)) return { block: true, reason: 'plan "' + rel + '" data_class=' + facts.data_class };
+  if (facts.size === 'L') {
+    const fb = decl.seat.agent_tool_fallback;
+    if (fb && ROLE_MODELS.includes(fb)) {
+      const sizeModel = executorSizeModel(decl.seat);
+      if (!sizeModel) return { block: true, reason: 'size L with a valid agent_tool_fallback but no usable size_models.L in the seat' };
+      return { model: sizeModel, size: 'L' };
+    }
+  }
+  return { model: decl.seat.model, size: facts.size };   // S/M always; L only when the seat cannot size (mirror)
+}
+
+// #3145 D1 — the ONE plan-review route resolver (the #2434 single-generator discipline, sibling of the
+// executor block above): a plan-review brief's TEXT alone decides {model, size, round, fold_only,
+// route_reason, data_class}. Called by the `plan-review-route` CLI (the dispatcher's Leg-2 call site) and
+// by the D5 checker branch below — never a second copy of the rule. INPUT-BOUND: the brief text is read
+// through the same 1 MiB cap briefPlanPaths already applies, and briefPlanPaths' own 8-distinct-path cap
+// bounds the per-brief plan-resolution loop, so an oversized brief cannot fan the resolver into unbounded
+// file reads. Round grammar mirrors the dispatcher's own `^ROUND: ([0-9]{1,6})$` flush-left line; zero or
+// 2+ ROUND lines read as round 0 (round-1 semantics — fails toward the full review, quality/cost-safe).
+// PRIOR-REVIEW grammar is prefix-strict (executor note 1, option b): ANY flush-left `PRIOR-REVIEW: <non-
+// empty value>` counts as present — the dispatcher (Leg 2) refuses the dispatch when the value names no
+// existing file, so the checker can decide fold from the text alone: any admitted row with the line had a
+// real file behind it.
+function briefRoundNumber(text) {
+  const hits = String(text == null ? '' : text).split('\n').map((l) => l.replace(/\r$/, ''))
+    .filter((l) => /^ROUND: [0-9]{1,6}[ \t]*$/.test(l));
+  if (hits.length !== 1) return 0;
+  return parseInt(hits[0].replace(/^ROUND: /, ''), 10) || 0;
+}
+
+function briefPriorReviewPresent(text) {
+  return String(text == null ? '' : text).split('\n').map((l) => l.replace(/\r$/, ''))
+    .some((l) => /^PRIOR-REVIEW: \S/.test(l));
+}
+
+// #2700 vantage chain, factored for the plan-review resolver (the executor block above keeps its own inline
+// copy byte-for-byte — this leg must not move a #3085-tested line): transcript cwd first, then the process
+// cwd, then the repo holding this helper. A miss on every candidate returns null (the CALLER decides what
+// that means — for plan-review it is exclusion from the size max, never a refusal, D2).
+function planFactsFromVantage(dispatchCwd, rel, task) {
+  const cands = [];
+  if (typeof dispatchCwd === 'string' && dispatchCwd.startsWith('/')) cands.push(path.join(dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    cands.push(path.join(selfDir, '..', rel));
+  }
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) return f;
+  }
+  return null;
+}
+
+// D2/D3: size = the LARGEST valid label among cited plans that resolve with size_source=plan (binding to
+// the task is implied — task-mismatch overrides size_source). No cited plan has a valid size -> size 'none'
+// -> size_models.L (unsized-full), NOT a refusal: flagging a missing size label is plan-review's own
+// BLOCKING job, refusing would deadlock the fix, and unsized-full is byte-identical to today's route.
+// fold_only (ROUND >= 2 + PRIOR-REVIEW) -> the seat model for EVERY size, route_reason=fold-only.
+// With no usable size_models.L (the pre-flip live config, D7 rollback) EVERY case returns the seat model —
+// Leg 1 is behaviour-neutral until the flip.
+function planReviewRouteFromBrief(briefText, task, seat, dispatchCwd) {
+  const out = { model: seat.model || '', size: 'none', round: 0, fold_only: false, route_reason: '', data_class: '' };
+  out.round = briefRoundNumber(briefText);
+  const sizeModel = executorSizeModel(seat);
+  const RANK = { S: 1, M: 2, L: 3 };
+  let best = ''; let bestRank = 0;
+  for (const rel of briefPlanPaths(briefText)) {
+    const facts = planFactsFromVantage(dispatchCwd, rel, task);
+    if (!facts || facts.size_source !== 'plan') continue;
+    const rank = RANK[facts.size] || 0;
+    if (rank > bestRank) { bestRank = rank; best = facts.size; out.data_class = facts.data_class; }
+  }
+  if (best) out.size = best;
+  if (out.round >= 2 && briefPriorReviewPresent(briefText)) {
+    out.fold_only = true; out.route_reason = 'fold-only';
+    return out;   // the seat model for every size (D3)
+  }
+  if (!best) {
+    out.route_reason = 'unsized-full';
+    if (sizeModel) out.model = sizeModel;
+    return out;
+  }
+  if (best === 'L' && sizeModel) { out.model = sizeModel; out.route_reason = 'size-L-zai'; }
+  else if (best === 'L') out.route_reason = 'size-L-no-size-model';
+  else out.route_reason = 'size-SM';
+  return out;
+}
+
+// #3145 D5 — the checker-side twin of the executor branch: the expected served model for a plan-review
+// subprocess-zai row, re-derived through the SAME resolver above from the row's OWN nonce-bound transcript
+// first record. Mirrors zaiExecutorRouteExpected's decl (pin-overlaid seat) usage exactly (#1918 layering
+// inherited, never bypassed: the S/M/fold model IS decl.seat.model, which seatDispatchIsSubprocess already
+// overlaid with any valid slug pin). Never BLOCKs on resolution (D2: unsized routes full, it does not
+// refuse) — the only failure this branch can report is the served-model comparison itself. D5 transition:
+// a row whose closedAt STRICTLY pre-dates the seat's committed size_route_since also admits the pre-change
+// model (= size_models.L — glm-5.3 in the flip config), so in-flight tasks reviewed before the flip still
+// close. Strikes are not consulted (same time-invariance reason as #3085 D3).
+function zaiPlanReviewRouteExpected(e, info, task, decl) {
+  const route = planReviewRouteFromBrief(info.firstText, task, decl.seat, info.dispatchCwd);
+  const since = decl.seat.size_route_since;
+  const closed = e && e.closedAt;
+  let preChange = '';
+  if (typeof since === 'string' && !isNaN(Date.parse(since)) && closed && !isNaN(Date.parse(String(closed)))
+    && Date.parse(String(closed)) < Date.parse(since)) {
+    const sm = executorSizeModel(decl.seat);
+    if (sm && sm !== route.model) preChange = sm;
+  }
+  route.pre_change_model = preChange;
+  return route;
+}
+
+// conservative-seat-map-single-slot-local-dispatch (2026-08-30), D7 — the subprocess-local sibling of
+// seatDispatchIsSubprocess(). Reads the NEW conservative_seat_map[role].primary overlay (never `seats[role]`,
+// which stays byte-untouched — see config/cc-routes.json's own overlay comment), fresh at check time, exactly
+// mirroring seatDispatchIsSubprocess()'s M1 discipline: admissibility is decided SOLELY by a live SSOT read,
+// never by the row's own self-declared marker. Returns {ok:false} on ANY unresolvable SSOT (missing/corrupt
+// file, missing overlay entry, missing primary, wrong dispatch value) -> falls through to the ordinary
+// agentId arm, never silently admits the weak arm. No slug-pin overlay exists for this class in v1 (the
+// overlay carries no routed_since -- D7: "supersession rights come with activation, not before").
+function overlaySeatDispatchIsSubprocess(role) {
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok) return { ok: false, seat: null };
+  const overlay = (routesLoaded.routes.conservative_seat_map || {})[role];
+  const primary = overlay && overlay.primary;
+  if (!primary || !isSubprocessDispatch(primary.dispatch)) return { ok: false, seat: null };
+  return { ok: true, seat: primary };
+}
+
+// The full subprocess-openrouter/subprocess-local provenance arm for one role's ledger row. Returns:
+//   null  -> NOT admissible (SSOT doesn't declare this seat subprocess-dispatched, or the row carries no
+//            dispatch marker) -> checkRole must fall through to the ordinary agentId arm UNCHANGED.
+//   ''    -> admissible AND fully verified -> treat as a pass.
+//   <str> -> admissible but verification FAILED -> this string is the block reason.
+//
+// D7 dispatch-class branch: a `dispatch: subprocess-local` row resolves its seat declaration from the
+// conservative_seat_map OVERLAY (overlaySeatDispatchIsSubprocess); every OTHER subprocess-* class (today,
+// exactly `subprocess-openrouter`) keeps the ORIGINAL seatDispatchIsSubprocess()/`seats[role]` path BYTE-FOR-
+// BYTE — this branch changes zero behavior for the live openrouter arm (#2075 AC-3 provider-agnosticism: a
+// new class is recognized with a targeted branch here, not a rewrite of the shared logic below, which stays
+// dispatch-class-agnostic — the same transcript-exists/nonce-bound/servedModel/artifact checks apply either
+// way, only WHERE `decl.seat` comes from differs).
+function checkSubprocessProvenance(role, e, session, task) {
+  if (!e || !isSubprocessDispatch(e.dispatch)) return null;
+  const decl = e.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+  if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
+
+  // #1947 M-A (execution-review round-2 FAIL) — a harness-signed, RESOLVING agentId on the SAME row must
+  // ALWAYS outrank a stale/self-declared subprocess marker; the stronger provenance must win a tie. This is
+  // the #1590-class monotonicity fix: D3's bounded fallback (a subprocess dispatch that stamped
+  // dispatch/transcript_path/nonce, then got rejected, then a bounded Anthropic Agent-tool retry self-appends
+  // a REAL agentId + its own artifact + verdict) previously left the STALE dispatch marker in place, so this
+  // function kept re-evaluating the SUPERSEDED subprocess evidence and false-BLOCKed the genuinely-completed
+  // fallback. Belt-and-braces alongside the overlayAppend clear-list fix below (which is the PRIMARY fix — a
+  // genuine agentId/oracle append now also clears dispatch/transcript_path/nonce, so this branch is normally
+  // unreachable for a correctly-composed row) — this tie-break covers any row that somehow still carries BOTH
+  // fields (e.g. an out-of-band ledger edit, or a compose path this round didn't anticipate).
+  if (e.agentId && agentResolves(session, e.agentId)) return null;
+
+  const info = subprocessTranscriptInfo(e.transcript_path);
+  if (!info.exists) {
+    return role + ' dispatch=' + e.dispatch + ' but transcript_path "' + (e.transcript_path || '') +
+      '" does not exist on disk';
+  }
+  if (!subprocessFirstRecordBound(info.firstText, task, role, e.nonce)) {
+    return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" first record does ' +
+      'not carry BOTH the spawn tag (3ROLE_TASK:' + task + ' ROLE:' + role + ') and this dispatch\'s nonce "' +
+      (e.nonce || '<missing>') + '" — a replayed/reused transcript is not admissible (M2)';
+  }
+  // #3085 D1/D2/D4 — for the ONE class the dispatcher sizes (executor + subprocess-zai), the expected
+  // served model is the dispatcher's own effective route for THIS row's plan (size-aware), never the bare
+  // seat default: since #3060 a size-L public plan is deliberately served on size_models.L. Slotted
+  // strictly AFTER the tag+nonce binding above (an unbound transcript never steers resolution) and AT the
+  // served-model comparison; every earlier check, and every OTHER dispatch class (plan-review, research,
+  // subprocess-local, subprocess-openrouter) keeps today's byte-identical seat-model comparison (D4).
+  if (role === 'executor' && e.dispatch === 'subprocess-zai') {
+    const route = zaiExecutorRouteExpected(e, info, task, decl);
+    if (route.block) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
+        route.reason;
+    }
+    if (!info.servedModel || info.servedModel !== route.model) {
+      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
+    }
+  } else if (role === 'plan-review' && e.dispatch === 'subprocess-zai' && executorSizeModel(decl.seat)) {
+    // #3145 D5 — the plan-review twin of the executor branch above, taken ONLY when the seat declares a
+    // usable size_models.L (the post-flip shape): with today's live config (no size_models) the resolver
+    // returns the seat model for every case, so the row keeps the byte-identical seat-model comparison
+    // below — Leg 1 is behaviour-neutral until the flip (AC-3). Expected model = the D1 resolver on THIS
+    // row's nonce-bound transcript first record (size / fold_only re-derived, never the row's own claim);
+    // a closedAt strictly before the seat's size_route_since also admits the pre-change model (D5
+    // transition). The #1918 slug-pin layering is inherited, not bypassed: decl.seat is the pin-overlaid
+    // row seatDispatchIsSubprocess already returned, and the resolver reads its .model directly.
+    const route = zaiPlanReviewRouteExpected(e, info, task, decl);
+    const okModels = [route.model];
+    if (route.pre_change_model) okModels.push(route.pre_change_model);
+    if (!info.servedModel || !okModels.includes(info.servedModel)) {
+      return 'plan-review dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size +
+        (route.fold_only ? ' fold_only' : '') + ')';
+    }
+  } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
+    return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
+      (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
+  }
+  // #2700 D2 — vantage-first, nonce-choice resolution: try the dispatch's own recorded cwd BEFORE today's
+  // chain; the FIRST candidate that carries the nonce wins. `ap` below is that winner (or '' if none did).
+  const vantageResolved = resolveArtifactVantage(e.artifact_path || '', info.dispatchCwd, e.nonce);
+  const ap = vantageResolved.winner;
+  if (!ap && vantageResolved.existing) {
+    // a candidate exists (vantage or today's chain) but none carried this dispatch's nonce — block, naming
+    // the first EXISTING candidate (never silently prefer a nonce-less copy over a nonce-bound one, #1590).
+    return role + ' dispatch=' + e.dispatch + ' artifact "' + vantageResolved.existing + '" does not contain ' +
+      'this dispatch\'s nonce "' + (e.nonce || '<missing>') + '" (M2 — binds artifact to this exact run)';
+  } else if (!ap && role !== 'executor') {
+    // executor's artifact is legitimately a PR URL/commit/branch string, never required to resolve on disk
+    // (mirrors the ordinary arm's own role-shaped exemption below); every other role needs a real disk path.
+    return role + ' dispatch=' + e.dispatch + ' artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
+  }
+  if (role === 'plan-review' && (!ap || !fileHas(ap, VERDICT_RE))) {
+    return 'plan-review artifact "' + (ap || e.artifact_path) + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
+  }
+  if (role === 'executor' && (!e.artifact_path || String(e.artifact_path).trim() === '')) {
+    return 'executor artifact_path missing (PR URL / commit / branch string)';
+  }
+  return '';   // admissible + fully verified -> pass.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2169 slice 3 — R-C route-change clause (design decision 3, .ai-workspace/plans/2026-08-25-2075-phase3-
+// recut.md). A genuinely subprocess-shaped (E2) incoming write may supersede a prior E1 (agentId-bound,
+// terminal) row ONLY IF (i) the seat's SSOT (config/cc-routes.json) CURRENTLY declares a dispatch:subprocess-*
+// route for this role, AND (ii) the prior row's closedAt STRICTLY pre-dates that seat's committed
+// routed_since value. Both terms are re-read FRESH from the SSOT here, at guard time — NEVER from the
+// incoming write's own claim (a forged/self-declared routed_since on the write itself carries zero weight).
+// Soundness: SSOT-gated, not writer-gated (an operator's committed routes.json decides, not the caller);
+// no deletion (the superseded E1 row survives verbatim as history — see the isNewRound wiring below); full
+// E2 verification unchanged (reuses checkSubprocessProvenance UNCHANGED, the #2051 "one evaluator, no
+// mirror" discipline); a post-flip sanctioned E1 fallback (closedAt >= routed_since) is PERMANENTLY outside
+// this clause's reach — that shape is a deliberate D3 fallback, not stale evidence.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Returns {allowed, since, reason}. `reason` explains a refusal; on allow, `since` carries the routed_since
+// value (for the caller's ROUTE-DRIFT audit note) and `reason` is ''.
+function evaluateRouteChangeSupersession(role, prior, fields, session, task) {
+  const refuse = (reason) => ({ allowed: false, since: '', reason });
+  if (!isSubprocessDispatch(fields.dispatch)) {
+    return refuse('the incoming write carries no subprocess-openrouter/-ollama --dispatch marker — R-C only ' +
+      'ever supersedes a prior E1 row with verified E2 (subprocess) evidence, never a bare verdict flip');
+  }
+  const routesLoaded = loadRoutesConfig();
+  // AC-27 — a CC_ROUTES_JSON override EXERCISED on the R-C path is audited, never silent, regardless of
+  // whether this evaluation ultimately allows or refuses (the override was still consulted to reach a
+  // decision). Mirrors the existing enforce-role-models ROUTES-OVERRIDE audit line (same writeBypassLog call
+  // shape) — one audit vocabulary, not two.
+  if (('CC_ROUTES_JSON' in process.env) && routesLoaded.ok) {
+    writeBypassLog('3role-ledger-route-change', 'ROUTES-OVERRIDE', 'PERMIT',
+      { task: sanitize(task), role: sanitize(role), route_config: routesLoaded.configPath });
+  }
+  if (!routesLoaded.ok) {
+    return refuse('R-C refused: SSOT unreadable (' + routesLoaded.error + ')');
+  }
+  const seat = (routesLoaded.routes.seats || {})[role];
+  if (!seat || !isSubprocessDispatch(seat.dispatch)) {
+    return refuse('R-C refused: SSOT does not currently declare seat "' + role + '" dispatch:subprocess-* ' +
+      '(no committed route to supersede onto)');
+  }
+  const since = seat.routed_since;
+  if (!since || isNaN(Date.parse(String(since)))) {
+    return refuse('R-C refused: SSOT seat "' + role + '" has no valid committed routed_since pin');
+  }
+  if (!prior.closedAt || isNaN(Date.parse(String(prior.closedAt)))) {
+    return refuse('R-C refused: the prior row has no valid closedAt to compare against routed_since (cannot ' +
+      'prove it pre-dates the route flip — fails closed rather than guessing)');
+  }
+  if (!(Date.parse(String(prior.closedAt)) < Date.parse(String(since)))) {
+    return refuse('R-C refused: the prior row\'s closedAt (' + prior.closedAt + ') does not strictly pre-date ' +
+      'seat "' + role + '"\'s committed routed_since (' + since + ') — a post-flip E1 fallback is permanently ' +
+      'outside R-C\'s reach (sanctioned by design, never treated as stale)');
+  }
+  // Full E2 verification unchanged (#2051 discipline: one evaluator, no mirror). Built ONLY from the
+  // incoming write's OWN fields — never composed with the stale prior row, so the prior's agentId/model can
+  // never leak into (or weaken) this check.
+  const verify = checkSubprocessProvenance(role, fields, session, task);
+  if (verify === null) {
+    return refuse('R-C refused: the incoming write is not admissible as subprocess-openrouter/-ollama ' +
+      'evidence under the current SSOT');
+  }
+  if (verify !== '') {
+    return refuse('R-C refused: ' + verify);
+  }
+  return { allowed: true, since, reason: '' };
+}
+
+// #2169 slice 3 — AC-31a: ROUTES-STALE advisory (never blocks a write). Fresh SSOT read: when this seat is
+// declared dispatch:subprocess-* AND the row's OWN prior line is ITSELF a subprocess (E2) row whose closedAt
+// pre-dates the seat's own committed routed_since pin, the pin is stale relative to what has already been
+// OBSERVED running — genuine subprocess evidence exists from before the pin claims routing began.
+function checkRoutesStale(role, prior) {
+  if (!prior || !isSubprocessDispatch(prior.dispatch)) return;
+  const decl = seatDispatchIsSubprocess(role);
+  if (!decl.ok) return;
+  const since = decl.seat.routed_since;
+  if (!since || isNaN(Date.parse(String(since)))) return;
+  if (!prior.closedAt || isNaN(Date.parse(String(prior.closedAt)))) return;
+  if (Date.parse(String(prior.closedAt)) < Date.parse(String(since))) {
+    console.error('ROUTES-STALE: seat "' + role + '"\'s committed routed_since (' + since + ') post-dates an ' +
+      'already-observed subprocess dispatch on this very row (closedAt ' + prior.closedAt + ') — the pin may ' +
+      'need to move earlier to reflect when routing actually began.');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2075 Phase 1 — D1's shared Provenance Record primitive: ONE strength lattice (E1 > E2 > E3), consulted by
+// every reader AND writer instead of ~14 sites each re-deriving "which vendor produced this row?" ad hoc.
+//
+// Two DISTINCT "verified kind" predicates on purpose (R5-N3 — the design's own round-5 review named this
+// split; AC-11's own protection-vs-admissibility test is the binary oracle that forces it):
+//   - computeVerifiedKind()            — the ADMISSIBILITY triple (does this row's evidence fully verify,
+//                                         including served-model equality?). Used by provenance-kind's
+//                                         REPORTING formula (AC-1/AC-24) — never by a write-side guard.
+//   - computeVerifiedKindForProtection() — the narrower PROTECTION predicate (execution record exists AND
+//                                         its first record is tag+nonce bound — served-model equality is an
+//                                         admissibility concern, not a protection one). Used ONLY to decide
+//                                         whether an E3-derived background sweep (reconcile-spawns /
+//                                         refresh-models) may write over a row at all (§D5(c), AC-9/AC-11a).
+// Neither predicate reads the STORED run_kind label — both recompute fresh from the row's own evidence every
+// time (agentResolves/agentBoundToTag for E1, the transcript-existence+binding check for E2), so a forged or
+// stale stored label can never inflate what a row is actually proven to be.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ADMISSIBILITY-scoped verified kind: 'E1' | 'E2' | 'none'. E1 requires a resolving AND spawn-record-bound
+// agentId (never resolveAgent()'s newest-mtime search — that is E3, a guess, never "verified"). E2 reuses
+// checkSubprocessProvenance UNCHANGED (the #2051 discipline: one evaluator, no mirror) — the full triple,
+// including served-model equality.
+function computeVerifiedKind(role, row, session, task) {
+  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
+    return 'E1';
+  }
+  if (row && isSubprocessDispatch(row.dispatch) && checkSubprocessProvenance(role, row, session, task) === '') {
+    return 'E2';
+  }
+  return 'none';
+}
+
+// PROTECTION-scoped verified kind: 'E1' | 'E2' | 'none'. Same E1 test as above (a resolving+bound agentId is
+// unconditionally strong evidence for both questions). The E2 arm is DELIBERATELY narrower than
+// checkSubprocessProvenance's full admissibility triple — it does NOT require served-model equality, only
+// that the row's own execution record exists and its first record is tag+nonce bound — because an E2 row
+// whose model happens to be unreadable is still real, verified evidence that must not be erased by a guess
+// (AC-11's honest-blank-beats-confidently-wrong split; R5-N3).
+function computeVerifiedKindForProtection(role, row, session, task) {
+  if (row && row.agentId && agentResolves(session, row.agentId) && agentBoundToTag(session, row.agentId, task, role)) {
+    return 'E1';
+  }
+  if (row && isSubprocessDispatch(row.dispatch)) {
+    // D7 dispatch-class branch (mirrors checkSubprocessProvenance above) — a subprocess-local row's
+    // protection-scoped admissibility must resolve against the conservative_seat_map OVERLAY, never
+    // `seats[role]` (which for `research` carries no subprocess-* dispatch at all, and for `executor`
+    // carries a DIFFERENT provider's declaration — either would silently misjudge decl.ok here).
+    const decl = row.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+    if (decl.ok) {
+      const info = subprocessTranscriptInfo(row.transcript_path);
+      if (info.exists && subprocessFirstRecordBound(info.firstText, task, role, row.nonce)) return 'E2';
+    }
+  }
+  return 'none';
+}
+
+// §D1 storage-layer rank order — witnessed(3) > bound(2) > inferred(1) > unset/absent(0). Governs the
+// write-once clamp in overlayAppend AND provenance-kind's REPORTING formula below (min(stored, verified)) —
+// the ONLY two consumers of the stored run_kind label; every write-side GUARD in this file reads verified
+// kind directly (see computeVerifiedKind[ForProtection] above), never this label.
+const RUN_KIND_RANK = { witnessed: 3, bound: 2, inferred: 1 };
+const KIND_LABEL_BY_RANK = { 3: 'E1', 2: 'E2', 1: 'E3', 0: 'none' };
+function verifiedKindRank(label) { return label === 'E1' ? 3 : (label === 'E2' ? 2 : 0); }
+
+// AC-1's REPORTING construction: min(stored run_kind, verified kind). A row with NO stored run_kind at all
+// (a pre-#2075 "legacy" row — AC-23) reports its verified kind directly, suffixed " legacy" so a consumer
+// can tell a classified-by-inference row from a genuinely stored one — never suffixed for a 'none' verdict
+// (there is nothing to distinguish a legacy 'none' from a stored one; AC-1's own "bare spawn placeholder"
+// arm asserts a bare 'none', no suffix).
+function provenanceKindOf(role, row, session, task) {
+  const verified = computeVerifiedKind(role, row, session, task);
+  if (!row || !('run_kind' in row) || row.run_kind == null) {
+    return verified === 'none' ? 'none' : (verified + ' legacy');
+  }
+  const storedRank = RUN_KIND_RANK[row.run_kind] || 0;
+  const rank = Math.min(storedRank, verifiedKindRank(verified));
+  return KIND_LABEL_BY_RANK[rank];
+}
+
+// provenance-kind --session S --task T --role R (#2075 AC-1). Prints exactly one of E1|E2|E3|none (optionally
+// " legacy"-suffixed) on stdout, exit 0, for every row shape — including a missing row (no line at all for
+// this role), which reports 'none'.
+function cmdProvenanceKind(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) { console.error('provenance-kind: --session, --task, --role are required'); process.exit(2); }
+  enforceSessionShape(session, task, role, 2);
+  const file = ledgerFile(session, task);
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); } catch (e) { /* no ledger yet */ }
+  let row = null;
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) row = j; } catch (e) { /* skip */ } }
+  console.log(provenanceKindOf(role, row, session, task));
+  process.exit(0);
+}
+
+// Returns null when the role is satisfied, else a problem string. `opts.rejectVacuousOracle` (#1276) — set
+// ONLY by the instrumentation-gate's `check --reject-vacuous-oracle` — additionally REJECTS an
+// execution-review oracle that exists + carries a PASS token but is vacuous (0 real assertions).
+function checkRole(role, e, session, opts, task) {
+  // #2169 slice 4, AC-28a — a `pending: true` row (the dispatch helper's pre-launch identity/liveness
+  // stamp, design decision 1) is NEVER terminal: it must never be counted as a completed role by the
+  // check/gate lanes, regardless of whichever other identity fields (dispatch/run_id/run_kind/run_source)
+  // ride along on the same stamp. Checked FIRST, before the subprocess-provenance arm, so this holds
+  // uniformly for every role/seat shape — never incidental on some OTHER field (e.g. a missing
+  // transcript_path) happening to also refuse it.
+  if (e && e.pending) {
+    return role + ' carries a pending:true stamp (an in-flight dispatch — the pre-launch identity/liveness ' +
+      'marker, not completed evidence) — wait for the atomic post-exit write that clears pending';
+  }
+  // #1947 M1/M2 — try the subprocess-openrouter arm FIRST. It returns null (not admissible for this row/SSOT
+  // state) for every ordinary Agent-tool-dispatched role, so this is a pure addition for everyone else.
+  const sub = checkSubprocessProvenance(role, e, session, task);
+  if (sub !== null) return sub || null;
+  const sk = classifySkip(e);
+  if (role === 'execution-review') {
+    if (sk.skip) {
+      return 'execution-review is NEVER inline-skippable (never grade your own homework) — it must resolve to a ' +
+        'real reviewer agentId OR an oracle:<path> that exists with a PASS token; "ran it inline myself" is not allowed';
+    }
+    // 2026-08-29 (R4, self-discovered during executor smoke-run — L1b): the oracle arm resolves a
+    // BARE DISK PATH with NO agentId requirement — the same "disk-only, self-authorable" shape
+    // --require-published-review exists to exclude (the plan's own ELI5: "A disk-only file still does
+    // NOT count"). It was already unconditional under --merge-head too (pre-existing #2480 scope,
+    // untouched here — L1a's oracle-via-merge-head allow stays byte-identical), but that was always
+    // reachable only via a DERIVABLE merge head; leg-3 being newly reachable with NO merge head at all
+    // (this task) would otherwise silently let a bare oracle file satisfy the stricter unbound mode too
+    // — reopening exactly the hole this flag closes. So: under requirePublishedReview, the oracle arm
+    // is INERT (falls through to the ordinary agentId + ref-arm path below, same as if e.oracle were
+    // unset) — an oracle row with no agentId then fails closed there, same shape as P2/P3.
+    if (e.oracle && !(opts && opts.requirePublishedReview)) {
+      const op = resolveArtifact(stripOraclePrefix(e.oracle));
+      if (!op) return 'execution-review oracle path "' + e.oracle + '" does not exist';
+      if (!fileHas(op, VERDICT_RE)) return 'execution-review oracle "' + op + '" lacks a PASS/verdict token';
+      // #1276: a PASS that asserts nothing is not a PASS. When the gate opts in (and the feature kill-switch
+      // is not set), reject a positively-vacuous oracle. The classifier fails OPEN, so this NEVER blocks on
+      // a parse error — only on a file proven to carry zero real-evidence lines.
+      if (opts && opts.rejectVacuousOracle && process.env.VACUOUS_ORACLE_OFF === '1') {
+        writeBypassLog('3role-ledger-execution-review-oracle', 'VACUOUS_ORACLE_OFF', 'PERMIT');
+      }
+      if (opts && opts.rejectVacuousOracle && process.env.VACUOUS_ORACLE_OFF !== '1' && isVacuousOracle(op)) {
+        return 'execution-review oracle "' + op + '" is vacuous — 0 real assertions (all-trivially-true / ' +
+          'bare-verdict / echo-only); a PASS that asserts nothing is not a PASS. Add a REAL check (an assert ' +
+          'command whose exit is the verdict, or a captured test-run summary with counts) OR name a real reviewer agentId';
+      }
+      return null;
+    }
+    if (!agentResolves(session, e.agentId)) {
+      return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
+    }
+    // #2480 O1 — when a merge head is known (opts.mergeHead truthy), the bare on-disk hit no longer
+    // satisfies THIS row: review evidence must be bound to the commit actually being merged, so only
+    // committed-tree resolution (the ref arm just below — the merge head, task-bound refs, or
+    // origin/master) counts. Scope is EXECUTION-REVIEW ONLY (planner/plan-review keep disk-first
+    // unconditionally — M5-control pins this). Absent a merge head this row stays BYTE-IDENTICAL to
+    // pre-#2480: the disk arm is still consulted first (scope exclusion 5 / AC-2).
+    // 2026-08-29 (additive): --require-published-review widens this SAME gate identically to a merge
+    // head — it also demands the ref-arm's PUBLISHED evidence instead of a disk-only artifact, but
+    // WITHOUT supplying a merge head, so the merge-head-gated candidate inside resolveArtifactAtRef
+    // stays inert (only the default-on task-bound-ref + origin/master candidates fire).
+    if (!(opts && (opts.mergeHead || opts.requirePublishedReview))) {
+      const ap = resolveArtifact(e.artifact_path);
+      if (ap) {
+        if (!fileHas(ap, VERDICT_RE)) return 'execution-review artifact "' + ap + '" lacks a verdict/PASS token';
+        return null;
+      }
+    }
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        if (content !== null && hasRefArmAffirmative(content)) return null;
+        return 'execution-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
+          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3 — ' +
+          'tolerates an optional column-0 markdown heading prefix and `**` bold decoration around the ' +
+          'keyword/value, but the value itself must still be affirmative)';
+      }
+    }
+    if (opts && opts.mergeHead) {
+      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" does not resolve at merge head ' +
+        opts.mergeHead + ' — the on-disk review evidence is not bound to the PR being merged (#2050 AC-1)' +
+        worktreeDangleHint(e.artifact_path);
+    }
+    // 2026-08-29 (additive, R2): --require-published-review's own distinct fallthrough message — a
+    // DIFFERENT code path from the merge-head-bound one above, so it needs its OWN wording (and the
+    // hook's remedy-trigger grep must key on it too — see enforce-review-or-lfah.sh).
+    if (opts && opts.requirePublishedReview) {
+      return 'execution-review artifact_path "' + (e.artifact_path || '') + '" is not published to an ' +
+        'origin/<task> ref (--require-published-review skips the disk-only arm; a disk-only artifact does ' +
+        'not count — publish the exec-review artifact to an ai-brain origin/<task> ref)' +
+        worktreeDangleHint(e.artifact_path);
+    }
+    return 'execution-review artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
+  }
+  // planner / plan-review / executor — inline-skippable with a SPECIFIC reason.
+  if (sk.skip) {
+    if (sk.ok) return null;
+    return role + ' ' + sk.err + ' — an inline-skip requires a SPECIFIC reason (the carve-out is for genuinely ' +
+      'inseparable-from-session-state work; "ran the ' + role + ' inline myself" is NOT a valid skip)';
+  }
+  if (!agentResolves(session, e.agentId)) {
+    return role + ' agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (' +
+      PROJECTS_ROOT + '/*/' + sanitize(session) + '/subagents/agent-' + (e.agentId || '') + '.jsonl) — forged or no ' +
+      'spawn happened; provide a real agentId OR an explicit inline-skip:<specific reason>';
+  }
+  if (role === 'planner') {
+    const ap = resolveArtifact(e.artifact_path);
+    if (ap) {
+      if (!fileHas(ap, PLAN_RE)) return 'planner artifact "' + ap + '" lacks a plan marker — needs a heading like ' +
+        '## ELI5, ### Binary AC, ## Binary acceptance criteria, ### Acceptance criteria, ## Acceptance, or ## AC';
+      return null;
+    }
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        if (content !== null && PLAN_RE.test(content)) return null;
+        return 'planner artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
+          ' (' + hit.repoDir + ') but its content lacks a plan marker';
+      }
+    }
+    return 'planner artifact_path "' + (e.artifact_path || '') + '" not found (the plan file)' +
+      worktreeDangleHint(e.artifact_path);
+  }
+  if (role === 'plan-review') {
+    const ap = resolveArtifact(e.artifact_path);
+    if (ap) {
+      if (!fileHas(ap, VERDICT_RE)) return 'plan-review artifact "' + ap + '" lacks a verdict token (PASS/FAIL/APPROVE/verdict/## Review)';
+      return null;
+    }
+    // #2088 ref-scoped arm — DEFAULT-ON (#2462 AC-1): always consulted, not gated on --merge-head. The
+    // merge-head candidate inside resolveArtifactAtRef only fires when opts.mergeHead is truthy; the
+    // task-bound-refs + origin/master candidate (in the helper's own home repo) fires regardless.
+    {
+      const hit = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        if (content !== null && hasRefArmAffirmative(content)) return null;
+        return 'plan-review artifact_path "' + (e.artifact_path || '') + '" resolved at ref ' + hit.ref +
+          ' (' + hit.repoDir + ') but its content lacks a flush-left affirmative Decision:/verdict line (W3 — ' +
+          'tolerates an optional column-0 markdown heading prefix and `**` bold decoration around the ' +
+          'keyword/value, but the value itself must still be affirmative)';
+      }
+    }
+    return 'plan-review artifact_path "' + (e.artifact_path || '') + '" not found' +
+      worktreeDangleHint(e.artifact_path);
+  }
+  // executor — artifact_path is a string (PR URL / commit / branch); existence on disk not required.
+  if (!e.artifact_path || String(e.artifact_path).trim() === '') {
+    return 'executor artifact_path missing (PR URL / commit / branch string)';
+  }
+  return null;
+}
+
+// ── #1509 Leg A — TRACKED, not merely present ────────────────────────────────────────────────────────────
+// The #861 class (6 recurrences): a reviewer's Bash cwd is the PRIMARY clone, not the PR worktree, so a
+// disk-path artifact lands present-but-untracked and never ships with the PR — yet today's `check` only
+// tests EXISTENCE (fileExists/resolveArtifact), which a present-but-untracked file passes. Leg A adds the
+// missing test: is the cited path actually git-tracked (or staged)? `git ls-files --error-unmatch` run with
+// `-C <the file's own containing directory>` so git auto-discovers whichever repo the artifact actually
+// lives in (works identically from the primary clone or any worktree). Exit 0 => tracked/staged => true;
+// exit 1 => a real "not known to git" verdict => false; any OTHER exit (128 not-a-repo, spawn error, missing
+// git binary) => can't-tell => null => the caller fails OPEN (never a false block on an environment hiccup —
+// mirrors every other can't-tell residual in this file).
+function isGitTracked(absPath) {
+  try {
+    const dir = path.dirname(absPath);
+    const res = spawnSync('git', ['-C', dir, 'ls-files', '--error-unmatch', '--', absPath], { encoding: 'utf8' });
+    if (res.error) return null;
+    if (res.status === 0) return true;
+    if (res.status === 1) return false;
+    return null;   // 128 (not a repo) or anything unexpected -> can't-tell -> fail-open.
+  } catch (e) { return null; }
+}
+
+// The three roles whose artifact is a disk path (planner, plan-review, execution-review) — Leg A is
+// role-keyed HARD on exactly these; executor is exempt BY ROLE (its legitimate artifact is a PR URL / sha /
+// branch string), never by guessing at the value's shape.
+const TRACKED_ROLES = ['planner', 'plan-review', 'execution-review'];
+
+// ── #1544 — perf-log jurisdiction key (ai-brain-toplevel membership) ───────────────────────────────────────
+// `isGitTracked(perfLog) === false` alone is jurisdiction-BLIND: it fires for an untracked file inside ANY
+// real git repo, not only ai-brain (verified 2026-07-17 — a hermetic `git init` temp dir + untracked file
+// also returns `false`). Blocking on that would be a false-BLOCKER (the one error class with no reviewer) for
+// a perf-log that legitimately lives in a DIFFERENT repo (the template's real home,
+// `~/.claude/agent-working-memory/...`, is NOT a git worktree at all — non-repo -> null -> already fail-open;
+// but a sibling git-tracked working-memory clone, or any other real repo, is NOT automatically safe without
+// this key). The fix: key the block on ai-brain-repo TOPLEVEL MEMBERSHIP, not bare tracked-ness.
+
+// Resolve the ai-brain toplevel from THIS ledger file's own resolved location (symlink-aware — reuses
+// selfDir()'s realpathSync trick so a ~/.claude/hooks/3role-ledger.mjs symlink install still resolves to the
+// real repo, not the dangling ~/.claude/hooks dir). Memoized (git spawnSync is not free); null when this
+// file itself somehow isn't inside a git repo (can't-tell -> every jurisdiction check below fails open).
+let _aiBrainToplevelCache;
+function aiBrainToplevel() {
+  if (_aiBrainToplevelCache !== undefined) return _aiBrainToplevelCache;
+  try {
+    const res = spawnSync('git', ['-C', selfDir(), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    _aiBrainToplevelCache = (res.status === 0) ? (res.stdout || '').trim() : null;
+  } catch (e) { _aiBrainToplevelCache = null; }
+  return _aiBrainToplevelCache;
+}
+
+// Resolve the git toplevel containing absPath's directory. null when absPath is not inside any real git repo
+// (exit 128), or on any spawn error / unexpected exit — the SAME can't-tell -> fail-open contract as
+// isGitTracked() above (never a false block on an environment hiccup).
+function repoToplevelFor(absPath) {
+  try {
+    const res = spawnSync('git', ['-C', path.dirname(absPath), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    return (res.status === 0) ? (res.stdout || '').trim() : null;
+  } catch (e) { return null; }
+}
+
+// ── #2088 — check-time-ONLY, ref-scoped resolution arm (DEFAULT-ON as of #2462) ───────────────────────────
+// `check` teaches the checker ONE more place to look for a role artifact that fails today's plain
+// filesystem resolution: committed git evidence at a BOUNDED set of candidate refs — never the object
+// store at large, never a push, never network I/O. `--merge-head <ref-or-sha>`, when passed, additionally
+// widens the candidate set with the current merge head; it is no longer REQUIRED to activate this arm
+// (#2462 AC-1 — plain `check` with no flags now consults refs/remotes/origin/<task>-* + origin/master too).
+// See the #2088 plan's "§The bounded ref set" for the full rationale (W1-W7 are the hard constraints this
+// code must never violate — still honored) and the #2462 plan for the default-on decision; this block is
+// the mechanical half.
+
+// planner-home-absolute-artifact-path-blocks-merge-gate-at-ship — resolve the NEAREST EXISTING ancestor
+// directory's realpath, then reattach whatever tail we had to strip to get there. Unlike a flat
+// fs.realpathSync(p), this tolerates p naming a file that does not physically exist on THIS disk (the
+// exact shape of a role artifact committed only on a task branch, never checked out here) — it only needs
+// SOME ancestor (in practice, the checkout root itself, which always exists) to be real. On any total
+// failure (e.g. p is not under any real directory at all) falls back to p unchanged — can't-tell -> no
+// normalization, never a crash.
+function realpathNearest(p) {
+  let cur = p;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      return real + p.slice(cur.length);
+    } catch (e) {
+      const parent = path.dirname(cur);
+      if (parent === cur) return p;   // hit the filesystem root without finding a real ancestor -> give up.
+      cur = parent;
+    }
+  }
+}
+
+// planner-home-absolute-artifact-path-blocks-merge-gate-at-ship — every checkout root git itself reports
+// for the SAME repository as repoDir: the main worktree AND every linked worktree (`git worktree list
+// --porcelain`, scoped to repoDir's own repo only — bounded, local, zero network, never a filesystem scan
+// or a name-pattern glob — NR-4). This is what lets a primary-clone-anchored (or any-other-checkout-
+// anchored) absolute/`~` artifact path resolve from whichever checkout `check` happens to run from. Falls
+// back to `[repoDir]` alone (today's narrower behavior) on any spawn trouble — can't-tell -> narrowest,
+// never a false-widen. Memoized per repoDir (git spawnSync is not free, and this is on the per-candidate
+// hot path).
+const _checkoutRootsCache = new Map();
+function checkoutRootsFor(repoDir) {
+  if (!repoDir) return [];
+  if (_checkoutRootsCache.has(repoDir)) return _checkoutRootsCache.get(repoDir);
+  let roots = [repoDir];
+  try {
+    const res = spawnSync('git', ['-C', repoDir, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' });
+    if (res.status === 0) {
+      const found = [];
+      for (const line of (res.stdout || '').split('\n')) {
+        const m = line.match(/^worktree\s+(.+)$/);
+        if (m) found.push(m[1].trim());
+      }
+      if (found.length) roots = found;
+    }
+  } catch (e) { /* fail-open: [repoDir] alone */ }
+  _checkoutRootsCache.set(repoDir, roots);
+  return roots;
+}
+
+// ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R2) — the PRIMARY root of
+// repoDir's repo family: git's documented ordering guarantees `git worktree list --porcelain` lists the
+// main worktree FIRST, and checkoutRootsFor() already parses that list — so the first entry IS the primary,
+// cwd-independent (the running helper's own repoDir may itself be a linked worktree; the family list is the
+// same regardless of which member queried it). Falls back to repoDir itself on any spawn trouble
+// (checkoutRootsFor's own can't-tell -> narrowest fallback already applies).
+function primaryRootFor(repoDir) {
+  const roots = checkoutRootsFor(repoDir);
+  return (roots && roots.length) ? roots[0] : repoDir;
+}
+
+// Strip a `<prefix><one-segment>/<tail>` shape from absReal when absReal starts with prefix; returns the
+// tail, or '' when absReal does not start with prefix OR there is no `/`-terminated one-segment component
+// after it (a bare `<prefix>` with nothing following, or `<prefix>` immediately followed by `/`, never
+// yields a candidate — R2's AC-R2-3 block arm: the strip maps a path, it never invents one).
+function stripOneSegmentPrefix(absReal, prefix) {
+  if (!absReal.startsWith(prefix)) return '';
+  const rest = absReal.slice(prefix.length);
+  const slashIdx = rest.indexOf('/');
+  return slashIdx > 0 ? rest.slice(slashIdx + 1) : '';
+}
+
+// #2023 dangle-class normalizer: derive a REPO-RELATIVE candidate path for a git `<ref>:<path>` lookup
+// inside repoDir. Strips a `.claude/worktrees/<slug>/` subtree prefix wherever it appears FIRST (a
+// worktree's git-tracked files use the SAME relative paths as the main repo, so the true repo-relative
+// tail is whatever follows that segment — this ordering is load-bearing: it pre-empts the nested-worktree
+// case below ever seeing a `.claude/worktrees/<slug>/…` path, so a P-anchored `~/…/.claude/worktrees/
+// <slug>/…` absolutized worktree path keeps resolving via THIS arm, never the checkout-root arm — named
+// risk rowc-reorder-regression-planrev-r1) and, failing that, strips an absolute/`~/`-expanded path's
+// prefix against ANY checkout root git reports for repoDir's own repository (planner-home-absolute-
+// artifact-path-blocks-merge-gate-at-ship — not only repoDir itself, so a path anchored at a DIFFERENT
+// checkout of the SAME repo still resolves) WHEN `widen` is true. Both sides are realpath-normalized
+// before comparison (via realpathNearest) so a symlinked root (macOS `/var` -> `/private/var`) can never
+// silently defeat the prefix match. Returns '' when the path cannot be made relative to ANY of repoDir's
+// own checkouts (e.g. it plainly points at a different repo) — the caller treats '' as "no candidate in
+// this repo", never as an error. The candidate root set stays bounded to THIS repo (checkoutRootsFor) — a
+// cross-repo path never resolves here, by construction.
+//
+// `widen` (default true) is a DELIBERATE per-call-site scope limit, not a general on/off knob: it is
+// FALSE only at call sites that resolve a raw `process.cwd()` against a CALLER-SUPPLIED --merge-head sha
+// with no independent task binding (resolveArtifactAtRef's merge-head candidate, rowIsAddedByPr,
+// resolveSessionScanForCheck) — there, widening the checkout-root set would let an artifact_path typed at
+// ANY sibling checkout of the SAME repo match ANY caller-passed sha, eroding the layout-independence
+// guarantee hooks/3role-ledger-execreview-artifact-shape-smoke-test.sh's D2 discriminator (AC-6
+// RED-first power) exists to prove — a real regression caught live by this ticket's own AC-6, not a
+// theoretical one. It stays TRUE (the fix) at the task/origin-ref-bound candidate inside
+// resolveArtifactAtRef (aiBrainToplevel()'s repoDir, checked only against refs/remotes/origin/<task>(-*)
+// and origin/master via candidateTaskRefs — task-scoped, not an arbitrary caller sha) — which is the ONLY
+// candidate the real incident (hand-run `check` from a worktree, helper=worktree) actually needed widened;
+// the probe table's "cwd=WT, helper=PRIMARY" cell already resolved pre-fix via this exact candidate,
+// confirming the narrower scope is sufficient, not merely convenient.
+function repoRelativeCandidate(rawPath, repoDir, widen) {
+  const p = String(rawPath == null ? '' : rawPath).trim();
+  if (!p) return '';
+  const wt = p.match(/(?:^|\/)\.claude\/worktrees\/[^/]+\/(.+)$/);
+  if (wt) return wt[1];
+  let abs = p;
+  if (abs.startsWith('~/')) abs = path.join(HOME, abs.slice(2));
+  if (path.isAbsolute(abs)) {
+    if (!repoDir) return '';
+    if (widen === false) {
+      const root = repoDir.replace(/\/+$/, '') + '/';
+      return abs.startsWith(root) ? abs.slice(root.length) : '';
+    }
+    const absReal = realpathNearest(abs);
+
+    // ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R2) — fold round 2
+    // B1: bucket 1 (segment-strip, BEFORE the checkout-root loop below) — the NESTED `.worktrees/<slug>/`
+    // shape, anchored at the git-reported PRIMARY root's own absolute realpath (never a bare `.worktrees/`
+    // segment match — AC-R2-2(e)). This MUST run before the checkout-root loop: a `<primary>/.worktrees/
+    // <slug>/…` path lies UNDER the primary root P, so the loop below would otherwise match P first and
+    // return the WRONG non-repo-relative tail `.worktrees/<slug>/…` (a strip placed after the loop is dead
+    // code for this shape — plan-review round-1 measurement, NR-7). Reached only at this widen===true
+    // (task-bound) arm — see the `widen` doc above; NEVER at the widen===false merge-head arm, which
+    // already returned above.
+    const primary = primaryRootFor(repoDir);
+    if (primary) {
+      const primaryReal = realpathNearest(primary).replace(/\/+$/, '');
+      const nestedRel = stripOneSegmentPrefix(absReal, primaryReal + '/.worktrees/');
+      if (nestedRel) return nestedRel;
+    }
+
+    // Bucket 2 — the #1616 live-checkout-root loop, unchanged.
+    for (const root of checkoutRootsFor(repoDir)) {
+      const rootReal = realpathNearest(root).replace(/\/+$/, '') + '/';
+      if (absReal.startsWith(rootReal)) return absReal.slice(rootReal.length);
+    }
+
+    // Bucket 3 — AFTER the loop misses: the two SIBLING shapes only, which genuinely lie OUTSIDE P (so the
+    // loop above never claims them, alive or quarantined; a trailing-slash prefix test cannot confuse
+    // `<name>/` with `<name>-wt-…`/`<name>-wt/…`). Bounded to the primary's own name + parent — never a
+    // hard-coded `ai-brain` literal, never a directory scan or glob (NR-4).
+    if (primary) {
+      const primaryReal = realpathNearest(primary).replace(/\/+$/, '');
+      const parent = path.dirname(primaryReal);
+      const base = path.basename(primaryReal);
+      const dashRel = stripOneSegmentPrefix(absReal, parent + '/' + base + '-wt-');
+      if (dashRel) return dashRel;
+      const slashRel = stripOneSegmentPrefix(absReal, parent + '/' + base + '-wt/');
+      if (slashRel) return slashRel;
+    }
+
+    return '';
+  }
+  return p;   // already repo-relative.
+}
+
+// Does `<ref>:<relPath>` exist as a blob in repoDir, right now, with ZERO network I/O (a local `git cat-file`
+// plumbing read — no fetch, no push, no remote contact)? Boolean only; any spawn trouble is false (this
+// candidate doesn't resolve here — the caller's remaining candidates, or the disk arm, still get their turn).
+function refHasBlob(repoDir, ref, relPath) {
+  if (!repoDir || !ref || !relPath) return false;
+  try {
+    const res = spawnSync('git', ['-C', repoDir, 'cat-file', '-e', ref + ':' + relPath], { encoding: 'utf8' });
+    return res.status === 0;
+  } catch (e) { return false; }
+}
+
+// Read `<ref>:<relPath>`'s blob content (W2 — content is read AT THE REF, never existence-at-ref paired with
+// content-from-disk). null on any failure.
+function readBlobAtRef(repoDir, ref, relPath) {
+  if (!repoDir || !ref || !relPath) return null;
+  try {
+    const res = spawnSync('git', ['-C', repoDir, 'show', ref + ':' + relPath], { encoding: 'utf8' });
+    return (res.status === 0) ? (res.stdout || '') : null;
+  } catch (e) { return null; }
+}
+
+// Candidate 2's ref set, in repoDir (the RUNNING HELPER's own home repo — see aiBrainToplevel() and the
+// plan's "which helper copy runs" contract): refs/remotes/origin/<task> (task-EXACT, #2497) +
+// refs/remotes/origin/<task>-* — the LOCAL MIRROR namespace ONLY (refs/heads/ is deliberately never
+// consulted, r1 N3 / r2 B1-R2) — plus origin/master (an already-shipped artifact). No network I/O:
+// for-each-ref reads whatever is ALREADY in the local ref store, however it got there (a real fetch from
+// origin, `git update-ref`, or `git fetch .` all look identical here — see the plan's §residual for why
+// that is an accepted, pinned gap, not a defect of this function).
+//
+// #2497: the dash-glob `<task>-*` alone structurally EXCLUDES a branch named EXACTLY `<task>` (the glob
+// demands a trailing `-` + >=1 char) — so a PR whose head branch is exactly the task id (no slug suffix)
+// had NO task-bound candidate here at all. Fix is the minimal bounded addition below: the task-EXACT ref
+// `refs/remotes/origin/<task>` (a literal ref name, never a glob) is pushed as one more candidate, derived
+// solely from sanitize(task) — the ledger row's own key, never a caller-supplied free ref. Never widened to
+// a bare `<task>*` glob (that would leak a sibling task's ref, e.g. task `700` matching `7001-x`); the exact
+// literal name matches ONLY the ref of that exact name (git ref matching is complete-component, not glob).
+function candidateTaskRefs(repoDir, task) {
+  const refs = [];
+  const t = sanitize(task);
+  if (repoDir && t) {
+    refs.push('refs/remotes/origin/' + t);
+    try {
+      const res = spawnSync('git', ['-C', repoDir, 'for-each-ref', '--format=%(refname)',
+        'refs/remotes/origin/' + t + '-*'], { encoding: 'utf8' });
+      if (res.status === 0) {
+        for (const line of (res.stdout || '').split('\n')) {
+          const l = line.trim();
+          if (l) refs.push(l);
+        }
+      }
+    } catch (e) { /* fail-open: no task-bound candidates found here */ }
+  }
+  refs.push('refs/remotes/origin/master');
+  return refs;
+}
+
+// Orchestrates the two candidate containers (§The bounded ref set): (1) the merge head, in the repo `check`
+// runs from — "does this artifact ship with the thing being merged?" — consulted ONLY when a mergeHead was
+// actually passed (there is no meaningful cwd-repo-at-mergeHead candidate without one); (2) task-bound refs
+// (+ origin/master) in the running helper's OWN home repo — the cross-repo / plugin-sync-ordering case,
+// consulted UNCONDITIONALLY (#2462 AC-1 default-on: this candidate never depended on mergeHead's value even
+// under #2088 — candidateTaskRefs() never reads it). Returns {ref, repoDir, relPath} for the FIRST candidate
+// whose blob exists, or null (no candidate resolves — the caller falls through to its existing "not found"
+// problem). No ref outside this bounded set is ever consulted.
+// #3325: container (2)'s repo set widens to the SAME bounded pair sizeSExempt uses when a caller that knows
+// the ledger session passes it (optional 4th arg — every pre-#3325 call shape keeps today's exact
+// behavior): the home repo (first, unchanged) plus the TICKET'S OWN repo (ticketRepoDirFor(session, task) —
+// exactly one named sibling, never a scan), each at its own task-bound ref set. Without a session the
+// consulted set is the home repo alone, byte-identical to pre-#3325.
+function resolveArtifactAtRef(rawPath, mergeHead, task, session) {
+  if (!rawPath) return null;
+  if (mergeHead) {
+    const cwdRepo = process.cwd();
+    const cwdRel = repoRelativeCandidate(rawPath, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound (see repoRelativeCandidate's `widen` doc).
+    if (cwdRel && refHasBlob(cwdRepo, mergeHead, cwdRel)) {
+      return { ref: mergeHead, repoDir: cwdRepo, relPath: cwdRel };
+    }
+  }
+  const homeRepo = aiBrainToplevel();
+  const homeReal = homeRepo ? realpathNearest(homeRepo).replace(/\/+$/, '') : '';
+  const tRepo = session !== undefined ? ticketRepoDirFor(session, task) : '';
+  const repos = [];
+  if (homeRepo) repos.push(homeRepo);
+  if (tRepo && tRepo !== homeRepo && tRepo !== homeReal) repos.push(tRepo);
+  for (const repo of repos) {
+    const rel = repoRelativeCandidate(rawPath, repo);
+    if (!rel) continue;
+    for (const ref of candidateTaskRefs(repo, task)) {
+      if (refHasBlob(repo, ref, rel)) return { ref, repoDir: repo, relPath: rel };
+    }
+  }
+  return null;
+}
+
+// W3 — the ref arm's STRICTER content bar for review roles: a FLUSH-LEFT (column-0, no leading whitespace —
+// the same discipline a line-anchored `^` gate needs to resist a quoted/indented impersonation; see AC-8)
+// affirmative Decision:/verdict line whose value is in CHECK_LANE_AFFIRMATIVE (PASS / PASS-WITH-FIXES /
+// APPROVE family) — never the broad legacy VERDICT_RE, which the bare substring "FAIL" or a lone "## Review"
+// heading would already satisfy.
+// #2437: the flush-left bar now tolerates ordinary markdown a human reviewer writes AROUND the verdict —
+// an optional emphasis-wrapping `**` at column 0 (`**Decision: PASS**`), closing decoration between the
+// keyword and its colon (`**Decision**: PASS`), and/or ONE bounded parenthetical qualifier immediately after
+// the keyword (`Decision (final): PASS` — a single non-nesting `(...)` group, so arbitrary prose still fails
+// to match). Composable (`**Decision (final)**: PASS`), never applied to the VALUE itself — the capture group
+// still reads only `[A-Za-z-]+` after the colon, so a decorated FAIL (`**Decision: FAIL**`) still fails
+// CHECK_LANE_AFFIRMATIVE membership (AC-8's value-blind trap) and quoted/indented/prose-led lines still never
+// match at column 0 (impersonation resistance unchanged).
+// #2462 AC-1b: ONE additional enumerated shape -- an optional column-0 markdown ATX heading prefix
+// (`#{1,6}` + required whitespace) immediately before the Decision/verdict keyword -- the repo's own
+// convention (real 2318 blobs open `## Decision: PASS`; P10). Still column-0-anchored (the `#` itself must
+// be the very first character of the line -- no leading whitespace before it, so `> ## Decision: PASS` and
+// `  ## Decision: PASS` still fail the anchor) and still never applied to the VALUE -- a decorated-and-headed
+// FAIL still fails CHECK_LANE_AFFIRMATIVE. A quoted/fenced decision line that does NOT begin the line with
+// `#`/`*`/the bare keyword (e.g. a backtick-wrapped inline-code quotation, `` `## Decision: PASS` ``) still
+// never matches -- the backtick is the first character consumed by `^` and satisfies none of the three
+// leading alternatives (r1/N7, pinned in hooks/_fixtures/2437-line-anchored-receipt-vectors.tsv).
+// ledger-w3-accept-heading-decision-line (2026-08-27): the ticket's "heading is refused" premise was STALE
+// (heading tolerance already shipped above, #2462 AC-1b) -- the REAL gap was the post-colon VALUE: a bold-
+// wrapped verdict word (`## Decision: **PASS**`, the exact incident line) still failed on master because of
+// the `**` around PASS, not the `##`. The post-colon tail now ALSO tolerates up to two bounded `\*{0,2}` star
+// runs around the value -- `Decision: **PASS**`, `**Decision:** PASS`, and the composed
+// `## **Decision:** **PASS**` (bolded keyword's closing `**` + bolded value's opening `**`, needs BOTH slots)
+// all now match. Still accept-only: the star runs stay `{0,2}` (bounded, never `+`/unbounded -- `Decision: ***
+// PASS` still fails to match), and the capture group is UNCHANGED (`[A-Za-z-]+` immediately after the star
+// slots) -- a decorated NEEDS-WORK/FAIL/REJECT still fails CHECK_LANE_AFFIRMATIVE membership no matter how it
+// is starred. Named accept-side-only risk (carried from plan-review, not a ship-gate hole): a few malformed-
+// but-affirmative forms also now match -- `Decision: * PASS` (single star), unbalanced `Decision: **PASS`,
+// inner-spaced `Decision: ** PASS **` -- but the SAME decorations on a NEGATIVE value still reject, so no
+// negative verdict can ever satisfy W3 through this widening.
+//
+// review-seat-publish-verdict backstop (task plan-review-seat-leaves-verdict-uncommitted-in-worktree-
+// blocking-w3-gate, named-risk note backstop-regex-sourced-from-helper): the SubagentStop backstop hook
+// (hooks/review-verdict-published-backstop.sh) needs a VALUE-AGNOSTIC sibling of hasRefArmAffirmative below
+// -- "does this content carry a flush-left Decision:/verdict: line AT ALL" (a published FAIL still counts
+// as published; Constraint C1) -- and it must never hand-type its own copy of the line grammar (a second
+// regex that could silently drift from this one, exactly the class this backstop exists to prevent).
+// hasRefArmAffirmative and hasRefArmDecisionLine both build their RegExp from this ONE source string, so
+// they structurally cannot diverge.
+// #2911 EOL anchor (mirrors the dispatcher's extract_reviewed_verdict() grammar -- kept in sync by hand):
+// the captured token counts ONLY when the next non-whitespace character after it is end-of-line (trailing
+// spaces before EOL allowed), one of ( [ - — – : ; , . (then the rest of the line is prose commentary), or
+// an asterisk run that is itself followed only by whitespace then EOL (a CLOSING bold, `PASS**`). A token
+// followed by a bare word (`verdict: pass the buck`, `Decision: PASS with fixes noted below`,
+// `**Decision: PASS** is what I would say`) is a prose sentence, not a verdict: hasRefArmAffirmative and
+// hasRefArmDecisionLine must both refuse it, so the W3 ref arm and the publish backstop cannot be
+// satisfied by prose. Decorated forms (`## **Decision (final)**: PASS`, `**Decision:** PASS`,
+// `### Decision: **APPROVE**`) keep matching.
+// #2911 r2 F1 (no backtracking, mirrors the dispatcher's declRe -- kept in sync by hand): the
+// `(?![A-Za-z-])` lookahead right after the capture forces the WHOLE word. Without it the engine could
+// give a hyphenated word back to an inner hyphen and treat that hyphen as the punctuation tail, so
+// `Decision: PASS-pending CI, see below` was affirmative via an invented `PASS`. A hyphen attached to
+// the word is part of the word (`PASS-W-FOLLOWUPS` at EOL still matches whole); a hyphen DETACHED by a
+// space is still a valid tail (`NEEDS-WORK - notes`).
+// #2911 r3 R2-F1 (mirrors the dispatcher's declRe -- kept in sync by hand): a closing EMPHASIS run
+// (asterisks or underscores) followed by a punctuation tail is now a VALID line (closing emphasis only
+// counted at end-of-line before), so `**Decision: FAIL** — two blockers remain` is value-driven instead
+// of invisible. A HYPHEN right after the closing run counts only when DETACHED (whitespace between run
+// and hyphen), so `**Verdict: APPROVE**-ish` cannot satisfy the W3 ref arm via a prefix through the
+// emphasis (the r2 whole-word rule re-asserted across the emphasis boundary).
+const DECISION_LINE_SOURCE =
+  '^(?:#{1,6}[ \\t]+)?(?:\\*{0,2}|_{0,2})(?:Decision|verdict)(?:\\*{0,2}|_{0,2})(?:\\s*\\([^()]*\\))?(?:\\*{0,2}|_{0,2})\\s*:\\s*(?:\\*{0,2}|_{0,2})\\s*(?:\\*{0,2}|_{0,2})([A-Za-z-]+)(?![A-Za-z-])(?:[ \\t]*$|[ \\t]*[(\\[\\-—–:;,.]|(?:\\*+|_+)[ \\t]*(?:$|[(\\[—–:;,.]|[ \\t]\\-))';
+function hasRefArmAffirmative(content) {
+  const s = String(content == null ? '' : content);
+  const re = new RegExp(DECISION_LINE_SOURCE, 'gim');
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (CHECK_LANE_AFFIRMATIVE.has(String(m[1]).toUpperCase())) return true;
+  }
+  return false;
+}
+// Value-agnostic sibling (see DECISION_LINE_SOURCE comment above): true iff content carries a flush-left
+// Decision:/verdict: line matching the SAME grammar, regardless of the captured value -- "the seat
+// published SOMETHING" vs "the seat published an AFFIRMATIVE something". Never consumed by
+// checkRole()/cmdCheck() (this plan's scope explicitly leaves `check`'s pass/fail semantics untouched) --
+// consumed only by cmdResolvePublishedVerdict below, which the backstop hook shells out to.
+function hasRefArmDecisionLine(content) {
+  const s = String(content == null ? '' : content);
+  const re = new RegExp(DECISION_LINE_SOURCE, 'gim');
+  return re.test(s);
+}
+
+// The #1544 perf-log tracked-check. Returns null when satisfied (out of jurisdiction, can't-tell, or
+// genuinely tracked/staged), else a "TRACKED:"-caller-prefixed problem string (the caller adds the prefix,
+// mirroring checkTrackedRole()'s contract). BLOCKS only when perfLogPath resolves to a file whose containing
+// repo's toplevel EQUALS the ai-brain toplevel (jurisdiction) AND that file is untracked. Every other
+// outcome — a different real repo, a non-repo path, an unresolvable path, or this ledger's own toplevel
+// being undeterminable — fails OPEN by design (#1544 BLOCKER 1 fix; see the doc comment above TRACKED_ROLES).
+function checkPerfLogTracked(perfLogPath) {
+  if (!perfLogPath) return null;
+  const abTop = aiBrainToplevel();
+  if (!abTop) return null;                          // can't determine our own jurisdiction -> fail open.
+  const fileTop = repoToplevelFor(perfLogPath);
+  if (!fileTop || fileTop !== abTop) return null;    // different repo / non-repo / unresolvable -> OUT of jurisdiction.
+  if (isGitTracked(perfLogPath) === false) {
+    return 'perf-log "' + perfLogPath + '" exists on disk inside the ai-brain repo but is NOT git-tracked ' +
+      '(present-but-untracked — it will never ship with the PR; the #1544 class, the same #861/#1509 leak one ' +
+      'surface over). git add + commit it (from a Rule-12 worktree), then re-complete.';
+  }
+  return null;   // tracked, staged, or can't-tell -> satisfied.
+}
+
+// Resolve the disk path Leg A should tracked-check for one of the TRACKED_ROLES entry, mirroring exactly
+// what checkRole() already resolves for that role (oracle wins for execution-review, else artifact_path).
+// Returns '' when there is no resolvable on-disk path for this role (nothing for Leg A to check — the base
+// existence leg already reports that as its own problem; Leg A never duplicates it).
+function resolveDiskPathForRole(role, e) {
+  if (role === 'execution-review') {
+    if (e.oracle) return resolveArtifact(stripOraclePrefix(e.oracle));
+    if (e.artifact_path) return resolveArtifact(e.artifact_path);
+    return '';
+  }
+  return resolveArtifact(e.artifact_path || '');
+}
+
+// Leg A per-role check. Returns null when satisfied (not a TRACKED_ROLES role, inline-skipped, no resolvable
+// disk path, or genuinely tracked/can't-tell), else a "TRACKED:"-prefixed problem string.
+function checkTrackedRole(role, e) {
+  if (!TRACKED_ROLES.includes(role)) return null;   // executor exemption + non-disk-path roles.
+  if (classifySkip(e).skip) return null;             // inline-skip has no artifact to tracked-check.
+  const ap = resolveDiskPathForRole(role, e);
+  if (!ap) return null;                              // no resolvable disk path -> the existence leg's problem, not Leg A's.
+  if (isGitTracked(ap) === false) {
+    return role + ' artifact "' + ap + '" exists on disk but is NOT git-tracked (present-but-untracked — it ' +
+      'will never ship with the PR; the #861/#1509 class, 6 recurrences). git add + commit it (from a Rule-12 ' +
+      'worktree), then re-complete.';
+  }
+  return null;   // tracked, staged, or can't-tell (fail-open) -> satisfied.
+}
+
+// ── #1537 — artifact PRIVACY scan over the SHIPPED, git-tracked 3-role artifacts ──────────────────────────
+// Sibling of Leg A directly above: Leg A proves the cited artifact is git-TRACKED; this leg proves that
+// TRACKED artifact's own PROSE is CLEAN of all FOUR regulated token classes (home-path / email / brand-
+// regulated / credential-secret — #1588: an artifact's OWN privacy-report table can itself quote the token).
+// Re-based (#1660 SL-10, design surface S-6) formally onto the #1660 SL-3 ENGINE CONTRACT: this leg never
+// lists or re-types its own class set — it shells out to the canonical `scripts/privacy-scan.sh --working
+// <path>` (count-based, fail-CLOSED, never echoes the matched bytes), which OWNS the four-class registry (see
+// that script's own header) and scans all four unconditionally on every `--working` invocation. Because the
+// class set lives ONLY in the engine, this leg (and its bash caller below) inherit any future class the
+// engine adds with ZERO code change here — KEEP the delegation, never reimplement scanning. Reuses the SAME
+// resolveDiskPathForRole() Leg A already computes (one resolution site, no re-typed regex). The scanner's OWN
+// absolute path is resolved ONCE by the BASH caller (which already presence-guards it for the ai-brain-only /
+// plugin-dormant discipline — and REFUSES rather than silently skipping when the scanner is tracked-but-
+// missing-on-disk, the #2401 S2 sparse-checkout-omission case, distinct from a genuine plugin-dormant install
+// where scripts/ was never tracked at all) and passed in via the PRIVACY_SCAN_BIN env var — this file never
+// hardcodes or re-derives that path.
+const PRIVACY_ROLES = TRACKED_ROLES;   // the same three disk-path roles Leg A already tracked-checks.
+
+// Run the canonical scanner over one resolved artifact path. Returns null when CLEAN (rc 0); otherwise a
+// count-only detail string covering BOTH "dirty" (scanner rc 1, its own count-summary stderr) and "can't-tell"
+// (scanner rc >=2 / spawn error) — #1266's fail-CLOSED discipline means BOTH outcomes BLOCK here, never wave
+// through a scan that could not run. NEVER reads or re-prints the artifact's own content — only the scanner's
+// own count-only stderr is captured.
+function scanArtifactPrivacy(absPath, scannerBin) {
+  const res = spawnSync(scannerBin, ['--working', absPath], {
+    encoding: 'utf8',
+    cwd: process.env.PRIVACY_SCAN_CWD || undefined,   // test-only isolation seam (#1537 AC6 email-source mutation); unset in production -> inherits the real process cwd (the primary clone), so `git config user.email` reads the REAL operator config there.
+  });
+  if (res.error) return 'privacy-scan could not run (' + res.error.message + ') — fail-closed, refusing to report clean';
+  if (res.status === 0) return null;
+  return (res.stderr || '').trim() || ('privacy-scan exited ' + res.status + ' with no detail — fail-closed');
+}
+
+// #1509 — the executor-cites-a-disk-path SURFACED NOTE (never a hard block; the #1494 shape). A measured
+// sweep of 246 real ledgers found executor==planner in 62 of them (a live, coexisting, doctrine-sanctioned
+// convention alongside the newer PR-URL citation) — so artifact_path alone cannot distinguish #1494's
+// mis-citation from those 62 shipped chains; that discrimination needs KIND/authorship inference, which is
+// #1532's own scope. This just makes the signal VISIBLE instead of silently dropped.
+function executorDiskPathNote(e) {
+  if (!e) return null;
+  const raw = String(e.artifact_path == null ? '' : e.artifact_path).trim();
+  if (!raw) return null;
+  const ap = resolveArtifact(raw);
+  if (!ap) return null;   // not an existing disk path (PR URL / branch / sha) -> nothing to surface.
+  return 'executor artifact_path "' + raw + '" resolves to a DISK PATH (' + ap + ') rather than a PR/commit/' +
+    'branch reference (the #1494 shape) — lower-fidelity, not blocked; kind/authorship verification is #1532.';
+}
+
+// #1532 — executor artifact-KIND leg. Returns null when satisfied (not an executor row, inline-skipped,
+// missing artifact_path — the base existence leg already reports those — or a ship reference / a
+// disk-resolving-but-non-plan-kind artifact), else a problem string. See the `check --enforce-artifact-
+// role-kind` doc comment above for the full discrimination + the hard-constraint safety property.
+function executorKindProblem(byRole) {
+  const e = byRole['executor'];
+  if (!e) return null;                              // missing-role already reported by the base existence leg.
+  if (classifySkip(e).skip) return null;             // inline-skip has no artifact to KIND-check.
+  const raw = String(e.artifact_path == null ? '' : e.artifact_path).trim();
+  if (!raw) return null;                             // base existence leg already reports this.
+  const ap = resolveArtifact(raw);
+  if (!ap) return null;                              // NOT an existing disk path -> a PR-URL/commit/branch
+                                                      // ship reference -> the hard constraint: never touched.
+  const plannerRow = byRole['planner'];
+  const plannerRaw = plannerRow ? String(plannerRow.artifact_path == null ? '' : plannerRow.artifact_path).trim() : '';
+  const plannerPath = plannerRaw ? resolveArtifact(plannerRaw) : '';
+  const sameAsPlanner = !!plannerPath && ap === plannerPath;          // predicate (a) — the exact #1494 shape.
+  const onPlansSegment = /(^|\/)\.ai-workspace\/plans\//.test(ap);    // predicate (b) — any other plan-kind doc.
+  if (!sameAsPlanner && !onPlansSegment) return null;   // disk-resolving but NOT plan-kind -> AC-4 pass.
+  const why = sameAsPlanner
+    ? 'equals the planner\'s own artifact_path (the exact #1494 shape — the executor re-cited the planner\'s ' +
+      'plan file instead of citing its own ship reference)'
+    : 'lies on a /.ai-workspace/plans/ path segment (a plan-kind document, not a ship reference)';
+  return 'executor artifact_path "' + raw + '" resolves to a DISK PATH (' + ap + ') that ' + why + '. An ' +
+    'executor\'s real artifact is a PR URL / commit sha / branch — never a plan document; cite the actual PR/commit.';
+}
+
+// ── #2496 — check-time-ONLY, in-session SIBLING-TOKEN resolution arm (merge-head-gated) ──────────────────
+// `check --task <T> --merge-head <sha>` sometimes finds `<T>.jsonl` absent, or present but missing one or
+// more REQUIRED_ROLES rows, even though the REAL 4-role review chain ran and closed under a longer,
+// sibling token in the SAME session (a multi-slice epic files its authoritative ledger as
+// `<T>-scanner-build.jsonl` while every per-slice PR's branch collapses to the bare `<T>` token —
+// enforce-review-or-lfah.sh derives TASKID from the head branch's LEADING DIGITS only). This arm teaches
+// `check` one more place to look: an in-session sibling ledger `<T>-….jsonl` (token-boundary-safe — task
+// "166" can never match "1660-….jsonl", since the separator immediately follows the sanitized token),
+// accepted ONLY when BOTH hold:
+//   (a) the sibling is itself a genuinely COMPLETE 4-role ledger — planner / plan-review / executor judged
+//       by the exact SAME checkRole() predicate `check` already applies to the bare token (never a second
+//       hand-written copy of it);
+//   (b) the sibling carries at least one execution-review row — iterated over ALL of that sibling's rows,
+//       never the last-row-wins byRole merge (a merged epic ledger's LAST row may be an unrelated slice) —
+//       that satisfies BOTH conjuncts of a binding deliberately STRICTER than checkRole()'s own ref arm:
+//         ADDED-BY-PR: the row's artifact_path resolves as a blob at --merge-head AND does NOT resolve at
+//           refs/remotes/origin/master, in the SAME repo `check` runs from (process.cwd() — the identical
+//           repo resolveArtifactAtRef()'s candidate 1 uses for its own merge-head lookup) — i.e. genuinely
+//           part of THIS PR's own diff, never a shipped sibling's review file merely riding along in the
+//           merge-head tree by inheritance (the confirmed false-allow this tightening exists to close: a
+//           review file that has already reached origin/master is present in EVERY off-master slice's tree
+//           whether or not that slice was ever reviewed).
+//         GENUINE: that SAME row passes checkRole('execution-review', row, ...) — resolvable agentId /
+//           oracle / subprocess provenance + verdict content, exactly as `check` demands of any
+//           execution-review row today.
+// Fail-CLOSED on every ambiguity, never "assume": no candidate sibling, an unreadable origin/master ref (a
+// configured/expected ref that cannot be verified makes ADDED-BY-PR unprovable, not falsified), a sibling
+// missing a required role or failing its predicate, or no execution-review row satisfying both conjuncts.
+// Merge-head-gated (cmdCheck's own trigger, below): with no --merge-head there is no binding evidence to
+// test ADDED-BY-PR against, so this arm never even runs — today's unbound-check behavior is byte-preserved.
+// A NAMED-RISK residual is carried, not fixed, here (registered `2496-genuine-content-forgery-path-
+// collision` via hooks/named-risk-notes.mjs): GENUINE reads verdict CONTENT from the author-controlled
+// merge-head blob (checkRole's own pre-existing #2050/#2480 property), so a deliberately-crafted forged
+// blob at an EXISTING sibling row's artifact_path can still satisfy both conjuncts. Pre-existing, not
+// widened by this arm beyond cross-slice agentId borrowing within one session; execution-review disposes it.
+
+// siblingLedgerCandidates: every `<T>-….jsonl` file in the session's ledger dir, sorted for determinism.
+// The regex anchors the separator immediately after the sanitized token, so a shorter numeric prefix (task
+// "166") can never match a longer sibling ("1660-….jsonl") — the token-boundary discipline this whole
+// class of bug is about (R1/AC-2).
+function siblingLedgerCandidates(session, task) {
+  const dir = path.join(LEDGER_DIR, sanitize(session));
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const t = sanitize(task);
+  if (!t) return [];
+  const re = new RegExp('^' + escapeRegExp(t) + '-.+\\.jsonl$');
+  return names.filter(n => re.test(n)).sort().map(n => ({
+    file: path.join(dir, n),
+    siblingTask: n.slice(0, -'.jsonl'.length),
+  }));
+}
+
+// ADDED-BY-PR, evaluated against the SAME repo `check` runs from (process.cwd()). Returns false on ANY
+// ambiguity (unreadable origin/master, a path that cannot be mapped into this repo, absent-at-merge-head,
+// present-at-master) — the R4 fail-closed contract: a can't-verify origin/master is treated as unprovable,
+// never as "assume absent" (which would let ADDED-BY-PR pass on nothing).
+function rowIsAddedByPr(row, mergeHead) {
+  const cwdRepo = process.cwd();
+  const masterRef = 'refs/remotes/origin/master';
+  let verify;
+  try { verify = spawnSync('git', ['-C', cwdRepo, 'rev-parse', '--verify', '--quiet', masterRef], { encoding: 'utf8' }); }
+  catch (e) { return false; }
+  if (verify.error || verify.status !== 0) return false;      // unreadable/unresolvable origin/master -> unprovable.
+  const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound.
+  if (!relPath) return false;                                  // can't map artifact_path into the merge-head's own repo.
+  if (!refHasBlob(cwdRepo, mergeHead, relPath)) return false;   // must be present at the merge head itself.
+  if (refHasBlob(cwdRepo, masterRef, relPath)) return false;    // must NOT already be present on origin/master.
+  return true;
+}
+
+// The tightened binding (ADDED-BY-PR AND GENUINE) for one execution-review row. GENUINE reuses checkRole()
+// verbatim — never a second hand-written admissibility copy.
+function rowSatisfiesTightenedBinding(row, session, task, checkOpts) {
+  if (!rowIsAddedByPr(row, checkOpts && checkOpts.mergeHead)) return false;
+  return checkRole('execution-review', row, session, checkOpts, task) === null;
+}
+
+// Is `siblingFile` itself a genuinely-complete 4-role ledger, AND does it carry at least one
+// execution-review row satisfying the tightened binding? Returns the qualifying row (for the stdout note)
+// or null. `checkOpts`/`task` are passed straight through from the outer `check` invocation so every
+// predicate call is byte-identical to what the bare-token loop already runs (reuse, never a fork).
+function siblingQualifies(siblingFile, session, task, checkOpts) {
+  let lines;
+  try { lines = fs.readFileSync(siblingFile, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) { return null; }
+  const byRole = {};
+  const execReviewRows = [];
+  for (const ln of lines) {
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    if (!j || !j.role) continue;
+    byRole[j.role] = j;                                   // last-row-wins, for the three non-execution-review roles.
+    if (j.role === 'execution-review') execReviewRows.push(j);
+  }
+  // #3154 D3 -- the sibling's OWN session + task id (taken from its ledger path), never the caller's: the
+  // size-S waiver for a sibling is judged on the sibling's ticket and plan. A slug sibling has no ticket -> none -> closed.
+  const sibSession = path.basename(path.dirname(siblingFile));
+  const sibTask = path.basename(siblingFile, '.jsonl');
+  const sibRoles = sizeSExempt(sibSession, sibTask).exempt ? ['planner', 'executor'] : ['planner', 'plan-review', 'executor'];
+  for (const role of sibRoles) {
+    const e = byRole[role];
+    if (!e) return null;
+    if (checkRole(role, e, session, checkOpts, task)) return null;
+  }
+  if (!execReviewRows.length) return null;
+  for (const row of execReviewRows) {         // iterate ALL rows — never the last-row-wins merge (L3019 class).
+    if (rowSatisfiesTightenedBinding(row, session, task, checkOpts)) return row;
+  }
+  return null;
+}
+
+// Orchestrator: scan every in-session sibling ledger (token-boundary-safe) for the FIRST that qualifies.
+// Merge-head-gated at the entry — callers pass checkOpts.mergeHead unconditionally; an absent/empty value
+// short-circuits to null with zero directory I/O (Intent #2's gate, satisfied here too, belt & suspenders
+// with the call-site gate in cmdCheck).
+function resolveSiblingForCheck(session, task, checkOpts) {
+  const mergeHead = checkOpts && checkOpts.mergeHead;
+  if (!mergeHead) return null;
+  for (const cand of siblingLedgerCandidates(session, task)) {
+    const row = siblingQualifies(cand.file, session, task, checkOpts);
+    if (row) return { siblingTask: cand.siblingTask, siblingFile: cand.file, row };
+  }
+  return null;
+}
+
+// Visibility, never silence (Intent #4): a resolver-granted ALLOW prints an explicit note naming the
+// sibling ledger + the merge-head-bound artifact, same discipline as the ROUTE-BYPASS:/DISPATCH: notes —
+// always distinguishable from a plain bare-token pass.
+function printSiblingResolveAllow(task, sib) {
+  console.log('SIBLING-RESOLVE: task ' + sanitize(task) + ' unresolved at the bare token; resolved via ' +
+    'in-session sibling ledger "' + sib.siblingTask + '" — execution-review artifact "' +
+    (sib.row.artifact_path || '') + '" is bound to this merge head (present at the merge head, absent at ' +
+    'origin/master — added by this PR, not inherited) and passes the genuine-provenance battery (#2496).');
+  console.log('OK: role-ledger complete for task ' + sanitize(task) +
+    ' (planner, plan-review, executor, execution-review all resolved via sibling ledger "' + sib.siblingTask + '")');
+}
+
+// ── D3/D3b (fix-enforce-review-ledger-taskid-nonnumeric-branch) — session-scan resolver arm ────────────
+// Generalizes the #2496 sibling arm above to a branch that encodes NO task id at all (shape (b): e.g.
+// `bakeoff-e2-exec`, ledger filed under a slug key like `fix-e2-bakeoff-corpus.jsonl`) — a branch shape
+// `siblingLedgerCandidates`' `^<T>-.+\.jsonl$` prefix regex structurally cannot match, since there is no
+// `<T>-` prefix relationship between the bare token and the real ledger file at all.
+//
+// IDENTITY WARNING (round-2-corrected, see the plan's Design §D3): ADDED-BY-PR alone is NOT sufficient
+// identity for an UNRESTRICTED session scan — an unrelated in-session task A's exec-review artifact can be
+// present at THIS task B's merge head (a stacked/co-mingled branch) and absent at origin/master, so
+// `siblingQualifies` (reused verbatim) would return A's row for B's check. D3b's REFERENCES-THIS-PR binding
+// (`referencesThisPr` below) is the mandatory SECOND, independent proof this arm demands beyond
+// `siblingQualifies` — never skip it.
+
+// sessionScanCandidates: every OTHER `*.jsonl` in the session's ledger dir, EXCLUDING the bare-token file
+// (already tried) and the token-boundary sibling set `siblingLedgerCandidates` already covers, sorted for
+// determinism (sorted-first-wins on multiple qualifying candidates).
+function sessionScanCandidates(session, task) {
+  const dir = path.join(LEDGER_DIR, sanitize(session));
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const t = sanitize(task);
+  if (!t) return [];
+  const bareFile = t + '.jsonl';
+  const siblingRe = new RegExp('^' + escapeRegExp(t) + '-.+\\.jsonl$');
+  return names
+    .filter((n) => n.endsWith('.jsonl') && n !== bareFile && !siblingRe.test(n))
+    .sort()
+    .map((n) => ({ file: path.join(dir, n), candTask: n.slice(0, -'.jsonl'.length) }));
+}
+
+// referencesThisPr (D3b — the case-3 defense): does `content` (the qualifying exec-review artifact's
+// bytes AT THE MERGE HEAD — never a mutable worktree copy) carry a boundary-safe reference to the
+// identity being merged? Exactly two accepted forms (round-3, B1' — the bare `#<N>` form is DELIBERATELY
+// NOT accepted; it is a saturated discriminator in this artifact class — exec-review artifacts routinely
+// cite OTHER tickets' numbers incidentally, e.g. the motivating artifact's own incidental `#1544`):
+//   1. a path-bounded `/pull/<N>` URL token, non-digit-terminated (so "/pull/166" never matches inside
+//      "/pull/1660" — the same token-boundary discipline `siblingLedgerCandidates` already applies).
+//   2. the branch name, bounded on both sides by a non-`[0-9A-Za-z._-]` separator (or start/end of
+//      string) — so a branch "e2" never matches inside "task-e2x".
+// Neither `pr` nor `branch` supplied -> false (never true on nothing to check against).
+function referencesThisPr(content, branch, pr) {
+  const text = String(content == null ? '' : content);
+  if (!text) return false;
+  if (pr) {
+    const prRe = new RegExp('/pull/' + escapeRegExp(String(pr)) + '(?!\\d)');
+    if (prRe.test(text)) return true;
+  }
+  if (branch) {
+    const branchRe = new RegExp('(^|[^0-9A-Za-z._-])' + escapeRegExp(String(branch)) + '($|[^0-9A-Za-z._-])');
+    if (branchRe.test(text)) return true;
+  }
+  return false;
+}
+
+// resolveSessionScanForCheck: merge-head-gated (mirrors resolveSiblingForCheck's own gate — an absent
+// mergeHead returns null with ZERO directory I/O, so the unbound legacy path stays byte-preserved).
+// Additionally gated on at least one of checkOpts.branch/checkOpts.pr being present — no binding evidence
+// supplied means the arm can never satisfy D3b, so it does not even scan (fail-closed; also keeps every
+// legacy caller that passes neither flag byte-identical). Scans sessionScanCandidates() for the FIRST
+// candidate that is BOTH genuinely-complete-and-provenance-clean (`siblingQualifies`, reused VERBATIM —
+// never a forked predicate) AND whose qualifying row's artifact, read at the merge head, satisfies
+// `referencesThisPr`. Returns `{ candTask, candFile, row }` or null.
+function resolveSessionScanForCheck(session, task, checkOpts) {
+  const mergeHead = checkOpts && checkOpts.mergeHead;
+  if (!mergeHead) return null;
+  const branch = (checkOpts && checkOpts.branch) || '';
+  const pr = (checkOpts && checkOpts.pr) || '';
+  if (!branch && !pr) return null;
+  const cwdRepo = process.cwd();
+  for (const cand of sessionScanCandidates(session, task)) {
+    const row = siblingQualifies(cand.file, session, task, checkOpts);
+    if (!row) continue;
+    const relPath = repoRelativeCandidate(row && row.artifact_path, cwdRepo, false);   // narrow: caller-supplied merge-head sha, not task-bound.
+    if (!relPath) continue;
+    const content = readBlobAtRef(cwdRepo, mergeHead, relPath);
+    if (content === null) continue;
+    if (!referencesThisPr(content, branch, pr)) continue;
+    return { candTask: cand.candTask, candFile: cand.file, row };
+  }
+  return null;
+}
+
+// Visibility, never silence (Intent #4, mirrors printSiblingResolveAllow) — a SESSION-SCAN-RESOLVE-granted
+// ALLOW is always distinguishable from a plain bare-token pass or a SIBLING-RESOLVE pass.
+function printSessionScanResolveAllow(task, cand) {
+  console.log('SESSION-SCAN-RESOLVE: task ' + sanitize(task) + ' unresolved at the bare token and no ' +
+    'token-boundary sibling matched; resolved via in-session ledger "' + cand.candTask + '" — execution-' +
+    'review artifact "' + (cand.row.artifact_path || '') + '" is bound to this merge head (present at the ' +
+    'merge head, absent at origin/master — added by this PR, not inherited), passes the genuine-provenance ' +
+    'battery (#2496), AND references the identity under merge (branch/PR — D3b).');
+  console.log('OK: role-ledger complete for task ' + sanitize(task) +
+    ' (planner, plan-review, executor, execution-review all resolved via in-session ledger "' + cand.candTask + '")');
+}
+
+// OVERLAY-MERGE core (#855), extracted so both `append` and `inherit-plan-review` write through the SAME
+// path (semantics unchanged vs the prior inline cmdAppend body). Reads the ledger, drops any prior line for
+// `role` (capturing it to MERGE onto), overlays ONLY the fields supplied in `fields` (own-key presence is the
+// "provided" signal — an absent key PERSISTS the prior value; role / session_id / ts always refresh), applies
+// the same mutual-exclusion guard, writes back. Recognized `fields` keys: agentId, artifact_path, skip_reason,
+// oracle, inherited_from. Returns the ledger file path.
+// #3326 fix cycle 1 — seed the task→carried-key record (.task-session-key/<task>, under a dot-directory
+// the *.jsonl task-file glob never sees). FIRST-CARRIED-KEY-WINS: if a valid record already exists
+// (regular file, 0 < size <= 256 bytes, token-safe non-empty content — the same shape cmdCarriedKey
+// reads), it is NEVER rewritten, by any writer; only an absent/invalid record is seeded. Called ONLY
+// from the explicit append/inherit command paths (overlayAppend's opts.carriedKeySeed), so a
+// reconcile-spawns or refresh-models write under the SPAWNING session can never redirect the merge
+// gate away from the carried key's complete ledger (the execution-review finding-2 repro: planner row
+// under key K, then reconcile-spawns under the new session N -> the pre-fix record flipped to N and
+// leg-3c checked N's partial ledger, order-dependently). One bounded read + one bounded write keyed by
+// the task; never a session-dir enumeration.
+function carriedKeySeed(session, task) {
+  const tKey3326 = sanitize(task), sKey3326 = sanitize(session);
+  if (!tKey3326 || !sKey3326) return;
+  try {
+    const idxDir3326 = path.join(LEDGER_DIR, '.task-session-key');
+    const idxFile3326 = path.join(idxDir3326, tKey3326);
+    let existing3326 = '';
+    try {
+      const st3326 = fs.statSync(idxFile3326);
+      if (st3326.isFile() && st3326.size > 0 && st3326.size <= 256) existing3326 = fs.readFileSync(idxFile3326, 'utf8');
+    } catch (e) { /* no record yet — seed below */ }
+    if (sanitize(existing3326.trim())) return;   // first carried key wins — never rewritten
+    fs.mkdirSync(idxDir3326, { recursive: true });
+    fs.writeFileSync(idxFile3326, sKey3326 + '\n');
+  } catch (e) { /* best-effort — see overlayAppend's record block */ }
+}
+
+function overlayAppend(session, task, role, fields, opts) {
+  const file = ledgerFile(session, task);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); } catch (e) { /* new file */ }
+  const kept = [];
+  // #1580 Fix B — retain EVERY earlier same-role row as HISTORY; only the LAST same-role row becomes
+  // `prior` (the row this call may merge onto, or supersede with a genuinely new round). Pre-#1580 this
+  // loop dropped ALL same-role lines unconditionally (only the last survived, as `prior`, itself about to
+  // be overwritten) — harmless when a role only ever had ONE round, but it silently destroyed round-1's
+  // evidence (e.g. its OBSERVED model) the instant a round-2 write landed. `olderRoundLines` are raw
+  // strings, re-emitted VERBATIM — never re-parsed, re-ordered, or mutated once superseded.
+  const priorSameRoleLines = [];
+  for (const ln of lines) {
+    try {
+      const j = JSON.parse(ln);
+      if (j && j.role === role) { priorSameRoleLines.push(ln); continue; }
+      kept.push(ln);
+    } catch (e) { kept.push(ln); }
+  }
+  // ledger-concurrent-append-agent-disambiguation Fix B — TARGET-ROW SELECTION BY AGENT IDENTITY. When
+  // this write carries an explicit agentId, bind to the row that ALREADY carries that SAME agentId,
+  // wherever it sits among this role's rows — never a position-based "last same-role row" heuristic.
+  // This is what makes a SubagentStop completion stamp (three-role-subagent-ledger.sh, always passes
+  // --agent) — or any other explicit --agent cmdAppend call — land on the STOPPING/NAMED agent's OWN
+  // row even when a sibling lane's row was written later (the measured SL-14 completion-refile bug: the
+  // old "prior = last same-role line" heuristic misread a same-agent close-out as a distinct-agent NEW
+  // ROUND — isNewRound below — and forked a fresh, empty artifact-less stub instead of merging onto the
+  // repairing agent's own real row). Search from the END so the common single-occurrence case resolves
+  // immediately and a genuine same-agent multi-write history still resolves to its most recent line. A
+  // miss (no existing row carries this agentId — the genuinely-NEW-round case, #1580 Fix B) falls
+  // through to the ORIGINAL "last same-role row" selection unchanged, so isNewRound's fork-a-fresh-row
+  // behavior for real new rounds is untouched (#1580 non-regression). A call with NO agentId at all
+  // (a bare self-append/repoint) also falls through unchanged — cmdAppend's own ambiguity refusal (Fix
+  // A) runs BEFORE this function is ever called, so a bare write only ever reaches here when at most
+  // one artifact-less candidate exists for this role.
+  let prior = null;
+  let priorIdx = -1;
+  const bindAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  if (bindAgentId) {
+    for (let i = priorSameRoleLines.length - 1; i >= 0; i--) {
+      let j;
+      try { j = JSON.parse(priorSameRoleLines[i]); } catch (e) { continue; }
+      if (j && j.agentId === bindAgentId) { prior = j; priorIdx = i; break; }
+    }
+  }
+  // #2701 D1 fold r2 finding 1(i) — NONCE-KEYED TARGET SELECTION, the twin of the agentId binding just
+  // above. A write carrying --run-id R (and NOT a --skip-reason — a skip is identity-less, fold r3 finding
+  // 2, and must never be nonce-pinned) binds to the same-role row that ALREADY carries run_id R, wherever
+  // it sits — this is what lets the dispatch helper's post-exit write (:1255-1257) and its rendered
+  // self-append instruction (:536) find their OWN row even when a sanctioned same-agent re-touch has since
+  // moved it off the tail (S9/AC-18). A miss (no row carries this run_id — the genuinely-new-identity case)
+  // falls through to the ordinary "last same-role row" selection, and D1's identity-boundary rule above
+  // decides whether that's a merge or a new round.
+  const pinRunId2701 = (!bindAgentId && !('skip_reason' in fields) && ('run_id' in fields))
+    ? String(fields.run_id == null ? '' : fields.run_id) : '';
+  if (priorIdx === -1 && pinRunId2701) {
+    for (let i = priorSameRoleLines.length - 1; i >= 0; i--) {
+      let j;
+      try { j = JSON.parse(priorSameRoleLines[i]); } catch (e) { continue; }
+      if (j && j.run_id === pinRunId2701) { prior = j; priorIdx = i; break; }
+    }
+  }
+  if (priorIdx === -1 && priorSameRoleLines.length) {
+    priorIdx = priorSameRoleLines.length - 1;
+    try { prior = JSON.parse(priorSameRoleLines[priorIdx]); } catch (e) { prior = null; }
+  }
+  const olderRoundLines = priorSameRoleLines.filter((_, i) => i !== priorIdx);
+  // #2169 slice 3, AC-31a — ROUTES-STALE advisory. Scoped to a genuinely subprocess-shaped incoming write
+  // (never fires for the vast majority of ordinary Agent-tool appends across the rest of this file) so this
+  // stays a pure addition with zero output-shape impact on any pre-existing non-subprocess fixture.
+  if (isSubprocessDispatch(fields.dispatch)) checkRoutesStale(role, prior);
+  // #2169 slice 3 — set by clause 2's R-C escape hatch below (allow-arm only); consumed by the isNewRound
+  // computation further down, alongside clause 3's divertNewRound3, so a sanctioned R-C supersession starts
+  // a genuinely FRESH row (no deletion — the superseded E1 row is retained verbatim as history) instead of
+  // Frankensteining the new E2 evidence onto the old E1 row's stale agentId/model fields.
+  let divertRouteChange = false;
+  // #1575 1a / #1580 Fix A — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: terminal evidence is
+  // EVIDENCE, a bare re-append is an ASSERTION, and the weak must never erase the strong. #1580 widens the
+  // outer TRIGGER from "prior carries a verdict" to "prior carries ANY terminal evidence"
+  // (priorHasTerminalEvidence — see its doc comment) so a completed EXECUTOR row (no verdict, ever) gets
+  // the SAME protection a completed review row already had; this is one extended guard, not a second one.
+  // Runs BEFORE any field is overlaid onto `entry`, and THROWS (writes nothing) rather than silently
+  // no-op'ing or preserving-and-mangling.
+  if (priorHasTerminalEvidence(prior)) {
+    // Clause 1 — verdict-LESS erasers are rejected. A skip_reason append (the clear-list below would erase
+    // verdict/agentId/artifact_path/closedAt/self_authored/oracle) or an inherited_from overlay
+    // (provenance-swap) that carries NO verdict of its own cannot erase ANY terminal evidence — not just a
+    // verdict. Keyed on terminal-evidence PRESENCE, never the skip keyword nor the verdict field alone —
+    // this closes the skip-eraser AND the inherit-eraser for EVERY terminal shape with one rule.
+    if ((('skip_reason' in fields) || ('inherited_from' in fields)) && !('verdict' in fields)) {
+      // Backward-compatible phrasing: when the terminal evidence includes a verdict, keep #1575's exact
+      // "a completed verdict ..." substring (existing consumers, e.g. three-role-transition-gate-smoke-
+      // test.sh AC-4b(i), grep for it) — the #1580-widened trigger only changes WHEN this clause fires, not
+      // the wording of the pre-existing verdict case. A prior row with NO verdict (the new executor-shaped
+      // case this fix adds) gets the generalized terminal-evidence summary instead.
+      const evidenceLabel = prior.verdict
+        ? ('a completed verdict "' + prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : ''))
+        : ('terminal evidence — ' + terminalEvidenceSummary(prior));
+      throw new GuardRejection(
+        'terminal-evidence guard (#1575/#1580): role ' + role + ' already carries ' + evidenceLabel +
+        ' — a verdict-LESS write (skip / inherit) cannot erase it. Run a new, genuinely bound review/run to ' +
+        'supersede it honestly.'
+      );
+    }
+    // Clause 2 (UNCHANGED from #1575, still verdict-scoped — a "verdict change" is only a meaningful concept
+    // when a verdict exists to change) — verdict-CHANGING appends require NEW, ATTRIBUTED evidence. A
+    // DIFFERENT verdict value is accepted ONLY when the SAME command also cites (i) an --agent whose
+    // transcript is SPAWN-RECORD-bound to this exact (task, role) AND distinct from the prior row's agentId
+    // (when the prior row has one), AND (ii) a --closed-at strictly newer than the prior row's closedAt
+    // (when the prior row has one). Same-VALUE re-appends and verdict-less writes are untouched by this
+    // clause (checked above/below). A prior row with NO verdict (e.g. a completed executor row) has no
+    // verdict for this clause to guard — that row's protection is entirely clause 1's job.
+    if (prior.verdict && ('verdict' in fields) && fields.verdict !== prior.verdict) {
+      const incomingAgent = ('agentId' in fields) ? fields.agentId : '';
+      const boundNew = !!incomingAgent && agentBoundToTag(session, incomingAgent, task, role);
+      const distinctAgent = !prior.agentId || (incomingAgent !== prior.agentId);
+      const closedAtOk = !prior.closedAt ||
+        (('closedAt' in fields) && !!fields.closedAt && String(fields.closedAt) > String(prior.closedAt));
+      if (!(boundNew && distinctAgent && closedAtOk)) {
+        // #2169 slice 3 — R-C route-change clause (design decision 3): the ordinary bound-agent supersession
+        // test above just failed (expected — a subprocess-openrouter write never carries --agent). Give a
+        // genuinely subprocess-shaped (E2) write ONE more, narrowly SSOT-gated chance before refusing outright.
+        const rc = evaluateRouteChangeSupersession(role, prior, fields, session, task);
+        if (rc.allowed) {
+          divertRouteChange = true;
+          console.error('ROUTE-DRIFT: role ' + role + ' seat routed to subprocess dispatch since ' + rc.since +
+            ' — prior row (closedAt ' + prior.closedAt + ', verdict "' + prior.verdict + '") superseded by a ' +
+            'verified subprocess (E2) write per the R-C route-change clause (#2169 slice 3, design decision 3).');
+        } else {
+          throw new GuardRejection(
+            'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
+            prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
+            ' — superseding it requires EITHER a NEW, ATTRIBUTED review in the SAME command (an --agent whose ' +
+            'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
+            'prior agentId, AND a --closed-at strictly newer than the prior closedAt) OR a sanctioned R-C ' +
+            'route-change supersession (' + rc.reason + '). A bare or same-agent verdict flip is refused; ' +
+            'spawn a genuinely NEW plan-review/review subagent and cite it, or satisfy R-C\'s SSOT-gated terms.'
+          );
+        }
+      }
+    }
+  }
+  // #2309 (R3.1/R4.1/R5.3) — CLAUSE 3: a verdict-INTRODUCING write landing on a BOUND row that carries no
+  // verdict yet. Clause 1/2 above (both keyed on priorHasTerminalEvidence()/prior.verdict) protect a row
+  // that already HAS terminal evidence; this closes the gap the cairn stone named ("key off the last
+  // VERDICT-BEARING row, not merely the last same-role row") — a bound row with NO verdict (whether truly
+  // bare, or DEAD: it gained closedAt/self_authored/artifact_path from an honest punch-out that never
+  // recorded a verdict — 6 such live rows exist today) is exactly the shape a forged `--verdict PASS
+  // --closed-at …` can merge onto for free, with no proof required. Trigger (R4.1's one-token re-key of
+  // R3.1's design — SUPERSEDES the original `!priorHasTerminalEvidence(prior)` term): prior row has a
+  // bound agentId, carries NO verdict yet (!prior.verdict), the incoming write introduces a verdict, and
+  // this is a SAME-round merge (an incoming --agent, if any, equals prior.agentId) — a genuinely NEW round
+  // (a DISTINCT incoming --agent) is isNewRound's claim below, outside this clause's by construction (R4.1
+  // honest-writer inventory item vi: relink-plan-review lands as a new-round write).
+  const clause3IncomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  const clause3SameRound = !clause3IncomingAgentId || (!!prior && clause3IncomingAgentId === prior.agentId);
+  let divertNewRound3 = false;
+  if (prior && prior.agentId && !prior.verdict && ('verdict' in fields) && clause3SameRound) {
+    // Proof — an EXECUTED self-append by the TARGET row's own agent (never the incoming claim, never
+    // newest-mtime). Nothing about the INCOMING command's flag shape can pre-empt the trigger — citing the
+    // target's own id via --agent and asserting --self-authored are ASSERTIONS, and an assertion never
+    // satisfies a guard (R3.1).
+    const proof = priorAgentTranscriptProves(prior, task, role, fields.verdict);
+    if (!proof.proves) {
+      // #2309 R5.3 — the ONE construct round 5 adds, applied ONLY in clause 3's two failure branches (no
+      // readable transcript / transcript does not prove, both collapsed into !proof.proves above): when the
+      // evidence structurally CANNOT exist — the target row is a DEAD round (closedAt stamped, verdict
+      // never recorded) — AND the incoming write carries NO identity claim at all (no --agent — the
+      // doctrine self-append shape), merging onto the dead row would MISATTRIBUTE the verdict and refusing
+      // would STRAND an honest reviewer with no runnable remedy (the manufactured-blocker class this ticket
+      // exists to kill). Neither is acceptable, so this write is DIVERTED to a NEW row instead (the
+      // isNewRound machinery below, widened by one OR-term) — the dead row's own verdict-less state is
+      // never touched, and the new row starts from an empty base, carrying only what THIS write provides.
+      // A write that CLAIMS the dead row's agentId (inAgent3 true) is NOT diverted — it stays fully guarded
+      // by the kill-switch-or-reject branch below (arm (m): identity-claiming forgeries over a dead row).
+      const inAgent3 = !!clause3IncomingAgentId;
+      const deadNoClaim3 = !!(prior.closedAt && !inAgent3);
+      if (deadNoClaim3) {
+        divertNewRound3 = true;
+      } else if (process.env.THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE === '1') {
+        // Documented operator escape (this comment block IS the pointer AC-13′ requires — see also the
+        // "Env overrides" list near the top of this file). An INTEGRITY gate's rejection names the failure,
+        // the evidence it wanted, and the remedy CLASS — never a runnable defeat token (R4.2) — so this
+        // switch's name is deliberately NEVER printed to the blocked actor's stderr, only used here and
+        // audited both to stderr (this line) and the internal bypass log.
+        console.error('AUDIT: clause-3 terminal-evidence guard bypassed via documented operator override ' +
+          '(role=' + role + ' task=' + sanitize(task) + ' agentId=' + prior.agentId + ')');
+        writeBypassLog('3role-ledger-clause3', 'THREE_ROLE_LEDGER_CLAUSE3_OVERRIDE', 'PERMIT',
+          { task: sanitize(task), role: sanitize(role) });
+      } else {
+        throw new GuardRejection(
+          'terminal-evidence guard (#2309 clause 3): role ' + role + ' carries a BOUND, verdict-less row ' +
+          '(agentId ' + prior.agentId + ') and this write would introduce a verdict onto it, but ' +
+          (proof.found
+            ? ('that agent\'s own transcript (' + proof.path + ') does not record an EXECUTED self-append ' +
+               'of this exact verdict at command position (a mention inside echo/printf/a quoted string ' +
+               'does not count)')
+            : ('that agent\'s own transcript could not be read (expected ' + PROJECTS_ROOT + '/*/' +
+               sanitize(prior.session_id || '') + '/subagents/agent-' + prior.agentId + '.jsonl)')) +
+          ' — a documented operator override exists for a genuinely can\'t-tell case (see this clause\'s ' +
+          'own comment above overlayAppend); otherwise spawn/cite the row\'s own agent\'s real self-append.'
+        );
+      }
+    }
+  }
+  // #1580 Fix B — ROUND BOUNDARY. A NEW, DISTINCT --agent arriving over a prior row that ALREADY had an
+  // agentId is the unforgeable-ish signal of a genuinely NEW round (a fresh subagent spawn), not a
+  // same-round compose. When detected: retain the just-superseded round's row VERBATIM as history (pushed
+  // below, never touched again) and start this entry FRESH — carrying only what THIS call provides, not
+  // the old round's artifact_path/closedAt/verdict/self_authored/oracle (those belong to round-1's
+  // evidence, already safely retained in its own line). A close-only append (no --agent at all) or a
+  // same-agent re-append never triggers this, so the existing single-round spawn-then-close AND
+  // close-then-spawn compose (#855, AC-4) is unaffected: on close-then-spawn the FIRST write (the close) has
+  // no prior row yet, so when the spawn's --agent later arrives `prior.agentId` is still absent and this
+  // stays false — that write correctly MERGES onto the close, one round, one line.
+  const incomingAgentId = ('agentId' in fields) ? String(fields.agentId == null ? '' : fields.agentId) : '';
+  // #2169 slice 3 — a sanctioned R-C route-change supersession (divertRouteChange, set by clause 2's escape
+  // hatch above) is ALSO a round boundary: the new E2 evidence must never compose onto the superseded E1
+  // row's stale agentId/artifact_path/verdict — it starts a genuinely fresh row, carrying only what THIS
+  // write provides, with the old E1 row retained verbatim as history (same "no deletion" mechanic as
+  // divertNewRound3 and the ordinary distinct-agent round boundary below).
+  // #2701 D1 — RUN-IDENTITY round boundary. A row's identity is its agentId if present, else its run_id
+  // (the doc comment above: "run_id is the run's own identity — agentId for E1, nonce for E2, absent for
+  // a bare marker"). A write's identity is its agentId if provided, else its run_id (a --skip-reason write
+  // is identity-less even when it carries --run-id — fold r3 finding 2 — because a skip is an ASSERTION,
+  // never a new round). When both sides carry an identity and they differ, this write opens a NEW row —
+  // dispatch_nonce/nonce are receipts, never identities, so the legacy #1947/#1989/#2169-S5 compose shapes
+  // (no run_id at all) are untouched. Second trigger (fold r1 finding 1, kept): the degraded {role}-only
+  // Agent stamp (effort_source==='assigned', no agentId) arriving over a run_id-identified row.
+  // #2701 fix-cycle-1 B1 — NAMESPACED comparison (execution-review FAIL, nr11's falsifier): the two
+  // identity fields live in DIFFERENT namespaces (an agentId is an Agent-tool run; a run_id is a
+  // subprocess dispatch), so comparing their raw string VALUES lets a write choose `--run-id <the row's
+  // own agentId>` and have it read as "the same identity" — silently merging a fresh subprocess claim onto
+  // an agent-bound row instead of opening a new round (the exact launder: `append --agent agL …` then
+  // `append --run-id agL --dispatch-nonce x` with no --agent, which used to compose onto agL's own row and
+  // hand `repair-crosswire` a P2-satisfying cross-wired shape it was never meant to see). Prefix each side
+  // with which field it came from before comparing, so an agentId "agL" and a run_id "agL" are NEVER the
+  // same identity, only ever equal to another value from the SAME field.
+  const priorIdentity2701 = prior
+    ? (prior.agentId ? ('agent:' + String(prior.agentId)) : (prior.run_id ? ('run:' + String(prior.run_id)) : ''))
+    : '';
+  const isSkip2701 = ('skip_reason' in fields);
+  const incomingRunId2701 = (('run_id' in fields) && !isSkip2701) ? String(fields.run_id == null ? '' : fields.run_id) : '';
+  const incomingIdentity2701 = incomingAgentId ? ('agent:' + incomingAgentId) :
+    (incomingRunId2701 ? ('run:' + incomingRunId2701) : '');
+  const identityBoundary2701 = !!(prior && priorIdentity2701 && incomingIdentity2701 && incomingIdentity2701 !== priorIdentity2701);
+  // #2902: a write that names a run_id is a bound write (it either matches the prior row's own run_id, or
+  // identityBoundary2701 already forks it), never the bare Agent-tool stamp this arm exists to catch. The
+  // z.ai dispatcher's close append carries --run-id <nonce> AND --effort-source assigned (#2822); without
+  // this exclusion that close opened a new round and split every z.ai run into two rows.
+  const degradedStamp2701 = !!(prior && !incomingAgentId && !incomingRunId2701 && !prior.agentId && prior.run_id &&
+    fields.effort_source === 'assigned');
+  const isNewRound = divertNewRound3 || divertRouteChange || identityBoundary2701 || degradedStamp2701;
+  for (const ln of olderRoundLines) kept.push(ln);
+  if (isNewRound) kept.push(JSON.stringify(prior));
+  // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
+  // overlay ONLY the fields this call provides. Unprovided fields PERSIST from the base; role / session_id /
+  // ts always refresh. This is what lets "agentId at spawn" and "artifact_path at close" compose into ONE
+  // line within a round, order-independent — neither writer clobbers the other — while a genuinely new
+  // round starts its own line instead of Frankensteining onto the old one.
+  const entry = { ...(isNewRound ? {} : (prior || {})), role, session_id: sanitize(session), ts: new Date().toISOString() };
+  if ('agentId' in fields) entry.agentId = fields.agentId;
+  if ('artifact_path' in fields) entry.artifact_path = fields.artifact_path;
+  if ('skip_reason' in fields) entry.skip_reason = fields.skip_reason;
+  if ('oracle' in fields) entry.oracle = fields.oracle;
+  if ('inherited_from' in fields) entry.inherited_from = fields.inherited_from;
+  // #1036: review roles (plan-review / execution-review / ship-review) may record a one-word VERDICT
+  // (APPROVE / PASS / BLOCK / SHIP-WITH-FIXES / APPROVE-WITH-NOTES). Read-only downstream: the agent-kanban
+  // board surfaces it as a colored pill. Overlay only when provided (back-compat: absent ⇒ no verdict).
+  if ('verdict' in fields) entry.verdict = fields.verdict;
+  // #1657 registry row 2 (cairn-search receipt) — the structured `cairn` field, overlaid onto the SAME
+  // row this role's own append already writes (own-key "provided" discipline: absent ⇒ untouched, same
+  // as every other overlay field here). Read via hooks/guardlib-receipt.mjs's cairn-search checker.
+  if ('cairn' in fields) entry.cairn = fields.cairn;
+  // #1100 item 3: provenance stamp — overlay only when provided (back-compat: absent ⇒ unstamped).
+  if ('self_authored' in fields) entry.self_authored = fields.self_authored;
+  // #1516 — the EXPLICIT close-stamp. Overlay only when provided (own-key "provided" discipline, same as
+  // every other field here). The ONLY writer that fires exclusively at close (three-role-subagent-ledger.sh,
+  // on SubagentStop) passes this — never the spawn-time hook — which is what makes "closedAt present" a
+  // trustworthy punch-out signal instead of a value that could land at dispatch. Optional + additive:
+  // check/checkRole never reference it, so a chain-role line gains it harmlessly too.
+  if ('closedAt' in fields) {
+    entry.closedAt = fields.closedAt;
+    // #2169 slice 4, AC-28b — an append carrying closedAt is the dispatch helper's atomic post-exit write
+    // (design decision 1(ii)): it clears the pre-launch `pending` liveness stamp in the SAME write. Own-key
+    // "closedAt provided" is the trigger (not a separate flag) — mirrors every other clear-on-provide rule
+    // in this function.
+    delete entry.pending;
+  }
+  // #1465 — OPTIONAL model+effort provenance. Overlay only when this call resolved a value (own-key
+  // presence is the "provided" signal, same discipline as every other field above); an unprovided key
+  // PERSISTS the prior line's value, so "model resolved at spawn-time self-append" composes with
+  // "artifact at close" exactly like agentId/artifact_path do (#855 overlay-merge).
+  if ('modelVersion' in fields) entry.modelVersion = fields.modelVersion;
+  if ('modelTier' in fields) entry.modelTier = fields.modelTier;
+  // #2782 — the served-provider stamp. Ordinary own-key overlay (same discipline as every field above):
+  // an unprovided key persists the prior line's value, so a close-only repoint composes with the
+  // dispatcher's model+provider stamp instead of erasing it.
+  if ('provider' in fields) entry.provider = fields.provider;
+  if ('effort' in fields) {
+    entry.effort = fields.effort;
+    // #1528 D2 C3 — `effort_source` is WRITER-STAMPED PROVENANCE for THIS `effort` value, not an
+    // independent overlay key: it can only ever describe whatever the SAME call just set `entry.effort`
+    // to, so it moves in lockstep with `effort` rather than persisting on its own. A call that supplies
+    // `--effort-source` stamps it; a call that supplies `--effort` WITHOUT `--effort-source` (every
+    // pre-#1528 caller) DELETES any prior tag — fail-SAFE: a value that changes hands with unknown
+    // provenance can never inherit a stale `observed` from an earlier writer's row.
+    if ('effort_source' in fields) entry.effort_source = fields.effort_source;
+    else delete entry.effort_source;
+  }
+  // review-round-counter-per-plan — `reviewed_plan`, an ordinary own-key overlay (same discipline as every
+  // field above): the plan-review round's PLAN identity, resolved from the DISPATCH context by the caller
+  // (spawn edge / dispatch helper / reconciler), never derived here. An unprovided key persists whatever the
+  // prior line already carried — this is what lets a spawn-time stamp (three-role-spawn-ledger.sh or the
+  // dispatch helper) compose with a later close-only `--artifact` repoint without either writer clobbering
+  // the other, exactly like agentId/artifact_path already compose (#855).
+  if ('reviewed_plan' in fields) entry.reviewed_plan = fields.reviewed_plan;
+  // #1640 S11 — the RUN-TIME reroute stamp. Overlay only when THIS call's --sense-reroute actually resolved
+  // one (own-key "provided" discipline, same as every field above): the spawn edge (three-role-spawn-ledger.sh)
+  // and the SubagentStop edge (three-role-subagent-ledger.sh) both pass --sense-reroute on every call, but
+  // senseReroute() returns null (no field set) whenever the session's ANTHROPIC_BASE_URL is empty, or the seat
+  // isn't SSOT-declared to a non-Anthropic provider, or the base-url doesn't resolve to any declared provider
+  // row — so an ordinary Anthropic-only role's line NEVER gains a reroute field. This is the ONLY writer of
+  // `reroute`; the completion gate (cmdCheck) only ever READS it, never senses env/base-url itself (S10
+  // anti-spoof — the stamp must be a run-time RECORD, not a check-time re-derivation).
+  if ('reroute' in fields) entry.reroute = fields.reroute;
+  // #1947 S3 — the subprocess-openrouter provenance fields (D2/M1/M2). Same own-key "provided" overlay
+  // discipline as every field above: unprovided keys persist the prior line's value, so a spawn-time
+  // dispatch/transcript/nonce stamp composes with a later close-only `--artifact` repoint exactly like
+  // agentId/artifact_path already compose.
+  if ('dispatch' in fields) entry.dispatch = fields.dispatch;
+  if ('transcript_path' in fields) entry.transcript_path = fields.transcript_path;
+  if ('nonce' in fields) entry.nonce = fields.nonce;
+  // #2169 slice 5 (S5-AC1, design decision 4) — the delivery-receipt STAMP. Own-key "provided" overlay,
+  // same discipline as dispatch/transcript_path/nonce above: an unprovided key persists the prior line's
+  // value, so a spawn-time stamp composes with a later close-only verdict append exactly like every other
+  // field here. The VALUE stored is hashDispatchNonce()'s one-way hash (minted by cmdAppend from the raw
+  // --dispatch-nonce token), never the plaintext — see that function's own comment for why. A row carrying
+  // this field is "STAMPED"; the delivery-receipt guard just below is scoped entirely to that presence.
+  if ('dispatch_nonce' in fields) entry.dispatch_nonce = fields.dispatch_nonce;
+  // #2169 slice 4, design decision 1 — the PENDING liveness stamp. A pre-launch dispatch write looks like
+  // {"role":"executor","dispatch":"subprocess-openrouter","run_kind":"bound","run_source":"dispatch-helper",
+  // "pending":true} — identity/liveness only, NEVER terminal evidence (never read by the terminal-evidence
+  // guard's clause 1/2 above — priorHasTerminalEvidence() does not test this field, by design), and
+  // deliberately erasable by a bare skip (AC-28c, the skip clear-list below): the stamp is an ASSERTION; the
+  // EVIDENCE (verdict/closedAt/etc) is what clause 1/2 protects, never the reverse. Cleared the moment a
+  // `closedAt` write lands (the atomic post-exit close, AC-28b, above) or a bare skip supersedes it.
+  if ('pending' in fields) entry.pending = fields.pending;
+  // #2075 D1 — run_id is an ordinary own-key overlay (same discipline as every field above): E1 -> agentId,
+  // E2 -> nonce, E3 -> absent. run_source is diagnostic-only, same discipline, never consulted by a gate.
+  if ('run_id' in fields) entry.run_id = fields.run_id;
+  if ('run_source' in fields) entry.run_source = fields.run_source;
+  // #2075 D1/§D5(a) round-4 storage-layer fix (R3-B1/R3-B2) — run_kind is WRITE-ONCE / monotone-non-
+  // decreasing, NOT an ordinary last-writer-wins overlay: `entry.run_kind` at this point already carries the
+  // PRIOR line's stored value (composed onto `entry` from `prior` above, for a same-round merge) or nothing
+  // (a genuinely new round, isNewRound above — that row's first run_kind write is legitimately unconstrained,
+  // matching the "round split runs first" ordering §D5(a) requires). An incoming write whose rank is <= the
+  // row's CURRENT stored rank is a field-level no-op — every OTHER field this call carries still merges
+  // exactly as before, and the append itself still exits 0 (submitting a stale/weaker claim is not an error).
+  // This is what closes R3-B1/R3-B2 at the storage layer: no later bare `--run-kind inferred` append can ever
+  // push an already-classified row's stored label back down, so §D5(a)/(c)'s VERIFIED-kind-only guards never
+  // need to defend against a demotion trick that reaches them through the stored field.
+  if ('run_kind' in fields) {
+    const incomingRank = RUN_KIND_RANK[fields.run_kind] || 0;
+    const existingRank = ('run_kind' in entry) ? (RUN_KIND_RANK[entry.run_kind] || 0) : 0;
+    if (!('run_kind' in entry) || incomingRank > existingRank) entry.run_kind = fields.run_kind;
+    // else: no-op — `entry.run_kind` is left at its current (higher-or-equal) value.
+  }
+  // Mutual-exclusion guard: a "ran/verified" signal (agentId for a real spawn, or oracle for a passing test)
+  // and a "skip" signal are mutually exclusive by intent, and checkRole tests skip FIRST. So providing
+  // agentId or oracle clears any inherited skip_reason (a stale skip can't mask a real spawn/oracle);
+  // conversely providing skip_reason clears inherited agentId/artifact_path/oracle (dead weight a merge could
+  // otherwise resurrect) — modelVersion/modelTier/effort/reroute join that clear-list too (#1465/#1640): they
+  // are provenance OF a real spawn's transcript/session, so a skip line must not carry a stale claimed model
+  // or a stale declared-reroute stamp. dispatch/transcript_path/nonce (#1947) join it for the same reason.
+  // #1947 M-A (execution-review round-2 FAIL) — a genuine, harness-signed agentId/oracle is STRICTLY
+  // STRONGER evidence than a self-declared subprocess-openrouter marker (no harness signs that marker at
+  // all), so it must supersede it the SAME way it supersedes a stale skip_reason: an agentId/oracle append
+  // now ALSO clears any inherited dispatch/transcript_path/nonce. Without this, D3's bounded fallback (a
+  // rejected subprocess dispatch stamped dispatch/transcript_path/nonce, then a bounded Anthropic retry
+  // self-appends a real agentId+artifact+verdict onto the SAME row) left the stale marker in place, and
+  // checkSubprocessProvenance kept re-evaluating the SUPERSEDED subprocess evidence against the FALLBACK's
+  // own artifact — which of course never contains the superseded dispatch's nonce — false-BLOCKing a
+  // genuinely-completed role. This is the primary fix; checkSubprocessProvenance's own agentId tie-break
+  // above is the belt-and-braces backstop for a row that reaches it with both fields still present.
+  if (('agentId' in fields) || ('oracle' in fields)) {
+    delete entry.skip_reason;
+    // #1947 M-A-2 (execution-review round-2 FAIL — fix-round 2) — the line above unconditionally cleared
+    // dispatch/transcript_path/nonce on the mere PRESENCE of an agentId/oracle KEY, never checking that
+    // either one actually RESOLVES. checkSubprocessProvenance's own tie-break (:1249) already gates the
+    // identical supersession decision on `agentResolves(session, e.agentId)` — a non-resolving agentId (a
+    // bogus/forged value, or an inert `--oracle` that this role's checkRole never even reads — it's read
+    // ONLY for execution-review, :1294/:1299) carries ZERO evidentiary weight and must not erase
+    // nonce-bound, transcript-verified subprocess provenance (the #1590 monotonicity rule: supersession must
+    // be evidence-gated, erasure-on-mere-presence never is). Preserving the fields when neither resolves is
+    // safe: :1249's tie-break still lets a LATER-resolving agentId win the comparison outright.
+    const agentSupersedes = ('agentId' in fields) && agentResolves(session, fields.agentId);
+    const oracleSupersedes = ('oracle' in fields) && role === 'execution-review' && (() => {
+      const op = resolveArtifact(stripOraclePrefix(fields.oracle));
+      return !!op && fileHas(op, VERDICT_RE);
+    })();
+    if (agentSupersedes || oracleSupersedes) {
+      delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+      // #2782 fix-1 (execution-review F1, #2823 fix-contract RULE) — provider is attribution OF the
+      // superseded dispatch's served-model stamp, and no agent append can re-set it (resolveModelFields
+      // copies only modelVersion/modelTier) — so the agent change clears it with the dispatch evidence.
+      delete entry.provider;
+    }
+  }
+  // #2169 slice 4, AC-28d + #1590 carried pitfall — a GENUINE subprocess-openrouter evidence BUNDLE (every
+  // one of dispatch + transcript_path + nonce + verdict + artifact_path present on THIS write, own-key
+  // "provided" discipline) is exactly as strong as the agentId/oracle supersession just above and must
+  // likewise clear a prior operator's skip_reason note: the sanctioned full-evidence close (design decision
+  // 1(ii)'s atomic post-exit write) legitimately closes out a row an operator had earlier marked skip. A
+  // BARE `--dispatch` marker (the pre-launch pending stamp — dispatch/run_id/run_kind/run_source/pending,
+  // with no transcript/nonce/verdict/artifact yet) carries none of that weight and must NOT erase the note —
+  // the assertion-erases-assertion trap (#1590 class): a bare marker must never masquerade as an evidence
+  // bundle.
+  const dispatchEvidenceBundleComplete = ('dispatch' in fields) && isSubprocessDispatch(fields.dispatch) &&
+    ('transcript_path' in fields) && !!fields.transcript_path &&
+    ('nonce' in fields) && !!fields.nonce &&
+    ('verdict' in fields) && !!fields.verdict &&
+    ('artifact_path' in fields) && !!fields.artifact_path;
+  if (dispatchEvidenceBundleComplete) {
+    delete entry.skip_reason;
+  }
+  if ('skip_reason' in fields) {
+    delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
+    // #2782 fix-1 (execution-review F1, #2823 fix-contract RULE) — provider joins every clear that
+    // clears modelVersion/modelTier: a skip line must not leave a stale provider stamp beside an
+    // erased model.
+    delete entry.modelVersion; delete entry.modelTier; delete entry.provider; delete entry.effort; delete entry.effort_source; delete entry.closedAt; delete entry.reroute;
+    delete entry.dispatch; delete entry.transcript_path; delete entry.nonce;
+    // #2169 slice 5 — dispatch_nonce joins the clear-list for the SAME reason as dispatch/transcript_path/
+    // nonce just above: it is provenance OF a real dispatch, and a skip is a declaration that no (or no
+    // longer relevant) run happened. This is what lets an operator reclaim a stamped-but-in-flight row
+    // exactly like they can already reclaim a `pending`-stamped one (S4 precedent) — the stamp is never
+    // terminal evidence, so it must remain erasable by a bare skip.
+    delete entry.dispatch_nonce;
+    // #2075 D1 — run_id/run_kind/run_source join the clear-list too: a skip line must not carry a stale
+    // claimed provenance kind (join the SAME reasoning as modelVersion/dispatch above — these are provenance
+    // OF a real run, and a skip is a declaration that no run happened).
+    delete entry.run_id; delete entry.run_kind; delete entry.run_source;
+    // review-round-counter-per-plan (plan Intent #1) — a skip row must not carry a stale plan identity: a
+    // skip declares "no run happened for this round", so any inherited reviewed_plan is dead weight a later
+    // merge could otherwise resurrect onto a round that was never actually reviewed.
+    delete entry.reviewed_plan;
+    // #2169 slice 4, AC-28c — the pending liveness stamp is a bare ASSERTION (design decision 1), so a
+    // legitimate skip erases it exactly like every other stale claimed-provenance field above. This is what
+    // makes an in-flight dispatch reclaimable by an operator skip without a separate escape hatch.
+    delete entry.pending;
+  }
+  // #2169 slice 5 (S5-AC2/AC3/AC4/AC6/AC7, design decision 4) — DELIVERY-RECEIPT GUARD. A write that
+  // carries a verdict (own-key "provided" trigger, matching every other clause's convention above) and
+  // lands on a row that is — or becomes, via THIS same call — dispatch_nonce-STAMPED must prove delivery:
+  // --receipt must hash (hashDispatchNonce) to the EXACT stored value. A row with no dispatch_nonce (every
+  // legacy row on disk today, and any row this call never stamps) is entirely untouched by this clause —
+  // S5-AC4's load-bearing counterfactual: a proof-less verdict append onto such a row still succeeds
+  // unchanged. Checked LAST (after the skip clear-list above), so a call that ALSO carries --skip-reason
+  // never trips it (its verdict/dispatch_nonce would already have been cleared by the block above by the
+  // time this runs). Throws BEFORE kept.push/fs.writeFileSync — the row is untouched on refusal, matching
+  // every other guard in this function.
+  if (('verdict' in fields) && fields.verdict && entry.dispatch_nonce) {
+    const receiptHash = (('receipt' in fields) && fields.receipt) ? hashDispatchNonce(fields.receipt) : '';
+    if (!receiptHash || receiptHash !== entry.dispatch_nonce) {
+      throw new GuardRejection(
+        'delivery-receipt guard (#2169 slice 5, AC-34, design decision 4): role ' + role + '\'s row is ' +
+        'dispatch_nonce-STAMPED (a genuine DISPATCH-NONCE:<token> dedicated line was delivered to this ' +
+        'dispatch) and this write carries a verdict, but no --receipt <token> was supplied, or it does not ' +
+        'match the delivered token. No value PRINTED on this row proves a caller\'s identity — the stored ' +
+        'dispatch_nonce is a ONE-WAY HASH, never the plaintext, so echoing it straight back as --receipt can ' +
+        'never satisfy this guard. Re-run this SAME append with --receipt "<the exact token from THIS ' +
+        'dispatch\'s own DISPATCH-NONCE: line>" to supply genuine proof of delivery.'
+      );
+    }
+  }
+  kept.push(JSON.stringify(entry));
+  fs.writeFileSync(file, kept.join('\n') + '\n');
+  // #3326 — durable task→carried-key record: after the row lands, remember (under a dot-directory the
+  // *.jsonl task-file glob never sees) WHICH session key this task's rows are filed under, so the merge-
+  // side review gate (enforce-review-or-lfah.sh leg-3c) can find the ticket's ledger under the CARRIED
+  // key when the merging orchestrator runs in a NEW session. Fix cycle 1 (execution-review finding 2):
+  // the record is now FIRST-CARRIED-KEY-WINS and is seeded ONLY from the explicit append/inherit command
+  // paths (the opts.carriedKeySeed flag below) — NEVER by the inferred background writers
+  // (reconcile-spawns under the SPAWNING session, refresh-models), whose spawn-record partial ledgers
+  // used to overwrite the key last-writer-wins and made the merge-gate admit order-dependent. The FIRST
+  // explicit append's key is the task's one carried key (the handoff card hands ONE key across
+  // sessions); a later explicit append under a different session never displaces it, and neither does
+  // any inferred write, in any order. Best-effort and SILENT by design: an unwritable index only
+  // removes the merge-side widening (the gate falls back to today's behavior, fail-closed) and must
+  // never change append's own output or success.
+  if (opts && opts.carriedKeySeed) carriedKeySeed(session, task);
+  return file;
+}
+
+// 3role-ledger-append-should-reject-unknown-flags — the COMPLETE, closed allowlist of every flag name
+// cmdAppend actually consumes: the 3 required flags checked at the top of cmdAppend below, plus the 23
+// optional flags each read via `'<flag>' in o` in the body that follows (:3069-3157 as of this comment —
+// keep this array and those consumers in LOCKSTEP: a future `if ('new' in o)` consumer added without also
+// adding 'new' here makes that consumer silently DEAD the instant its own smoke runs — fail-closed, loud,
+// not a silent miss). A name listed here with no live consumer is inert but harmless. 26 names total.
+const APPEND_KNOWN_FLAGS = [
+  // required (checked immediately below)
+  'session', 'task', 'role',
+  // optional — every flag a sanctioned writer passes today (see the plan's caller-evidence survey)
+  'agent', 'artifact', 'reviewed-plan', 'skip-reason', 'oracle', 'verdict', 'cairn', 'dispatch',
+  'transcript', 'nonce', 'dispatch-nonce', 'receipt', 'pending', 'run-kind', 'run-id', 'run-source',
+  'self-authored', 'effort', 'effort-source', 'model-version', 'model-tier', 'closed-at', 'sense-reroute',
+  'provider',   // #2782 — the served-provider stamp (validated against the SSOT provider ids below).
+];
+
+function cmdAppend(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) { console.error('append: --session, --task, --role are required'); process.exit(2); }
+  enforceSessionShape(session, task, role, 2);
+  // #3258 D4 — append-time FLAG-SHAPE refusal (fail-closed: exit 2, distinct BLOCK token, BEFORE
+  // any ledger file read/write or row write). Armed on the SAME default-store predicate as the
+  // session-shape guard above (SESSION_SHAPE_GUARD_ARMED): a THREE_ROLE_LEDGER_DIR-redirected
+  // store is a smoke fixture, not the asset (dozens of sibling suites append synthetic
+  // non-numeric tasks under redirect — measured), while every production append lands in the
+  // default store with a real ticket number, a real session UUID, and — when closing — a real ISO
+  // timestamp. --session itself is the session-shape guard's own clause (one line above).
+  if (SESSION_SHAPE_GUARD_ARMED) {
+    if (taskIdentityProblem(session, task, role)) {
+      console.error('BLOCK (3role-ledger append-flag-shape): --task "' + String(task == null ? '' : task)
+        + '" is not a ticket id the ticket store knows (all digits, or a slug id with a ticket file — '
+        + 'never a branch slug like "3258-memory-trim" that names no ticket). Read the ticket id from '
+        + 'the brief and re-append with it. Nothing was written.');
+      process.exit(2);
+    }
+    if ('closed-at' in o) {
+      const closedAtRaw = String(o['closed-at'] == null ? '' : o['closed-at']);
+      if (!isIsoTimestamp(closedAtRaw)) {
+        console.error('BLOCK (3role-ledger append-flag-shape): --closed-at "' + closedAtRaw
+          + '" is not an ISO 8601 timestamp (e.g. 2026-10-18T12:00:00.000Z — never "now" or any '
+          + 'relative wording). Pass the real close-time instant. Nothing was written.');
+        process.exit(2);
+      }
+    }
+  }
+  if (!RECORDABLE_ROLES.includes(role)) { console.error('append: --role must be one of ' + RECORDABLE_ROLES.join(', ')); process.exit(2); }
+  // 3role-ledger-append-should-reject-unknown-flags — UNKNOWN-FLAG REFUSAL, fail-closed. Runs BEFORE any
+  // ledger file read/write and BEFORE every state-dependent guard below (fix-A ambiguity, #1769 warn,
+  // verdict-fail-loud), so an unknown flag is always named regardless of ledger state, for every
+  // RECORDABLE_ROLES role. KEY-ONLY: this checks flag NAMES, never values — a bare valueless flag is fine,
+  // and an `--artifact=path` single-token form is the unknown NAME "artifact=path" (parseArgs never splits
+  // on '=', so it was silently dropped before and is refused now, same as any other unrecognized name).
+  // `__dupFlags` (:912) is non-enumerable, so Object.keys(o) never sees it here — #2189's own duplicate-flag
+  // refusal already ran in the dispatcher before cmdAppend was ever called.
+  {
+    const unknown = Object.keys(o).filter((k) => !APPEND_KNOWN_FLAGS.includes(k));
+    if (unknown.length) {
+      console.error('BLOCK (3role-ledger unknown-flag): append refuses unrecognized flag(s) ' +
+        unknown.map((k) => '--' + k).join(', ') + ' — nothing written. Known flags: ' +
+        APPEND_KNOWN_FLAGS.map((k) => '--' + k).join(', ') + '.');
+      process.exit(2);
+    }
+  }
+  // #1528 D2 C1/C2 — EFFORT-SOURCE fail-closed guard. Runs BEFORE any ledger file read/write, same
+  // discipline as the unknown-flag refusal immediately above. C1: the value must be exactly "assigned" or
+  // "observed" — anything else, including a bare valueless flag (parseArgs yields ''), is refused, naming
+  // the bad value. C2: `--effort-source` REQUIRES `--effort` on the SAME call — a provenance claim with no
+  // value to attribute is meaningless. Both refuse with the SAME stable stderr token so either failure mode
+  // is one grep.
+  if ('effort-source' in o) {
+    const rawEffortSource = o['effort-source'];
+    if (rawEffortSource !== 'assigned' && rawEffortSource !== 'observed') {
+      console.error('BLOCK (3role-ledger effort-source): --effort-source "' + rawEffortSource +
+        '" is not one of the two legal values (assigned, observed) — nothing written.');
+      process.exit(2);
+    }
+    if (!('effort' in o)) {
+      console.error('BLOCK (3role-ledger effort-source): --effort-source requires --effort on the SAME ' +
+        'call (a provenance claim with no value to attribute is meaningless) — nothing written.');
+      process.exit(2);
+    }
+  }
+  // #2782 AC-6 — PROVIDER fail-closed guard. Runs BEFORE any ledger file read/write, same discipline as
+  // the two guards immediately above. The value must be a member of the SSOT's CLOSED provider vocabulary
+  // (the keys of `providers` in config/cc-routes.json, read FRESH at call time — plan N5) — a typo'd or
+  // invented provider id must never land on a row the proving-run tally (#2580) will group by. When the
+  // SSOT itself is unreadable the closed vocabulary is unknown, so EVERY value is refused (fail-closed —
+  // never fail-open on a missing vocabulary). Refusal names the legal ids, writes nothing.
+  if ('provider' in o) {
+    const provVal = String(o.provider == null ? '' : o.provider);
+    const provIds = ssotProviderIds2782();
+    if (!provIds || !provIds.includes(provVal)) {
+      console.error('BLOCK (3role-ledger provider): --provider "' + provVal + '" is not one of the SSOT ' +
+        'provider ids (keys of `providers` in config/cc-routes.json, read at call time): ' +
+        (provIds && provIds.length ? provIds.join(', ') : 'the SSOT is unreadable, so no provider id can be validated') +
+        ' — nothing written.');
+      process.exit(2);
+    }
+  }
+  // exec-review-ledger-append-reject-absolute-scratchpad-artifact-path-must-be-repo-relative — D1/D2/D3.
+  // execution-review is the ONLY role whose row the merge gate resolves under `--merge-head`
+  // (checkRole's mergeHead branch / #2050 AC-1), so it is the only role for which a machine-local
+  // `--artifact` path is a structural dead end, not merely a durability warning (the pre-existing #2462
+  // AC-6 WARN below still fires, WARN-only, for every OTHER role). D1: REJECT (exit 2, ledger byte-
+  // untouched — this runs BEFORE any ledger file read, same discipline as the unknown-flag refusal
+  // above) when the trimmed raw `--artifact` argument is absolute (leading `/`), home-anchored (`~` or
+  // leading `~/`), or escapes the repo (a `..` PATH SEGMENT — split on `/` and compare each segment for
+  // EXACT equality to `..`, never a substring `includes('..')`, which would false-reject a legitimate
+  // dotted filename like `foo..md` or `v1.2..bak`). D2: on ACCEPT, store the raw repo-relative string
+  // VERBATIM for execution-review (bypassing normalizeArtifact()'s cwd-absolutizing branches below) —
+  // only that form is layout-independent (primary clone, `.claude/worktrees/<slug>/`, a sibling
+  // `ai-brain-wt-*` worktree alike) under `<merge-head>:<path>` resolution; normalizeArtifact() would
+  // re-absolutize a relative arg that happens to exist at the calling cwd, silently re-introducing the
+  // exact unresolvable-at-merge-head shape D1 exists to reject (plan-review finding #1 — D1 without D2
+  // does not close the incident). D3: THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1 makes BOTH D1 and
+  // D2 inert (restores pre-fix behavior in full, including normalizeArtifact()'s absolutizing store) for
+  // the legacy smoke fixtures that assert an absolutized execution-review artifact_path — audited via
+  // writeBypassLog() + an AUDIT: stderr line, its name NEVER printed in the D1 rejection text itself (a
+  // gate's own block message must not carry its own defeat token — mirrors the CLAUSE3_OVERRIDE
+  // precedent above). The switch is append-side only: it never touches checkRole/checkSubprocessProvenance,
+  // so a switch-bypassed absolute path still fails `check --merge-head` and still blocks the merge —
+  // it cannot manufacture a passing check, only suppress this one append-time shape refusal.
+  const execReviewShapeOff = process.env.THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF === '1';
+  const execReviewRawArtifact = ('artifact' in o) ? String(o.artifact == null ? '' : o.artifact).trim() : '';
+  const execReviewShapeGuardActive = role === 'execution-review' && execReviewRawArtifact !== '';
+  if (execReviewShapeGuardActive && !execReviewShapeOff) {
+    const isAbsolute = execReviewRawArtifact.startsWith('/');
+    const isHomeAnchored = execReviewRawArtifact === '~' || execReviewRawArtifact.startsWith('~/');
+    const hasDotDotSegment = execReviewRawArtifact.split('/').some((seg) => seg === '..');
+    if (isAbsolute || isHomeAnchored || hasDotDotSegment) {
+      console.error('BLOCK (3role-ledger execreview-artifact-shape): --artifact "' + execReviewRawArtifact +
+        '" is not repo-relative. execution-review evidence is bound to the PR head (checkRole\'s --merge-head ' +
+        'arm, #2050 AC-1: `git cat-file -e <merge-head-sha>:<path>`), which can NEVER resolve a machine-local ' +
+        'path — an absolute path, a home/tilde-anchored path, or a path escaping the repo via a ".." segment. ' +
+        'Commit the verdict at a repo-root-relative path on the PR branch, push it, then re-append with THAT ' +
+        'path. If the worktree that produced it is already gone, first extract the branch-committed file into ' +
+        'the primary clone at the same repo-relative path, then re-append.');
+      process.exit(2);
+    }
+  } else if (execReviewShapeGuardActive && execReviewShapeOff) {
+    console.error('AUDIT: execreview-artifact-shape guard bypassed via documented operator override ' +
+      '(role=' + role + ' task=' + sanitize(task) + ')');
+    writeBypassLog('3role-ledger-execreview-artifact-shape', 'THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF',
+      'PERMIT', { task: sanitize(task), role: sanitize(role) });
+  }
+  // Map the CLI flag names onto the canonical entry field names overlayAppend overlays.
+  const fields = {};
+  if ('agent' in o) fields.agentId = o.agent;
+  if ('artifact' in o) {
+    // D2 (see block above): a repo-relative execution-review artifact is stored VERBATIM, never through
+    // normalizeArtifact()'s cwd-absolutizing branches — gated by the SAME kill-switch as D1 (#2309-style
+    // switch discipline: one env var makes the whole feature inert, never a half-applied state where D1
+    // rejects but D2 still absolutizes, or D1 is off but D2 still stores verbatim).
+    //
+    // ledger-artifact-path-normalize-relative-from-worktree-cwd-and-sibling-wt-strip (R1): the THIRD leg —
+    // execution-review with the D1/D2 kill-switch ON (execReviewShapeOff) — is D3, "restores pre-fix
+    // behaviour in FULL, including normalizeArtifact()'s absolutizing store" (the switch's own contract),
+    // so it deliberately calls normalizeArtifact() WITHOUT `{ repoRelative: true }` — untouched by R1. Only
+    // the remaining case (every role OTHER than execution-review) opts into the new repo-relative store.
+    if (role === 'execution-review' && !execReviewShapeOff) {
+      fields.artifact_path = execReviewRawArtifact;
+    } else if (role === 'execution-review' && execReviewShapeOff) {
+      fields.artifact_path = normalizeArtifact(o.artifact);   // D3 legacy path — byte-for-byte untouched.
+    } else {
+      fields.artifact_path = normalizeArtifact(o.artifact, { repoRelative: true });   // #1199 Part B + R1.
+    }
+  }
+  // review-round-counter-per-plan — the plan-review round's PLAN identity (never the reviewer's own
+  // artifact — that stays `--artifact`/artifact_path). normalizeArtifact() applies the same cwd-independent
+  // + home-tilde treatment as --artifact; for an absolute path it never statSyncs for existence (only its
+  // relative-path branches do, and those defer to verbatim on a miss rather than failing), so a moved/
+  // deleted historical plan file's path is still stored intact.
+  if ('reviewed-plan' in o) fields.reviewed_plan = normalizeArtifact(o['reviewed-plan']);
+  if ('skip-reason' in o) fields.skip_reason = o['skip-reason'];
+  if ('oracle' in o) fields.oracle = o.oracle;
+  if ('verdict' in o) fields.verdict = o.verdict;
+  // #1657 registry row 2 (cairn-search receipt) — the STRUCTURED copy of a role's `cairn:` prose citation,
+  // captured on the SAME row as everything else this role's own self-append already writes (planner/
+  // plan-review append this at whichever call actually records their row — the field is populated at
+  // WRITE time, not backfilled later, per the plan-review note on capture timing). Read via
+  // `node hooks/guardlib-receipt.mjs check --type cairn-search --session S --task T [--role R]`.
+  // Ordinary own-key overlay (see overlayAppend) — omitting this flag on a later call leaves it untouched.
+  if ('cairn' in o) fields.cairn = o.cairn;
+  // #1947 S3 — the subprocess-openrouter provenance fields (D2/M1/M2). Written ONLY by
+  // tools/openrouter-role-dispatch.sh's own self-append (or the role's own self-append, mirroring today's
+  // agentId self-append convention) — `check`'s admissibility gate (checkSubprocessProvenance) reads these
+  // three fields ONLY when the SSOT independently declares this role's seat dispatch=subprocess-openrouter;
+  // writing them on any other role's row is inert (the SSOT gate ignores an unrecognised marker).
+  if ('dispatch' in o) fields.dispatch = o.dispatch;
+  if ('transcript' in o) fields.transcript_path = normalizeArtifact(o.transcript);
+  if ('nonce' in o) fields.nonce = o.nonce;
+  // #2169 slice 5 (design decision 4, AC-34) — the delivery-receipt STAMP + PROOF flags.
+  // --dispatch-nonce <RAW TOKEN>: the MINTING side (the Agent-tool spawn edge today; the subprocess
+  // dispatch helper too, slice 6) supplies the raw token it saw on a genuine DISPATCH-NONCE:<token>
+  // dedicated line. This CLI layer hashes it (hashDispatchNonce) BEFORE handing it to overlayAppend —
+  // the ledger row NEVER stores the plaintext, only the one-way hash (S5-AC6 harvest ban).
+  // --receipt <RAW TOKEN>: the PROOF side — a verdict-carrying append's claim of delivery. Passed through
+  // RAW (never pre-hashed here); overlayAppend's delivery-receipt guard hashes it at comparison time
+  // against the row's stored dispatch_nonce. The flag is spelled --receipt (never --run — that name
+  // collided with Phase 2's AC-13).
+  if ('dispatch-nonce' in o && o['dispatch-nonce']) fields.dispatch_nonce = hashDispatchNonce(o['dispatch-nonce']);
+  if ('receipt' in o) fields.receipt = o.receipt;
+  // #2169 slice 4 — the pending liveness stamp CLI flag. Flag presence is the "provided" signal (same
+  // discipline as --self-authored above); a bare `--pending` (no value) is true, `--pending false` is false.
+  if ('pending' in o) fields.pending = (o.pending !== 'false');
+  // #2075 Phase 1, D1 — the provenance-kind fields. Written ONLY by the writer that obtained the identity
+  // (three-role-subagent-ledger.sh -> witnessed; the dispatch helper -> bound; cmdReconcileSpawns /
+  // cmdRefreshModels -> inferred, stamped internally below, never via this flag). --run-kind is WRITE-ONCE /
+  // monotone-non-decreasing under overlayAppend (see its own comment there); --run-id/--run-source are
+  // ordinary own-key overlays.
+  if ('run-kind' in o) fields.run_kind = o['run-kind'];
+  if ('run-id' in o) fields.run_id = o['run-id'];
+  if ('run-source' in o) fields.run_source = o['run-source'];
+  // #1100 item 3: provenance — a line authored BY the role's own agent (its SubagentStop scan saw the agent
+  // self-append for this role) carries self_authored:true. Flag presence is the "provided" signal; a bare
+  // `--self-authored` (no value) is true, `--self-authored false` is false.
+  if ('self-authored' in o) fields.self_authored = (o['self-authored'] !== 'false');
+  // #1466 — EXPLICIT provenance overlay flags, parsed BEFORE the model auto-capture below so a resolvable
+  // transcript (OBSERVED) can still overwrite an explicitly-asserted --model-version/--model-tier (ASSIGNED)
+  // when both are present on the SAME call — normally they never co-occur (see the file-header comment).
+  // --effort has NO auto-capture counterpart any more (removed below), so this is its ONLY source.
+  if ('effort' in o) fields.effort = o.effort;
+  // #1528 D2 — provenance tag for the effort value THIS call carries. Reaching here means the C1/C2 guard
+  // above already validated the value (exactly "assigned"/"observed") and confirmed --effort was also
+  // provided on this same call; overlayAppend's own-key discipline (see its `effort` block) does the
+  // lockstep set-or-delete.
+  if ('effort-source' in o) fields.effort_source = o['effort-source'];
+  if ('model-version' in o) fields.modelVersion = o['model-version'];
+  if ('model-tier' in o) fields.modelTier = o['model-tier'];
+  // #2782 — the served-provider stamp. The VALUE was already validated fail-closed against the SSOT
+  // provider ids near the top of this handler; this is the ordinary own-key overlay onto the entry.
+  if ('provider' in o) fields.provider = o.provider;
+  // #1516 — explicit close-stamp flag. ONLY three-role-subagent-ledger.sh (SubagentStop) passes this; every
+  // other caller omits it, so overlayAppend's per-key "provided" discipline leaves an unstamped line alone.
+  if ('closed-at' in o) fields.closedAt = o['closed-at'];
+  // #1465 — CENTRALIZED best-effort MODEL capture (unchanged by #1466 — only the effort half below moved).
+  // Runs on EVERY append (both a role's own self-append AND the SubagentStop hook's later --agent
+  // re-append), so the stop-time re-append automatically backfills modelVersion/modelTier from the
+  // by-then-COMPLETE transcript with ZERO edit to the shell hook (see AC1-LIVE's fallback branch). Fail-open
+  // throughout: any resolution failure just omits the field (back-compat — old ledger lines and
+  // check/checkRole never reference these).
+  //   agentId for the model lookup <- --agent when present, ELSE resolveAgent(session, task, role) (a
+  //   self-append carries no --agent; its own transcript is scanned for the literal spawn tag).
+  //   model <- transcriptModel(session, agentId) -> modelVersion; modelIdToTier(modelVersion) -> modelTier.
+  // This OBSERVED capture wins over an explicit --model-version/--model-tier from above ONLY when a real
+  // message.model line already exists (at spawn time it never does yet, so an ASSIGNED stamp survives
+  // untouched until the role's own transcript actually completes — #1466 AC-8b, "observed wins").
+  // #1481: this now calls the SHARED resolveModelFields() helper (extracted, not re-implemented) — the
+  // exact same transcriptModel()->overlay-merge path cmdRefreshModels reuses for the in-flight backfill.
+  // #2782 intent 1 — SUBPROCESS-PROVENANCE GATE on that capture. An append that carries (or binds, via
+  // --run-id, to a row carrying) subprocess provenance — dispatch=subprocess-* — and that names NO --agent
+  // must never consult the blind resolveAgent() search inside resolveModelFields(): the newest-mtime winner
+  // that search returns is a SIBLING agent's transcript (the measured AC-1 leak: a z.ai subprocess row
+  // stamped with whichever Claude lane's agent transcript happened to be newest). On that row shape the
+  // search is skipped ENTIRELY — explicit --model-version/--model-tier set above are honored VERBATIM
+  // (never clobbered by an observed sibling), and no model is ever guessed. An EXPLICIT --agent keeps
+  // today's E1 observed-wins capture byte-identical (AC-3, and the mixed E1+E2 held-out case: the named
+  // agent's own transcript decides, row-level gate).
+  {
+    const explicitAgent = ('agent' in o && o.agent) ? o.agent : '';
+    const subProcGated2782 = !explicitAgent && appendBoundToSubprocess2782(session, task, role, fields);
+    if (!subProcGated2782) {
+      const modelFields = resolveModelFields(session, task, role, explicitAgent);
+      if (modelFields.modelVersion) fields.modelVersion = modelFields.modelVersion;
+      if (modelFields.modelTier) fields.modelTier = modelFields.modelTier;
+    }
+  }
+  // #1640 S11 — the reroute-stamp RECORDER. Opt-in via --sense-reroute (only the spawn edge
+  // three-role-spawn-ledger.sh and the SubagentStop edge three-role-subagent-ledger.sh pass it); reads ONLY
+  // this process's OWN environment (the session's inherited ANTHROPIC_BASE_URL) at RUN-TIME, resolved against
+  // the SSOT's declared provider rows for THIS role's seat — never at check-time (see cmdCheck's declared
+  // sensor, which reads ONLY the field this writes). senseReroute() fails closed to null (field omitted) on
+  // any ambiguity, so an ordinary Anthropic session never gains a stamp.
+  if ('sense-reroute' in o) {
+    const r = senseReroute(role);
+    if (r) fields.reroute = r;
+  }
+  // #1466 — the #1465 AMBIENT `process.env.CLAUDE_EFFORT` auto-capture that used to sit here is REMOVED. It
+  // stamped the ORCHESTRATOR's session effort on EVERY append — including a close-out `--artifact`-only call
+  // with no effort opinion of its own — so the moment a role's real effort differed from the orchestrator's,
+  // the very next unrelated append silently clobbered it back to the session value (the bug this fixes).
+  // Effort is now written ONLY via the explicit --effort flag above: the spawn hook stamps ASSIGNED, the
+  // SubagentStop hook stamps OBSERVED (`effort.level`), and every other append (self-record, close-out)
+  // passes none — overlayAppend's per-key "provided" discipline then PRESERVES the role's real value untouched.
+  // #897/#2462 AC-6 — DURABILITY FLAG at append time. #897 (original): a build worktree is transient
+  // (quarantined at cleanup), so an artifact_path under `.claude/worktrees/<slug>/` DANGLES the moment the
+  // worktree is removed — and the completion gate (which checks the artifact file EXISTS) then BLOCKs.
+  // #2462 (widened): the SAME durability failure recurs for a home/tilde-anchored or otherwise machine-local
+  // absolute path, and for a temp/scratch dir — none of these are a stable, git-trackable repo-relative
+  // location either (the live #2462 reproducer: this very task's own round-3 plan-review self-append cited
+  // `~/coding_projects/ai-brain-wt-2462-plan-fold-r2/.ai-workspace/plans/...` — silent, rc=0, pre-fix). The
+  // committed artifact lives at a stable repo-relative path after merge+FF; cite THAT. WARN (stderr is
+  // visible to the orchestrator, unlike an exit-0 hook nudge — #769) but do NOT block: the cited path may
+  // legitimately still exist this instant, and a role whose real artifact genuinely is ephemeral-shaped must
+  // never be BRICKED by this leg (AC-6's own over-blocking guard) — only the executor's PR-URL/branch/sha
+  // artifact_path and a genuine repo-relative path are UNFLAGGED by construction (neither shape below ever
+  // matches a bare token or a path with no leading `/`/`~` and no worktree segment).
+  //
+  // Checked against the RAW --artifact ARGUMENT (o.artifact), never the possibly-rewritten `fields.artifact_
+  // path`: normalizeArtifact() collapses a HOME-rooted absolute path to `~/...` but leaves an absolute path
+  // OUTSIDE $HOME untouched — so a detector reading only the post-normalize value for a leading `~` would
+  // silently miss that case (checking the raw argument catches both, uniformly).
+  {
+    const rawArtifactArg = ('artifact' in o) ? String(o.artifact == null ? '' : o.artifact).trim() : '';
+    if (rawArtifactArg && /(^|\/)\.claude\/worktrees\//.test(rawArtifactArg)) {
+      console.error('WARN (3role-ledger #897): --artifact path is inside a build worktree (.claude/worktrees/) — ' +
+        'it will DANGLE once the worktree is quarantined, and the completion gate will then BLOCK. Cite the ' +
+        'stable, git-tracked repo-relative path the artifact lands at after merge+FF, OR complete the task ' +
+        'before quarantine.');
+    } else if (rawArtifactArg && (rawArtifactArg === '~' || rawArtifactArg.startsWith('~/') || rawArtifactArg.startsWith('/'))) {
+      console.error('WARN (3role-ledger #2462 AC-6): --artifact "' + rawArtifactArg + '" cites an ephemeral or ' +
+        'anchored location (a home/tilde-anchored or otherwise machine-local absolute path, or a temp/scratch ' +
+        'dir) — not a stable, git-trackable repo-relative path. It will not survive a worktree quarantine, a ' +
+        'different checkout, or a different machine. Re-append with a repo-relative --artifact path (from this ' +
+        'repo\'s own root), then re-complete.');
+    }
+  }
+  // ledger-concurrent-append-agent-disambiguation Fix A — AMBIGUITY REFUSAL, fail-closed. Runs BEFORE
+  // the #1769 warn below AND before the overlayAppend call (~line 2762 as of this fix) — i.e. before
+  // ANY of overlayAppend's internal machinery (clause-1/2 terminal-evidence, clause-3 transcript-proof
+  // #2309, #1580 isNewRound) ever runs, so this refusal structurally pre-empts all of it (plan-review
+  // round-2 R2). Trigger keys STRICTLY on the ABSENCE of --agent — an append carrying --verdict and/or
+  // --skip-reason is STILL "bare" for this rule (R1): the canonical review-role self-append shape is
+  // exactly `--verdict <PASS|FAIL> --artifact <p>`, no --agent, so a predicate that exempted --verdict
+  // (like #1769's isBareRepoint below) would leave that shape completely uncovered. Deliberately does
+  // NOT reuse #1769's isBareRepoint — a DIFFERENT, narrower trigger (only the truly bare no-flags-at-all
+  // case) protecting a DIFFERENT, WARN-only concern (the reused-task-id case, #1749).
+  //
+  // Count ONLY artifact-less same-role rows for this task (a row that already carries an artifact_path
+  // is complete evidence, not an ambiguous merge candidate). More than one such row means overlayAppend's
+  // target-row selection cannot honestly tell which row this write is for — merging onto whichever one
+  // happens to be selected would silently cross-wire the artifact onto the wrong lane's row (the measured
+  // SL-8/SL-9 concurrent cross-wire incident). REFUSE outright (non-zero exit, ledger file untouched —
+  // this block only ever READS the file) rather than guess; the remedy is a plain, actionable retry with
+  // --agent naming the specific target row.
+  // #2701 D1 — ONE IDENTITY PER WRITE. A write naming BOTH --agent and --run-id is refused outright: no
+  // sanctioned writer ever does it, and it is the exact write that mints a self-cross-wired row (nr9).
+  if (('agent' in o) && ('run-id' in o)) {
+    console.error('BLOCK (3role-ledger one-identity #2701): a write may name only ONE run identity — ' +
+      '--agent and --run-id together are refused; nothing written.');
+    process.exit(2);
+  }
+  {
+    // #2701 fold r2 finding 1 / fold r3 finding 1 — Fix A EXEMPTS a --run-id-pinned write (except a
+    // --skip-reason write, which D1 treats as identity-less and never nonce-pins) exactly like an --agent
+    // write: once D1 gives each dispatch round its own row, the helper's post-exit write and its rendered
+    // self-append instruction must not collide with Fix A's ambiguity refusal just because an OLDER
+    // artifact-less same-role row (a stranded pending dispatch, an Agent dead round, or D4's lifted agent
+    // row) exists. The ONLY row left OUT of the live-candidate count is a `pending` row that a NEWER
+    // same-role row with a DIFFERENT identity has since superseded (a stranded dispatch) — fold r3 undid
+    // the dead-round exclusion (it reopened the concurrent-lane cross-wire Fix A exists to stop: two live
+    // agent rows, one bare self-append, must still be refused with exit 2 — AC-17's stopped-lane clause).
+    const hasAgent = ('agent' in o) || (('run-id' in o) && !('skip-reason' in o));
+    if (!hasAgent) {
+      const artifactLessRows = [];
+      const all2701 = [];
+      try {
+        const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
+        for (const ln of raw) {
+          try {
+            const j = JSON.parse(ln);
+            if (j && j.role === role) all2701.push(j);
+          } catch (e) { /* skip unparsable line */ }
+        }
+      } catch (e) { /* no ledger file yet -> artifactLessRows stays [] */ }
+      const id2701 = (r) => String((r && (r.agentId || r.run_id)) || '');
+      all2701.forEach((j, i) => {
+        if (j.artifact_path) return;
+        if (j.pending && all2701.slice(i + 1).some((k) => id2701(k) && id2701(k) !== id2701(j))) return; // superseded pending only
+        artifactLessRows.push(j);
+      });
+      if (artifactLessRows.length > 1) {
+        const ids = artifactLessRows.map((r) => (r.agentId || '(no agentId)')).join(', ');
+        console.error('BLOCK (3role-ledger fix-A ambiguity, ledger-concurrent-append-agent-disambiguation): ' +
+          'role ' + role + ' has ' + artifactLessRows.length + ' artifact-less rows for task ' +
+          sanitize(task) + ' (agentIds: ' + ids + ') — a bare append (no --agent; this trigger fires ' +
+          'regardless of --verdict/--skip-reason) cannot tell which row this write is for. Merging onto ' +
+          'whichever row happens to be selected would silently cross-wire this artifact onto the wrong ' +
+          'lane\'s row. Pass --agent <the specific row\'s agentId> to pin the target unambiguously.');
+        process.exit(2);
+      }
+    }
+  }
+  // #1769: a BARE repoint (no --agent, no --verdict, no --skip-reason — i.e. only artifact_path and/or the
+  // best-effort model fields are being provided) merges onto overlayAppend's "prior" row: whichever line was
+  // written LAST for this (task, role), NOT necessarily the review event the caller has in mind. When one
+  // 3ROLE_TASK id has been reused across MULTIPLE independent reviews of this role (a compound ticket bundling
+  // several PRs, each execution-reviewed separately), "prior" may already belong to a LATER, unrelated review
+  // by the time this repoint runs — silently cross-attributing this artifact_path to the wrong agentId with no
+  // error anywhere in the pipeline (live incident 2026-07-20, #1749: a follow-up archival reviewer's own
+  // self-append became "prior" before an artifact-only repoint landed on it). Detect: count prior same-role
+  // lines for this task BEFORE this call; if >1 exist and this call supplies NEITHER --agent NOR --verdict
+  // NOR --skip-reason, the merge target is ambiguous — warn (do not block; the caller may genuinely intend
+  // the latest row).
+  {
+    const isBareRepoint = !('agent' in o) && !('verdict' in o) && !('skip-reason' in o);
+    if (isBareRepoint) {
+      let priorSameRoleCount = 0;
+      try {
+        const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
+        for (const ln of raw) { try { const j = JSON.parse(ln); if (j && j.role === role) priorSameRoleCount++; } catch (e) { /* skip */ } }
+      } catch (e) { /* no ledger file yet -> priorSameRoleCount stays 0 */ }
+      if (priorSameRoleCount > 1) {
+        console.error('WARN (3role-ledger #1769): AMBIGUOUS repoint target — role ' + role + ' already has ' +
+          priorSameRoleCount + ' prior lines for task ' + sanitize(task) + ' (this task id has been reused ' +
+          'across multiple independent reviews of this role). This bare append (no --agent/--verdict/' +
+          '--skip-reason) will merge onto whichever row is CURRENTLY LAST — possibly a DIFFERENT review than ' +
+          'the one you mean to repoint. Pass --agent <the specific reviewer\'s agentId> explicitly (plus ' +
+          '--verdict/--effort/--self-authored/--closed-at to preserve them — an agent-change starts a FRESH ' +
+          'row, not a merge) to pin the target unambiguously.');
+      }
+    }
+  }
+  // 3role-ledger-review-append-should-require-verdict-fail-loud — a REVIEW role's own OUTCOME write must
+  // carry --verdict (or a sanctioned --skip-reason/--oracle) or fail loud, instead of silently landing a
+  // verdict-empty row that three-role-transition-gate.sh only discovers much later as a confusing
+  // "no verdict recorded yet" block. Runs BEFORE overlayAppend (mirrors the fix-A ambiguity idiom above) —
+  // read-only, writes NOTHING, so a refusal here leaves the ledger file byte-untouched.
+  {
+    const REVIEW_ROLES = ['plan-review', 'execution-review'];
+    const isReviewRole = REVIEW_ROLES.includes(role);
+    // R2 — `--decision` is not a ledger verdict field (append has no handler for it; it belongs to a
+    // SEPARATE permit subsystem, `log-bypass`). Fires on ANY review-role append carrying --decision,
+    // independent of --agent and independent of every other carve-out below — no sanctioned writer ever
+    // passes --decision to `append`.
+    if (isReviewRole && ('decision' in o)) {
+      console.error('BLOCK (3role-ledger verdict-fail-loud): --decision is not a ledger verdict field — ' +
+        'append() has no handler for it and silently drops it; --decision belongs to a separate permit ' +
+        'subsystem (log-bypass), not this ledger. A review role\'s outcome write must use --verdict ' +
+        '<PASS|FAIL> (or --skip-reason/--oracle for a sanctioned skip). Re-append with --verdict instead ' +
+        'of --decision.');
+      process.exit(2);
+    }
+    // R1/R3 — a bare (no --agent) review-role artifact-only self-append landing on a verdict-less row.
+    // (i) no --agent; (ii) --artifact supplied; (iii) no non-empty --verdict/--skip-reason/--oracle
+    // supplied on THIS call (R3: a valueless/empty --verdict counts as missing); (iv) the TARGET row —
+    // the SAME "prior" row overlayAppend selects for a no-agentId call (the last same-role line, mirrors
+    // :2682-2685 above; none on a first write) — carries none of {verdict, skip_reason, oracle,
+    // inherited_from} AND is not a subprocess-openrouter dispatch (the row's own dispatch marker, or
+    // --dispatch subprocess-openrouter on this same call) — the sanctioned subprocess-reviewer self-append
+    // (tools/openrouter-role-dispatch.sh:539 pre-stamps the row BEFORE the subprocess runs) is exempt here.
+    if (isReviewRole) {
+      const hasAgent = ('agent' in o);
+      const artifactSupplied = ('artifact' in o) && o.artifact !== '';
+      const verdictSupplied = ('verdict' in o) && o.verdict !== '';
+      const skipReasonSupplied = ('skip-reason' in o) && o['skip-reason'] !== '';
+      const oracleSupplied = ('oracle' in o) && o.oracle !== '';
+      if (!hasAgent && artifactSupplied && !verdictSupplied && !skipReasonSupplied && !oracleSupplied) {
+        let priorRow = null;
+        try {
+          const raw = fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n').filter(l => l.trim());
+          for (const ln of raw) {
+            try {
+              const j = JSON.parse(ln);
+              if (j && j.role === role) priorRow = j; // last same-role line wins, same as overlayAppend's fallback
+            } catch (e) { /* skip unparsable line */ }
+          }
+        } catch (e) { /* no ledger file yet -> priorRow stays null (a first write) */ }
+        const priorHasEvidence = !!(priorRow && (priorRow.verdict || priorRow.skip_reason || priorRow.oracle || priorRow.inherited_from));
+        const priorSubprocess = !!(priorRow && isSubprocessDispatch(priorRow.dispatch));
+        const callSubprocess = isSubprocessDispatch(fields.dispatch);
+        const subprocessExempt = priorSubprocess || callSubprocess;
+        if (!priorHasEvidence && !subprocessExempt) {
+          console.error('BLOCK (3role-ledger verdict-fail-loud): role ' + role + ' is a review role and this ' +
+            'artifact-only self-append (no --agent) would land on a verdict-less row with no --verdict/' +
+            '--skip-reason/--oracle recorded. A review role\'s outcome write must carry --verdict <PASS|FAIL> ' +
+            '(or --skip-reason "<reason>"/--oracle <path> for a sanctioned skip). Re-append with --verdict ' +
+            '<PASS|FAIL> --artifact <path>.');
+          process.exit(2);
+        }
+      }
+    }
+  }
+  let file;
+  try {
+    // #3326 fix cycle 1 — the explicit append path seeds the task->carried-key record (inferred
+    // writers never do; see carriedKeySeed).
+    file = overlayAppend(session, task, role, fields, { carriedKeySeed: true });
+  } catch (e) {
+    if (e instanceof GuardRejection) { console.error('BLOCK: ' + e.message); process.exit(2); }
+    throw e;
+  }
+  // #1709 W1 — usage capture is a SIBLING of this write, keyed on the SAME "this append carries
+  // --closed-at" signal #1465's centralized model capture already uses (three-role-subagent-ledger.sh's
+  // close-time re-append is the only sanctioned caller). No new append flag (§3 — the 26/26 known-flag pin
+  // stands). Wrapped so ANY failure anywhere in the usage path (missing/unreadable/malformed transcript, no
+  // usage-bearing record, an unresolvable fork boundary, a non-numeric counter) never changes this append's
+  // rc or touches the ledger row already written above — fail-open, exactly like transcriptModel().
+  if ('closed-at' in o) {
+    try {
+      const explicitAgentForUsage = ('agent' in o && o.agent) ? o.agent : '';
+      const agentIdForUsage = explicitAgentForUsage || resolveAgent(session, task, role);
+      captureUsageAtClose(session, agentIdForUsage);
+    } catch (e) { /* fail-open — see comment above; the ledger row and rc are already committed */ }
+  }
+  console.log('OK appended role=' + role + ' -> ' + file);
+  process.exit(0);
+}
+
+// #1709 W2 — usage-backfill [--session S] [--dry-run]. Offline, idempotent, PER AGENT (§2.3): walks every
+// ledger row (in --session S, or every session dir when omitted) that carries an agentId; for each DISTINCT
+// agentId with no usage-store record yet and a transcript still on disk, derives + writes the record; an
+// agentId already stamped is never rewritten; an agentId with no transcript is never touched. Dedup is by
+// agentId alone (never per (session, agentId)) so the SAME agent counted on rows in two different session
+// dirs is still only stamped once. **Never opens a ledger file for writing** — only fs.readFileSync ever
+// touches a ledger *.jsonl below; row order, `ts`, every other key and every ledger file's mtime are
+// untouched by construction (B3). `--dry-run` tallies without calling writeUsageStoreFile at all.
+function cmdBackfill(o) {
+  const sessionFilter = o.session ? sanitize(o.session) : '';
+  const dryRun = ('dry-run' in o);
+
+  let sessions = [];
+  try {
+    sessions = fs.readdirSync(LEDGER_DIR).filter((s) => {
+      try { return fs.statSync(path.join(LEDGER_DIR, s)).isDirectory(); } catch (e) { return false; }
+    });
+  } catch (e) { sessions = []; }
+  if (sessionFilter) sessions = sessions.filter((s) => s === sessionFilter);
+
+  let wouldStamp = 0, already = 0, noTranscript = 0;
+  const seenAgents = new Set();
+  for (const sess of sessions) {
+    const dir = path.join(LEDGER_DIR, sess);
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch (e) { continue; }
+    for (const fn of files) {
+      if (!fn.endsWith('.jsonl')) continue;
+      let lines = [];
+      try { lines = fs.readFileSync(path.join(dir, fn), 'utf8').split('\n').filter((l) => l.trim()); }
+      catch (e) { continue; }
+      for (const ln of lines) {
+        let row;
+        try { row = JSON.parse(ln); } catch (e) { continue; }
+        if (!row || !row.agentId) continue;
+        const agentId = String(row.agentId).replace(/[^0-9A-Za-z_-]/g, '');
+        if (!agentId || seenAgents.has(agentId)) continue;
+        seenAgents.add(agentId);
+        if (fileExists(usageStoreFile(agentId))) { already++; continue; }
+        const transcriptPath = findAgentTranscriptFile(sess, agentId);
+        if (!transcriptPath) { noTranscript++; continue; }
+        wouldStamp++;
+        if (!dryRun) {
+          try {
+            const metaPath = findAgentMetaFile(sess, agentId);
+            const usage = deriveUsageFromTranscript(transcriptPath, metaPath);
+            if (usage) writeUsageStoreFile(agentId, usage);
+          } catch (e) { /* fail-open, per agent — never touches the ledger file, never aborts the sweep */ }
+        }
+      }
+    }
+  }
+  console.log('would_stamp=' + wouldStamp + ' already=' + already + ' no_transcript=' + noTranscript);
+  process.exit(0);
+}
+
+// #881: inherit-plan-review --session S --task T --parent P
+// A LEG sub-task (T) may inherit its PARENT's (P) planner + plan-review ledger lines — but ONLY if the parent
+// genuinely has a real, TRANSCRIPT-BACKED planner AND plan-review (verify-then-write, fail-closed). A missing /
+// forged / inline-skipped parent review BLOCKs (exit 3) and writes NOTHING — you cannot launder an absent or
+// fabricated parent review onto a leg, and the session-bound inline-skip carve-out does NOT transfer to a leg.
+function cmdInherit(o) {
+  const session = o.session, task = o.task, parent = o.parent;
+  if (!session || !task || !parent) { console.error('inherit-plan-review: --session, --task, --parent are required'); process.exit(2); }
+  enforceSessionShape(session, task, 'inherit-plan-review', 2);
+  const block = (reason) => {
+    console.error('BLOCK: cannot inherit — parent task ' + sanitize(parent) + ' has no verified plan-review (' + reason + ')');
+    process.exit(3);
+  };
+  const pfile = ledgerFile(session, parent);
+  let lines;
+  try { lines = fs.readFileSync(pfile, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) { block('no parent ledger file: ' + pfile); }
+  const byRole = {};
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  const planner = byRole['planner'];
+  const planReview = byRole['plan-review'];
+  if (!planner) block('parent has no planner line');
+  if (!planReview) block('parent has no plan-review line');
+  // EXPLICIT inline-skip rejection (the #881 catch). checkRole returns null for a well-formed inline-skip, so
+  // we must reject skip_reason here BEFORE trusting either entry — the carve-out is session-bound and does not
+  // transfer to a leg (a leg inherits ONLY a transcript-backed parent planner + plan-review).
+  for (const [r, ent] of [['planner', planner], ['plan-review', planReview]]) {
+    if ('skip_reason' in ent) {
+      block('parent ' + r + ' was inline-skipped — the carve-out does not apply to legs; provide a real ' +
+        'transcript-backed ' + r + ' for the parent first');
+    }
+  }
+  // Verify-or-fail-closed: run the SAME checkRole `check` uses on both parent entries.
+  for (const [r, ent] of [['planner', planner], ['plan-review', planReview]]) {
+    const prob = checkRole(r, ent, session, undefined, parent);
+    if (prob) block(prob);
+  }
+  // #1575 1a-2 — three additional fail-closed PRECONDITIONS (verify-THEN-write, exit 3, writes NOTHING),
+  // evaluated BEFORE either overlayAppend call below (round-4 D2: leg-terminality in particular must NOT be
+  // delegated to the 1a guard inside overlayAppend — cmdInherit writes the planner row first, so a
+  // guard-inside-the-overlay would fire only on the SECOND write, after the planner row already carries
+  // inherited_from, breaking the "writes NOTHING" contract).
+  const blockPrecond = (reason) => {
+    console.error('BLOCK: cannot inherit — ' + reason);
+    process.exit(3);
+  };
+  // Precondition 1 — PARENT-LEG RELATION: the parent's own ledgered PLANNER artifact (the reviewed plan
+  // file) must NAME the leg task id (a genuine leg is a sub-slice of the parent's plan; #1064 discipline).
+  // #2174 — the plain disk resolver can HIT a STALE copy (the last-merged primary-clone file, per the
+  // #897/#2023 ~/-rooted stable-path doctrine) that SHADOWS the fresher branch copy plan-review actually
+  // reviewed while the parent task's branch is still unmerged (the #2169 blocker). When the disk-resolved
+  // copy misses OR fails the leg-naming test, ALSO consult the SAME bounded trusted-ref candidate set
+  // checkRole's planner/plan-review arms already use (#2088/#2462: resolveArtifactAtRef/candidateTaskRefs),
+  // keyed to the PARENT id — NEVER the leg id (AC-2(a): a leg-keyed ref must NOT satisfy this precondition,
+  // or the candidate set could be forged by anyone who can push a `<leg>-*` branch). No merge head is passed
+  // (inherit-plan-review takes no --merge-head); the candidate set is refs/remotes/origin/<parent>-* +
+  // origin/master in the helper's own home repo — refs/heads/ is deliberately never consulted (AC-2(b)).
+  // Content is read AT THE REF (W2 — readBlobAtRef, never disk content paired with ref existence) and must
+  // carry BOTH a plan marker (PLAN_RE) AND the leg-naming token — the same bar as the disk arm (AC-2(c): a
+  // parent-ref blob that exists but doesn't name the leg still refuses). Fail-closed otherwise, with a block
+  // message naming both copies consulted.
+  {
+    const legToken = sanitize(task);
+    const legRe = new RegExp('(^|[^0-9A-Za-z._-])' + legToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9A-Za-z._-])');
+    const ap = resolveArtifact(planner.artifact_path);   // already existence+PLAN_RE-verified by checkRole above.
+    let diskContent = '';
+    try { diskContent = fs.readFileSync(ap, 'utf8'); } catch (e) { /* fall through -> disk arm fails below */ }
+    const diskNamesLeg = !!(legToken && legRe.test(diskContent));
+    if (!diskNamesLeg) {
+      const hit = resolveArtifactAtRef(planner.artifact_path, undefined, parent);
+      const refContent = hit ? readBlobAtRef(hit.repoDir, hit.ref, hit.relPath) : null;
+      const refNamesLeg = !!(hit && refContent !== null && PLAN_RE.test(refContent) && legToken && legRe.test(refContent));
+      if (!refNamesLeg) {
+        blockPrecond('parent planner artifact "' + ap + '" (disk)' +
+          (hit ? ' and ref ' + hit.ref + ' (' + hit.repoDir + ')' : ' and no parent-keyed ref candidate ' +
+            '(refs/remotes/origin/' + sanitize(parent) + '-* + origin/master) resolved') +
+          ' does not name leg task ' + legToken +
+          ' — a genuine leg must be listed in the parent plan (the #1064 discipline: tag CHILD ids, not the ' +
+          'epic\'s). Add the leg id to the plan (an honest, visible edit), or provide the correct --parent.');
+      }
+    }
+  }
+  // Precondition 2 — PARENT VERDICT condition: the parent's plan-review row must carry an AFFIRMATIVE
+  // verdict (the gate's own allowlist, one vocabulary, not two). Absent also refuses (fail-closed).
+  {
+    const v = typeof planReview.verdict === 'string' ? planReview.verdict.toUpperCase().trim() : '';
+    if (!AFFIRMATIVE_VERDICTS.has(v)) {
+      blockPrecond('parent plan-review verdict is ' + (v || '<absent>') + ' — inherit requires an AFFIRMATIVE ' +
+        'verdict (' + [...AFFIRMATIVE_VERDICTS].join('|') + '); the parent\'s remediation is a re-review, not a ' +
+        'silent inherit.');
+    }
+  }
+  // Precondition 3 — LEG TERMINALITY: if the LEG's OWN plan-review row already carries a verdict, refuse up
+  // front — a completed per-leg review is never papered over by a hand-me-down.
+  {
+    const legFile = ledgerFile(session, task);
+    let legLines = [];
+    try { legLines = fs.readFileSync(legFile, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { /* no leg ledger yet -> fine */ }
+    let legPlanReview = null;
+    for (const ln of legLines) { try { const j = JSON.parse(ln); if (j && j.role === 'plan-review') legPlanReview = j; } catch (e) { /* skip */ } }
+    if (legPlanReview && legPlanReview.verdict) {
+      blockPrecond('leg ' + sanitize(task) + ' already has a completed plan-review verdict "' + legPlanReview.verdict +
+        '"' + (legPlanReview.agentId ? ' (agentId ' + legPlanReview.agentId + ')' : '') +
+        ' — a hand-me-down inherit cannot paper over a completed per-leg review. Run a new, genuinely bound ' +
+        'review to supersede it honestly.');
+    }
+  }
+  // Success: append both parent entries into the LEG ledger verbatim (same agentId + artifact_path) + an
+  // inherited_from marker, through the same overlay-merge path so a later real per-leg review overwrites
+  // clean. The plan-review row ALSO carries the parent's verdict (the gate's universal screen reads it —
+  // arm (2) is only reachable when the inherited row itself carries an affirmative verdict). The 1a guard
+  // (clause 1/2) inside overlayAppend runs here too as a defense-in-depth BACKSTOP — unreachable in the
+  // sanctioned flow given precondition 3 above, but never bypassed.
+  try {
+    overlayAppend(session, task, 'planner', { agentId: planner.agentId, artifact_path: planner.artifact_path, inherited_from: sanitize(parent) }, { carriedKeySeed: true });
+    overlayAppend(session, task, 'plan-review', { agentId: planReview.agentId, artifact_path: planReview.artifact_path, inherited_from: sanitize(parent), verdict: planReview.verdict }, { carriedKeySeed: true });
+  } catch (e) {
+    if (e instanceof GuardRejection) blockPrecond(e.message);
+    throw e;
+  }
+  console.log('OK inherited plan-review from parent ' + sanitize(parent) + ' -> task ' + sanitize(task));
+  process.exit(0);
+}
+
+// #3325 -- the TICKET'S OWN repo, resolved as exactly ONE sibling directory: the parent of the ai-brain
+// primary root (the projects folder) joined with the ticket-named repo name (readTicketRepo) -- the SAME
+// parent+name construction repoRelativeCandidate's bucket-3 sibling arm uses. NEVER a scan, glob or
+// enumeration of the projects folder: a ticket with absent/invalid metadata.repo resolves '' here and the
+// waiver consults the ai-brain toplevel ONLY (today's behaviour, fail-closed). A ticket naming ai-brain
+// itself resolves the primary root (deduped against home/home-real by the caller, so those tickets stay
+// byte-identical to the pre-#3325 helper).
+function ticketRepoDirFor(session, task) {
+  const home = aiBrainToplevel();
+  if (!home) return '';
+  const name = readTicketRepo(undefined, session, task).repo;
+  if (!name) return '';
+  const primaryReal = realpathNearest(primaryRootFor(home)).replace(/\/+$/, '');
+  return path.join(path.dirname(primaryReal), name);
+}
+
+// #3154 -- the ONE size-S plan-review waiver predicate. EVERY checker that used to demand a plan-review row
+// (the transition gate's admission, `check`'s required-role loop, the sibling resolver, the edit-path hook, the
+// instrumentation gate's leg 4b, the goal-driver laundering check) asks THIS function, never a private copy.
+// exempt === true ONLY when ALL hold: (a) the TICKET says size S (live read, `readTicketSize`); (b) the planner
+// row's plan, read FROM THE TASK'S PUBLISHED REFS (`candidateTaskRefs` + `readBlobAtRef`, zero network I/O;
+// the cwd's disk is NEVER consulted) says `size: S` and is bound to the task; (c) the ledger holds NO
+// plan-review row at all (once any review has started, the review governs -- a negative review is never
+// "waived" by the size); (d) the ledger parses to the end. Anything else is { exempt:false, reason } with
+// `reason` from a closed list, so a stranded S ticket is diagnosable, never silent. Fails toward REVIEW.
+// #3325 widened (b)'s WHERE, never its conditions: the plan is looked for in the BOUNDED repo set -- the
+// ai-brain toplevel (unchanged, first) plus the TICKET'S OWN repo (ticketRepoDirFor) -- at the SAME
+// task-bound ref set in each (candidateTaskRefs). A plan in ANY other repo (any sibling the ticket does
+// not name) is out of the set: plan-unresolvable, review stays demanded. For ai-brain tickets (no
+// metadata.repo, or one naming ai-brain itself) the consulted set, verdict, reason and detail are
+// byte-identical to the pre-#3325 helper (hooks/_fixtures/3role-ledger-pre3325-xrepo-snapshot.mjs).
+// INPUT-BOUND: ticket file <= 4 MiB (readTicketSize/readTicketRepo), plan blob <= PLAN_MAX_BYTES per
+// candidate ref, ledger read once, the repo set is exactly the <= 2 named dirs above (never a scan --
+// an oversized or invalid metadata.repo resolves '' and the set collapses to 1, fail-closed).
+function sizeSExempt(session, task) {
+  const no = (reason, detail) => ({ exempt: false, reason, detail: detail || '' });
+  const tr = readTicketSize(undefined, session, task);
+  if (tr.size === 'M' || tr.size === 'L') return no('ticket-size-' + tr.size);
+  if (tr.size !== 'S') {
+    if (tr.shown === 'none') {
+      return no('ticket-size-none', 'looked up ticket store <tasks-root>/<session>/<task>.json for session=' +
+        sanitize(session) + ' task=' + sanitize(task) + ' (absent, unreadable, or no metadata.size)');
+    }
+    return no('ticket-size-invalid', 'ticket metadata.size is "' + tr.shown + '" (valid: S, M, L)');
+  }
+  let raw;
+  try { raw = fs.readFileSync(ledgerFile(session, task), 'utf8'); } catch (e) { return no('no-planner-row', 'no ledger file'); }
+  const rows = [];
+  for (const ln of raw.split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { return no('ledger-junk', 'an unparseable ledger line was found'); }
+    rows.push(j);
+  }
+  if (rows.some((j) => j && j.role === 'plan-review')) return no('review-row-present');
+  let plannerRow = null;
+  for (const j of rows) { if (j && j.role === 'planner') plannerRow = j; }
+  if (!plannerRow || typeof plannerRow.artifact_path !== 'string' || !plannerRow.artifact_path.trim()) return no('no-planner-row');
+  // #3325 -- the bounded repo set: the ai-brain toplevel (unchanged, first) plus the TICKET'S OWN repo
+  // when the ticket names one (exactly one sibling dir -- ticketRepoDirFor; never a scan). Each repo is
+  // consulted at its own task-bound ref set with the SAME per-repo bars; the FIRST repo whose ref holds
+  // the blob wins. The per-repo problem strings reproduce the pre-#3325 wording verbatim, so an
+  // ai-brain-only consultation renders a byte-identical detail (single-element join).
+  const home = aiBrainToplevel();
+  const homeReal = home ? realpathNearest(home).replace(/\/+$/, '') : '';
+  const tRepo = ticketRepoDirFor(session, task);
+  const repos = [];
+  if (home) repos.push(home);
+  if (tRepo && tRepo !== home && tRepo !== homeReal) repos.push(tRepo);
+  const probs = [];
+  let text = null;
+  let rel = '';
+  for (const repo of repos) {
+    const r = repoRelativeCandidate(plannerRow.artifact_path, repo);
+    if (!r || r.indexOf('.ai-workspace/plans/') !== 0) {
+      probs.push('planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
+      continue;
+    }
+    const refs = candidateTaskRefs(repo, task);
+    for (const ref of refs) {
+      const t = readBlobAtRef(repo, ref, r);
+      if (t !== null) { text = t; rel = r; break; }
+    }
+    if (text !== null) break;
+    probs.push('plan ' + r + ' not found (or too large) at refs consulted: ' + refs.join(', '));
+  }
+  if (!repos.length) probs.push('planner artifact_path does not map to a primary-relative .ai-workspace/plans/ path');
+  if (text === null || text.length > PLAN_MAX_BYTES) {
+    return no('plan-unresolvable', probs.join('; '));
+  }
+  if (!planBoundToTask(path.join('/', rel), text, task)) return no('plan-unbound');
+  const sz = parsePlanSize(text);
+  if (!sz.ok) return no('plan-size-' + sz.source);
+  if (sz.size !== 'S') return no('plan-size-' + sz.size);
+  return { exempt: true, reason: 'ticket=S plan=S', detail: '', plan: rel };
+}
+
+// #3154 -- the required-role list for ONE task: REQUIRED_ROLES minus plan-review iff the size-S waiver applies.
+// `check` and the sibling resolver iterate THIS; cmdRefreshModels deliberately keeps iterating REQUIRED_ROLES.
+function requiredRolesFor(session, task) {
+  const sz = sizeSExempt(session, task);
+  return { roles: sz.exempt ? REQUIRED_ROLES.filter((r) => r !== 'plan-review') : REQUIRED_ROLES, sizeS: sz };
+}
+
+// #1575 Lane 1b — the transition gate's plan-review ADMISSION decision, as a single reusable function. The
+// bash gate (three-role-transition-gate.sh) shells out to the `gate-plan-review` CLI below instead of
+// re-implementing this contract in a second language — ONE evaluator, exercised directly by node-level
+// smokes AND by the real gate. Returns { allow, class, detail }; `class` is '' when allow=true, else one of
+// the EIGHT named fail-closed classes the plan requires the block message to distinguish:
+//   not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn / inherited-row-unbound-to-parent /
+//   deliberate-skip-closed / junk-line / subprocess-unverified
+function evaluatePlanReviewGate(session, task) {
+  // #3154 D2 -- the size-S waiver arm is consulted FIRST. It never admits a skip_reason row (that arm stays
+  // closed); on non-exempt every existing block class is unchanged and `detail` appends why S did not apply.
+  const sz = sizeSExempt(session, task);
+  if (sz.exempt) return { allow: true, class: 'size-s-exempt', detail: 'size-S waiver (' + sz.reason + ') plan=' + sz.plan, plan: sz.plan };
+  const r = evaluatePlanReviewGateCore(session, task);
+  if (!r.allow) r.detail = r.detail + ' | size-s: ' + sz.reason + (sz.detail ? ' (' + sz.detail + ')' : '');
+  return r;
+}
+function evaluatePlanReviewGateCore(session, task) {
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    return { allow: false, class: 'not-finished', detail: file + ' (no ledger file — no plan-review has ever run for this task)' };
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  // Evaluate the LAST PARSEABLE plan-review line — explicitly last-match (#1580 will make >=2 lines normal;
+  // a first-match read would silently prefer a stale round-1 PASS over a round-2 BLOCK).
+  let lastIdx = -1;
+  let lastEntry = null;
+  const parsedOk = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    let j = null;
+    let ok = true;
+    try { j = JSON.parse(rawLines[i]); } catch (e) { ok = false; }
+    parsedOk.push(ok);
+    if (ok && j && j.role === 'plan-review') { lastIdx = i; lastEntry = j; }
+  }
+  if (lastIdx === -1) {
+    return { allow: false, class: 'not-finished', detail: file + ' (no parseable plan-review line)' };
+  }
+  // Trailing-junk rule (pinned round 4, fail-closed): any UNPARSEABLE line AFTER the last parseable
+  // plan-review line blocks — post-#1580 a "valid-PASS then junk" file is otherwise ambiguous between two
+  // readings, and fail-closed is the safe one.
+  for (let i = lastIdx + 1; i < parsedOk.length; i++) {
+    if (!parsedOk[i]) {
+      return { allow: false, class: 'junk-line', detail: file + ' (unparseable line ' + (i + 1) + ' follows the last plan-review line)' };
+    }
+  }
+  // #2701 D3 — LATEST-ROUND pre-screen, additive and monotonic: it can only ever turn an ALLOW into a
+  // BLOCK, never the reverse. The bottom LINE is not always the latest ROUND (a sanctioned same-identity
+  // re-touch re-emits an older row at the file's tail — the M2 reorder), so the gate must judge by the
+  // role's full history's effective verdict, exactly as `check` Lane B already does (one evaluator, no
+  // mirror — #2051 discipline). Runs AFTER the trailing-junk rule, BEFORE the universal verdict screen
+  // below, so an in-flight verdict-less last row still falls through to that screen's own no-verdict class
+  // (AC-4d), and a single PASS or an honest FAIL-then-PASS by a distinct, newer round still ALLOWs.
+  {
+    const parsedLines2701 = rawLines.filter((_, i) => parsedOk[i]);
+    const eff2701 = effectiveVerdictRow(verdictRows(rowsForRole(parsedLines2701, 'plan-review')), 'plan-review', session, task);
+    if (eff2701 && !CHECK_LANE_AFFIRMATIVE.has(String(eff2701.verdict))) {
+      return {
+        allow: false, class: 'negative-verdict',
+        detail: file + ' (verdict=' + eff2701.verdict + ', agentId=' + (eff2701.agentId || '<none>') +
+          ', run_id=' + (eff2701.run_id || '<none>') + ') — the review did not pass; a newer or ' +
+          'unsuperseded negative round governs'
+      };
+    }
+  }
+  const e = lastEntry;
+  // Universal verdict screen (an ALLOWLIST in the code, never a denylist — D3): runs FIRST, on EVERY arm,
+  // regardless of any other field on the line.
+  const verdict = typeof e.verdict === 'string' ? e.verdict.toUpperCase().trim() : '';
+  if (!verdict) {
+    if ('skip_reason' in e && !e.agentId && !e.inherited_from) {
+      return { allow: false, class: 'deliberate-skip-closed', detail: file + ' (line ' + (lastIdx + 1) + ') — there is NO skip path for plan-review at this gate' };
+    }
+    return { allow: false, class: 'no-verdict', detail: file + ' (line ' + (lastIdx + 1) + ') — no verdict recorded yet' };
+  }
+  if (!AFFIRMATIVE_VERDICTS.has(verdict)) {
+    return { allow: false, class: 'negative-verdict', detail: file + ' (line ' + (lastIdx + 1) + ', verdict=' + verdict + ') — the review did not pass; re-plan, re-review' };
+  }
+  // Arm 3 (#2051) — subprocess-openrouter provenance, consulted FIRST after the universal verdict screen,
+  // mirroring checkRole's own consult-order (:1305-1308). Calls the SAME checkSubprocessProvenance the
+  // completion gate already trusts (the #1947 verifier) — never re-implements it (C1/C2: one evaluator, no
+  // mirror; Scope discipline forbids touching that function). Tri-state contract mapped onto the gate:
+  //   null  -> NOT admissible for this row/SSOT state (no dispatch marker, or SSOT silent, or a RESOLVING
+  //            agentId outranks the dispatch marker at checkSubprocessProvenance's own :1264 tie-break) ->
+  //            fall through to arms 1/2 COMPLETELY UNCHANGED — a pure addition for every ordinary row.
+  //   ''    -> admissible AND fully verified -> ALLOW.
+  //   <str> -> admissible but verification FAILED -> BLOCK, fail-closed, class subprocess-unverified (the
+  //            8th named class, #2051 C5), carrying that string as the detail.
+  // Placement is pinned (C2/#1590 monotonicity), not stylistic: a NON-resolving agentId is NOISE and must
+  // never erase otherwise-valid nonce evidence — arm-3-last would let arm 1's no-bound-reviewer-spawn false-
+  // block a valid dual-signal row before the subprocess arm ever ran (AC-10 discriminates the two placements).
+  const sub = checkSubprocessProvenance('plan-review', e, session, task);
+  if (sub !== null) {
+    if (sub === '') return { allow: true, class: '', detail: '' };
+    return { allow: false, class: 'subprocess-unverified', detail: file + ' (line ' + (lastIdx + 1) + ') — ' + sub };
+  }
+  // Arm 1 — completed-review (primary): affirmative verdict (screened above) AND closedAt (the SubagentStop
+  // punch-out) AND agentId, AND that agentId is SPAWN-RECORD-bound to 3ROLE_TASK:<task> ROLE:plan-review.
+  if (e.closedAt && e.agentId && !e.inherited_from) {
+    if (agentBoundToTag(session, e.agentId, task, 'plan-review')) return { allow: true, class: '', detail: '' };
+    return {
+      allow: false, class: 'no-bound-reviewer-spawn',
+      detail: file + ' (line ' + (lastIdx + 1) + ') — agentId "' + e.agentId + '" is not spawn-record-bound to ' +
+        '3ROLE_TASK:' + task + ' ROLE:plan-review (its transcript\'s FIRST record does not carry that tag)',
+    };
+  }
+  // Arm 2 — inherited-review: inherited_from + agentId + artifact_path present, AND that agentId is
+  // PARENT-bound (spawn-record carries 3ROLE_TASK:<inherited_from> ROLE:plan-review).
+  if (e.inherited_from && e.agentId && e.artifact_path) {
+    if (agentBoundToTag(session, e.agentId, e.inherited_from, 'plan-review')) return { allow: true, class: '', detail: '' };
+    return {
+      allow: false, class: 'inherited-row-unbound-to-parent',
+      detail: file + ' (line ' + (lastIdx + 1) + ') — agentId "' + e.agentId + '" is not spawn-record-bound to ' +
+        'parent 3ROLE_TASK:' + e.inherited_from + ' ROLE:plan-review',
+    };
+  }
+  // Neither arm's structural shape is satisfied (missing closedAt/agentId, or an incomplete inherited row).
+  return {
+    allow: false, class: 'not-finished',
+    detail: file + ' (line ' + (lastIdx + 1) + ') — missing completed-review evidence (closedAt + bound agentId, ' +
+      'or a complete inherited row)',
+  };
+}
+
+// #1575: gate-plan-review --session S --task T -> exit 0 (ALLOW, silent) or exit 2 (BLOCK, stderr names the
+// evidence class + the ledger file/line). The transition gate's ENTIRE plan-review-admission decision lives
+// HERE (evaluatePlanReviewGate) — the bash hook is a thin caller, not a second implementation.
+function cmdGatePlanReview(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task) { console.error('gate-plan-review: --session and --task are required'); process.exit(2); }
+  enforceSessionShape(session, task, 'gate-plan-review', 2);
+  const r = evaluatePlanReviewGate(session, task);
+  if (r.allow && r.class === 'size-s-exempt') {
+    // #3154 D2c -- review-only mode: --require-review answers "does an AFFIRMATIVE REVIEW exist?" and so
+    // refuses the waiver class (exit 2, NO audit line). Flagless = admission: the waiver is allowed and audited.
+    if ('require-review' in o) {
+      console.error('BLOCK:size-s-exempt-not-a-review|' + r.detail);
+      process.exit(2);
+    }
+    writeBypassLog('3role-ledger-size-s-exempt', 'SIZE-S-SKIP', 'PERMIT', { task: sanitize(task), plan: r.plan, ticket_size: 'S' });
+    process.exit(0);
+  }
+  if (r.allow) { process.exit(0); }
+  console.error('BLOCK:' + r.class + '|' + r.detail);
+  process.exit(2);
+}
+
+// #3154 D4: size-s-exempt --session S --task T -> exit 0 + `EXEMPT ...` | exit 1 + `NOT-EXEMPT <reason>` | exit 2 usage.
+// The single shared predicate exposed to non-node callers (the edit-path hook, instrumentation gate leg 4b,
+// goal-driver laundering-check). Silent on the audit log: the audited uses are the transition and completion arms.
+function cmdSizeSExempt(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task) { console.error('size-s-exempt: --session and --task are required'); process.exit(2); }
+  enforceSessionShape(session, task, 'size-s-exempt', 2);
+  const r = sizeSExempt(session, task);
+  if (r.exempt) { console.log('EXEMPT ' + r.reason + ' plan=' + r.plan); process.exit(0); }
+  console.log('NOT-EXEMPT ' + r.reason + (r.detail ? ' -- ' + r.detail : ''));
+  process.exit(1);
+}
+
+// ── #1936 — read-side history lanes (STRICTLY ADDITIVE; `byRole` selection, checkRole, and the ENTIRE
+// write path — cmdAppend, both terminal-evidence clauses, round-boundary logic — are UNTOUCHED). `check`
+// today reads only the byRole-selected (last-parse-wins) row per role and references neither `.verdict` nor
+// `.closedAt` (see the plan's Context section). These two lanes read PAST that single row, across each
+// role's FULL history, so a content-free row (bare spawn, artifact-only re-point, unattributed verdict
+// overlay) can never silently bury a recorded review outcome. Default-ON, no opt-in flag, no kill-switch,
+// no bypass token (round-1 decision, confirmed by four plan-review rounds): the observed failure was an
+// orchestrator trusting a bare `check` OK, and the remedy for a legitimate block is always available —
+// spawn a fresh review, whose sanctioned three-write lifecycle (spawn-shaped agent append, mid-turn
+// self-append, stop-shaped closed-at append) both records honestly and satisfies the read precondition
+// with no extra ceremony (see the plan's §"The sanctioned supersession flow").
+
+// Check-lane affirmative set = AFFIRMATIVE_VERDICTS (:844, UNCHANGED — it keeps gating cmdInherit and the
+// executor-spawn gate at their current strictness) PLUS `PASS-WITH-FIXES`, as a SEPARATE check-lane
+// constant (round-1 review N2, corpus-measured: 12 effective PASS-WITH-FIXES closes across 9 tasks, 6 of
+// which pass `check` today and would false-block under `:844` verbatim). Still an ALLOWLIST (D3):
+// NEEDS-WORK, SHIP-WITH-FIXES, BLOCK-resolved, REVISE, typos, empty — all block.
+const CHECK_LANE_AFFIRMATIVE = new Set([...AFFIRMATIVE_VERDICTS, 'PASS-WITH-FIXES']);
+
+// Parse an ISO-ish closedAt string to epoch MILLISECONDS (round-3 review N-d): the corpus provably carries
+// mixed sub-second/second precision that inverts lexicographically inside a shared second
+// (`"...:20.500Z" < "...:20Z"` as strings while 20.500s > 20s as instants) — so every closedAt comparison in
+// both lanes below compares PARSED epoch values, never strings. Absent/unparseable -> null, treated as
+// ABSENT throughout (never a false "equal" or a string-order artifact).
+function parseClosedAtMs(v) {
+  if (!v) return null;
+  const t = Date.parse(String(v));
+  return Number.isNaN(t) ? null : t;
+}
+
+// Every row for ONE role, in ledger PARSE ORDER (file top-to-bottom) — the role's FULL history, never just
+// the byRole-selected (last-parse-wins) row. Unparseable lines are silently skipped (mirrors the byRole
+// build loop's own `catch (e) { /* skip */ }`). #2701 D3: file order is NOT reliably chronological — a
+// sanctioned same-round re-touch (an agentId- or run_id-bound write) re-emits its target row at the file's
+// TAIL regardless of when that round actually happened, so "latest round governs" only holds in the BLOCK
+// direction (effectiveVerdictRow's negative-supersession branch, gated by supersedesNegative's own
+// distinct+newer-closedAt test) — the affirmative branch is unconditional newest-BY-FILE-ORDER-wins, same
+// as before this ticket.
+function rowsForRole(lines, role) {
+  const out = [];
+  for (const ln of lines) {
+    try { const j = JSON.parse(ln); if (j && j.role === role) out.push(j); } catch (e) { /* skip */ }
+  }
+  return out;
+}
+
+// Verdict-BEARING rows only (a truthy `.verdict` field). A bare spawn row, an artifact-only re-point, or a
+// provenance/oracle-only row carries no verdict and is read PAST — never treated as evidence by Lane B. A
+// row carrying BOTH a verdict and an oracle is verdict-bearing (the recorded decision outranks a token-file
+// — the plan's Lane B bullet); nothing here inspects `.oracle` at all.
+function verdictRows(rows) {
+  return rows.filter((r) => r && r.verdict);
+}
+
+// The monotonicity ruling (Intent §"The monotonicity ruling"): a later verdict-bearing row supersedes a
+// currently-effective NEGATIVE verdict ONLY when it carries an agentId DISTINCT from the negative row's AND
+// a closedAt STRICTLY newer than the negative row's (parsed-epoch comparison; equal is NOT strictly newer
+// -> refuse). Absence semantics: the superseding row MUST itself carry both an agentId and a closedAt that
+// PARSES — an absent/unparseable value on the superseding side can never supersede (an unparseable
+// superseder is treated exactly like an absent one). A negative row lacking either field makes that half
+// trivially satisfied (an attributed, punched-out superseder is distinct/newer than nothing by
+// construction) — this is what lets AC-14's raw hand-written shapes and the real #1821 fixture (whose bare
+// shield row is never itself the negative — the negative is the FAIL row, which always carries both fields
+// in the corpus) resolve correctly without a separate code path.
+// #2701 D3 (fold r1 finding 2) — WIDENED to let a verified, agentId-less subprocess round supersede a
+// negative exactly as a fresh Agent-tool reviewer can, so a z.ai PASS after any FAIL is not blocked
+// forever once D1 gives each dispatch its own row. An agentId-less candidate supersedes only when its
+// subprocess provenance is VERIFIED (checkSubprocessProvenance === '', the #2051 one-evaluator), its
+// run_id differs from the negative row's identity (agentId or run_id), and its closedAt is strictly
+// newer — an unverified subprocess PASS never supersedes (fail-closed, AC-4f).
+function supersedesNegative(candidate, negative, role, session, task) {
+  if (!candidate) return false;
+  const candMs = parseClosedAtMs(candidate.closedAt);
+  if (candMs === null) return false;
+  let distinct;
+  if (candidate.agentId) {
+    distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
+  } else {
+    if (!role || checkSubprocessProvenance(role, candidate, session, task) !== '') return false;
+    const negId2701 = String(negative.agentId || negative.run_id || '');
+    distinct = !!candidate.run_id && String(candidate.run_id) !== negId2701;
+  }
+  if (!distinct) return false;
+  const negMs = parseClosedAtMs(negative.closedAt);
+  const newer = (negMs === null) ? true : (candMs > negMs);
+  return newer;
+}
+
+// Walk a role's verdict-bearing rows OLDEST -> NEWEST, folding them into ONE effective verdict row per the
+// ruling above. A later row supersedes a currently-effective AFFIRMATIVE verdict UNCONDITIONALLY (newest
+// wins); it supersedes a currently-effective NEGATIVE verdict only per supersedesNegative() above — otherwise
+// the row is read PAST and the negative stays effective. Returns null when the role carries NO
+// verdict-bearing row at all (Lane B stays SILENT — today's honest fail-open residual, pinned by AC-7(c)).
+function effectiveVerdictRow(vrows, role, session, task) {
+  let eff = null;
+  for (const row of vrows) {
+    if (!eff) { eff = row; continue; }
+    if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) { eff = row; continue; }   // affirmative -> unconditional newest-wins
+    if (supersedesNegative(row, eff, role, session, task)) eff = row;       // negative -> gated supersession
+    // else: read PAST this row, keep the negative effective.
+  }
+  return eff;
+}
+
+// Lane B — outcome MONOTONICITY, for ONE review-pair role (execution-review OR plan-review — the shield is
+// role-symmetric, round-2 review N1). Returns null (silent) when the role carries no verdict anywhere in its
+// history, or its effective verdict is check-lane affirmative; else a `NEGATIVE-VERDICT:` problem string.
+function laneBProblem(role, lines, session, task) {
+  const vrows = verdictRows(rowsForRole(lines, role));
+  if (!vrows.length) return null;                        // no verdict on ANY row of the role -> silent (AC-7(c)).
+  const eff = effectiveVerdictRow(vrows, role, session, task);
+  if (CHECK_LANE_AFFIRMATIVE.has(eff.verdict)) return null;
+  return 'NEGATIVE-VERDICT: role ' + role + ' — effective recorded verdict is "' + eff.verdict + '" (agentId ' +
+    (eff.agentId || '<none>') + ', ' + (eff.closedAt ? 'closedAt ' + eff.closedAt : 'no closedAt') +
+    ') — a recorded negative verdict is superseded only by a later verdict row carrying an agentId DISTINCT ' +
+    'from the negative row\'s AND a closedAt STRICTLY newer than the negative row\'s. Sanctioned remedy: ' +
+    'spawn a fresh ' + role + ' (the three-write lifecycle records + supersedes with no extra ceremony).';
+}
+
+// Lane A — round-aware FRESHNESS (rebuilt per B3; never a raw timestamp inequality). For a (subject ->
+// review) pair, a `STALE-REVIEW:` problem fires ONLY when the ledger shows a genuinely NEW subject round
+// left unreviewed — ALL THREE conditions below. Any missing/unparseable input -> that condition can't hold
+// -> fail OPEN (silent) — never a false block on an environment can't-tell.
+function laneAProblem(subjectRole, reviewRole, byRole, lines) {
+  // (1) the review role's authoritative row carries closedAt.
+  const review = byRole[reviewRole];
+  if (!review || !review.closedAt) return null;
+  const reviewMs = parseClosedAtMs(review.closedAt);
+  if (reviewMs === null) return null;
+
+  // (2) the subject role's history has >=2 rows, and its authoritative row carries an agentId AND a
+  //     closedAt STRICTLY newer than the review's closedAt (equal allows — same parsed-epoch semantics as
+  //     Lane B).
+  const subjectAuth = byRole[subjectRole];
+  if (!subjectAuth || !subjectAuth.agentId || !subjectAuth.closedAt) return null;
+  const subjMs = parseClosedAtMs(subjectAuth.closedAt);
+  if (subjMs === null) return null;
+  if (!(subjMs > reviewMs)) return null;                 // equal or older -> not a newer unreviewed round.
+
+  const subjectRows = rowsForRole(lines, subjectRole);
+  if (subjectRows.length < 2) return null;                // no second round exists to have been left unreviewed
+                                                            // (kills the #1760/#1719 resume-re-close class — a
+                                                            // same-agent SubagentStop re-append merges onto the
+                                                            // SAME row rather than creating a second one).
+
+  // (3) an OLDER subject row exists with a DISTINCT agentId whose closedAt is at-or-before the review's
+  //     closedAt — the round the review could actually have covered.
+  const olderRows = subjectRows.slice(0, -1);
+  const hasCoveredRound = olderRows.some((r) => {
+    if (!r || !r.agentId || r.agentId === subjectAuth.agentId) return false;
+    const ms = parseClosedAtMs(r.closedAt);
+    if (ms === null) return false;
+    return ms <= reviewMs;
+  });
+  if (!hasCoveredRound) return null;
+
+  return 'STALE-REVIEW: ' + reviewRole + ' (closedAt ' + review.closedAt + ') is stale against a newer ' +
+    subjectRole + ' round (agentId ' + subjectAuth.agentId + ', closedAt ' + subjectAuth.closedAt +
+    ') that the review could not have covered — spawn a fresh ' + reviewRole + ' to cover it.';
+}
+
+function cmdCheck(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
+  enforceSessionShape(session, task, 'check', 2);
+  // #2480 O4 / #2050 AC-1d — an EXPLICITLY empty `--merge-head` value is a USAGE ERROR, distinct from
+  // every chain-incomplete message below. `o['merge-head'] || ''` (the checkOpts read further down)
+  // treats "flag passed with an empty value" and "flag omitted entirely" identically, so
+  // `check --merge-head ''` would silently degrade to the unbound legacy path instead of failing
+  // loudly. `'merge-head' in o` is the ONLY signal that distinguishes "the flag was on the command
+  // line" from "the flag was never passed" (parseArgs sets o[key]='' for both a bare trailing flag and
+  // an explicit empty value, but never adds the key at all when it wasn't typed) — an omitted flag
+  // still falls through to today's unbound check untouched (M6-control). Raised BEFORE the ledger-file
+  // read below so this stays a distinct usage error, not "no role-ledger found" (M6).
+  if (('merge-head' in o) && String(o['merge-head'] == null ? '' : o['merge-head']) === '') {
+    console.log('BLOCK: --merge-head was passed but empty — this is a USAGE ERROR (#2050 AC-1d), not a ' +
+      'chain-incomplete result. Omit --merge-head entirely for an unbound check, or pass the real merge-head sha.');
+    process.exit(2);
+  }
+  const file = ledgerFile(session, task);
+  let lines;
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) {
+    // #2496 — before giving up, try the merge-head-gated in-session sibling-token resolver (Intent #1/#2):
+    // the bare token may be genuinely absent while a complete, merge-head-bound review chain exists under a
+    // sibling token in the SAME session (the confirmed live class). No --merge-head -> resolveSiblingForCheck
+    // returns null immediately with zero directory I/O, so the byte-preserved unbound path below is UNCHANGED.
+    const absentScanOpts = { mergeHead: o['merge-head'] || '', rejectVacuousOracle: ('reject-vacuous-oracle' in o),
+      branch: o['branch'] || '', pr: o['pr'] || '' };
+    const sibAbsent = resolveSiblingForCheck(session, task, absentScanOpts);
+    if (sibAbsent) { printSiblingResolveAllow(task, sibAbsent); process.exit(0); }
+    // D3 — no token-boundary sibling either: try the session-scan arm (D3b-bound; inert with no
+    // --branch/--pr, so a legacy caller passing neither flag falls through byte-identically).
+    const scanAbsent = resolveSessionScanForCheck(session, task, absentScanOpts);
+    if (scanAbsent) { printSessionScanResolveAllow(task, scanAbsent); process.exit(0); }
+    console.log('BLOCK: no role-ledger found for task ' + sanitize(task) + ' in this session (' + file +
+      '). Append a ledger line per role: node hooks/3role-ledger.mjs append --session <sid> --task <id> --role <role> ...');
+    process.exit(2);
+  }
+  const byRole = {};
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  // #1276: the vacuous-oracle rejection is OPT-IN via --reject-vacuous-oracle (only the instrumentation
+  // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
+  // #2088: --merge-head only widens checkRole()'s ref-scoped arm with the current merge head as an EXTRA
+  // candidate; the arm itself is DEFAULT-ON as of #2462 (task-bound refs + origin/master are consulted
+  // regardless of whether this flag is present — see resolveArtifactAtRef()). Absent/empty just means the
+  // merge-head candidate is skipped, not that the whole arm is skipped.
+  const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '',
+    requirePublishedReview: ('require-published-review' in o),
+    branch: o['branch'] || '', pr: o['pr'] || '' };
+  const problems = [];
+  // #2496 — tracks ONLY the "missing X ledger line" problems the REQUIRED_ROLES loop below pushes (never
+  // any other problem class: checkRole content failures, laneA/laneB, model-policy, tracked, kind,
+  // privacy). This is the sibling resolver's trigger set — see the SIBLING-RESOLVE attempt near the end of
+  // this function, gated on `problems.length === missingRoleProblems.length` (i.e. the ONLY reason this
+  // bare token is blocked is one-or-more literally-missing required-role rows — the confirmed live class;
+  // an unrelated problem on an otherwise-present row is never silently papered over by a sibling).
+  const missingRoleProblems = [];
+  // #1947 M-B (execution-review round-2 FAIL) — D2 promised "check output labels these rows distinctly", but
+  // the string `dispatch=subprocess-openrouter` previously appeared ONLY in comments and in BLOCK-reason
+  // text — never on the success path, so a subprocess-verified row was indistinguishable in `check`'s output
+  // from an ordinary harness-signed pass. Collected here and printed unconditionally (success or not, so it
+  // is visible even when other roles still have problems) — see the DISPATCH: print near the end.
+  const dispatchLabels = [];
+  // #3154 D3 -- the required chain for THIS task: plan-review is waived iff the shared size-S predicate says so.
+  const reqFor = requiredRolesFor(session, task);
+  const sizeSCheck = reqFor.sizeS;
+  for (const role of reqFor.roles) {
+    const e = byRole[role];
+    if (!e) {
+      const m = 'missing ' + role + ' ledger line' + (role === 'plan-review' ? '; size-s: ' + sizeSCheck.reason +
+        (sizeSCheck.detail ? ' (' + sizeSCheck.detail + ')' : '') : '');
+      problems.push(m); missingRoleProblems.push(m); continue;
+    }
+    const r = checkRole(role, e, session, checkOpts, task);
+    if (r) { problems.push(r); continue; }
+    // Re-run the SAME pure, side-effect-free admissibility check checkRole() itself just consulted — an
+    // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
+    // subprocess arm, not the ordinary agentId arm. #2075 AC-3: label the ROW's actual dispatch value, never
+    // a hardcoded vendor literal — a subprocess-ollama row must not be mislabeled subprocess-openrouter.
+    if (checkSubprocessProvenance(role, e, session, task) === '') {
+      // D7: label from the SAME source checkSubprocessProvenance itself just verified against — a
+      // subprocess-local row's model lives on the OVERLAY, never `seats[role]` (#2075 AC-3: label the row's
+      // actual dispatch value + the model it was actually verified against, never a mismatched re-derivation).
+      const decl = e.dispatch === 'subprocess-local' ? overlaySeatDispatchIsSubprocess(role) : seatDispatchIsSubprocess(role);
+      dispatchLabels.push('role=' + role + ' dispatch=' + e.dispatch + ' model=' + ((decl.seat && decl.seat.model) || '<unknown>'));
+    }
+  }
+  // #1936 -- Lane B (outcome monotonicity) + Lane A (round-aware freshness). Read-side only, strictly
+  // additive: both lanes only ADD problems on top of whatever the base existence/checkRole loop above
+  // already found (or didn't) -- they never suppress or loosen an existing test, and they run unconditionally
+  // (no opt-in flag) for both review-pair roles / both subject-review pairs. Each lane is independently
+  // silent on any missing/unparseable/absent input (fail-open by design -- see each function's doc comment).
+  for (const role of ['execution-review', 'plan-review']) {
+    const laneB = laneBProblem(role, lines, session, task);
+    if (laneB) problems.push(laneB);
+  }
+  {
+    const laneAExec = laneAProblem('executor', 'execution-review', byRole, lines);
+    if (laneAExec) problems.push(laneAExec);
+    const laneAPlan = laneAProblem('planner', 'plan-review', byRole, lines);
+    if (laneAPlan) problems.push(laneAPlan);
+  }
+  // #1448 per-role MODEL-POLICY enforcement (opt-in via --enforce-role-models; only the instrumentation gate
+  // passes it). Compare each REQUIRED role's ACTUAL transcript model to the tier cc-roles.env resolves for it.
+  // Fail-SAFE: no config resolved => skip ENTIRELY (all-opus is the safe default we must not false-block).
+  // Per role: inline-skip / missing / unresolvable-agentId / no message.model => fail-open (can't-tell). A
+  // mismatch pushes a MODEL-POLICY: problem (=> exit 2). Fable->Opus silent reroute (expected fable, actual
+  // opus) is OK-with-note. Also honors the feature kill-switch CC_ROLE_MODEL_GATE_OFF=1 internally (belt &
+  // suspenders: the gate already strips the flag, but a direct `check --enforce-role-models` must skip too).
+  // #1512 — resume-induced quality up-tier NOTEs (allowed, never silent — AC-3). Populated below, printed
+  // near the end alongside PROVENANCE (only reachable when the loop below does NOT push a BLOCK problem).
+  const resumeNotes = [];
+  if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF === '1') {
+    writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_MODEL_GATE_OFF', 'PERMIT');
+  }
+  if (('enforce-role-models' in o) && process.env.CC_ROLE_MODEL_GATE_OFF !== '1') {
+    const { found, cfg } = loadRoleConfig();
+    // #1640 S8/S10 — SSOT consultation for the expected side + the declared-reroute contract. Mirrors
+    // cmdResolveRoleModel's precedence EXACTLY: an explicit CC_ROLES_ENV override is AUTHORITATIVE + TERMINAL,
+    // so it short-circuits SSOT consultation entirely — every PRE-#1640 fixture in this file sets CC_ROLES_ENV
+    // and is therefore COMPLETELY UNAFFECTED by anything below (routesLoaded.ok stays false for them, exactly
+    // reproducing today's roleModelFromCfg-only comparison).
+    const routesLoaded = ('CC_ROLES_ENV' in process.env) ? { ok: false, routes: null, configPath: '' } : loadRoutesConfig();
+    // #1918 n4/D3b — the whole-file pin diagnostic (malformed/unreadable pin file), announced ONCE for this
+    // whole enforce-role-models pass, AFTER routesLoaded is resolved (never masking the #2401/SSOT-corrupt
+    // fail-safes above) and gated the SAME way the per-role tier-pin overlay below is (seatPinBlind() inside
+    // announceSeatPinFileProblem() already covers CC_ROLES_ENV/CC_ROUTES_JSON).
+    announceSeatPinFileProblem();
+    if (found) {
+      lintRoleConfig(cfg, routesLoaded.ok ? routesLoaded.routes : null);   // S8(b): SSOT-vocabulary hint, additive-only.
+      // #1640 S10 binding point 4 — an enforcement run under a caller-supplied CC_ROUTES_JSON audits itself
+      // ONCE per invocation, naming the task, regardless of whether any individual role turns out declared.
+      if (('CC_ROUTES_JSON' in process.env) && routesLoaded.ok) {
+        writeBypassLog('3role-ledger-enforce-role-models', 'ROUTES-OVERRIDE', 'PERMIT',
+          { task: sanitize(task), route_config: routesLoaded.configPath });
+      }
+      for (const role of REQUIRED_ROLES) {
+        const e = byRole[role];
+        if (!e || ('skip_reason' in e)) continue;              // no transcript to read for a missing / inline-skip role
+        if (!agentResolves(session, e.agentId)) continue;      // presence already reported above; can't-tell here
+
+        // #1640 S8 — the SSOT-aware expected side (viaSSOT=false and IDENTICAL to today's roleModelFromCfg
+        // whenever CC_ROLES_ENV is set, the role has no declared SSOT seat, or the seat's model is undeclared).
+        const expectedSide = resolveExpectedSide(routesLoaded, cfg, role);
+
+        const actualId = transcriptModel(session, e.agentId);   // concrete id, '' if no assistant model line
+        const actualAnthropicTier = modelIdToTier(actualId);     // '' unless actualId is a claude-* id
+
+        if (!actualAnthropicTier && !(routesLoaded.ok && identifyModel(routesLoaded.routes, actualId).ok)) {
+          // TIER can't-tell (existing fail-open, UNCHANGED) — neither a claude-* id nor SSOT-declared anywhere.
+          // The version-pin sub-leg is keyed to the LEGACY expected tier (roleModelFromCfg), exactly as before
+          // #1640 — a declared non-Anthropic seat never even reaches a CC_TIER_*_VERSION pin (no such pin
+          // exists for a non-Anthropic tier name), so this branch's behavior is byte-identical pre/post-#1640.
+          const legacyExpected = roleModelFromCfg(cfg, role);
+          const pin = roleVersionFromCfg(cfg, role, legacyExpected);
+          if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
+            writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
+          }
+          const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
+          if (versionOn) problems.push('MODEL-VERSION: role ' + role + ' — the transcript model is unreadable/' +
+            'unparseable (' + (actualId || '<none>') + ') so the ' + legacyExpected + ' pin ' + pin + ' CANNOT be ' +
+            'verified (fail-closed: a configured pin means we do not wave through can\'t-tell). ' +
+            'Kill-switch: CC_ROLE_VERSION_GATE_OFF=1 (or CC_ROLE_MODEL_GATE_OFF=1).');
+          continue;                                              // ... but a pin fail-CLOSES the version sub-leg
+        }
+
+        // #1640 S10 binding point 1 — the DECLARED sensor. READ-ONLY: consults ONLY the role's OWN already-
+        // recorded ledger stamp (e.reroute, written by S11's spawn/SubagentStop recorder edges) — NEVER
+        // process.env.ANTHROPIC_BASE_URL, NEVER a base-url, NEVER a routes-file override, at THIS (check) time.
+        // An exported base-url in the check's OWN environment blesses NOTHING (the anti-spoof fixture, AC1.8(e)).
+        const stamp = (e.reroute && e.reroute.provider) ? e.reroute : null;
+        const seatDeclaredNonAnthropic = !!(expectedSide.viaSSOT && expectedSide.provider && expectedSide.provider !== 'anthropic');
+        const declared = !!(stamp && seatDeclaredNonAnthropic && stamp.provider === expectedSide.provider);
+
+        if (actualAnthropicTier) {
+          // #1640 S10 binding point 2 — an ANTHROPIC OBSERVATION keeps FULL tier+version enforcement, declared
+          // or not: the comparison is against the role's ORDINARY (legacy) policy tier, never the SSOT's
+          // declared non-Anthropic tier (which an Anthropic observation could never equal anyway). This is
+          // BYTE-IDENTICAL to the pre-#1640 comparison for every role whose seat is not SSOT-declared non-
+          // Anthropic (expectedSide.tier === legacyExpected in that case).
+          let expected = roleModelFromCfg(cfg, role);
+          // #3218 D4 site 4 — ROUTE pin overlay, resolved FIRST (before the size overlay and the tier pin
+          // below): a valid route pin sets the completion gate's expected tier from the SAME D3 effective
+          // row every other reader consumes (its agent_tool_fallback — the pinned model's tier_equivalent
+          // for a pin onto anthropic; the seat's own SSOT tier for a subprocess pin), and suppresses both
+          // the size overlay and the tier pin (one role, one effective pin; a pin wins over the size rule).
+          const rSeatPin = routesLoaded.ok ? resolveRoutePin(role, routesLoaded.routes) : { pinned: false, present: false };
+          if (rSeatPin.refusalNote) process.stderr.write(rSeatPin.refusalNote + '\n');
+          if (rSeatPin.pinned) {
+            process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' completion-gate expected tier pinned via route to "' +
+              rSeatPin.value + '" (tier ' + rSeatPin.seat.agent_tool_fallback + ')' +
+              (rSeatPin.reason ? ' reason="' + rSeatPin.reason + '"' : '') +
+              (rSeatPin.set_at ? ' set_at=' + rSeatPin.set_at : '') + '\n');
+            expected = rSeatPin.seat.agent_tool_fallback;
+          }
+          // #3140 Leg 2 -- planner size overlay on the completion gate's expected side (same function as the
+          // resolver: plannerSizeOverlay). Applied BEFORE the seat pin below, so a pin still wins.
+          const sizeOv = rSeatPin.pinned ? { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' }
+            : plannerSizeOverlay(routesLoaded, role, session, task, o['tasks-dir']);
+          if (sizeOv.applies) expected = sizeOv.tier;
+          // #1918 D2/AC3/AC4(b)/AC5(b) — TIER pin overlay on the completion gate's OWN tier-mismatch
+          // comparison (the actual gate this role's Anthropic-observed transcript is judged against).
+          // Gated on `routesLoaded.ok`, which is ALREADY forced false under CC_ROLES_ENV (line ~3022) —
+          // resolveTierPin() independently self-excludes CC_ROUTES_JSON too (seatPinBlind(), D3b), so this
+          // stays pin-blind under BOTH terminal test seams (AC6) and never reachable before the clean-SSOT
+          // resolve above (D3c/n4). A malformed/off-vocabulary pin resolves `expected` UNCHANGED (AC4/AC5).
+          const seatPin = (routesLoaded.ok && !rSeatPin.pinned) ? resolveTierPin(role) : { pinned: false };
+          if (seatPin.refusalNote) process.stderr.write(seatPin.refusalNote + '\n');
+          if (seatPin.pinned) {
+            process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' completion-gate expected tier pinned to "' +
+              seatPin.tier + '"' + (seatPin.reason ? ' reason="' + seatPin.reason + '"' : '') +
+              (seatPin.set_at ? ' set_at=' + seatPin.set_at : '') + '\n');
+            expected = seatPin.tier;
+          }
+          const pin = roleVersionFromCfg(cfg, role, expected);
+          if (pin && process.env.CC_ROLE_VERSION_GATE_OFF === '1') {
+            writeBypassLog('3role-ledger-enforce-role-models', 'CC_ROLE_VERSION_GATE_OFF', 'PERMIT');
+          }
+          const versionOn = pin && process.env.CC_ROLE_VERSION_GATE_OFF !== '1';
+          const actual = actualAnthropicTier;
+          if (actual === expected) {                               // tier match => OK; check the version sub-leg
+            if (versionOn && actualId !== pin) problems.push('MODEL-VERSION: role ' + role + ' ran on ' + actualId +
+              ' but cc-roles.env pins ' + expected + ' -> ' + pin + ' (ASSERT-LATEST drift: the tier latest may ' +
+              'have moved, or the role ran on an unexpected version). If ' + actualId + ' is the new blessed ' +
+              'latest, update CC_TIER_' + expected.toUpperCase() + '_VERSION (or CC_ROLE_' + roleKeyStem(role) +
+              '_MODEL_VERSION), then re-run the plugin sync; else investigate. Kill-switch: CC_ROLE_VERSION_GATE_OFF=1.');
+            continue;
+          }
+          // #3140 Leg 2: when the fable expectation CAME FROM the size-L overlay (not the seat default), a
+          // planner that ran on opus is a real down-tier for a size-L ticket, not a silent reroute: no exemption.
+          if (expected === 'fable' && actual === 'opus' && !sizeOv.applies) continue; // Anthropic silent fable->opus reroute => OK-with-note (version sub-leg skipped)
+          // #3149 -- pre-cutover size-L GRANDFATHER (plan D1-D5). Scope: ONLY the planner, ONLY when the
+          // size-L overlay (never a seat pin -- the pin overlay above already had its chance to win, D5)
+          // set the fable expectation, ONLY an Opus observation (the pre-Leg-2 rule's allowed shape; every
+          // other path is byte-identical in effect, D3). The anchor is the transcript's earliest harness-
+          // written timestamp (D1), compared to the SSOT-recorded cutover AS INSTANTS, strictly-before (R2:
+          // both straddling arms carry non-UTC offsets so a string compare fails them). Fail closed on an
+          // absent/malformed/future cutover (D2, with a stderr note) and on an unreadable run start (D4).
+          if (sizeOv.applies && expected === 'fable' && actual === 'opus' && !seatPin.pinned) {
+            const cut = plannerSizeCutover(routesLoaded);
+            if (cut.note) process.stderr.write(cut.note);
+            const started = transcriptRunStartEpoch(session, e.agentId);
+            const startIso = isNaN(started) ? '<unreadable>' : new Date(started).toISOString();
+            const cutIso = cut.ok ? new Date(cut.epoch).toISOString() : '<not a usable cutover: seats.planner.size_models_cutover>';
+            if (cut.ok && !isNaN(started) && started < cut.epoch) {
+              // Allowed, never silently: a distinct token on stderr (D3). A run that started pre-cutover and
+              // ran past it is still grandfathered -- the run predates the rule (LOW-2, stated intent).
+              process.stderr.write('SIZE-L-GRANDFATHERED: role planner ran on opus (transcript model ' + actualId +
+                ') on a size-L ticket, but its run STARTED ' + startIso + ', strictly before the size-L planner ' +
+                'cutover ' + cutIso + ' -- judged by the rule of its time (allowed with note; no action needed).\n');
+              continue;
+            }
+            // D6 -- the size-L rule is what set the expectation, so the block names the rule, the ticket's
+            // size, the honest recoveries (Fable re-run FIRST; the operator-only, machine-wide seat pin as
+            // an explicit LAST RESORT), the automatic pre-cutover acceptance, and both instants so the
+            // reader can see WHY this row was not grandfathered. It never names the planner seat-default
+            // env var: editing it cannot fix a size-derived expectation.
+            problems.push('MODEL-POLICY: role planner ran on opus (transcript model ' + actualId + ') but the ' +
+              'SIZE-L RULE (seats.planner.size_models.L in the cc-routes.json SSOT) resolves planner -> fable ' +
+              'for this size-' + sizeOv.size + ' ticket -- the seat default is not the source of this expectation, ' +
+              'so changing it in cc-roles.env cannot fix this. Recovery 1 (do this first): re-run the planner on ' +
+              'fable (it is accepted automatically once the Fable cap allows). Recovery 2 (operator-only, LAST ' +
+              'RESORT, machine-wide for EVERY ticket while it is set): set-seat-pin --role planner --tier opus ' +
+              '--reason "<why>", then clear-seat-pin --role planner --reason "<why>" to undo it afterwards. ' +
+              'A planner whose run STARTED before ' +
+              'the size-L cutover is accepted automatically (this run started ' + startIso + '; cutover ' + cutIso +
+              '). Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+            continue;
+          }
+          // #1512 — resume-induced quality UP-tier: allow-with-note, narrowly scoped to (a) the role was
+          // genuinely resumed via SendMessage (an unforgeable harness-authored boundary marker, not a proxy
+          // event), (b) its PRE-resume model matched policy (so the mismatch is provably resume-caused, not a
+          // wrong spawn), and (c) the OBSERVED tier is a STRICT quality up-tier over policy.
+          // #1624 (operator decision 2026-07-17): model-cost is enforced at booking/spawn time (the leading-edge
+          // gate), not at close — by close the spend is already SUNK, so blocking a role that ran on a STRICTLY
+          // more-capable tier than policy does nothing for cost control, it only withholds a quality win. So ANY
+          // strict up-tier (isResumeUpTier===true) is now allowed-with-note at close, WITH or WITHOUT a resume
+          // boundary. The resume-matched shape above keeps its own RESUME-UPTIER wording (it is telling a true,
+          // more specific story — a resumed role, not a fresh spawn); every OTHER strict-up-tier shape (no resume
+          // boundary at all, or a resume boundary whose pre-resume model didn't match policy) falls to the
+          // CLOSE-UPTIER branch below — a DISTINCT, honestly-worded note (plan-review F1): it must never claim a
+          // resume boundary that didn't happen. A DOWN-tier (isResumeUpTier===false) never reaches either branch
+          // and still falls straight through to the hard BLOCK below — the guardrail this change does not relax.
+          if (isResumeUpTier(expected, actual)) {
+            const rb = resumeBoundaryModels(session, e.agentId);
+            if (rb.hasResume && modelIdToTier(rb.preResumeModel) === expected) {
+              let note = 'RESUME-UPTIER: role ' + role + ' was resumed via SendMessage (not respawned) — its ' +
+                'transcript shows model ' + (rb.preResumeModel || '<none>') + ' (matching policy ' + expected +
+                ') BEFORE the resume boundary and ' + actualId + ' (' + actual + ') AFTER it. A resume-induced ' +
+                'up-tier is allowed-with-note: it preserves the resumed agent\'s accumulated context (the whole ' +
+                'reason to resume instead of respawn), and the only cost is running the rework on a costlier ' +
+                'model. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+              if (actual === 'fable') {
+                note += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+                  'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
+                  'Max-plan-included usage — surfaced here so the cost is never hidden.';
+              }
+              resumeNotes.push(note);
+              continue;
+            }
+            // #1624 — no resume boundary (or a resume boundary whose PRE-resume model didn't match policy, so it
+            // cannot honestly be attributed to the resume). Either way the role's ACTUAL tier is a strict quality
+            // up-tier over policy; the spend is already sunk at close. Allow-with-note using a token that does NOT
+            // claim a resume boundary happened (F1 — the resume wording would be a false statement here).
+            let closeNote = 'CLOSE-UPTIER: role ' + role + ' ran on a MORE-capable tier than policy — a quality ' +
+              'up-tier; the cost is already sunk at close (transcript model ' + actualId + ' (' + actual + ') vs ' +
+              'policy ' + expected + '). Model cost is enforced at booking/spawn time, not at close. ' +
+              'Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.';
+            if (actual === 'fable') {
+              closeNote += ' FABLE-CAP-BUDGET: Fable is a capped seat (up to 50% of the weekly limit, not a ' +
+                'deadline); the ~2x-Opus-per-token figure applies to API/usage-credit billing only, not ' +
+                'Max-plan-included usage — surfaced here so the cost is never hidden.';
+            }
+            resumeNotes.push(closeNote);
+            continue;
+          }
+          problems.push('MODEL-POLICY: role ' + role + ' ran on ' + actual + ' (transcript model ' + actualId +
+            ') but cc-roles.env resolves ' + role + ' -> ' + expected + '. Re-run the role on model:' + expected +
+            ', or update CC_ROLE_' + roleKeyStem(role) + '_MODEL in cc-roles.env. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.' +
+            (declared ? ' (NOTE: this role is DECLARED to non-Anthropic provider ' + expectedSide.provider +
+              ', but the OBSERVED model is Anthropic and mismatches the ordinary policy tier — declaration ' +
+              'never waves an Anthropic mismatch through.)' : ''));
+          continue;
+        }
+
+        // ── Non-Anthropic observation (actualId resolves via the SSOT vocabulary to SOME provider/tier). ──
+        const obsIdent = routesLoaded.ok ? identifyModel(routesLoaded.routes, actualId) : { ok: false };
+        const actualProvider = obsIdent.ok ? obsIdent.provider : '';
+        const actualTier = obsIdent.ok ? obsIdent.tierEquivalent : '';
+
+        if (!declared) {
+          // #1640 S10 binding point 1 — an UNDECLARED non-Anthropic model HARD-BLOCKS, regardless of whether
+          // the observed id happens to be a real, SSOT-declared vocabulary entry (S10(b): "catches a sensor
+          // that would declare on ANY non-claude id" — a valid-looking vocabulary match is NOT itself a
+          // declaration; only a recorded run-time stamp is).
+          problems.push('MODEL-POLICY: role ' + role + ' ran on a non-Anthropic model (' + actualId +
+            (actualTier ? ', tier_equivalent ' + actualTier : '') + (actualProvider ? ', provider ' + actualProvider : '') +
+            ') with NO recorded run-time reroute stamp on its own ledger line — an undeclared non-Anthropic ' +
+            'model is hard-blocked (the gate catching an off-policy model is it working). If this is a ' +
+            'deliberate declared switch, the role must be spawned/closed through the recorder edges ' +
+            '(three-role-spawn-ledger.sh / three-role-subagent-ledger.sh) while the session\'s inherited ' +
+            'ANTHROPIC_BASE_URL resolves to a declared SSOT provider row. Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+          continue;
+        }
+
+        // declared === true from here (stamp present, seat SSOT-declared non-Anthropic, stamp names that seat's
+        // OWN declared provider). Binding point 2's fail-closed half: the observed id must be IN-VOCABULARY for
+        // the DECLARED provider specifically — a stamp naming provider X never blesses an id from provider Y.
+        if (!actualProvider || actualProvider !== expectedSide.provider || actualTier !== expectedSide.tier) {
+          problems.push('MODEL-POLICY: role ' + role + ' is DECLARED to provider ' + expectedSide.provider +
+            ' (' + expectedSide.model + ', tier_equivalent ' + expectedSide.tier + ') but the OBSERVED model ' +
+            actualId + ' resolves to ' + (actualProvider ? 'provider ' + actualProvider + ' / tier_equivalent ' + actualTier : 'no declared provider') +
+            ' — off-vocabulary for the declared provider; fail-closed (declaration never waves through an ' +
+            'off-vocabulary observation). Kill-switch: CC_ROLE_MODEL_GATE_OFF=1.');
+          continue;
+        }
+
+        // #1640 S9 — DECLARED ALLOW. The version-pin sub-leg is DORMANT for this observation (per-OBSERVATION,
+        // never per-session — an Anthropic observation on this SAME declared role would still hit the fully-
+        // enforced branch above): a non-Anthropic observed id can never equal a claude-* version pin, so
+        // silently NOT checking it here (rather than always-mismatching) is the correct dormancy, not a gap.
+        // #1640 S10 binding point 3 — every declared allow writes the unified audit log (SESSION-REROUTE),
+        // naming the task + role + resolved provider; a DATA-SENSITIVITY note rides along when the flipped-to
+        // provider does not clear the seat's declared sensitivity class. Read the note text back (parent M1
+        // verification): it names the provider row resolved, satisfying S8(a)'s expected-side probe too (the
+        // SAME fixture — a declared, in-vocabulary, matching seat — is what makes the expected side observable
+        // via THIS surface; see the plan's Advisory A1 gradeability clause).
+        const liveSeat = (routesLoaded.routes.seats || {})[role] || {};
+        const seatForSensCheck = Object.assign({}, liveSeat, { provider: expectedSide.provider });
+        const sensClearance = checkDataSensitivity(routesLoaded.routes, seatForSensCheck);
+        let reroteNote = 'SESSION-REROUTE: role ' + role + ' DECLARED to provider ' + expectedSide.provider +
+          ' (model ' + expectedSide.model + ', tier_equivalent ' + expectedSide.tier + ') — allowed with note; ' +
+          'audit logged; MODEL-VERSION sub-leg dormant for this observation.';
+        if (!sensClearance.ok) {
+          // #1880 intent 6/7a -- the advisory is NOT silenced by an acceptance; it is REWORDED. A matching
+          // acceptance names itself (never claims a refusal that isn't happening); a drifted/absent/mismatched
+          // acceptance behaves EXACTLY as if none were present -- the plain uncleared DATA-SENSITIVITY note.
+          const acc = checkAcceptance(routesLoaded.routes, seatForSensCheck);
+          if (acc.ok) {
+            const a = acc.acceptance;
+            reroteNote += ' DATA-SENSITIVITY-ACCEPTED: seat ' + role + ' provider ' + a.provider +
+              ' posture-at-decision ' + a.posture_at_decision + ' decided ' + a.decided + ' authority ' + a.authority +
+              ' — accepted risk, not a refusal.';
+          } else {
+            reroteNote += ' DATA-SENSITIVITY: ' + sensClearance.reason;
+          }
+        }
+        resumeNotes.push(reroteNote);
+        writeBypassLog('3role-ledger-enforce-role-models', 'SESSION-REROUTE', 'PERMIT',
+          { task: sanitize(task), role, provider: expectedSide.provider });
+      }
+    }
+  }
+  // #1100 item 3: provenance flags — a required role that ran as a REAL spawn (not an inline-skip) but whose
+  // line lacks the self_authored stamp is provenance-unverified (an orchestrator-fabricated line has no
+  // authoring agent turn). By DEFAULT this only SURFACES (never a silent brick — the honest residual: a
+  // quiet-but-legit agent that forgot to self-append). Strict-block is opt-IN via --require-provenance.
+  const provenanceFlags = [];
+  for (const role of REQUIRED_ROLES) {
+    const e = byRole[role];
+    if (!e || ('skip_reason' in e)) continue;        // missing handled above; skips don't have an authoring turn
+    if (!e.self_authored) provenanceFlags.push(role);
+  }
+  const requireProv = ('require-provenance' in o);
+  if (requireProv) {
+    for (const role of provenanceFlags) problems.push(role + ' lacks a self_authored provenance stamp (--require-provenance)');
+  }
+  // #2075 AC-23 — legacy-row surfacing: ALWAYS-ON (never opt-in, never blocking), the drift detector for an
+  // unpatched writer. A required-role row with NO stored `run_kind` key at all predates this design (or was
+  // written by a writer that has not been taught to stamp it yet) — its kind is still computed correctly
+  // (from live, verified evidence — see provenanceKindOf's legacy branch), this is visibility only.
+  const legacyRoles = [];
+  for (const role of REQUIRED_ROLES) {
+    const e = byRole[role];
+    if (!e || ('skip_reason' in e)) continue;   // missing handled above; a skip has no run to classify
+    if (!('run_kind' in e)) legacyRoles.push(role);
+  }
+  // #1509 Leg A — TRACKED, not merely present. Opt-in via --enforce-tracked-artifacts (only the completion
+  // gate passes it; base `check` stays existence-only — AC-3). Role-keyed HARD block for the three disk-path
+  // roles; executor is exempt by role but its disk-path row (if any) is surfaced as a NOTE, never blocked.
+  const executorNotes = [];
+  if ('enforce-tracked-artifacts' in o) {
+    for (const role of REQUIRED_ROLES) {
+      const e = byRole[role];
+      if (!e) continue;   // missing-role already reported by the base existence leg above.
+      const tp = checkTrackedRole(role, e);
+      if (tp) problems.push('TRACKED: ' + tp);
+    }
+    const execNote = executorDiskPathNote(byRole['executor']);
+    if (execNote) executorNotes.push(execNote);
+    // #1544 — perf-log jurisdiction-keyed tracked-check, riding the SAME Leg A flag (git-only, always-on).
+    // NOT gated on --enforce-artifact-privacy — that is the monotonicity fix (#1590): the perf-log's
+    // tracked-ness must not be silenceable by THREE_ROLE_ARTIFACT_PRIVACY_OFF=1.
+    const perfLogTracked = o['perf-log'] || '';
+    if (perfLogTracked) {
+      const pp = checkPerfLogTracked(perfLogTracked);
+      if (pp) problems.push('TRACKED: ' + pp);
+    }
+  }
+  // #1532 — executor artifact-KIND leg. Opt-in via --enforce-artifact-role-kind (only the instrumentation
+  // gate passes it on the tagged completion path). See executorKindProblem() above for the discrimination;
+  // this is a hard BLOCK (pushed to problems[], routed to the same exit-2 path below), not a note — it
+  // upgrades the #1509 NOTE-EXECUTOR advisory into a real gate for the #1494 shape.
+  if ('enforce-artifact-role-kind' in o) {
+    const kp = executorKindProblem(byRole);
+    if (kp) problems.push('KIND: ' + kp);
+  }
+  // #1537 — artifact-privacy leg. Opt-in via --enforce-artifact-privacy (only the completion gate passes it).
+  // DORMANT (no problems pushed, no error) when PRIVACY_SCAN_BIN is unset/unresolvable — the ai-brain-only /
+  // plugin-safe discipline (the plugin ports this file but never the scanner, so a plugin install silently
+  // no-ops here exactly like the tracked-artifacts leg's HELPER-absence residual elsewhere in this file).
+  if ('enforce-artifact-privacy' in o) {
+    const scannerBin = process.env.PRIVACY_SCAN_BIN || '';
+    if (scannerBin && fileExists(scannerBin)) {
+      for (const role of PRIVACY_ROLES) {
+        const e = byRole[role];
+        if (!e) continue;                            // missing-role already reported by the base existence leg.
+        if (classifySkip(e).skip) continue;           // inline-skip has no artifact to scan.
+        const ap = resolveDiskPathForRole(role, e);
+        if (!ap) continue;                            // no resolvable disk path -> not this leg's problem.
+        const detail = scanArtifactPrivacy(ap, scannerBin);
+        if (detail) problems.push('PRIVACY: ' + role + ' artifact "' + ap + '" FAILED the privacy scan (' + detail + ')');
+      }
+      // The run's cited perf-log card (#1537 round-2 scope promotion). Boundary rule: IN scope ONLY when it
+      // resolves to a file that is git-tracked INSIDE the ai-brain repo (reuse isGitTracked — the SAME
+      // discriminator Leg A uses). Anything else (out-of-repo path, in-repo-but-untracked, unresolvable) is
+      // fail-OPEN here: not scanned, no error, no block — an ai-brain completion gate structurally has no
+      // jurisdiction over a file it cannot prove is a shipped ai-brain artifact.
+      const perfLog = o['perf-log'] || '';
+      if (perfLog && isGitTracked(perfLog) === true) {
+        const detail = scanArtifactPrivacy(perfLog, scannerBin);
+        if (detail) problems.push('PRIVACY: perf-log card "' + perfLog + '" FAILED the privacy scan (' + detail + ')');
+      }
+    }
+  }
+  // #2496 — the merge-head-gated in-session sibling-token resolver (Intent #1/#2). Fires ONLY when the
+  // SOLE reason this bare token is blocked is one-or-more literally-missing required-role rows (the
+  // confirmed live class — a stub ledger under the bare token while the real chain closed under a
+  // sibling) AND a merge-head was passed (no binding evidence otherwise). Every other problem class
+  // (checkRole content failures on a PRESENT row, laneA/laneB, model-policy, tracked, kind, privacy) is
+  // NEVER papered over — `problems.length === missingRoleProblems.length` requires missing-role rows to be
+  // the ONLY thing in `problems`.
+  if (checkOpts.mergeHead && missingRoleProblems.length > 0 && problems.length === missingRoleProblems.length) {
+    const sib = resolveSiblingForCheck(session, task, checkOpts);
+    if (sib) { printSiblingResolveAllow(task, sib); process.exit(0); }
+    // D3 — no token-boundary sibling either: try the session-scan arm (D3b-bound).
+    const scan = resolveSessionScanForCheck(session, task, checkOpts);
+    if (scan) { printSessionScanResolveAllow(task, scan); process.exit(0); }
+  }
+  if (problems.length) { console.log('BLOCK: ' + problems.join('; ')); process.exit(2); }
+  // #1947 M-B — print AFTER the problems-guard (so it only reaches stdout on genuine roles-satisfied paths,
+  // matching AC-5(d)/AC-6(d)'s "check exits 0 AND its output labels the row" contract) but BEFORE the final
+  // OK: line, honestly distinct from a harness-signed pass exactly as D2 promised.
+  if (dispatchLabels.length) {
+    console.log('DISPATCH: ' + dispatchLabels.join(' | '));
+  }
+  if (resumeNotes.length) {
+    console.log('NOTE: ' + resumeNotes.join(' | '));
+  }
+  if (executorNotes.length) {
+    console.log('NOTE-EXECUTOR: ' + executorNotes.join(' | '));
+  }
+  if (provenanceFlags.length) {
+    console.log('PROVENANCE: ' + provenanceFlags.join(', ') +
+      ' provenance-unverified (no self_authored stamp — orchestrator-fabricated or a quiet agent that did not self-append)');
+  }
+  if (legacyRoles.length) {
+    console.log('PROVENANCE-LEGACY: ' + legacyRoles.join(', ') +
+      ' — no stored run_kind (pre-#2075 row, or a writer not yet taught to stamp it); kind is computed fresh ' +
+      "from this row's live, verified evidence — see `provenance-kind` — never from a stored label.");
+  }
+  // #1989 — ROUTE-BYPASS trailing-edge detector: an always-on, pure-output advisory (exit code UNCHANGED — the
+  // model-policy legs own blocking; this is visibility, not a gate) printed on the roles-satisfied path, sibling
+  // of DISPATCH:/NOTE:/NOTE-EXECUTOR:/PROVENANCE:. Fires PER required role when ALL hold: (1) the routes SSOT,
+  // read FRESH through seatDispatchIsSubprocess() (M1: the SSOT decides admissibility, never the row — a future
+  // seat flip is covered automatically), declares that seat dispatch==subprocess-openrouter; (2) the role's
+  // ledger line exists and is not an inline-skip; (3) NO subprocess dispatch stamp SURVIVES on ANY of the role's
+  // ledger lines (scans ALL lines[], not just the merged byRole last row — a stamp on ANY surviving line
+  // suppresses the advisory for that role).
+  //
+  // HONEST DETECTION SEMANTICS (round-2 B1 fix, option (i)): absence of a surviving stamp does NOT mean "never
+  // attempted" — both sanctioned D3-fallback shapes leave zero surviving ledger evidence: a dispatch that fails
+  // pre-success never reaches the helper's success-path stamp write (tools/openrouter-role-dispatch.sh stamps
+  // only on success), and a stamped dispatch SUPERSEDED by the bounded Agent-tool retry is ERASED by
+  // overlayAppend's clear-list (delete entry.dispatch/transcript_path/nonce, gated on agentResolves — the
+  // #1590 monotonicity arm, NOT weakened here). So the advisory's claim is exactly "no surviving subprocess
+  // dispatch stamp" — wording that is honest in BOTH a habitual-bypass case AND a genuine D3 fallback (each an
+  // exceptional, visible event). It NEVER says "never attempted", and it names the receipt file's
+  // OR-DISPATCH-FALLBACK / OR-SEAT-SMOKE lines (task-keyed via task=) as the human disambiguator between the two
+  // causes. No absolute $HOME/`/Users/` paths (N5 — the helper is named repo-relatively; advisory stdout gets
+  // quoted into committed artifacts). INDEPENDENT of the Direction-2 block-once marker (N3 — different
+  // surfaces, different keys, NO shared state; a future "optimization" that suppressed this behind the
+  // spawn-time marker would recreate the silent-bypass hole, so the two stay independent in fact, not intent).
+  // First-wave volume (N4): both plan-review AND executor are subprocess-declared today, so this fires on
+  // essentially every existing task in current session ledgers — the ticket's requested retroactive visibility,
+  // not a regression.
+  for (const role of REQUIRED_ROLES) {
+    const decl = seatDispatchIsSubprocess(role);
+    if (!decl.ok) continue;                          // (1) SSOT declares this seat subprocess-dispatched right now
+    const e = byRole[role];
+    if (!e || ('skip_reason' in e)) continue;         // (2) role line exists and is not an inline-skip
+    // (3) no surviving subprocess dispatch stamp on ANY of the role's ledger lines.
+    let stampSurvives = false;
+    for (const ln of lines) {
+      let j; try { j = JSON.parse(ln); } catch (er) { continue; }
+      if (j && j.role === role && isSubprocessDispatch(j.dispatch)) { stampSurvives = true; break; }
+    }
+    if (stampSurvives) continue;
+    // #3190 -- a needle-receipt agent-tool close is NOT a bypass either: when the task's current receipt
+    // window holds a non-drill executor NEEDLE-LINT row (task-keyed; the brief binding was enforced at spawn
+    // time by the route gate's resolve-route --brief call), print ROUTE-NEEDLE instead of ROUTE-BYPASS.
+    // Exit code unchanged (advisory), same as the ROUTE-SIZE branch below.
+    if (role === 'executor' && o.task && needleReceiptAdmits(o.task, null)) {
+      const fbTier3190 = (decl.seat && decl.seat.agent_tool_fallback) || '<unknown>';
+      console.log('ROUTE-NEEDLE: role=' + role + ' -> agent-tool ' + fbTier3190 + ' (first-class, needle receipt)');
+      continue;
+    }
+    // #2985 D9 -- a first-class Agent-tool route is NOT a bypass: when the plan-review row's reviewed_plan
+    // resolves (same resolver as the gate and the helper) to an effective agent-tool route for THIS task,
+    // print ROUTE-SIZE instead of ROUTE-BYPASS. Anything unresolvable keeps today's advisory.
+    {
+      const prRow = byRole['plan-review'];
+      if (prRow && typeof prRow.reviewed_plan === 'string' && prRow.reviewed_plan && decl.seat) {
+        // reviewed_plan is stored repo-relative (normalizeArtifact): resolve against the cwd first, then against
+        // the repo that holds THIS ledger helper (so a check run from another cwd still finds the plan).
+        let facts = resolvePlanFacts(prRow.reviewed_plan, o.task);
+        if (facts.unresolvable && !path.isAbsolute(prRow.reviewed_plan)) {
+          let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+          facts = resolvePlanFacts(path.join(selfDir, '..', prRow.reviewed_plan), o.task);
+        }
+        if (!facts.unresolvable) {
+          const eff = effectiveRouteFor(role, decl.seat, facts);
+          if (eff.effective_dispatch === 'agent-tool') {
+            console.log('ROUTE-SIZE: role=' + role + ' size=' + (facts.size || '-') +
+              (facts.data_class === 'operator-private' ? ' data-class=operator-private' : '') +
+              ' -> agent-tool ' + eff.effective_tier + ' (first-class)');
+            continue;
+          }
+        }
+      }
+    }
+    const seatModel = (decl.seat && decl.seat.model) || '<unknown>';
+    console.log('ROUTE-BYPASS: role=' + role + ' (seat model ' + seatModel + ', declared dispatch=subprocess-openrouter)' +
+      " — no surviving subprocess dispatch stamp on this routed seat's ledger lines, so its work did not CLOSE" +
+      ' via the subprocess route (tools/openrouter-role-dispatch.sh). agent_tool_fallback made the run gate-clean:' +
+      ' this is a VISIBILITY note, not a verdict invalidation. The two causes are a habitual Agent-tool bypass OR' +
+      " a sanctioned D3 fallback — disambiguate by reading .ai-workspace/status/1947-seat-mix-live-smoke.md's" +
+      ' OR-DISPATCH-FALLBACK / OR-SEAT-SMOKE receipt lines (task-keyed via their task= field).');
+  }
+  // #1528 D4 — EFFORT-PROVENANCE advisory. Prints UNCONDITIONALLY on the roles-satisfied path (unlike every
+  // advisory above, which only prints when it has something to flag) — even at 4/4 informative — so its
+  // absence from stdout can never be mistaken for "no rows to report" (AC-R7). Sibling of PROVENANCE:/
+  // ROUTE-BYPASS:, pure output, exit code UNCHANGED. Computed over the SAME merged byRole[role]
+  // last-row-per-role every other advisory above already uses. Downstream rule (D1): a row is
+  // effort-INFORMATIVE iff `effort_source === "observed"` — "assigned" and absent (unattributed, whether or
+  // not `effort` itself is present) are both evidentially void, so a conveyance statistic computed over void
+  // rows is visibly wrong here rather than silently wrong.
+  {
+    let observedCount = 0, assignedCount = 0, unattributedCount = 0;
+    const perRoleLabel = {};
+    for (const role of REQUIRED_ROLES) {
+      const e = byRole[role];
+      const src = e && e.effort_source;
+      let label;
+      if (src === 'observed') { label = 'observed'; observedCount++; }
+      else if (src === 'assigned') { label = 'assigned'; assignedCount++; }
+      else { label = 'unattributed'; unattributedCount++; }
+      perRoleLabel[role] = label;
+    }
+    console.log('EFFORT-PROVENANCE: informative=' + observedCount + '/' + REQUIRED_ROLES.length +
+      ' observed=' + observedCount + ' assigned=' + assignedCount + ' unattributed=' + unattributedCount +
+      ' (planner=' + perRoleLabel.planner + ', plan-review=' + perRoleLabel['plan-review'] +
+      ', executor=' + perRoleLabel.executor + ', execution-review=' + perRoleLabel['execution-review'] + ')');
+  }
+  if (sizeSCheck.exempt) {
+    // #3154 D3/D5 -- the waived OK line KEEPS the `OK: role-ledger complete` prefix (oracles.mjs matches it) and
+    // names the waiver; one audit line per allowing evaluation.
+    writeBypassLog('3role-ledger-size-s-exempt', 'SIZE-S-SKIP', 'PERMIT', { task: sanitize(task), plan: sizeSCheck.plan, ticket_size: 'S' });
+    console.log('OK: role-ledger complete for task ' + sanitize(task) +
+      ' (planner, executor, execution-review resolved; plan-review: WAIVED size-s (ticket=S plan=S))');
+    process.exit(0);
+  }
+  console.log('OK: role-ledger complete for task ' + sanitize(task) +
+    ' (planner, plan-review, executor, execution-review all resolved)');
+  process.exit(0);
+}
+
+// #3326 — carried-key --task T -> the session key this task's ledger rows are carried under (the
+// FIRST explicit append's key — first-carried-key-wins, never rewritten by any later writer; see
+// carriedKeySeed), on
+// stdout. The merge-side gate's leg-3c uses this to retry its bound `check` under the CARRIED key when the
+// payload session is a NEW session. ONE bounded read of ONE task-keyed file (<= 256 bytes, token-safe
+// content) under LEDGER_DIR/.task-session-key/ — NEVER an enumeration of session dirs, so a ledger that
+// was never appended through this helper (no index entry) is invisible here exactly as before the
+// widening (fail-closed: exit 1, no output). The record itself is seeded by carriedKeySeed from the
+// explicit append path's own --session/--task only (see there) — a merge payload's command text can
+// never influence it, and no inferred writer ever rewrites it.
+function cmdCarriedKey(o) {
+  const task = o.task;
+  if (!task) { console.error('carried-key: --task is required'); process.exit(2); }
+  const t = sanitize(task);
+  let raw = '';
+  if (t) {
+    try {
+      const f = path.join(LEDGER_DIR, '.task-session-key', t);
+      const st = fs.statSync(f);
+      if (st.isFile() && st.size > 0 && st.size <= 256) raw = fs.readFileSync(f, 'utf8');
+    } catch (e) { /* no record — fail closed below */ }
+  }
+  const key = sanitize(raw.trim());
+  if (!key) process.exit(1);   // no derivable carried key — nothing printed, never a guess or a scan.
+  console.log(key);
+  process.exit(0);
+}
+
+// #860: resolve-agent --session S --task T --role R -> newest-mtime tagged transcript's agentId on stdout.
+function cmdResolveAgent(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) { console.error('resolve-agent: --session, --task, --role are required'); process.exit(2); }
+  enforceSessionShape(session, task, role, 2);
+  const agentId = resolveAgent(session, task, role);
+  if (!agentId) process.exit(1);   // no transcript carries the tag — print nothing, fail.
+  console.log(agentId);
+  process.exit(0);
+}
+
+// #1303: resolve-artifact --session S --task T --role R -> existence-checked absolute artifact_path on stdout.
+// Reuses ledgerFile() + resolveArtifact() (the load-bearing helpers) and the SAME last-line-per-role parse
+// cmdCheck/cmdInherit use. Exits non-zero on every "no usable artifact" branch so the gate falls back to the
+// convention dir (the #1266 ledger-first fix). Only artifact_path is read — verdict/skip fields are ignored.
+function cmdResolveArtifact(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) { console.error('resolve-artifact: --session, --task, --role are required'); process.exit(2); }
+  enforceSessionShape(session, task, role, 2);
+  const file = ledgerFile(session, task);
+  let lines;
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
+  catch (e) { process.exit(1); }   // no ledger -> caller falls back to convention dir
+  const byRole = {};
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  const e = byRole[role];
+  if (!e || !e.artifact_path || String(e.artifact_path).trim() === '') process.exit(1);
+  const abs = resolveArtifact(e.artifact_path); // expands ~ / CLAUDE_PROJECT_DIR / cwd / $HOME, '' if not on disk
+  if (!abs) process.exit(1);
+  console.log(abs);
+  process.exit(0);
+}
+
+// #2462 AC-4 — resolve-artifacts-for-task --task T [--merge-head R]: the RAW per-row resolution primitive
+// the corpus verifier (scripts/2462-branch-only-artifact-corpus-verifier.mjs) shells out to, so its
+// resolution predicate is the SAME code checkRole()/resolveArtifact()/resolveArtifactAtRef() run for `check`
+// — never a second hand-written copy that could silently drift from it. Unlike `check` (session-scoped, role-
+// completeness-gated), this walks EVERY ledger file for the task ACROSS ALL SESSION DIRS under LEDGER_DIR
+// (AC-4's cross-session population predicate) and reports EVERY row found (including superseded round
+// history — AC-4 says "every ledger row", not "the current effective row per role"), one JSON object per
+// line on stdout: {session, role, ref: <the artifact_path/oracle string>, resolved: bool, via: <string>}.
+// Never a pass/fail gate itself — exit 0 whenever ≥1 ledger file was found for the task (even if some rows
+// fail to resolve; the caller decides), exit 1 when NO ledger file exists for this task anywhere (so the
+// caller can distinguish "task not in the population" from "task found, rows examined").
+function cmdResolveArtifactsForTask(o) {
+  const task = o.task;
+  if (!task) { console.error('resolve-artifacts-for-task: --task is required'); process.exit(2); }
+  const mergeHead = o['merge-head'] || '';
+  const t = sanitize(task);
+  let sessionDirs = [];
+  try { sessionDirs = fs.readdirSync(LEDGER_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); }
+  catch (e) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  const files = [];
+  for (const sd of sessionDirs) {
+    const f = path.join(LEDGER_DIR, sd, t + '.jsonl');
+    if (fileExists(f)) files.push({ session: sd, file: f });
+  }
+  if (files.length === 0) { console.log('NO-LEDGER ' + t); process.exit(1); }
+  for (const { session, file } of files) {
+    let lines = [];
+    try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { continue; }
+    for (const ln of lines) {
+      let row;
+      try { row = JSON.parse(ln); } catch (e) { continue; }
+      if (!row || !row.role) continue;
+      const role = row.role;
+      if (classifySkip(row).skip) {
+        console.log(JSON.stringify({ session, role, ref: '', resolved: true, via: 'inline-skip' }));
+        continue;
+      }
+      if (role === 'executor') {
+        const ok = !!(row.artifact_path && String(row.artifact_path).trim());
+        console.log(JSON.stringify({ session, role, ref: row.artifact_path || '', resolved: ok, via: ok ? 'string' : 'empty' }));
+        continue;
+      }
+      const rawRef = (role === 'execution-review' && row.oracle) ? stripOraclePrefix(row.oracle) : row.artifact_path;
+      if (!rawRef || !String(rawRef).trim()) {
+        console.log(JSON.stringify({ session, role, ref: rawRef || '', resolved: false, via: 'empty' }));
+        continue;
+      }
+      const contentRe = role === 'planner' ? PLAN_RE : VERDICT_RE;
+      const disk = resolveArtifact(rawRef);
+      if (disk) {
+        const ok = fileHas(disk, contentRe);
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? 'disk' : 'disk-content-fail', at: disk }));
+        continue;
+      }
+      const hit = resolveArtifactAtRef(rawRef, mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+      if (hit) {
+        const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+        const ok = content !== null && (role === 'planner' ? PLAN_RE.test(content) : hasRefArmAffirmative(content));
+        console.log(JSON.stringify({ session, role, ref: rawRef, resolved: ok, via: ok ? ('ref:' + hit.ref) : ('ref-content-fail:' + hit.ref), at: hit.repoDir + ':' + hit.relPath }));
+        continue;
+      }
+      console.log(JSON.stringify({ session, role, ref: rawRef, resolved: false, via: 'not-found' }));
+    }
+  }
+  process.exit(0);
+}
+
+// review-seat-publish-verdict backstop primitive (task plan-review-seat-leaves-verdict-uncommitted-in-
+// worktree-blocking-w3-gate) — resolve-published-verdict --session S --task T --role R [--merge-head H]:
+// finds the LAST ledger row for (session, task, role) and resolves its artifact_path/oracle-ref via the
+// REF ARM ONLY (resolveArtifactAtRef — task-bound refs + origin/master, + merge-head if given) — NOT the
+// disk-first arm resolve-artifacts-for-task above uses (Constraint C2: a disk-only PASS is not "published"
+// — that is exactly the lane-1-shaped defect this whole ticket exists to close). Prints ONE line to stdout:
+//   row:<0|1> ref-hit:<0|1> ref:<ref-or-none> decision-line:<0|1> affirmative:<0|1> artifact:<encoded-or-none>
+// row=0           — no ledger row exists for this (session,task,role) at all.
+// ref-hit=0       — a row exists but its artifact_path/oracle does not resolve at ANY candidate ref
+//                   (whether or not it exists on disk — disk is not consulted here).
+// decision-line=1 — the ref-resolved content carries a flush-left Decision:/verdict: line, ANY value
+//                   (hasRefArmDecisionLine — the value-agnostic sibling of hasRefArmAffirmative, built
+//                   from the SAME DECISION_LINE_SOURCE — Constraint C1).
+// affirmative=1   — informational only: that line's value is ALSO in CHECK_LANE_AFFIRMATIVE. The backstop
+//                   hook does not gate on this field (C1 — a published FAIL is still published); it is
+//                   printed for operator visibility / smoke assertions only.
+// artifact         — the row's raw artifact_path/oracle string, encodeURIComponent'd (so a path can never
+//                     break the single-line whitespace-delimited output) — lets a caller build a repair
+//                     recipe naming the REAL path without re-reading the ledger file itself.
+// Not a pass/fail gate itself (mirrors resolve-artifacts-for-task's contract; does not change
+// checkRole()/cmdCheck() pass/fail semantics) — exit 0 whenever the ledger file for (session,task) is
+// readable, exit 1 when it is not (lets the caller fail open on a missing ledger, same shape as
+// resolve-artifacts-for-task's NO-LEDGER exit 1).
+function cmdResolvePublishedVerdict(o) {
+  const session = o.session, task = o.task, role = o.role;
+  if (!session || !task || !role) {
+    console.log('resolve-published-verdict: --session, --task, and --role are all required');
+    process.exit(2);
+  }
+  const mergeHead = o['merge-head'] || '';
+  const file = ledgerFile(session, task);
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
+  catch (e) {
+    console.log('row:0 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:none');
+    process.exit(1);
+  }
+  let last = null;
+  for (const ln of lines) {
+    let row; try { row = JSON.parse(ln); } catch (e) { continue; }
+    if (row && row.role === role) last = row;   // LAST matching row wins, same semantics as cmdCheck's byRole
+  }
+  if (!last) {
+    console.log('row:0 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:none');
+    process.exit(0);
+  }
+  // A row carrying skip_reason (classifySkip) self-declares "no artifact to publish" — checkRole() already
+  // judges whether the reason is SPECIFIC enough at `check` time (its own message covers that); this
+  // primitive stays out of that judgment and simply reports it as satisfied so the backstop hook does not
+  // fire on a legitimately-skipped review.
+  if (classifySkip(last).skip) {
+    console.log('row:1 ref-hit:1 ref:inline-skip decision-line:1 affirmative:1 artifact:none');
+    process.exit(0);
+  }
+  const rawRef = (role === 'execution-review' && last.oracle) ? stripOraclePrefix(last.oracle) : last.artifact_path;
+  const encRef = rawRef ? encodeURIComponent(String(rawRef)) : 'none';
+  if (!rawRef || !String(rawRef).trim()) {
+    console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
+    process.exit(0);
+  }
+  const hit = resolveArtifactAtRef(rawRef, mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+  if (!hit) {
+    console.log('row:1 ref-hit:0 ref:none decision-line:0 affirmative:0 artifact:' + encRef);
+    process.exit(0);
+  }
+  const content = readBlobAtRef(hit.repoDir, hit.ref, hit.relPath);
+  if (content === null) {
+    console.log('row:1 ref-hit:1 ref:' + hit.ref + ' decision-line:0 affirmative:0 artifact:' + encRef);
+    process.exit(0);
+  }
+  const decisionLine = hasRefArmDecisionLine(content) ? 1 : 0;
+  const affirmative = hasRefArmAffirmative(content) ? 1 : 0;
+  console.log('row:1 ref-hit:1 ref:' + hit.ref + ' decision-line:' + decisionLine + ' affirmative:' + affirmative + ' artifact:' + encRef);
+  process.exit(0);
+}
+
+// #1350: heartbeat --session S --task T -> bump <task>.jsonl mtime to ~now (touch-existing OR create-zero-byte).
+// Writes NO JSONL line (AC-4 non-corruption by construction). ALWAYS exits 0 (fail-open) — a heartbeat error
+// must never wedge the spawn it instruments, so the whole body is wrapped and every failure path returns 0.
+function cmdHeartbeat(o) {
+  try {
+    const session = o.session, task = o.task;
+    // Missing args -> nothing to touch; fail-open (do NOT exit 2 like the other subcommands).
+    if (!session || !task) process.exit(0);
+    enforceSessionShape(session, task, 'heartbeat', 0);
+    const file = ledgerFile(session, task);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fileExists(file)) {
+      // Create a ZERO-byte file. 'a' (append) NEVER truncates — so even on a race where a real append just
+      // created a non-empty <task>.jsonl, this opens-and-closes without clobbering its content.
+      fs.closeSync(fs.openSync(file, 'a'));
+    }
+    // Advance mtime to ~now (the entire board signal). Content is left untouched on every path.
+    const now = new Date();
+    fs.utimesSync(file, now, now);
+  } catch (e) { /* fail-open: a heartbeat error never blocks the spawn */ }
+  process.exit(0);
+}
+
+// #1481: refresh-models --session S -> in-flight model backfill (the NEW in-flight TRIGGER'S oracle unit;
+// see the file-header doc block above). Walks <LEDGER_DIR>/<S>/*.jsonl; for each REQUIRED-role line that
+// lacks a modelVersion and is not inline-skipped, re-resolves the model via the SAME resolveModelFields()
+// helper cmdAppend uses and overlay-appends ONLY the model fields (idempotent, absent->present only —
+// never rewrites an already-present model, never touches agentId/artifact_path/effort/verdict/
+// self_authored). Fires kanban-resync.sh (backgrounded) at most ONCE per invocation, only when >=1 role
+// actually changed. ALWAYS exits 0 (fail-open) — mirrors cmdHeartbeat's contract: a refresh error must
+// never wedge the caller (a backgrounded hook trigger with no one watching stderr).
+function cmdRefreshModels(o) {
+  try {
+    const session = o.session;
+    if (!session) { console.log('OK refresh-models: no --session given (fail-open, nothing to do)'); process.exit(0); }
+    enforceSessionShape(session, null, 'refresh-models', 0);
+    const sess = sanitize(session);
+    const dir = path.join(LEDGER_DIR, sess);
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); }
+    catch (e) { console.log('OK refresh-models: no ledger dir for session ' + sess); process.exit(0); }
+    let scanned = 0;
+    let changed = 0;
+    for (const fn of files) {
+      const task = fn.slice(0, -('.jsonl'.length));
+      const file = path.join(dir, fn);
+      let lines;
+      try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
+      catch (e) { continue; }
+      const byRole = {};
+      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+      for (const role of REQUIRED_ROLES) {
+        const e = byRole[role];
+        if (!e) continue;                       // no line for this role yet -> nothing to refresh
+        if ('skip_reason' in e) continue;        // inline-skip -> no transcript to read
+        if (e.modelVersion) continue;            // ABSENT->PRESENT ONLY: already has a model, never rewrite
+        // #2075 D5(c) — E3 CONTAINMENT (AC-9/AC-11a): a row already carrying protection-verified E2 evidence
+        // (a subprocess dispatch, no agentId of its own) must not have its blank modelVersion filled from an
+        // unrelated sibling — resolveModelFields('' explicitAgent) would fall back to a blind cross-session
+        // search precisely for this row shape. A verified-E1 row is unaffected (its own e.agentId is passed
+        // explicitly below, so no search ever runs for it) — AC-10's ordinary-row backfill keeps working.
+        if (computeVerifiedKindForProtection(role, e, sess, task) === 'E2') continue;
+        scanned++;
+        const modelFields = resolveModelFields(sess, task, role, e.agentId || '');
+        if (!modelFields.modelVersion) continue; // transcript still carries no message.model line yet -> too early
+        // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (same
+        // reasoning as cmdReconcileSpawns above; D1 names resolveModelFields's own callers explicitly).
+        modelFields.run_kind = 'inferred';
+        modelFields.run_source = 'refresh-models';
+        overlayAppend(sess, task, role, modelFields);
+        changed++;
+      }
+    }
+    if (changed > 0) fireResyncBackground();
+    console.log('OK refresh-models: session=' + sess + ' scanned=' + scanned + ' changed=' + changed);
+    process.exit(0);
+  } catch (e) {
+    console.log('OK refresh-models: error (fail-open): ' + (e && e.message ? e.message : e));
+    process.exit(0);
+  }
+}
+
+// #1229 — reproduces three-role-subagent-ledger.sh's EXACT self_authored provenance predicate (never a
+// blind stamp): an ASSISTANT message in the agent's OWN transcript containing a Bash tool_use whose command
+// invokes `3role-ledger.mjs ... append ...` AND names `--role <role>`. Fail-open: any read/parse trouble
+// returns false (never fabricates a stamp on a can't-tell path).
+function transcriptSelfAuthored(file, role) {
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) { return false; }
+  const roleRe = new RegExp('--role\\s+' + role);
+  for (const ln of content.split('\n')) {
+    if (!ln.trim()) continue;
+    let j;
+    try { j = JSON.parse(ln); } catch (e) { continue; }
+    const isAsst = j && (j.type === 'assistant' || (j.message && j.message.role === 'assistant'));
+    if (!isAsst) continue;
+    const c = j.message && j.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const blk of c) {
+      if (!blk || blk.type !== 'tool_use') continue;
+      if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+      const cmd = String((blk.input && blk.input.command) || '');
+      if (/3role-ledger\.mjs[\s\S]*?\bappend\b/.test(cmd) && roleRe.test(cmd)) return true;
+    }
+  }
+  return false;
+}
+
+// #1851 root-cause fix (AC2(ii) -- the hoist's own residual per-group scaling cost; plan finding F1 named this
+// exact risk as non-blocking, on the assumption AC9's 60s live ceiling would absorb it -- AC2(ii)'s own load-
+// bearing timing assertion proves that assumption wrong for the group-count axis specifically). Before this
+// fix, cmdReconcileSpawns's group loop called resolveModelFields() (-> transcriptModel(), which re-`readdir`s
+// PROJECTS_ROOT AND full-`readFileSync`s the winner's transcript) AND transcriptSelfAuthored() (an INDEPENDENT
+// full `readFileSync` + per-line `JSON.parse` of the SAME winner transcript) as two SEPARATE calls per group.
+// D1's hoist collapsed the DISCOVERY pass to O(corpus), but these two later-record derivations read PAST the
+// bounded first-record window D2 deliberately stops at, so neither can be served from the D3 per-file
+// checkpoint -- leaving a cost that scales with GROUP COUNT ALONE (not corpus size) whenever a meaningful
+// fraction of groups still lack modelVersion/self_authored (the cold-start shape AC2(ii)'s fixture measures).
+// Measured (Docker --cpus=0.5 --memory=512m, 8 reps, same corpus/5x-G-contrast shape as the smoke's arm(ii)):
+// pre-fix ratio ~1.44-1.52x; this fix alone (no test-threshold or fixture change) brings it to ~1.0-1.1x (see
+// PR body for the full before/after table) -- confirming the redundant double-read was the dominant driver,
+// not environmental noise. deriveLaterRecordFacts() reads the winner's transcript file EXACTLY ONCE and
+// extracts everything BOTH fields need in that single pass -- halving the worst-case (both fields missing)
+// per-group later-record cost -- and takes the transcript's PATH directly (already known via
+// transcriptByAgentId from the single corpus pass) instead of re-deriving it through transcriptModel()'s
+// readdir(PROJECTS_ROOT) + per-slug path guess, eliminating a second per-group directory scan entirely.
+// transcriptModel()/transcriptSelfAuthored()/resolveModelFields() are left UNCHANGED for their other caller
+// (cmdRefreshModels), which does not already hold a transcript-path map and must keep the readdir-based lookup.
+function deriveLaterRecordFacts(file, role) {
+  const result = { modelId: '', selfAuthored: false };
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) { return result; }
+  const roleRe = new RegExp('--role\\s+' + role);
+  for (const ln of content.split('\n')) {
+    const s = ln.trim();
+    if (!s) continue;
+    let j; try { j = JSON.parse(s); } catch (e) { continue; }
+    if (!j) continue;
+    const isAsst = j.type === 'assistant' || (j.message && j.message.role === 'assistant');
+    if (!isAsst) continue;
+    if (j.message && typeof j.message.model === 'string' && j.message.model) result.modelId = j.message.model;
+    if (!result.selfAuthored) {
+      const c = j.message && j.message.content;
+      if (Array.isArray(c)) {
+        for (const blk of c) {
+          if (!blk || blk.type !== 'tool_use') continue;
+          if (String(blk.name || '').toLowerCase() !== 'bash') continue;
+          const cmd = String((blk.input && blk.input.command) || '');
+          if (/3role-ledger\.mjs[\s\S]*?\bappend\b/.test(cmd) && roleRe.test(cmd)) { result.selfAuthored = true; break; }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+// #2701 D4 — repair-crosswire: the ONE sanctioned repair for a row an earlier writer cross-wired (an
+// Agent-tool spawn stamp merged onto a subprocess dispatch's own row instead of opening a new one — the
+// exact defect D1 now prevents going forward). Fail-closed predicate P1-P5 (exit 3, writes nothing, names
+// the failing term); idempotent (a row this tool already repaired, or one that was never cross-wired,
+// exits 0 with "nothing to repair" and touches nothing); a wet run backs the file up first (a sibling
+// `.repair-backup/` directory, never a `*.jsonl` glob target) and rewrites atomically (tmp + rename).
+// `--dry-run` prints the same BEFORE/AFTER and writes nothing (byte-identity is an AC).
+function cmdRepairCrosswire(o) {
+  const session = o.session, task = o.task, role = o.role, runId = o['run-id'];
+  if (!session || !task || !role || !runId) {
+    console.error('repair-crosswire: --session, --task, --role, --run-id are required');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-crosswire', 2);
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-crosswire P1): no ledger file exists for task ' + sanitize(task) +
+      ' — no row could carry run_id ' + runId + '. Nothing written.');
+    process.exit(3);
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+
+  // P1 — exactly one row of role R whose run_id equals --run-id.
+  const matchIdx = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const j = parsed[i];
+    if (j && j.role === role && j.run_id === runId) matchIdx.push(i);
+  }
+  if (matchIdx.length !== 1) {
+    console.error('BLOCK (3role-ledger repair-crosswire P1): ' + matchIdx.length + ' row(s) of role ' + role +
+      ' carry run_id ' + runId + ' (need exactly one) — nothing written.');
+    process.exit(3);
+  }
+  const idx = matchIdx[0];
+  const row = parsed[idx];
+
+  // P2 — the row carries subprocess provenance AND an agentId (it is cross-wired — the invariant is
+  // violated). IDEMPOTENT carve-out: a row this SAME tool already repaired (no agentId, but its own
+  // repair_ticket marker is present) is the honest no-op outcome of a re-run naming the same run_id, not a
+  // refusal — the row genuinely has nothing left to fix. Anything else failing P2 (a row that was never
+  // cross-wired at all — missing an agentId with no repair marker, or an agentId with no subprocess
+  // provenance) is a REFUSAL: the operator named a real run_id whose row does not match the precondition
+  // this tool exists to fix.
+  if (!row.agentId && row.repair_ticket === '2701') {
+    console.log('OK repair-crosswire: nothing to repair (row ' + idx + ' was already repaired by this tool).');
+    process.exit(0);
+  }
+  if (!row.agentId || !rowHasSubprocessProvenance2701(row)) {
+    console.error('BLOCK (3role-ledger repair-crosswire P2): row ' + idx + ' does not carry both subprocess ' +
+      'provenance and an agentId (it was never cross-wired) — nothing written.');
+    process.exit(3);
+  }
+
+  // P3 — a real spawn of this seat exists to own the new row (the row's agentId is tag-bound).
+  if (!agentBoundToTag(session, row.agentId, task, role)) {
+    console.error('BLOCK (3role-ledger repair-crosswire P3): no spawn transcript tag-bound to 3ROLE_TASK:' +
+      sanitize(task) + ' ROLE:' + sanitize(role) + ' was found for agentId ' + row.agentId + ' — nothing written.');
+    process.exit(3);
+  }
+
+  // P4 — no OTHER row of role R already carries that agentId.
+  for (let i = 0; i < parsed.length; i++) {
+    if (i === idx) continue;
+    const j = parsed[i];
+    if (j && j.role === role && j.agentId === row.agentId) {
+      console.error('BLOCK (3role-ledger repair-crosswire P4): another row (line ' + (i + 1) + ') of role ' +
+        role + ' already carries agentId ' + row.agentId + ' — nothing written.');
+      process.exit(3);
+    }
+  }
+
+  // P5 — fail-closed on any ledger-append mention in the lifted agent's own transcript that the
+  // command-position parser cannot read plainly (see priorAgentTranscriptP5's own comment).
+  const p5 = priorAgentTranscriptP5(row, task, role);
+  if (!p5.ok) {
+    console.error('BLOCK (3role-ledger repair-crosswire P5): the lifted agent\'s own transcript' +
+      (p5.path ? ' (' + p5.path + ')' : '') + ' shows ' + p5.reason + ' — lifting agentId ' + row.agentId +
+      ' could let that agent\'s own verdict supersede its own earlier flip. Nothing written.');
+    process.exit(3);
+  }
+
+  const dryRun = ('dry-run' in o);
+  const LIFTED_FIELDS_2701 = ['agentId', 'modelVersion', 'modelTier', 'effort', 'effort_source', 'self_authored', 'closedAt'];
+  const before = JSON.parse(JSON.stringify(row));
+
+  const subprocessRow = JSON.parse(JSON.stringify(row));
+  const agentRow = { role: row.role, session_id: row.session_id, ts: new Date().toISOString(), run_kind: 'bound',
+    run_source: 'repair-crosswire', repaired_from_run_id: runId };
+  for (const k of LIFTED_FIELDS_2701) {
+    if (k in subprocessRow) { agentRow[k] = subprocessRow[k]; delete subprocessRow[k]; }
+  }
+  subprocessRow.repair_ticket = '2701';
+  subprocessRow.repair_at = new Date().toISOString();
+  subprocessRow.repair_moved_agent = before.agentId;
+
+  console.error('AUDIT: repair-crosswire — session=' + sanitize(session) + ' task=' + sanitize(task) +
+    ' role=' + sanitize(role) + ' run_id=' + runId + (dryRun ? ' (dry-run)' : ''));
+  console.error('BEFORE: ' + JSON.stringify(before));
+  console.error('AFTER (subprocess row): ' + JSON.stringify(subprocessRow));
+  console.error('AFTER (new agent row): ' + JSON.stringify(agentRow));
+
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-crosswire: would rewrite row ' + idx + ' and append a new bound row for ' +
+      'agentId ' + before.agentId + '. Nothing written.');
+    console.log('BEFORE: ' + JSON.stringify(before));
+    console.log('AFTER (subprocess row): ' + JSON.stringify(subprocessRow));
+    console.log('AFTER (new agent row): ' + JSON.stringify(agentRow));
+    process.exit(0);
+  }
+
+  const backupDir = path.join(path.dirname(file), '.repair-backup');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, sanitize(task) + '.jsonl.' + new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.copyFileSync(file, backupFile);
+
+  const newLines = rawLines.slice();
+  newLines[idx] = JSON.stringify(subprocessRow);
+  newLines.push(JSON.stringify(agentRow));
+  const tmp = file + '.tmp-repair-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, newLines.join('\n') + '\n');
+  fs.renameSync(tmp, file);
+
+  console.log('OK repair-crosswire: repaired row ' + idx + ' for agentId ' + before.agentId + '; backup at ' + backupFile);
+  process.exit(0);
+}
+
+// #2782 intent 3 / AC-8 — repair-subprocess-models: the ONE sanctioned repair for EXISTING wrong-or-empty
+// model stamps on subprocess-provenance rows. Rewrites modelVersion/modelTier/provider ONLY on rows that
+// (a) carry subprocess provenance (rowHasSubprocessProvenance2701 — the class whose existing value is known
+// blind: a subprocess row never had an honest transcript-model capture before #2782's gate), (b) carry NO
+// agentId (a cross-wired row is repair-crosswire's job, never this tool's), and (c) carry a transcript_path
+// that YIELDS a served model — the served id read from that transcript is the only truth this tool trusts.
+// An E1 (Agent-tool / Claude-seat) row is NEVER touched (its modelVersion was observed from its own
+// transcript, and plan (iii) pins it byte-identical). Non-goals by construction: no directory walk (only
+// the named task's own ledger file + the transcript each candidate row names — INPUT-BOUND: a bounded,
+// finite read set, no growth loop), no invention (a tier the SSOT cannot resolve and a provider the row's
+// own dispatch marker cannot name are simply never written), idempotent (a row already matching the
+// transcript truth is a no-op on re-run). --dry-run prints counts and writes nothing (byte-identity AC);
+// a wet run backs the file up FIRST (a `<task>.jsonl.bak-<iso>` sibling, N2) and rewrites atomically
+// (tmp + rename), never leaving a half-written ledger.
+function cmdRepairSubprocessModels(o) {
+  const session = o.session;
+  if (!session) {
+    console.error('repair-subprocess-models: --session is required (--task optional: bound to ONE task file)');
+    process.exit(2);
+  }
+  // #2782 AC-8/AC-8-live — the plan's invocation is `--session S [--dry-run]` (a SESSION-wide count over
+  // the orchestrator session's task files); --task narrows the run to ONE task file (an AC-8 fixture seam
+  // and a blast-radius bound an operator may want). INPUT-BOUND: the read set is exactly that one file, or
+  // the session's OWN drawer's *.jsonl files — a flat, finite listing, never a recursive walk, never a
+  // glob outside the session directory, so the repair cannot loop or grow with the store.
+  const task = ('task' in o) ? String(o.task == null ? '' : o.task) : '';
+  enforceSessionShape(session, task, 'repair-subprocess-models', 2);
+  const sessDir = path.join(LEDGER_DIR, sanitize(session));
+  let files;
+  if (task) {
+    files = [ledgerFile(session, task)];
+  } else {
+    let names = [];
+    try { names = fs.readdirSync(sessDir).filter((f) => f.endsWith('.jsonl')).sort(); } catch (e) { names = []; }
+    files = names.map((f) => path.join(sessDir, f));
+    if (!files.length) {
+      console.error('BLOCK (3role-ledger repair-subprocess-models P1): no ledger files exist for session ' +
+        sanitize(session) + ' — no row could carry a subprocess model stamp. Nothing written.');
+      process.exit(3);
+    }
+  }
+  const dryRun = ('dry-run' in o);
+  const provIds = ssotProviderIds2782() || [];
+  const jobs = [];      // { file, rawLines, repairs: [{ idx, row, changes }] } — files that NEED a rewrite
+  let unreadable = 0, untouched = 0;
+  for (const file of files) {
+    let raw;
+    try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+      if (task) {
+        console.error('BLOCK (3role-ledger repair-subprocess-models P1): no ledger file exists for task ' +
+          sanitize(task) + ' — no row could carry a subprocess model stamp. Nothing written.');
+        process.exit(3);
+      }
+      continue;   // session-wide: a file vanished between listing and read — skipped, never invented
+    }
+    const rawLines = raw.split('\n');
+    const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+    const repairs = [];   // { idx, row, changes }
+    for (let i = 0; i < parsed.length; i++) {
+      const row = parsed[i];
+      if (!row || row.role == null) continue;
+      if (!rowHasSubprocessProvenance2701(row) || row.agentId) { untouched++; continue; }
+      const tp = (row.transcript_path == null) ? '' : String(row.transcript_path);
+      if (!tp) { untouched++; continue; }   // no transcript named -> the value is not known blind -> untouched
+      const served = transcriptModelFromPath(tp);
+      if (!served) { unreadable++; continue; }   // transcript gone / carries no model line (held-out case 3)
+      const changes = {};
+      if (row.modelVersion !== served) changes.modelVersion = served;
+      const tier = modelIdToTier(served) || identifyModelViaSSOT(served);
+      if (tier && row.modelTier !== tier) changes.modelTier = tier;
+      const prov = isSubprocessDispatch(row.dispatch) ? row.dispatch.slice('subprocess-'.length) : '';
+      if (prov && provIds.includes(prov) && row.provider !== prov) changes.provider = prov;
+      if (Object.keys(changes).length) repairs.push({ idx: i, row, changes });
+      else untouched++;
+    }
+    if (repairs.length) jobs.push({ file, rawLines, repairs });
+  }
+  if (dryRun) {
+    console.log('DRY-RUN repair-subprocess-models: would-rewrite=' + jobs.reduce((a, j) => a + j.repairs.length, 0) +
+      ' rewritten=0' + ' unreadable=' + unreadable + ' untouched=' + untouched + ' — nothing written.');
+    process.exit(0);
+  }
+  if (!jobs.length) {
+    console.log('OK repair-subprocess-models: rewritten=0 unreadable=' + unreadable + ' untouched=' +
+      untouched + ' — nothing to rewrite.');
+    process.exit(0);
+  }
+  let n = 0;
+  for (const j of jobs) {
+    // N2 backup, per-file, BEFORE the rewrite: a `<task>.jsonl.bak-<iso>` sibling of the file itself.
+    const backupFile = path.join(path.dirname(j.file), path.basename(j.file) + '.bak-' +
+      new Date().toISOString().replace(/[:.]/g, '-'));
+    fs.copyFileSync(j.file, backupFile);
+    console.log('backup=' + backupFile);
+    const newLines = j.rawLines.slice();
+    for (const r of j.repairs) {
+      for (const [k, v] of Object.entries(r.changes)) r.row[k] = v;
+      newLines[r.idx] = JSON.stringify(r.row);
+      n++;
+    }
+    const tmp = j.file + '.tmp-repair-' + process.pid + '-' + Date.now();
+    fs.writeFileSync(tmp, newLines.join('\n'));
+    fs.renameSync(tmp, j.file);
+  }
+  console.log('OK repair-subprocess-models: rewritten=' + n + ' unreadable=' + unreadable +
+    ' untouched=' + untouched);
+  process.exit(0);
+}
+
+// #2902 — repair-split-run: merges the two halves of a z.ai dispatcher run that the pre-#2902 close append
+// split into an earlier pending/artifact row and a later closedAt row (same run_id). Fail-closed predicate
+// P1-P4 (exit 3, writes nothing); idempotent; dry-run prints BEFORE/AFTER and writes nothing; a wet run
+// backs up first and rewrites atomically. No lock exists, so a wet run re-reads the file right before the
+// rename and refuses if the bytes changed, and refuses while the task has an open pending row unless
+// --allow-pending is given.
+function cmdRepairSplitRun(o) {
+  const session = o.session, task = o.task, runId = o['run-id'];
+  if (!session || !task || !runId) {
+    console.error('repair-split-run: --session, --task, --run-id are required');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-split-run', 2);
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): no ledger file exists for task ' + sanitize(task) + '. Nothing written.');
+    process.exit(3);
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+  const matchIdx = [];
+  for (let i = 0; i < parsed.length; i++) { if (parsed[i] && parsed[i].run_id === runId) matchIdx.push(i); }
+  if (matchIdx.length === 1 && parsed[matchIdx[0]].repair_ticket === '2902') {
+    console.log('OK repair-split-run: nothing to repair (run ' + runId + ' was already repaired by this tool).');
+    process.exit(0);
+  }
+  if (matchIdx.length !== 2) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): ' + matchIdx.length + ' row(s) carry run_id ' + runId +
+      ' (need exactly two) — nothing written.');
+    process.exit(3);
+  }
+  const a = parsed[matchIdx[0]], b = parsed[matchIdx[1]];
+  if (a.role !== b.role || a.agentId || b.agentId || !/^OR-NONCE-/.test(String(runId))) {
+    console.error('BLOCK (3role-ledger repair-split-run P1): the two rows must share a role, carry no agentId, and the run_id ' +
+      'must be a dispatcher nonce (OR-NONCE-*) — nothing written.');
+    process.exit(3);
+  }
+  if (!a.artifact_path || a.closedAt) {
+    console.error('BLOCK (3role-ledger repair-split-run P2): the earlier row must carry artifact_path and no closedAt — nothing written.');
+    process.exit(3);
+  }
+  if (!b.closedAt || b.artifact_path || !String(b.dispatch || '').startsWith('subprocess-')) {
+    console.error('BLOCK (3role-ledger repair-split-run P3): the later row must carry closedAt and subprocess dispatch, and no artifact_path — nothing written.');
+    process.exit(3);
+  }
+  if (a.session_id !== b.session_id) {
+    console.error('BLOCK (3role-ledger repair-split-run P4): the two rows disagree on session_id — nothing written.');
+    process.exit(3);
+  }
+  const dryRun = ('dry-run' in o);
+  const NEVER_2902 = ['run_kind', 'run_source', 'dispatch_nonce', 'artifact_path', 'agentId'];
+  const merged = { ...a };
+  for (const k of Object.keys(b)) { if (!NEVER_2902.includes(k)) merged[k] = b[k]; }
+  delete merged.pending;
+  merged.repair_ticket = '2902';
+  merged.repair_at = new Date().toISOString();
+  merged.repair_merged_from_line = matchIdx[1] + 1;
+  console.error('AUDIT: repair-split-run — session=' + sanitize(session) + ' task=' + sanitize(task) + ' run_id=' + runId + (dryRun ? ' (dry-run)' : ''));
+  console.log('BEFORE: ' + JSON.stringify(a));
+  console.log('BEFORE: ' + JSON.stringify(b));
+  console.log('AFTER: ' + JSON.stringify(merged));
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-split-run: would merge line ' + (matchIdx[1] + 1) + ' onto line ' + (matchIdx[0] + 1) + '. Nothing written.');
+    process.exit(0);
+  }
+  const openPending = parsed.some((j, i) => j && j.pending === true && i !== matchIdx[0]);
+  if (openPending && !('allow-pending' in o)) {
+    console.error('BLOCK (3role-ledger repair-split-run P5): task ' + sanitize(task) + ' has another pending row still open; ' +
+      'a concurrent close append could be lost (no lock). Re-run when quiesced, or pass --allow-pending. Nothing written.');
+    process.exit(3);
+  }
+  const backupDir = path.join(path.dirname(file), '.repair-backup');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, sanitize(task) + '.jsonl.' + new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.copyFileSync(file, backupFile);
+  const newLines = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    if (i === matchIdx[1]) continue;
+    newLines.push(i === matchIdx[0] ? JSON.stringify(merged) : rawLines[i]);
+  }
+  const tmp = file + '.tmp-repair-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, newLines.join('\n') + '\n');
+  let again = null;
+  try { again = fs.readFileSync(file, 'utf8'); } catch (e) { again = null; }
+  if (again !== raw) {
+    try { fs.unlinkSync(tmp); } catch (e) { /* best effort */ }
+    console.error('BLOCK (3role-ledger repair-split-run P6): the ledger changed while this repair was running — nothing written.');
+    process.exit(3);
+  }
+  fs.renameSync(tmp, file);
+  console.log('OK repair-split-run: merged line ' + (matchIdx[1] + 1) + ' onto line ' + (matchIdx[0] + 1) + '; backup at ' + backupFile);
+  process.exit(0);
+}
+
+// #1229 / #1851: reconcile-spawns --session S — see the file-header doc block near the top of this file
+// (the "reconcile-spawns" subcommand entry) for the full design rationale, including the #1851 incremental
+// rewrite (D1 hoist / D2 bounded read / D3 per-file checkpoint / D4 correctness / D5 wall-clock budget / D6
+// no-silent-loss). Short version: walks every subagent transcript for the session, discovers tagged (task,
+// role) pairs with a REAL transcript, and backfills only what a missing/self-append-only row is missing:
+// agentId, modelVersion/modelTier, self_authored. Never touches artifact_path/closedAt/verdict/skip_reason.
+// ALWAYS exits 0 (fail-open) — a sweep error must never wedge the hook call it rides.
+function cmdReconcileSpawns(o) {
+  try {
+    const session = o.session;
+    if (!session) { console.log('OK reconcile-spawns: no --session given (fail-open, nothing to do)'); process.exit(0); }
+    enforceSessionShape(session, null, 'reconcile-spawns', 0);
+    const sess = sanitize(session);
+    const startTs = Date.now();
+    const budgetMsRaw = Number(process.env.RECONCILE_SPAWNS_BUDGET_MS);
+    const budgetMs = Number.isFinite(budgetMsRaw) && budgetMsRaw >= 0 ? budgetMsRaw : 20000; // 0 is a valid ("truncate immediately") value -- must not fall through `||`'s falsy-zero coercion
+    const fullRederiveEveryN = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_EVERY_N);
+    const FULL_REDERIVE_EVERY_N = Number.isFinite(fullRederiveEveryN) && fullRederiveEveryN > 0 ? fullRederiveEveryN : 20;
+    const fullRederiveMaxAgeMs = Number(process.env.RECONCILE_SPAWNS_FULL_REDERIVE_MAX_AGE_MS);
+    const FULL_REDERIVE_MAX_AGE_MS = Number.isFinite(fullRederiveMaxAgeMs) && fullRederiveMaxAgeMs > 0 ? fullRederiveMaxAgeMs : (6 * 60 * 60 * 1000);
+
+    let slugs = [];
+    try { slugs = fs.readdirSync(PROJECTS_ROOT); }
+    catch (e) { console.log('OK reconcile-spawns: no projects root'); process.exit(0); }
+
+    // Discovery pass (unchanged cost model -- cheap, readdir + stat only). Now ALSO captures each transcript's
+    // (dev, ino) file identity (the D3 checkpoint cache key).
+    let newestMtime = 0;
+    const transcripts = []; // {agentId, file, mtimeMs, dev, ino, size}
+    for (const slug of slugs) {
+      const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
+      let files = [];
+      try { files = fs.readdirSync(dir); } catch (e) { continue; }
+      for (const fn of files) {
+        const m = fn.match(/^agent-(.+)\.jsonl$/);
+        if (!m) continue;
+        const f = path.join(dir, fn);
+        let st;
+        try { st = fs.statSync(f); } catch (e) { continue; }
+        if (!st.isFile()) continue;
+        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, size: st.size });
+        if (st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
+      }
+    }
+    if (transcripts.length === 0) { console.log('OK reconcile-spawns: no subagent transcripts for session ' + sess); process.exit(0); }
+
+    // #1851 D6 -- an unreadable/corrupt/schema-mismatched sidecar fails open to the SAME empty shape a
+    // genuinely-first-ever run sees (readReconcileCheckpoint's own contract) -- coldStart below is true in
+    // both cases, forcing a full re-derivation rather than "nothing to do".
+    const checkpoint = readReconcileCheckpoint(sess);
+    const coldStart = Object.keys(checkpoint.files).length === 0;
+    const nextRunCount = checkpoint.runCount + 1;
+    const dueByCount = (nextRunCount % FULL_REDERIVE_EVERY_N) === 0;
+    const dueByAge = checkpoint.lastFullDeriveTs === 0 || (Date.now() - checkpoint.lastFullDeriveTs) > FULL_REDERIVE_MAX_AGE_MS;
+    const dueForFullRederive = coldStart || dueByCount || dueByAge; // #1851 D6 periodic belt-and-braces (AC5)
+
+    // Cheap per-session watermark: short-circuits to the readdir/stat scan above (no per-transcript read, no
+    // writes) when no transcript has advanced past the last sweep AND a periodic full re-derive isn't due
+    // (a full re-derive must be able to run even on an otherwise-quiescent session, per D6).
+    const watermarkFile = path.join(LEDGER_DIR, sess, '.reconcile-watermark');
+    let lastWatermark = 0;
+    try { lastWatermark = Number(fs.readFileSync(watermarkFile, 'utf8').trim()) || 0; } catch (e) { lastWatermark = 0; }
+    if (!dueForFullRederive && newestMtime > 0 && newestMtime <= lastWatermark) {
+      console.log('OK reconcile-spawns: session=' + sess + ' no new transcript activity since last sweep (watermark)');
+      process.exit(0);
+    }
+
+    // #1851 D1/D2/D3/D5 -- the ONE pass that replaces the old per-group resolveAgent() re-scan. Oldest-first
+    // (D5: strict forward progress under a wall-clock budget -- if truncated, the OLDEST unprocessed
+    // transcripts are exactly what the NEXT invocation picks up first). For each transcript: reuse its
+    // per-file checkpoint (D3) when NOT due a full re-derive AND the file's identity is unchanged AND its
+    // size has not SHRUNK (D3: a shrink means possible truncation/rewrite -> re-derive); otherwise a bounded
+    // D2 read + D1 tag extraction. Builds `groups` (every known (task, role) pair -- D6: never skipped just
+    // because its transcript didn't change) and `tagWinners` (the newest-mtime candidate per group, replacing
+    // resolveAgent()'s per-group corpus re-scan with a Map lookup).
+    const sortedTranscripts = transcripts.slice().sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const newFilesCache = Object.assign({}, checkpoint.files); // seed with prior knowledge (D5 partial-progress safety)
+    const groups = new Set(); // "task role"
+    const tagWinners = new Map(); // "task role" -> {agentId, mtimeMs}
+    const transcriptByAgentId = new Map();
+    for (const t of transcripts) transcriptByAgentId.set(t.agentId, t);
+
+    let firstRecordsRead = 0;
+    let firstRecordsCached = 0;
+    let truncated = false;
+    for (const t of sortedTranscripts) {
+      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
+      const identity = t.dev + ':' + t.ino;
+      const cachedEntry = !dueForFullRederive ? checkpoint.files[identity] : undefined;
+      let discovery, winners, reviewedPlan;
+      if (cachedEntry && t.size >= cachedEntry.size) {
+        discovery = cachedEntry.discovery || null;
+        winners = Array.isArray(cachedEntry.winners) ? cachedEntry.winners : [];
+        // review-round-counter-per-plan — a checkpoint written BEFORE this field existed simply lacks the
+        // key; falls back to '' (no crash, no phantom extraction) and gets picked up on the next full
+        // re-derive (periodic, #1851 D6) or the next time this file's size actually changes.
+        reviewedPlan = cachedEntry.reviewedPlan || '';
+        firstRecordsCached++;
+      } else {
+        const line = readFirstNonEmptyLine(t.file);
+        const text = firstRecordTextFromLine(line);
+        const extracted = extractTagsFromText(text);
+        discovery = extracted.discovery;
+        winners = extracted.winners;
+        reviewedPlan = findPlanPathTextual(text);
+        firstRecordsRead++;
+      }
+      newFilesCache[identity] = { size: t.size, discovery, winners, reviewedPlan };
+      if (discovery) groups.add(discovery.task + ' ' + discovery.role);
+      for (const w of winners) {
+        const key = w.task + ' ' + w.role;
+        const cur = tagWinners.get(key);
+        if (!cur || t.mtimeMs > cur.mtimeMs) tagWinners.set(key, { agentId: t.agentId, mtimeMs: t.mtimeMs });
+      }
+    }
+
+    // #1851 D1/D4/D6 -- group -> row loop. Same per-row semantics as before (never disturb an inline-skip row
+    // or a row already bound to a DIFFERENT agentId -- the #1580 round-boundary trap), but the winner is now a
+    // Map lookup (tagWinners), never a resolveAgent() corpus re-scan. modelVersion resolution is now GATED on
+    // `!prior.modelVersion` (D1 item 5 fix -- previously unconditional); self_authored keeps its existing gate.
+    let scanned = 0;
+    let groupsEvaluated = 0;
+    let changed = 0;
+    let laterRecordRederives = 0;
+    let anyRowFailed = false;
+    const groupsArr = Array.from(groups);
+    for (const key of groupsArr) {
+      if (Date.now() - startTs >= budgetMs) { truncated = true; break; }
+      const [task, role] = key.split(' ');
+      groupsEvaluated++;
+      scanned++;
+
+      const winner = tagWinners.get(key);
+      const agentId = winner ? winner.agentId : '';
+      if (!agentId) continue; // fail-open: matches resolveAgent()'s own '' return for an unbound group (D1 seam).
+
+      const file = ledgerFile(sess, task);
+      let lines = [];
+      try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { /* no ledger yet */ }
+      let prior = null;
+      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role === role) prior = j; } catch (e) { /* skip */ } }
+
+      // Never disturb an inline-skip row (mirrors cmdRefreshModels's own `if ('skip_reason' in e) continue`).
+      if (prior && ('skip_reason' in prior)) continue;
+      // Never disturb a row that already carries a DIFFERENT real agentId (the #1580 round-boundary trap) --
+      // write ONLY when the row is absent, its agentId is absent, or its agentId equals the resolved one.
+      if (prior && prior.agentId && prior.agentId !== agentId) continue;
+      // #2075 D5(c) — E3 CONTAINMENT (fixes B16, the ~30s corruption timer). `agentId` above is ALWAYS
+      // E3-derived (a blind, cross-session, newest-mtime SEARCH — resolveAgent()'s own contract), so the one
+      // genuine corruption vector is a row that ALREADY carries protection-verified E2 evidence (a subprocess
+      // dispatch with no agentId of its own): this sweep's search could otherwise find an unrelated Anthropic
+      // sibling's transcript and misattribute its model onto this row (measured live, cairn 2026-07-28:270).
+      // A row already carrying a resolving+bound agentId (verified E1) is UNAFFECTED by this guard — its own
+      // agentId is passed explicitly to deriveLaterRecordFacts below, so no blind search ever runs for it
+      // (AC-10's ordinary-Anthropic-row backfill keeps working unchanged).
+      if (computeVerifiedKindForProtection(role, prior, sess, task) === 'E2') continue;
+      // #2701 D2 — widen the containment: a row carrying subprocess provenance and NO agentId must never
+      // have an identity INFERRED onto it by this sweep, verified or not. An E3 inference is a blind,
+      // newest-mtime transcript search — claiming a nonce-identified row with it is exactly the write-side
+      // cross-wire this ticket exists to stop, and the honest outcome is that this sweep writes NOTHING for
+      // the group (the spawn hook and SubagentStop are the real E1 writers for it).
+      if (prior && !prior.agentId && rowHasSubprocessProvenance2701(prior)) continue;
+
+      // Compute ONLY the fields genuinely missing so a group with nothing left to add makes NO overlayAppend
+      // call at all (idempotency -- a bare re-append would still refresh `ts` and break byte-identity).
+      const fields = {};
+      let hasChange = false;
+      if (!prior || !prior.agentId) { fields.agentId = agentId; hasChange = true; }
+
+      // #1851 D1 item 5 fix: GATE modelVersion/self_authored resolution on absence (previously modelVersion was
+      // unconditional -- a fixed bug: an already-stamped row paid a full transcript re-parse on every sweep
+      // forever). #1851 root-cause fix (AC2(ii)): a group needing EITHER field used to pay TWO separate full
+      // transcript re-reads (resolveModelFields -> transcriptModel, then transcriptSelfAuthored) -- now ONE
+      // deriveLaterRecordFacts() call serves both, halving the per-group later-record cost (see its own header
+      // comment for the measured before/after).
+      const needModelVersion = !prior || !prior.modelVersion;
+      const needSelfAuthored = !prior || !prior.self_authored;
+      if (needModelVersion || needSelfAuthored) {
+        laterRecordRederives++;
+        const tr = transcriptByAgentId.get(agentId);
+        const facts = tr ? deriveLaterRecordFacts(tr.file, role) : { modelId: '', selfAuthored: false };
+        if (needModelVersion && facts.modelId) {
+          fields.modelVersion = facts.modelId;
+          hasChange = true;
+          const tier = modelIdToTier(facts.modelId) || identifyModelViaSSOT(facts.modelId);
+          if (tier && (!prior || !prior.modelTier)) { fields.modelTier = tier; hasChange = true; }
+        }
+        if (needSelfAuthored && facts.selfAuthored) { fields.self_authored = true; hasChange = true; }
+      }
+
+      // review-round-counter-per-plan — reviewed_plan backfill, add-only-when-missing (never overwrites a
+      // present value — a genuine spawn-time/dispatch-helper stamp always wins). Gated to plan-review rows:
+      // the field's meaning ("the plan THIS round was of") is plan-review-specific. The textual extraction
+      // was already computed per-transcript above (findPlanPathTextual, no statSync) and cached in
+      // newFilesCache keyed by the WINNING transcript's own (dev, ino) identity — a plain Map lookup, no
+      // second file read here. Side benefit, not load-bearing for any AC: legacy rows whose transcripts
+      // still exist get opportunistically backfilled on later sweeps.
+      if (role === 'plan-review' && (!prior || !prior.reviewed_plan)) {
+        const winTr = transcriptByAgentId.get(agentId);
+        const winCache = winTr ? newFilesCache[winTr.dev + ':' + winTr.ino] : null;
+        const reviewedPlanRaw = winCache && winCache.reviewedPlan ? winCache.reviewedPlan : '';
+        if (reviewedPlanRaw) { fields.reviewed_plan = normalizeArtifact(reviewedPlanRaw); hasChange = true; }
+      }
+
+      if (!hasChange) continue;
+      // #2075 D1/D5(c) item 2 — stamp run_kind:inferred on anything this heuristic sweep DOES write (round-1
+      // blocker B3's fix: a search-backfilled row must never be byte-identical on disk to a genuine E1 row).
+      // The write-once clamp in overlayAppend means this can only ever RAISE an absent/lower stored value,
+      // never lower an already-classified row's — no extra guard needed here.
+      fields.run_kind = 'inferred';
+      fields.run_source = 'reconcile-spawns';
+      try { overlayAppend(sess, task, role, fields); changed++; }
+      catch (e) { anyRowFailed = true; /* one row's failure is logged-and-skipped, never fatal */ console.error('WARN reconcile-spawns: row ' + task + '/' + role + ' failed: ' + (e && e.message ? e.message : e)); }
+    }
+
+    // #1851 D3 -- persist every per-file checkpoint earned this run (even a truncated one -- D5 partial-progress
+    // safety) and the run bookkeeping (runCount always advances; lastFullDeriveTs advances only when a full
+    // re-derive actually happened this run).
+    writeReconcileCheckpoint(sess, {
+      schemaVersion: RECONCILE_CHECKPOINT_SCHEMA,
+      runCount: nextRunCount,
+      lastFullDeriveTs: dueForFullRederive ? Date.now() : checkpoint.lastFullDeriveTs,
+      files: newFilesCache,
+    });
+
+    // #1851 D4(c) -- the coarse watermark advances ONLY after a sweep that completed with nothing truncated or
+    // row-failed (previously unconditional -- a real bug: a failed row was never retried unless some
+    // transcript's mtime happened to advance past it).
+    if (!truncated && !anyRowFailed) {
+      try { fs.mkdirSync(path.dirname(watermarkFile), { recursive: true }); fs.writeFileSync(watermarkFile, String(newestMtime)); } catch (e) { /* best-effort */ }
+    }
+    if (changed > 0) fireResyncBackground();
+    const elapsedMs = Date.now() - startTs;
+    console.log(
+      'OK reconcile-spawns: session=' + sess + ' scanned=' + scanned + ' changed=' + changed +
+      ' transcripts=' + transcripts.length +
+      ' firstRecordsRead=' + firstRecordsRead + ' firstRecordsCached=' + firstRecordsCached +
+      ' groupsKnown=' + groups.size + ' groupsEvaluated=' + groupsEvaluated +
+      ' laterRecordRederives=' + laterRecordRederives +
+      ' elapsedMs=' + elapsedMs +
+      ' truncated=' + truncated +
+      ' coldStart=' + coldStart + ' fullRederive=' + dueForFullRederive
+    );
+    process.exit(0);
+  } catch (e) {
+    console.log('OK reconcile-spawns: error (fail-open): ' + (e && e.message ? e.message : e));
+    process.exit(0);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// refresh-lane-intents --session S  (ticket live-pool-members-undercounts-long-running-lanes, plan
+// .ai-workspace/plans/2026-08-30-live-pool-members-longrunning-lane-liveness.md, PASSED round 4)
+//
+// The lane-liveness RECONCILER: rides hooks/lane-heartbeat.sh's already-throttled touch-branch (beside
+// refresh-models/reconcile-spawns) and, per beat, makes a genuinely-running chain-role/ship-tail lane's
+// spawn-intent marker (<LANE_INTENT_DIR>/<session>/<task>.json) stay FRESH for the lane's whole life —
+// closing the root cause: BOTH of hooks/sole_lane_math.py's live_pool_members() sources (the ledger-mtime
+// window and the marker's own written-once-at-spawn 90-min TTL) are fixed-lifetime, anchored at write
+// time, so a long-running lane (a chain role appends nothing to its own ledger file while it runs) drops
+// out while still live. This command REFRESHES a live lane's marker each beat (so it never ages out) and
+// SYMMETRICALLY unlinks a marker only on POSITIVE EVIDENCE the lane it names has ended (never on a
+// transcript's mere absence or staleness — R3-1/NR-2's withdrawn arm) — see the plan's Decision section
+// for the full derivation and the four review rounds' fold history.
+//
+// Marker shape is the SAME one hooks/lane-ceiling-gate.sh already writes at PERMIT
+// ({task, role, pool, session, written_at_ms}), ADDITIVELY carrying one new optional field this command is
+// the ONLY writer of: `agentId` — the winning transcript's agentId, stamped the first time this reconciler
+// determines the task is genuinely LIVE. A lane-ceiling-gate.sh-authored marker (no agentId yet — it fires
+// at PERMIT, before any transcript exists) is left completely untouched by the unlink pass below until
+// THIS reconciler itself binds it (NR-7): the DEAD-unlink test is keyed on the MARKER's own recorded
+// agentId, never on "whichever transcript currently wins the task" — this is what keeps a transcript-
+// invisible subprocess-dispatched seat's marker (config/cc-routes.json: plan-review/executor route via
+// `claude -p`, #1947) safe beside an aged, closedAt-less sibling Agent transcript (e.g. a stale planner
+// round) — R3-1's concrete counterexample. A marker with no agentId is NEVER unlinked here; it rides the
+// pre-existing LANE_INTENT_TTL_MS / lane-ceiling-gate.sh mtime-GC backstop exactly as today.
+//
+// Fail-open + non-mutating on any missing precondition (AC-6): an absent PROJECTS_ROOT/session subagents
+// dir, zero transcripts for the session, or an unreadable/corrupt reconcile checkpoint (readReconcileCheckpoint
+// already fails open to the cold-start empty shape) never blocks — and when nothing is DISCOVERABLE, the
+// marker store is left completely byte-identical (no write of any kind is attempted).
+const LANE_POOL_ROLE_MAP = {
+  planner: 'work',
+  'plan-review': 'work',
+  executor: 'work',
+  'execution-review': 'work',
+  'ship-tail': 'ship_tail',
+};
+// NR-3 (registered, deferred) — this is a JS TWIN of hooks/sole_lane_math.py's own POOL_ROLE_MAP. A code
+// comment marks the twin in BOTH sites; single-sourcing is deferred until a THIRD start-boundary consumer
+// needs the mapping (mirrors the module's own documented dedupe rule), per the plan's Deferred-follow-ups.
+
+const LANE_TRANSCRIPT_FRESH_FLOOR_MS = 900000;   // 15 min — >= the 10-min max foreground-Bash silent gap
+const LANE_TRANSCRIPT_FRESH_CAP_MS = 1800000;    // 30 min — upper clamp bounding the ghost-marker window
+
+// R2-2/AC-10 — the committed measurement artifact backing LANE_TRANSCRIPT_FRESH_MS's default: the p99 of
+// per-transcript MAXIMUM inter-record gap, over transcripts whose run reached a terminal state (excludes a
+// still-actively-growing transcript — see scripts/lane-transcript-fresh-window-measure.mjs's own header for
+// the exact, MEASURED tail-treatment definition; real subagent transcripts on this harness carry no
+// `type:"result"` envelope, so the population is scoped by recency-of-last-write instead), floored/capped
+// as above (see that script for the derivation and
+// .ai-workspace/measurements/2026-08-30-lane-transcript-fresh-window/measurement.json for the committed
+// number — AC-10 independently recomputes the clamp from this file's raw p99MaxGapMs and asserts it equals
+// the shipped default, so the artifact is an oracle, not decoration).
+function laneTranscriptFreshMeasurementFile() {
+  const top = aiBrainToplevel();
+  if (!top) return null;
+  return path.join(top, '.ai-workspace', 'measurements', '2026-08-30-lane-transcript-fresh-window', 'measurement.json');
+}
+
+function resolveLaneTranscriptFreshMs() {
+  const envRaw = process.env.LANE_TRANSCRIPT_FRESH_MS;
+  if (envRaw != null && envRaw !== '') {
+    const n = Number(envRaw);
+    if (Number.isFinite(n) && n > 0) return n; // explicit operator override — authoritative, unclamped
+  }
+  const file = laneTranscriptFreshMeasurementFile();
+  if (file) {
+    try {
+      const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const p99 = Number(j && j.p99MaxGapMs);
+      if (Number.isFinite(p99) && p99 > 0) {
+        return Math.min(LANE_TRANSCRIPT_FRESH_CAP_MS, Math.max(LANE_TRANSCRIPT_FRESH_FLOOR_MS, p99));
+      }
+    } catch (e) { /* fall through to the generous fail-safe below */ }
+  }
+  // Artifact missing/corrupt/unreachable (e.g. a ported/plugin copy shipping no measurement file) — fail
+  // SAFE to the CAP, the generous end: an unknown window being wrong-PERMISSIVE (a live lane rides a few
+  // extra minutes before reclaim) is strictly safer than wrong-RESTRICTIVE (this plan's own undercount bug).
+  return LANE_TRANSCRIPT_FRESH_CAP_MS;
+}
+
+const LANE_CLOSED_ACTIVITY_SLACK_DEFAULT_MS = 5000; // 5s — low end per plan-review N2; clears measured p99 skew (0.951s) with wide margin
+
+function resolveLaneClosedActivitySlackMs() {
+  const envRaw = process.env.LANE_CLOSED_ACTIVITY_SLACK_MS;
+  if (envRaw != null && envRaw !== '') {
+    const n = Number(envRaw);
+    if (Number.isFinite(n) && n >= 0) return n; // explicit operator override — authoritative
+  }
+  return LANE_CLOSED_ACTIVITY_SLACK_DEFAULT_MS;
+}
+
+// stall-check-liveness-window-shorter-than-long-executor-runtime — the RESUMED-lane predicate. A row's
+// `closedAt` stamp is TERMINAL (genuinely closed) only when the bound agentId's own transcript shows NO
+// activity after the stamp (beyond `slackMs`). `closedAt` is `...Z` (UTC, N3) — Date.parse treats the `Z`
+// suffix as UTC natively, so no manual offset handling is needed. `transcriptMtimeMs` is the SAME agentId's
+// transcript mtime already resolved by the caller (never re-stat'd here — the data is already local, per
+// the plan-review's load-bearing-assumption #1). Fails toward the LEGACY (terminal/closed) reading on any
+// can't-tell case (malformed closedAt, or no transcript mtime known for this agentId) — this predicate only
+// ever WIDENS what counts as "still alive" when it has POSITIVE evidence of post-close activity; it never
+// invents liveness from an absence.
+function closedAtIsTerminal(closedAt, transcriptMtimeMs, slackMs) {
+  if (!closedAt) return false; // not closed at all — irrelevant to this predicate, caller handles separately
+  const closedMs = Date.parse(closedAt);
+  if (!Number.isFinite(closedMs)) return true; // malformed stamp — can't-tell, fail toward legacy (terminal)
+  if (transcriptMtimeMs == null || !Number.isFinite(transcriptMtimeMs)) return true; // no transcript evidence of resumption — terminal
+  return transcriptMtimeMs <= (closedMs + slackMs);
+}
+
+// CRASHED evidence for one specific agentId's transcript: an explicit terminal/abnormal-error record the
+// harness itself writes — a record carrying `isApiErrorMessage: true` (the real, MEASURED signal a live
+// harness stamps on an abnormal finish, e.g. a session-limit/rate-limit death mid-run; confirmed present
+// verbatim across this machine's own transcript corpus — real subagent transcripts carry NO `type:"result"`
+// envelope, so that shape was never a real signal here). NEVER inferred from silence: a transcript that
+// simply stops writing has NO such record, and per R3-1/NR-2 that population (a dropped SubagentStop, no
+// closedAt AND no crash record) rides the existing LANE_INTENT_TTL_MS backstop exactly as today — this
+// function is not consulted for it.
+//
+// autonomous-stall-check-undercounts-sendmessage-resumed-lanes (2026-09-10): a crash record's mere
+// PRESENCE is no longer sufficient evidence of death — the standing SendMessage 429-recovery flow resumes
+// a crash-scarred lane and the harness never rewrites/removes the old crash record, so a resumed lane's
+// transcript carries the record forever. This function now returns POSITION information alongside
+// presence — the LAST `isApiErrorMessage:true` record's own `timestamp` (ms since epoch via Date.parse;
+// the `Z` suffix is UTC-native, same convention as closedAtIsTerminal()) — read in the SAME single pass
+// (no second scan, per NR-3: multi-MB transcripts exist). `hasCrash` alone still answers "does this
+// transcript carry crash evidence anywhere" (unchanged from the old boolean); `lastCrashMs` feeds
+// crashRecordIsTerminal() below, the mirror of closedAtIsTerminal() for this arm. Pure position+time
+// comparison — GENERAL over any transcript shape (crash record first/mid/last, any record count), never
+// fixture-memorized (named risk crash-terminality-predicate-must-be-general-not-fixture-memorized).
+function transcriptCrashInfo(file) {
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) { return { hasCrash: false, lastCrashMs: null }; }
+  let hasCrash = false;
+  let lastCrashMs = null;
+  for (const ln of content.split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    if (j && j.isApiErrorMessage === true) {
+      hasCrash = true;
+      const ts = Date.parse(j.timestamp);
+      if (Number.isFinite(ts)) lastCrashMs = ts; // last crash record in file order wins
+    }
+  }
+  return { hasCrash, lastCrashMs };
+}
+
+// Mirror of closedAtIsTerminal() for the crash-record positive-evidence arm (Decision section: "one
+// doctrine for both positive-evidence arms: ended means nothing happened after the ending stamp"). A
+// crash record counts as DEATH only when the bound agentId's own transcript shows NO activity after it
+// beyond `slackMs`. Fails toward TERMINAL (death) on any can't-tell case (a crash record whose own
+// timestamp is unparseable/missing, or no transcript mtime known) — this predicate only ever WIDENS what
+// counts as "still alive" when it has POSITIVE evidence of post-crash activity; it never invents liveness
+// from an absence, matching closedAtIsTerminal()'s own fail-safe direction.
+function crashRecordIsTerminal(lastCrashMs, transcriptMtimeMs, slackMs) {
+  if (lastCrashMs == null || !Number.isFinite(lastCrashMs)) return true; // no usable crash timestamp — can't-tell, fail toward legacy (terminal)
+  if (transcriptMtimeMs == null || !Number.isFinite(transcriptMtimeMs)) return true; // no transcript evidence of resumption — terminal
+  return transcriptMtimeMs <= (lastCrashMs + slackMs);
+}
+
+// The ledger row for an EXACT (task, role, agentId) triple, or null. Scans every line (current AND
+// retained-history rows — #1580 Fix B keeps prior rounds on disk) because a real agentId is a unique,
+// content-addressed identity: finding it anywhere in the file correctly answers "did THIS lane's own row
+// ever get stamped closedAt", independent of whether a LATER round has since become the role's "current"
+// row. `overlayAppend` always appends the active row last, so on the rare chance of an exact-duplicate
+// (task, role, agentId) collision (never expected in practice) the LAST line wins, matching disk order.
+function ledgerRowForRoleAgent(sess, task, role, agentId) {
+  const file = ledgerFile(sess, task);
+  let lines = [];
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); } catch (e) { return null; }
+  let row = null;
+  for (const ln of lines) {
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    if (j && j.role === role && j.agentId === agentId) row = j;
+  }
+  return row;
+}
+
+function cmdRefreshLaneIntents(o) {
+  const freshMs = resolveLaneTranscriptFreshMs();
+  const slackMs = resolveLaneClosedActivitySlackMs();
+  try {
+    const session = o.session;
+    if (!session) {
+      console.log('OK refresh-lane-intents: no --session given (fail-open, nothing to do) freshMs=' + freshMs);
+      process.exit(0);
+    }
+    enforceSessionShape(session, null, 'refresh-lane-intents', 0);
+    const sess = sanitize(session);
+    const nowMs = Date.now();
+
+    // Discover this session's subagent transcripts (mirrors cmdReconcileSpawns's own discovery pass).
+    let slugs = [];
+    try { slugs = fs.readdirSync(PROJECTS_ROOT); }
+    catch (e) {
+      console.log('OK refresh-lane-intents: session=' + sess + ' no projects root, marker store untouched freshMs=' + freshMs);
+      process.exit(0);
+    }
+    const transcripts = []; // {agentId, file, mtimeMs, dev, ino}
+    for (const slug of slugs) {
+      const dir = path.join(PROJECTS_ROOT, slug, sess, 'subagents');
+      let files = [];
+      try { files = fs.readdirSync(dir); } catch (e) { continue; }
+      for (const fn of files) {
+        const m = fn.match(/^agent-(.+)\.jsonl$/);
+        if (!m) continue;
+        const f = path.join(dir, fn);
+        let st;
+        try { st = fs.statSync(f); } catch (e) { continue; }
+        if (!st.isFile()) continue;
+        transcripts.push({ agentId: m[1], file: f, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino });
+      }
+    }
+    if (transcripts.length === 0) {
+      console.log('OK refresh-lane-intents: session=' + sess + ' no subagent transcripts, marker store untouched freshMs=' + freshMs);
+      process.exit(0);
+    }
+    const transcriptByAgentId = new Map();
+    for (const t of transcripts) transcriptByAgentId.set(t.agentId, t);
+
+    // Resolve {task, role} per transcript: checkpoint (dev:ino) lookup first — content never re-read for a
+    // mapped transcript. For a transcript that is FRESH but UNMAPPED (checkpoint lag, worst exactly for the
+    // newest lane — round-1 fold F5), self-derive via the SAME bounded first-line tag extraction
+    // reconcile-spawns itself uses; the fresh-unmapped set is small by construction, so cost stays bounded
+    // and this command never depends on reconcile-spawns' own scheduling.
+    const checkpoint = readReconcileCheckpoint(sess);
+    let selfDerived = 0;
+    const resolved = []; // {task, role, agentId, mtimeMs}
+    for (const t of transcripts) {
+      const identity = t.dev + ':' + t.ino;
+      const cached = checkpoint.files[identity];
+      let discovery = (cached && cached.discovery) ? cached.discovery : null;
+      if (!discovery) {
+        const age = nowMs - t.mtimeMs;
+        if (age <= freshMs) {
+          const line = readFirstNonEmptyLine(t.file);
+          const text = firstRecordTextFromLine(line);
+          discovery = extractTagsFromText(text).discovery;
+          selfDerived++;
+        }
+      }
+      if (discovery && discovery.task && discovery.role) {
+        resolved.push({ task: discovery.task, role: discovery.role, agentId: t.agentId, mtimeMs: t.mtimeMs });
+      }
+    }
+
+    // Per-task resolution (F2): consider ONLY pool-mapped transcripts (research/unknown roles are SKIPPED —
+    // they neither count the task nor suppress a pool-mapped sibling); newest-transcript-mtime wins.
+    const winners = new Map(); // task -> {role, pool, agentId, mtimeMs}
+    for (const r of resolved) {
+      const pool = LANE_POOL_ROLE_MAP[r.role];
+      if (!pool) continue;
+      const cur = winners.get(r.task);
+      if (!cur || r.mtimeMs > cur.mtimeMs) winners.set(r.task, { role: r.role, pool, agentId: r.agentId, mtimeMs: r.mtimeMs });
+    }
+
+    const intentDir = resolveLaneIntentDir();
+    const sessDir = path.join(intentDir, sess);
+
+    // REFRESH (LIVE): write/recreate the marker for every task whose winner is FRESH and not yet closed.
+    // "Closed" is decided by closedAtIsTerminal(), NOT raw closedAt presence (stall-check-liveness-window-
+    // shorter-than-long-executor-runtime): a resumed agent (SendMessage continuation after a turn-boundary
+    // SubagentStop) whose transcript kept writing past closedAt+slack is treated exactly like a never-closed
+    // lane here — refreshed, never skipped.
+    let refreshed = 0, skippedClosed = 0, skippedStale = 0, resumed = 0;
+    for (const [task, w] of winners) {
+      const fresh = (nowMs - w.mtimeMs) <= freshMs;
+      if (!fresh) { skippedStale++; continue; } // AC-2/AC-7(c) — a stale winner is never (re)created here
+
+      const closedAt0 = ledgerRowForRoleAgent(sess, task, w.role, w.agentId)?.closedAt;
+      // resumed++ is NOT counted here — the unlink pass below re-examines every marker file (including one
+      // just (re)written here) via the SAME predicate and is the single source of truth for the `resumed=`
+      // diagnostic count, so a task never gets counted twice for the one class it belongs to.
+      if (closedAt0 && closedAtIsTerminal(closedAt0, w.mtimeMs, slackMs)) { skippedClosed++; continue; } // AC-3
+
+      let priorWrittenAtMs = 0;
+      try {
+        const priorRaw = JSON.parse(fs.readFileSync(path.join(sessDir, task + '.json'), 'utf8'));
+        priorWrittenAtMs = Number(priorRaw && priorRaw.written_at_ms) || 0;
+      } catch (e) { /* absent/unreadable prior — treated as none */ }
+
+      // F6 — pre-write re-check: re-read the ledger IMMEDIATELY before the write and abort if a closedAt
+      // landed since the check above (closes the race to a single re-check; the symmetric unlink below is
+      // the backstop for anything that still slips through). Same terminal predicate — a re-check that finds
+      // a NEW closedAt still only skips if it is itself terminal (AC-3(v): a resumed lane's second, later
+      // close stamp is terminal again because the transcript's last write can no longer be after it).
+      const closedAt1 = ledgerRowForRoleAgent(sess, task, w.role, w.agentId)?.closedAt;
+      if (closedAt1 && closedAtIsTerminal(closedAt1, w.mtimeMs, slackMs)) { skippedClosed++; continue; }
+
+      const marker = {
+        task,
+        role: w.role,
+        pool: w.pool,
+        session: sess,
+        written_at_ms: Math.max(nowMs, priorWrittenAtMs), // F2(c) — MONOTONE, never regressed
+        agentId: w.agentId,                                // NR-7 — binds a future DEAD-unlink to THIS lane
+      };
+      try {
+        fs.mkdirSync(sessDir, { recursive: true });
+        const tmp = path.join(sessDir, '.' + task + '.json.tmp-' + process.pid + '-' + Date.now());
+        fs.writeFileSync(tmp, JSON.stringify(marker));
+        fs.renameSync(tmp, path.join(sessDir, task + '.json'));
+        refreshed++;
+      } catch (e) { /* best-effort — a failed refresh must never block the rest of the sweep */ }
+    }
+
+    // UNLINK (POSITIVE-EVIDENCE-ONLY — F1/R2-1/R3-1/NR-7): for every marker ALREADY on disk, unlink iff the
+    // MARKER'S OWN bound agentId (never "the task's current winning transcript") proves CLOSED (a ledger row
+    // for that exact role+agentId carries closedAt) or CRASHED (that agentId's own transcript bears an
+    // explicit terminal-error record). A marker with no agentId — a lane-ceiling-gate.sh PERMIT-time write
+    // this reconciler has never yet bound (TaskUpdate-origin, zero-transcript, the spawn->first-beat race, or
+    // a still-unbound transcript-invisible subprocess seat) — is NEVER touched here; it rides the pre-existing
+    // TTL/GC backstop untouched, exactly as today (AC-9/AC-11). Staleness alone NEVER counts as death (AC-7c).
+    let unlinkedClosed = 0, unlinkedCrashed = 0, survivedStale = 0, survivedNoAgent = 0;
+    let existingFiles = [];
+    try { existingFiles = fs.readdirSync(sessDir).filter((f) => f.endsWith('.json') && !f.startsWith('.')); }
+    catch (e) { existingFiles = []; }
+    for (const fn of existingFiles) {
+      const fp = path.join(sessDir, fn);
+      let marker;
+      try { marker = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch (e) { continue; }
+      if (!marker || typeof marker !== 'object') continue;
+      const markerAgentId = marker.agentId ? String(marker.agentId) : '';
+      if (!markerAgentId) { survivedNoAgent++; continue; } // R2-1/NR-7 — no bound agentId, never DEAD-unlink
+
+      const task = sanitize(fn.replace(/\.json$/, ''));
+      const role = String(marker.role || '');
+      const row = ledgerRowForRoleAgent(sess, task, role, markerAgentId);
+      const tr = transcriptByAgentId.get(markerAgentId);
+      if (row && row.closedAt) {
+        // stall-check-liveness-window-shorter-than-long-executor-runtime: DEAD-unlink only when closedAt is
+        // TERMINAL (no post-close transcript activity beyond slackMs). A resumed lane's marker SURVIVES this
+        // pass untouched (AC-3(ii)/(iv)) — it is neither unlinked here nor re-derived as CLOSED elsewhere.
+        if (closedAtIsTerminal(row.closedAt, tr ? tr.mtimeMs : null, slackMs)) {
+          try { fs.unlinkSync(fp); unlinkedClosed++; } catch (e) { /* best-effort */ }
+        } else {
+          resumed++; // marker survives — resumed lane, not reaped as CLOSED
+        }
+        continue;
+      }
+      if (tr) {
+        const crash = transcriptCrashInfo(tr.file);
+        if (crash.hasCrash) {
+          // autonomous-stall-check-undercounts-sendmessage-resumed-lanes: a crash record is DEATH only when
+          // it is the transcript's terminal activity (mirrors the closedAt branch above). A crash-scarred
+          // lane that kept writing past crash+slack (the SendMessage 429-recovery flow) survives here and
+          // counts toward `resumed=` — symmetric with the closedAt-resumed arm, never counted twice.
+          if (crashRecordIsTerminal(crash.lastCrashMs, tr.mtimeMs, slackMs)) {
+            try { fs.unlinkSync(fp); unlinkedCrashed++; } catch (e) { /* best-effort */ }
+          } else {
+            resumed++; // marker survives — crash-scarred but resumed lane, not reaped as CRASHED
+          }
+          continue;
+        }
+      }
+      survivedStale++; // stale-but-open, no crash evidence, or the agentId's transcript is gone (can't-tell) — never death (R3-1)
+    }
+
+    console.log(
+      'OK refresh-lane-intents: session=' + sess + ' transcripts=' + transcripts.length +
+      ' selfDerived=' + selfDerived + ' tasksResolved=' + winners.size +
+      ' refreshed=' + refreshed + ' skippedClosed=' + skippedClosed + ' skippedStale=' + skippedStale +
+      ' unlinkedClosed=' + unlinkedClosed + ' unlinkedCrashed=' + unlinkedCrashed +
+      ' survivedStale=' + survivedStale + ' survivedNoAgent=' + survivedNoAgent +
+      ' resumed=' + resumed +
+      ' freshMs=' + freshMs + ' slackMs=' + slackMs
+    );
+    process.exit(0);
+  } catch (e) {
+    console.log('OK refresh-lane-intents: error (fail-open): ' + (e && e.message ? e.message : e) + ' freshMs=' + freshMs);
+    process.exit(0);
+  }
+}
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// #1448: resolve-role-model --role <role> [--with-effort] [--with-version]
+// Prints the configured model TIER for a role (the single value the orchestrator + both model hooks consume),
+// fail-SAFE to opus (missing/malformed config OR an invalid per-role value => opus). With --with-effort prints
+// "<model> <effort>". Lints the config on read (defect-3 stderr visibility). Always exits 0 — a resolver error
+// must never wedge a spawn; opus is the safe answer.
+//
+// #1640 S6/S7 — SSOT-first read path, presence-guarded fallback (SKIP-not-FAIL, #1619). This is the ONLY
+// consumer of config/cc-routes.json for role->model resolution — `check --enforce-role-models`'s own
+// roleModelFromCfg() call (below) is UNTOUCHED, still 100% the legacy path; widening it is out of scope here
+// and would risk the byte-frozen hooks/3role-ledger-smoke-test.sh (its M1-M9 arms, AC1.3). Precedence, in
+// priority order (each short-circuits the ones below it):
+//   1. SSOT PRESENT but CORRUPT (unparseable JSON / unreadable) -> UNCONDITIONAL fail-safe to opus for the
+//      requested role, regardless of CC_ROLES_ENV — never a silent fall-through to a possibly-stale legacy
+//      view (S7 AC1.5 a-control: a present, differently-configured env view must NOT rescue a broken SSOT —
+//      the safety-critical case). The lint (routesLoaded.error) names the offending file on stderr.
+//   2. CC_ROLES_ENV explicitly SET in process.env -> an explicit legacy-only override, extending the
+//      existing AUTHORITATIVE+TERMINAL test/debug-isolation semantic (#1448, resolveConfigPath() above) to
+//      also mean "skip SSOT" — resolves via TODAY'S frozen legacy path verbatim. This is what keeps the
+//      byte-frozen smoke's CC_ROLES_ENV-driven arms (M1-M9, always explicitly set) passing unedited (AC1.3).
+//   3. SSOT PRESENT + VALID + CC_ROLES_ENV unset -> the real SSOT-first path (S6): look up
+//      routes.seats[role]; a MISSING key fail-safes JUST that role to opus (S7 AC1.5 b — proves per-role
+//      isolation, not a global crash); a PRESENT seat resolves its declared model's tier via identifyModel().
+//      Effort/version are enriched from the legacy cfg (same default candidate chain) when resolvable — the
+//      SSOT schema doesn't carry per-role effort/version yet, and this keeps a real, unguarded invocation's
+//      output identical to today's (the two sources agree on every role's TIER as of the S1 import / #1813
+//      re-verify — hand-verified byte-identical for all six roles across all three flag shapes at S6 time —
+//      so this branch is provably a no-op on THIS repo's checked-in files today, AC1.1).
+//   4. SSOT genuinely ABSENT (ROUTE-NOT-FOUND) -> presence-guarded SKIP-not-FAIL (S6/AC1.2): fall back 100%
+//      to today's frozen legacy path — a consumer that hasn't adopted the SSOT yet must not break.
+function printRoleModel(model, effort, version, withEffort, withVersion) {
+  if (!withEffort && !withVersion) { console.log(model); process.exit(0); }
+  if (withEffort && !withVersion) {
+    // #1448 shape, UNCHANGED for back-compat (three-role-model-policy-gate.sh does `read -r EXPECTED EFFORT`):
+    // "<model> <effort>", or bare "<model>" when no effort is configured (no trailing empty token).
+    console.log(model + (effort ? ' ' + effort : ''));
+    process.exit(0);
+  }
+  // #1466 — version requested (alone, or together with effort). `version` is NEVER empty — a spawn-time
+  // badge stamp must always have something non-blank to show. When effort is ALSO requested but unresolved,
+  // use a `-` sentinel (not '') so a plain `read -r A B C` over the space-joined line always yields exactly
+  // 3 tokens.
+  const tokens = withEffort ? [model, effort || '-', version || model] : [model, version || model];
+  console.log(tokens.join(' '));
+  process.exit(0);
+}
+
+// TODAY'S frozen resolution — byte-identical to the pre-#1640-S6 `cmdResolveRoleModel` body. Used both as the
+// CC_ROLES_ENV-explicit-override branch and as the SSOT-genuinely-absent fallback branch.
+function legacyResolveRoleModel(role, withEffort, withVersion) {
+  const { found, cfg } = loadRoleConfig();
+  if (found) lintRoleConfig(cfg);
+  const model = found ? roleModelFromCfg(cfg, role) : 'opus';
+  const effort = found ? roleEffortFromCfg(cfg, role) : '';
+  const version = (found && roleVersionFromCfg(cfg, role, model)) || model;
+  printRoleModel(model, effort, version, withEffort, withVersion);
+}
+
+// #2401 S1 -- is `config/` tracked in git's index but absent on disk (the sparse-checkout
+// omission signature), genuinely not tracked at all (a legitimate plugin-dormant install), or is
+// the answer unknowable (git errored)? Returns 'tracked' | 'not-tracked' | 'unknown'. Deliberately
+// mirrors cairn/lib/persist-root-resolve.mjs's discriminator (same shape, different directory) --
+// duplicated rather than cross-imported because hooks/ ships flat (see this file's own header
+// comment: "FLAT file... because setup.sh only symlinks flat hook files").
+function configDirGitTrackedState(repoRoot) {
+  let res;
+  try {
+    res = spawnSync('git', ['-C', repoRoot, 'ls-files', '--', 'config'], { encoding: 'utf8' });
+  } catch (e) { return 'unknown'; }
+  if (!res || res.error || res.status !== 0) return 'unknown';
+  if (typeof res.stdout !== 'string') return 'unknown';
+  return res.stdout.trim().length > 0 ? 'tracked' : 'not-tracked';
+}
+
+// Returns a non-empty problem string when config/ is a sparse-checkout omission (or git
+// can't say), else ''. NOTE the fail-CLOSED-on-can't-tell polarity here is the OPPOSITE of this
+// file's isGitTracked() (which deliberately fails OPEN on a can't-tell for artifact-provenance
+// checks) -- here the downstream consequence of guessing wrong is a SILENT all-opus fallback with
+// zero signal, so "git could not answer" must be treated as unsafe to assume "not tracked"
+// (plan-review N2, #2401).
+function configDirSparseOmissionProblem(repoRoot) {
+  const configDir = path.join(repoRoot, 'config');
+  let isDir = false;
+  try { isDir = fs.statSync(configDir).isDirectory(); } catch (e) { isDir = false; }
+  if (isDir) return ''; // on disk -> today's behavior, unchanged
+  const state = configDirGitTrackedState(repoRoot);
+  if (state === 'not-tracked') return ''; // genuinely configless install (plugin-dormant) -> quiet, unchanged
+  const reason = state === 'tracked'
+    ? 'is tracked in git\'s index but absent on disk (this looks like a sparse-checkout worktree that omitted config/)'
+    : 'could not be confirmed tracked/untracked (git ls-files errored) -- treated as unsafe to assume absent';
+  return 'CONFIG-SPARSE-OMISSION: ' + configDir + ' ' + reason +
+    ' -- refusing to silently fall back to opus. Restore config/ in this worktree, or set CC_ROLES_ENV explicitly.';
+}
+
+// #3140 Leg 2 -- size-aware PLANNER tier. ONE implementation, three callers (cmdResolveRoleModel, the
+// `check --enforce-role-models` expected side, and -- via resolve-role-model -- the spawn gate): #2434 single-
+// generator discipline. The size comes from the TICKET (`<tasks-root>/<session>/<task>.json` .metadata.size),
+// never from the plan file (no plan exists at planner spawn time). Valid values: exactly S, M, L. D7: this
+// reader loads ONLY metadata.size and never prints or returns subject/description. INPUT-BOUND: a ticket file
+// larger than 4 MiB, a non-regular file, or a session/task token outside [0-9A-Za-z._-]{1,128} (or containing
+// "..") is treated as "no size" (fails toward Opus, never toward the capped tier).
+function readTicketSize(tasksDirOpt, session, task) {
+  const out = { size: '', shown: 'none' };
+  const safe = /^[0-9A-Za-z._-]{1,128}$/;
+  const s = session == null ? '' : String(session);
+  const t = task == null ? '' : String(task);
+  if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return out;
+  const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
+    : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
+  try {
+    const p = path.join(root, s, t + '.json');
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const v = j && j.metadata && typeof j.metadata === 'object' ? j.metadata.size : undefined;
+    if (v === 'S' || v === 'M' || v === 'L') { out.size = v; out.shown = v; return out; }
+    if (typeof v === 'string' && /^[A-Za-z0-9]{1,8}$/.test(v)) out.shown = v;
+    else if (v !== undefined && v !== null) out.shown = 'invalid';
+  } catch (e) { /* unreadable / missing / bad JSON => no size */ }
+  return out;
+}
+
+// #3325 -- the ticket's OWN repo name, read from the SAME ticket record readTicketSize reads
+// (<tasks-root>/<session>/<task>.json .metadata.repo — present on real monday-bot tickets, measured
+// 2026-10-22: a bare SIBLING DIRECTORY NAME like "monday-bot", never a path). The exact same input
+// bounds as readTicketSize (session/task token-safe [0-9A-Za-z._-]{1,128}, no "..", regular file
+// <= 4 MiB, loads ONLY metadata.repo and never any other field). Returns { repo } with repo '' on
+// absent/invalid/non-token-shaped values (".." and "." refuse too — a name, never a traversal) --
+// every caller treats '' as "the ticket names no repo", never an error, never a scan.
+function readTicketRepo(tasksDirOpt, session, task) {
+  const out = { repo: '' };
+  const safe = /^[0-9A-Za-z._-]{1,128}$/;
+  const s = session == null ? '' : String(session);
+  const t = task == null ? '' : String(task);
+  if (!safe.test(s) || !safe.test(t) || s.includes('..') || t.includes('..')) return out;
+  const root = (typeof tasksDirOpt === 'string' && tasksDirOpt) ? tasksDirOpt
+    : (process.env.PROGRESS_TASKS_DIR || path.join(os.homedir(), '.claude', 'tasks'));
+  try {
+    const p = path.join(root, s, t + '.json');
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) return out;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const v = j && j.metadata && typeof j.metadata === 'object' ? j.metadata.repo : undefined;
+    if (typeof v === 'string' && safe.test(v) && v !== '.' && v !== '..' && !v.includes('..')) out.repo = v;
+  } catch (e) { /* unreadable / missing / bad JSON => no repo named */ }
+  return out;
+}
+
+// The planner size overlay: returns { applies, tier, model, size, shown }.  `applies` is true ONLY for
+// role==='planner' with a --task/--session pair, a valid SSOT seat carrying a vocabulary-valid size_models.L,
+// and a ticket size of exactly 'L'. Deleting size_models.L restores all-Opus (config-only rollback, D2).
+// `eligible` says the overlay machinery is live for this call (so a non-L answer should note SIZE-TIER-DEFAULT).
+function plannerSizeOverlay(routesLoaded, role, session, task, tasksDirOpt) {
+  const none = { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' };
+  if (role !== 'planner' || !task || !session) return none;
+  if (!routesLoaded || !routesLoaded.ok || !routesLoaded.routes) return none;
+  const seat = (routesLoaded.routes.seats || {}).planner;
+  if (!seat) return none;
+  const sm = seat.size_models;
+  if (!sm || typeof sm !== 'object' || Array.isArray(sm) || typeof sm.L !== 'string' || !sm.L) return none;
+  const ident = identifyModel(routesLoaded.routes, sm.L);
+  if (!ident.ok || !ident.tierEquivalent) return none;
+  const r = readTicketSize(tasksDirOpt, session, task);
+  const base = { applies: false, eligible: true, tier: ident.tierEquivalent, model: sm.L, size: r.size, shown: r.shown };
+  if (r.size === 'L') base.applies = true;
+  return base;
+}
+
+// #3149 D2 -- the size-L planner CUTOVER instant, read ONLY from the routes SSOT (live, or a fixture routes
+// under the pre-existing CC_ROUTES_JSON test seam -- the same seam that already governs size_models and is
+// audit-logged; LOW-1: that seam can move the cutover with the whole routes file, posture unchanged). NO CLI
+// flag, env var or ledger field can supply it. FAILS CLOSED: absent/empty key => { ok:false } with NO note
+// (today's behaviour: block, A5); a present-but-unparsable value or one in the FUTURE (later than the gate's
+// own clock) => { ok:false } PLUS a one-line stderr note naming the key (A6/A11). Callers compare as
+// INSTANTS (epoch ms), never as strings (R2).
+// #3149 fix1 (M1) -- the ONE shape every reader and every lint of the cutover key accepts: an ISO 8601
+// instant with an EXPLICIT offset (`Z` or ±hh:mm). Date.parse alone also accepts non-ISO text ("Oct 15
+// 2026 ...") and reads an offset-less value as LOCAL time -- both silently widen the grandfather window.
+// Anything off-shape fails closed: NaN here => the reader refuses to grandfather and the lint names the key.
+const ISO_INSTANT_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+function parseIsoInstantWithOffset(v) {
+  if (typeof v !== 'string' || !ISO_INSTANT_WITH_OFFSET.test(v)) return NaN;
+  return Date.parse(v); // still NaN on calendar-invalid shapes (month 13, etc.)
+}
+function plannerSizeCutover(routesLoaded) {
+  const none = { ok: false, epoch: NaN, note: '' };
+  if (!routesLoaded || !routesLoaded.ok || !routesLoaded.routes) return none;
+  const seat = (routesLoaded.routes.seats || {}).planner;
+  if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) return none;
+  const v = seat.size_models_cutover;
+  const epoch = parseIsoInstantWithOffset(v);
+  if (typeof v !== 'string' || !v || !Number.isFinite(epoch)) {
+    return { ok: false, epoch: NaN, note: 'SIZE-L-CUTOVER-INVALID: seats.planner.size_models_cutover = "' + v +
+      '" is not an ISO 8601 instant with an explicit offset (Z or ±hh:mm) -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
+  }
+  if (epoch > Date.now()) {
+    return { ok: false, epoch, note: 'SIZE-L-CUTOVER-FUTURE: seats.planner.size_models_cutover = "' + v +
+      '" is later than the gate\'s own clock -- NO size-L grandfathering (fail closed); fix the key in the routes SSOT.\n' };
+  }
+  return { ok: true, epoch, note: '' };
+}
+
+// #3149 D1 -- a planner's harness-recorded RUN START: the EARLIEST `timestamp` field across the rows of the
+// planner's own Agent-tool transcript (same glob transcriptModel()/agentResolves() read for the observed
+// model). The ledger row's `ts` is NEVER trusted: overlayAppend refreshes it on every append, so a later
+// close stamp would fake a post-cutover start (the live #2949 pair: transcript start 12:00:27Z < cutover
+// 12:18:54Z < row ts 12:22:17Z). Returns NaN on any unreadable/missing/unparsable shape (D4: the caller
+// fails CLOSED -- not grandfathered). A run that STARTS pre-cutover and CONTINUES past it (resume or long
+// run) is grandfathered by this anchor by design (LOW-2): the run predates the rule.
+function transcriptRunStartEpoch(session, agentId) {
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!aid) return NaN;
+  const sess = sanitize(session);
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return NaN; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    let best = NaN;
+    for (const ln of content.split('\n')) {
+      const s = ln.trim();
+      if (!s) continue;
+      let j; try { j = JSON.parse(s); } catch (e) { continue; }
+      if (j && typeof j.timestamp === 'string') {
+        const t = Date.parse(j.timestamp);
+        if (!isNaN(t) && (isNaN(best) || t < best)) best = t;
+      }
+    }
+    if (!isNaN(best)) return best;
+  }
+  return NaN;
+}
+
+function cmdResolveRoleModel(o) {
+  const role = o.role;
+  if (!role) { console.error('resolve-role-model: --role is required (planner|plan-review|executor|execution-review|orchestrator|research|ship-tail)'); process.exit(2); }
+  const withEffort = ('with-effort' in o);
+  const withVersion = ('with-version' in o);
+
+  // #2401 S1 -- loud-or-correct gate, BEFORE any SSOT/legacy config resolution below. Skipped
+  // when CC_ROLES_ENV is explicitly set: that caller has already opted out of config/ entirely
+  // (test isolation / an explicit override), so a config/ omission elsewhere is none of its
+  // concern -- matches Step 2's existing "explicit legacy-only override" precedence.
+  if (!('CC_ROLES_ENV' in process.env)) {
+    let selfDir;
+    try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+    catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    const repoRoot = path.join(selfDir, '..');
+    const sparseProblem = configDirSparseOmissionProblem(repoRoot);
+    if (sparseProblem) {
+      process.stderr.write(sparseProblem + '\n');
+      process.exit(3);
+    }
+  }
+
+  // Step 1 — corrupt/unreadable SSOT: unconditional fail-safe, checked BEFORE any CC_ROLES_ENV override
+  // (S7 a-control: a present, differently-configured legacy view must NEVER rescue a broken SSOT).
+  const routesLoaded = loadRoutesConfig();
+  if (!routesLoaded.ok && /^ROUTE-(PARSE|READ)-ERROR/.test(routesLoaded.error)) {
+    process.stderr.write(routesLoaded.error + '\n');
+    printRoleModel('opus', '', 'opus', withEffort, withVersion);
+    return;
+  }
+
+  // Step 2 — explicit legacy-only override (see precedence note above).
+  if ('CC_ROLES_ENV' in process.env) {
+    return legacyResolveRoleModel(role, withEffort, withVersion);
+  }
+
+  // Step 3 — SSOT present + valid + no override: the real SSOT-first path (S6).
+  if (routesLoaded.ok) {
+    let seat = (routesLoaded.routes.seats || {})[role];
+    if (!seat) {
+      process.stderr.write('ROUTE-ROLE-MISSING: routes.seats.' + role + ' not declared in ' + routesLoaded.configPath +
+        ' -- falling back to opus fail-safe (this role only).\n');
+      printRoleModel('opus', '', 'opus', withEffort, withVersion);
+      return;
+    }
+    // #3218 D3/D4 site 1 — ROUTE pin overlay, AFTER the clean-SSOT lookup (same #2401/#1918 ordering
+    // discipline as the tier pin below: a pin can never mask a config/ sparse-omission or rescue a broken
+    // SSOT). A valid route pin swaps in the D3 effective row wholesale: its agent_tool_fallback always
+    // carries the tier this resolver must answer with (the pinned model's tier_equivalent for a pin onto
+    // anthropic, R4; the seat's own SSOT Anthropic tier for a pin onto a subprocess provider — an
+    // accidental Agent-tool spawn of a z.ai-pinned planner lands on Opus, never Fable). A refused route
+    // entry resolves UNPINNED with a SEAT-PIN-REFUSED note; it also suppresses the tier pin (one role,
+    // one effective pin, D1) and the planner size overlay (size_models is dropped from the effective row
+    // — a pin wins over the size rule, R2).
+    announceSeatPinFileProblem();
+    const routePin = resolveRoutePin(role, routesLoaded.routes);
+    if (routePin.refusalNote) process.stderr.write(routePin.refusalNote + '\n');
+    if (routePin.pinned) {
+      process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' route pinned to "' + routePin.value + '"' +
+        (routePin.reason ? ' reason="' + routePin.reason + '"' : '') + (routePin.set_at ? ' set_at=' + routePin.set_at : '') + '\n');
+      seat = routePin.seat;
+    }
+    // #1947 AC-2/M3 -- a seat carrying an explicit `agent_tool_fallback` tier (the two subprocess-dispatched
+    // seats, plan-review/executor) resolves to THAT tier here, NEVER to model_vocabulary's tier_equivalent.
+    // Both OpenRouter dispatch slugs (moonshotai/kimi-k3, z-ai/glm-5.2) carry tier_equivalent:"fable" -- using
+    // it here would silently burn the Fable weekly cap the moment any accidental Agent-tool spawn (or a D3
+    // bounded fallback-to-Anthropic retry) resolved this role. `resolve-role-model` must keep answering with
+    // the SAFE fallback tier so that path lands on today's proven behavior (opus/sonnet), never fable.
+    if (seat.agent_tool_fallback && ROLE_MODELS.includes(seat.agent_tool_fallback)) {
+      const fbTier = seat.agent_tool_fallback;
+      const { found: fbFound, cfg: fbCfg } = loadRoleConfig();
+      if (fbFound) lintRoleConfig(fbCfg);
+      const fbEffort = fbFound ? roleEffortFromCfg(fbCfg, role) : '';
+      const fbVersion = (fbFound && roleVersionFromCfg(fbCfg, role, fbTier)) || fbTier;
+      printRoleModel(fbTier, fbEffort, fbVersion, withEffort, withVersion);
+      return;
+    }
+    const ident = identifyModel(routesLoaded.routes, seat.model);
+    if (!ident.ok || !ident.tierEquivalent) {
+      process.stderr.write('ROUTE-MODEL-UNDECLARED: routes.seats.' + role + '.model "' + seat.model +
+        '" is not in any provider\'s declared vocabulary -- falling back to opus fail-safe (this role only).\n');
+      printRoleModel('opus', '', 'opus', withEffort, withVersion);
+      return;
+    }
+    let tier = ident.tierEquivalent;
+    // #3140 Leg 2 -- size overlay (planner only): L ticket -> size_models.L tier. Applied BEFORE the seat pin so
+    // an operator seat pin still wins (D3 confirmation, "pin wins"). #3218: suppressed entirely under a
+    // route pin (the effective row drops size_models — a route pin wins over the size rule too, R2).
+    let sizeModel = '';
+    const sov = routePin.pinned ? { applies: false, eligible: false, tier: '', model: '', size: '', shown: 'none' }
+      : plannerSizeOverlay(routesLoaded, role, o.session, o.task, o['tasks-dir']);
+    if (sov.applies) { tier = sov.tier; sizeModel = sov.model; }
+    else if (sov.eligible && !sov.size) process.stderr.write('SIZE-TIER-DEFAULT: planner size=' + sov.shown + ' -> ' + tier + '\n');
+    // #1918 D2/D3(c) — TIER pin overlay, AFTER the clean-SSOT resolve above (D3c) and AFTER the #2401
+    // sparse-omission guard at the top of this function — a pin can never mask a config/ sparse-omission or
+    // rescue a broken SSOT, it only overlays an ALREADY-clean resolve. resolveTierPin() is itself seam-blind
+    // (D3b) and fails safe to `false` on a malformed/off-vocabulary pin, so `tier` only ever changes here to
+    // an already-declared value. #3218 D1: suppressed under a route pin (one role, one effective pin).
+    announceSeatPinFileProblem();
+    const pin = routePin.pinned ? { pinned: false } : resolveTierPin(role);
+    if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
+    if (pin.pinned) {
+      process.stderr.write('SEAT-PIN-HONORED: role ' + role + ' tier pinned to "' + pin.tier + '"' +
+        (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+      tier = pin.tier;
+    }
+    const { found: legacyFound, cfg: legacyCfg } = loadRoleConfig();
+    if (legacyFound) lintRoleConfig(legacyCfg);
+    const effort = legacyFound ? roleEffortFromCfg(legacyCfg, role) : '';
+    const version = (legacyFound && roleVersionFromCfg(legacyCfg, role, tier)) || (pin.pinned ? tier : (sizeModel || seat.model || tier));
+    printRoleModel(tier, effort, version, withEffort, withVersion);
+    return;
+  }
+
+  // Step 4 — SSOT genuinely ABSENT (ROUTE-NOT-FOUND): presence-guarded SKIP-not-FAIL (S6/AC1.2).
+  return legacyResolveRoleModel(role, withEffort, withVersion);
+}
+
+// #1494: resolve-effective-tier --model M --subagent-type T --transcript P [--session S] [--agents-dir D]
+//        [--projects-root R]
+// CLI mirror of resolveEffectiveTier() — prints "<tier> <source> agentdef=<tier|none>" on stdout, ALWAYS
+// exits 0 (like resolve-role-model; a resolver error must never wedge the caller — it already fails CLOSED
+// to tier=unknown internally, which is the caller's cue to block, not a process-level failure).
+function cmdResolveEffectiveTier(o) {
+  // Guard fires whenever --session was PASSED on the CLI, independent of whether
+  // resolveEffectiveTier()'s own internal precedence ever actually derives a path from it (it does not
+  // when --model is also given — the session branch is skipped entirely). D3 scopes this subcommand as
+  // "when --session is given" at the CLI-flag level, not at the internal-branch level.
+  if (o.session) enforceSessionShape(o.session, null, 'resolve-effective-tier', 0);
+  const r = resolveEffectiveTier({
+    model: o.model,
+    subagentType: o['subagent-type'],
+    transcriptPath: o.transcript,
+    session: o.session,
+    agentsDir: o['agents-dir'],
+    projectsRoot: o['projects-root'],
+  });
+  console.log(r.tier + ' ' + r.source + ' agentdef=' + (r.agentdefTier || 'none'));
+  process.exit(0);
+}
+
+// ── #1543 log-bypass — the single shared WRITE-TIME attributed bypass-audit path ───────────────────────
+// Every ai-brain hook that reads a `*_OVERRIDE`/`*_OFF` kill-switch and honors it routes through THIS
+// subcommand instead of hand-rolling its own `echo ... >> .rule-12-overrides.log` line (the ~21 legacy
+// writers) or staying silent (the ~61 readers that logged nothing — the #1543 core defect). One JSONL
+// record per exercised bypass: `{ts,session,agent,task,role,hook,var,decision}` — see
+// docs/rule-12-overrides-log-schema.md for the published shape.
+//
+// CLI surface (AC-4 / N5 — STRUCTURAL privacy enforcement): `log-bypass --hook H --var V --decision
+// PERMIT|DENY [--session S] [--agent-id A] [--agent-type T]`. There is NO `--cmd` / command / positional
+// parameter ANYWHERE on this subcommand — raw command text is UNREACHABLE by construction, not merely
+// "not currently passed". When session/agent-id/agent-type are omitted, the CLI best-effort reads them
+// from a JSON payload on STDIN (mirroring the hook's own PreToolUse payload, which the bash wrapper
+// `hook_log_bypass` in lib-hook-override.sh pipes through unmodified) — but the STDIN parse below reads
+// ONLY the three keys `session_id`/`agent_id`/`agent_type`; it never references `tool_input` or any
+// command-bearing field, so piping a full raw hook payload (which DOES contain `tool_input.command` for
+// a Bash hook) still cannot leak command text — the parser structurally never looks at that key.
+//
+// Attribution (AC-0a/AC-0b, live-captured 2026-07-11 — see
+// .ai-workspace/research/2026-07-11-1543-in-subagent-pretooluse-bash-payload-capture.md):
+//   - `agent_id` PRESENT  -> subagent-originated. Locate the dedicated per-agent transcript
+//     `<PROJECTS_ROOT>/<slug>/<session>/subagents/agent-<agent_id>.jsonl` (the exact file
+//     `agentResolves()`/`resolveAgent()` already target — mirrors, does not reuse, since the direction is
+//     inverted: agentId -> task/role, not task/role -> agentId). Parse ONLY that file's FIRST JSONL
+//     record's `message.content` text (never a raw whole-file grep — the parent transcript AND a
+//     whole-file scan of the subagent transcript are both measured-polluted with historical/doc-example
+//     `3ROLE_TASK:... ROLE:...` text re-injected on later turns; the tag is unambiguous only in the
+//     original dispatch message). Regex `3ROLE_TASK:(\S+) ROLE:(\S+)` against that text. Match -> stamp
+//     the real task/role. No match / file missing -> fall back to the untagged-subagent sentinel
+//     (task:"", role:"") — NEVER fabricate a role for a subagent whose dispatch prompt carried no tag.
+//   - `agent_id` ABSENT -> main-session/orchestrator event (measured discriminator, #1494 + this
+//     capture). Stamped IMMEDIATELY as the orchestrator sentinel (task:"", role:"orchestrator") — the
+//     transcript is NEVER parsed for a tag on this path (that is what keeps the doc/memory pollution
+//     above from ever reaching a main-session record, not just an optimization).
+function readStdinJSON() {
+  try {
+    if (process.stdin.isTTY) return null;
+    const raw = fs.readFileSync(0, 'utf8');
+    if (!raw || !raw.trim()) return null;
+    const d = JSON.parse(raw);
+    // Structural privacy enforcement: extract ONLY these three keys. Do not reference d.tool_input or
+    // any other field anywhere in this function — that is what makes raw command text unreachable even
+    // when a full raw hook payload is piped in.
+    return {
+      session_id: d.session_id != null ? String(d.session_id) : '',
+      agent_id: d.agent_id != null ? String(d.agent_id) : '',
+      agent_type: d.agent_type != null ? String(d.agent_type) : '',
+    };
+  } catch (e) { return null; }
+}
+
+// Parse ONLY message.content text of the subagent transcript's FIRST record for the live 3ROLE_TASK tag.
+// #1575: reuses the shared firstRecordText() extractor (Lane 1c — ONE predicate, not a second copy).
+function tagFromSubagentTranscript(session, agentId) {
+  const sess = sanitize(session);
+  const aid = String(agentId == null ? '' : agentId).replace(/[^0-9A-Za-z_-]/g, '');
+  if (!sess || !aid) return null;
+  let slugs = [];
+  try { slugs = fs.readdirSync(PROJECTS_ROOT); } catch (e) { return null; }
+  for (const slug of slugs) {
+    const f = path.join(PROJECTS_ROOT, slug, sess, 'subagents', 'agent-' + aid + '.jsonl');
+    if (!fileExists(f)) continue;
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    const text = firstRecordText(content);
+    if (!text) continue;
+    const m = text.match(/3ROLE_TASK:(\S+) ROLE:(\S+)/);
+    if (m) return { task: m[1], role: m[2] };
+  }
+  return null;
+}
+
+function rule12LogPath() {
+  return process.env.RULE12_LOG || path.join(HOME, '.claude', '.rule-12-overrides.log');
+}
+
+// #1543 — internal (in-process, non-exiting) sibling of cmdLogBypass for this file's OWN bypass-var
+// reads (e.g. the `check --enforce-role-models` kill-switches below). Those call sites are a direct
+// CLI/library invocation with no PreToolUse hook payload to read session/agent context from — same
+// honest "no Claude Code session context" case as post-commit-auto-push.sh's native-git-hook path —
+// so they correctly fall to the orchestrator sentinel (AC-8: never a fabricated role). Best-effort,
+// never throws — a logging failure must never affect the caller's gate decision.
+// #1640 S10 point 3/4 — OPTIONAL 4th param `extra` ({task, role, provider, route_config}), overlaid onto the
+// record only when the caller supplies it. Every PRE-#1640 call site (the *_OFF/*_OVERRIDE kill-switch bypass
+// logging elsewhere in this file) passes 3 args, so `extra` is undefined and the record keeps writing EXACTLY
+// the pre-#1640 8-key shape (see docs/rule-12-overrides-log-schema.md) — additive-only, never a behavior change
+// for those writers. The declared-reroute `SESSION-REROUTE`/`ROUTES-OVERRIDE` audit lines (cmdCheck's enforce
+// leg, below) are the only callers that pass `extra`, naming the task/role/resolved-provider so the printed
+// note's claim ("allowed with note; audit logged") is independently checkable in the log file itself — never a
+// second, quieter log (the parent's binding point 3).  Also widens the `var` sanitizer to allow `-` (unchanged
+// for every existing all-underscore *_OFF/*_OVERRIDE varName; needed so 'SESSION-REROUTE'/'ROUTES-OVERRIDE'
+// survive intact for the grep-based ACs).
+function writeBypassLog(hookName, varName, decision, extra) {
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      session: '',
+      agent: '',
+      task: '',
+      role: 'orchestrator',
+      hook: sanitize(hookName),
+      var: String(varName || '').replace(/[^A-Za-z0-9_-]/g, ''),
+      decision: (String(decision).toUpperCase() === 'DENY') ? 'DENY' : 'PERMIT',
+    };
+    if (extra && typeof extra === 'object') {
+      if (extra.task) record.task = sanitize(extra.task);
+      if (extra.role) record.role = sanitize(extra.role);
+      if (extra.provider) record.provider = sanitize(extra.provider);
+      if (extra.route_config) record.route_config = String(extra.route_config);
+      // #3154 D5 -- additive allowlist widening for the SIZE-S-SKIP audit line (plan path sanitized, size S/M/L only).
+      if (extra.plan) record.plan = String(extra.plan).replace(/[^0-9A-Za-z._\/-]/g, '');
+      if (extra.ticket_size && /^[SML]$/.test(String(extra.ticket_size))) record.ticket_size = String(extra.ticket_size);
+    }
+    const logPath = rule12LogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) { /* best-effort — never throws, never blocks the caller */ }
+}
+
+// #1543 AC-4/N5: the ONLY key set ever written — a positional/`--cmd` param does not exist on this CLI,
+// so there is no code path that could add a command-text key even if a caller tried to smuggle one in.
+function cmdLogBypass(o) {
+  const hookName = sanitize(o.hook || '');
+  const varName = String(o.var || '').replace(/[^A-Za-z0-9_]/g, '');
+  const decision = (String(o.decision || '').toUpperCase() === 'DENY') ? 'DENY' : 'PERMIT';
+  if (!hookName || !varName) {
+    console.log('BLOCK: log-bypass requires --hook and --var');
+    process.exit(2);
+  }
+  const stdinPayload = readStdinJSON();
+  const session = o.session || (stdinPayload && stdinPayload.session_id) || '';
+  const agentId = o['agent-id'] || (stdinPayload && stdinPayload.agent_id) || '';
+  const agentType = o['agent-type'] || (stdinPayload && stdinPayload.agent_type) || '';
+
+  let task = '', role = '';
+  if (agentId) {
+    const tag = tagFromSubagentTranscript(session, agentId);
+    if (tag) { task = tag.task; role = tag.role; }
+    // else: subagent-originated but untagged -> task/role stay "" (distinguishable from a real role,
+    // never fabricated; distinct from the orchestrator sentinel because `agent` is still non-empty).
+  } else {
+    role = 'orchestrator';
+  }
+
+  const record = {
+    ts: new Date().toISOString(),
+    session: sanitize(session),
+    agent: String(agentId || '').replace(/[^0-9A-Za-z_-]/g, ''),
+    task: sanitize(task),
+    role: sanitize(role) || (agentId ? '' : 'orchestrator'),
+    hook: hookName,
+    var: varName,
+    decision,
+  };
+  const logPath = rule12LogPath();
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) {
+    console.log('WARN: log-bypass could not write ' + logPath + ': ' + (e && e.message ? e.message : e));
+    process.exit(0); // logging must never block the caller's gate — fail-open
+  }
+  console.log('OK: logged ' + hookName + '/' + varName + ' -> ' + logPath);
+  process.exit(0);
+  // (agentType is intentionally unused beyond availability for a future soft-fallback; keeping it
+  // resolved-but-unused documents that it WAS considered, per the AC-0a capture's agent_type field.)
+  void agentType;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1640 M0 — Model Router SSOT v2: resolve-route / identify-model / lint-routes (build-slices S1-S4).
+//
+// ADDITIVE ONLY: nothing above this block is touched. The frozen `resolve-role-model` contract (roleModelFromCfg,
+// lintRoleConfig, modelIdToTier, resolveConfigPath/loadRoleConfig, CC_ROLES_ENV) is untouched — AC0.3/AC0.4 prove
+// byte-for-byte zero behavior change. Nothing in the existing chain consumes any of this yet (M0 is a
+// zero-behavior-change milestone; config/cc-roles.env stays authoritative for the interactive chain until M1/S13).
+// See `.ai-workspace/plans/2026-07-17-fable-router.md` (parent, milestone M0) and its decomposition
+// `.ai-workspace/plans/2026-07-17-fable-1640-router-build-slices.md` (S1-S5).
+
+// Resolve config/cc-routes.json's path. Mirrors resolveConfigPath()'s CC_ROLES_ENV pattern exactly:
+//   CC_ROUTES_JSON, when SET, is AUTHORITATIVE + TERMINAL (unreadable/absent path => not-found, same shape as
+//   CC_ROLES_ENV=/nonexistent above) — this is what every M0 fixture uses to point at a bundled red/green file
+//   without touching the shipped config/cc-routes.json. Unset => config/cc-routes.json next to this file,
+//   walked through fs.realpathSync (symlink-safe — same defect-1b rationale as resolveConfigPath()).
+function resolveRoutesConfigPath() {
+  if ('CC_ROUTES_JSON' in process.env) {
+    const p = process.env.CC_ROUTES_JSON;
+    return (p && fileExists(p)) ? p : '';
+  }
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const cand = path.join(selfDir, '..', 'config', 'cc-routes.json');
+  return fileExists(cand) ? cand : '';
+}
+
+// Load + parse the routes SSOT. Never throws: { ok, routes, error, configPath }. A missing file, an unreadable
+// file, and unparseable JSON are all distinct, honestly-labeled ROUTE-* errors (never a silent {}).
+function loadRoutesConfig() {
+  const configPath = resolveRoutesConfigPath();
+  if (!configPath) return { ok: false, routes: null, error: 'ROUTE-NOT-FOUND: no config/cc-routes.json resolved (checked CC_ROUTES_JSON / config/cc-routes.json)', configPath: '' };
+  let raw;
+  try { raw = fs.readFileSync(configPath, 'utf8'); }
+  catch (e) { return { ok: false, routes: null, error: 'ROUTE-READ-ERROR: ' + configPath + ': ' + (e && e.message ? e.message : e), configPath }; }
+  let routes;
+  try { routes = JSON.parse(raw); }
+  catch (e) { return { ok: false, routes: null, error: 'ROUTE-PARSE-ERROR: ' + configPath + ': ' + (e && e.message ? e.message : e), configPath }; }
+  return { ok: true, routes, error: '', configPath };
+}
+
+// #2782 AC-6 — the SSOT's CLOSED provider vocabulary (the keys of `providers` in config/cc-routes.json,
+// read FRESH at call time — plan N5). Returns null when the SSOT cannot be loaded: the caller fails
+// CLOSED on null (no provider id can be validated against a vocabulary that cannot be read).
+function ssotProviderIds2782() {
+  try {
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return null;
+    return Object.keys((rl.routes && rl.routes.providers) || {});
+  } catch (e) { return null; }
+}
+
+// Credential-hygiene lint (AC0.6, #1640 S1). Every `auth`/`*credential*`-class field on a provider row must be
+// an env:/keychain: indirection — no literal credential value, no "non-secret literal" escape (review B3 deleted
+// that escape; endpoint URLs are not credential-class and are covered by the smoke's separate count-based scans,
+// not this lint). Returns an array of problem strings naming the offending key (empty = clean).
+function lintRoutesConfig(routes) {
+  const problems = [];
+  if (!routes || typeof routes !== 'object') return problems;
+  const providers = routes.providers || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    if (!row || typeof row !== 'object') continue;
+    for (const key of Object.keys(row)) {
+      if (!/^auth$/i.test(key) && !/credential/i.test(key)) continue;
+      const val = row[key];
+      if (typeof val !== 'string') continue;
+      if (!/^(env:|keychain:)/.test(val)) {
+        problems.push('ROUTE-SECRET-LITERAL: providers.' + pid + '.' + key + ' is not an env:/keychain: indirection');
+      }
+    }
+  }
+  // #3060 D1 -- seats.<seat>.size_models: only the L key is defined, and its value must be a model the seat's own
+  // provider declares in model_vocabulary (fail closed: an undeclared slug would be dispatched as a hand-typed id).
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_models' in seat)) continue;
+    const sm = seat.size_models;
+    if (!sm || typeof sm !== 'object' || Array.isArray(sm)) { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models must be an object'); continue; }
+    const vocab = ((providers[seat.provider] || {}).model_vocabulary) || {};
+    for (const [k, v] of Object.entries(sm)) {
+      if (k !== 'L') { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' -- only the L key is defined'); continue; }
+      if (typeof v !== 'string' || !Object.prototype.hasOwnProperty.call(vocab, v)) {
+        problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' = "' + v + '" is not in providers.' + seat.provider + '.model_vocabulary');
+      }
+    }
+  }
+  // #3149 D2 -- seats.<seat>.size_models_cutover: the OPTIONAL grandfather cutover instant for the size-L
+  // planner rule (a planner whose run STARTED strictly before it is judged by the pre-rule expectation).
+  // Anything present but not an ISO 8601 instant with an EXPLICIT offset (Z or ±hh:mm) fails closed AT
+  // LINT TIME too -- the gate would already refuse to grandfather on it, but the lint names the key so the
+  // SSOT never ships malformed (fix1/M1: Date.parse alone also accepts non-ISO text and local time).
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_models_cutover' in seat)) continue;
+    const cv = seat.size_models_cutover;
+    if (typeof cv !== 'string' || !Number.isFinite(parseIsoInstantWithOffset(cv))) {
+      problems.push('SIZE-MODEL-CUTOVER-INVALID: seats.' + sid + '.size_models_cutover = "' + cv + '" is not an ISO 8601 instant with an explicit offset (Z or ±hh:mm)');
+    }
+  }
+  // #3145 D5 -- seats.<seat>.size_route_since: the OPTIONAL transition pin (rows closed strictly before it
+  // also admit the pre-change model). Anything present but not a parseable ISO 8601 string fails closed at
+  // lint time -- a garbage pin would silently widen the transition window to "every row" (Date.parse NaN).
+  for (const [sid, seat] of Object.entries(routes.seats || {})) {
+    if (!seat || typeof seat !== 'object' || !('size_route_since' in seat)) continue;
+    const v = seat.size_route_since;
+    if (typeof v !== 'string' || isNaN(Date.parse(v))) {
+      problems.push('SIZE-ROUTE-SINCE-INVALID: seats.' + sid + '.size_route_since = "' + v + '" is not a parseable ISO 8601 date');
+    }
+  }
+  return problems;
+}
+
+// C-2 capability guard (resolve-time, parent AC0.2 / S2). Fail-closed on a missing OR unknown task_class,
+// treated as the MOST restrictive class (sustained-agentic) — never silently permissive. Three-part refusal
+// shape is assembled by the caller (nonzero exit + this reason on stderr + empty stdout); this function only
+// decides ok/reason.
+const MOST_RESTRICTIVE_TASK_CLASS = 'sustained-agentic';
+function checkCapability(routes, seatRow) {
+  const taskClasses = (routes && routes.task_classes) || {};
+  const rawClass = seatRow && seatRow.task_class;
+  const effectiveClass = (rawClass && Object.prototype.hasOwnProperty.call(taskClasses, rawClass))
+    ? rawClass : MOST_RESTRICTIVE_TASK_CLASS;
+  const classDef = taskClasses[effectiveClass];
+  const provider = seatRow && seatRow.provider;
+  const allowed = (classDef && Array.isArray(classDef.allowed_providers)) ? classDef.allowed_providers : [];
+  if (!allowed.includes(provider)) {
+    return { ok: false, reason: 'ROUTE-FEASIBILITY: provider "' + provider + '" is not allowed for task_class "' +
+      effectiveClass + '" (seat declared: ' + (rawClass || '<missing>') + ')' };
+  }
+  return { ok: true, reason: '' };
+}
+
+// C-3 data-sensitivity guard (resolve-time, parent AC0.8 / S3). Fail-closed on a missing seat sensitivity
+// (treated operator-private) AND on a missing/unverified/unrecognized provider posture (treated
+// unverified-or-trains) — an unverified external fact can only over-restrict, never leak. The lattice's middle
+// class (no-training-default) clears `internal` but REFUSES `operator-private` — the review-B2 boundary.
+const DATA_POSTURE_CLASSES = ['local', 'zdr-enforced', 'anthropic-baseline', 'no-training-default', 'unverified-or-trains'];
+const DATA_SENSITIVITY_CLEARANCE = {
+  'operator-private': ['local', 'zdr-enforced', 'anthropic-baseline'],
+  'internal': ['local', 'zdr-enforced', 'anthropic-baseline', 'no-training-default'],
+  'public': null, // bounded only by C-2 — every posture clears
+};
+function checkDataSensitivity(routes, seatRow) {
+  const providers = (routes && routes.providers) || {};
+  const rawSensitivity = seatRow && seatRow.data_sensitivity;
+  const sensitivity = Object.prototype.hasOwnProperty.call(DATA_SENSITIVITY_CLEARANCE, rawSensitivity)
+    ? rawSensitivity : 'operator-private';
+  const provider = seatRow && seatRow.provider;
+  const providerRow = providers[provider];
+  const rawPosture = providerRow && providerRow.data_posture && providerRow.data_posture.class;
+  const posture = (rawPosture && DATA_POSTURE_CLASSES.includes(rawPosture)) ? rawPosture : 'unverified-or-trains';
+  const clearance = DATA_SENSITIVITY_CLEARANCE[sensitivity];
+  if (clearance !== null && !clearance.includes(posture)) {
+    return { ok: false, reason: 'ROUTE-DATA-SENSITIVITY: seat sensitivity "' + sensitivity + '" (declared: ' +
+      (rawSensitivity || '<missing>') + ') is not cleared for provider "' + provider + '" posture "' + posture +
+      '" (declared: ' + (rawPosture || '<missing>') + ')' };
+  }
+  return { ok: true, reason: '' };
+}
+
+// C-3W — the accepted-disclosure last-resort check (#1880, Intent 3/3a). Consulted ONLY when C-3 has already
+// refused (resolveRoute/checkEnvelope both gate this behind a failed checkDataSensitivity — C-3W can never
+// touch C-2, never widen C-3's own lattice, and never apply to a provider it does not name). Clears a C-3
+// refusal for a seat ONLY when `seatRow.accepted_disclosure` (an array) contains a record whose `provider`,
+// `sensitivity_at_decision`, and `posture_at_decision` all match — EXACTLY, three-way — the seat's declared
+// provider and the RAW DECLARED values `checkDataSensitivity` reads BEFORE normalising them (never the
+// normalised `operator-private`/`unverified-or-trains` fallback locals): a typo'd/omitted/unrecognised
+// sensitivity, or a missing/deleted/changed posture, therefore matches no record and the C-3 refusal stands.
+// Never throws on absent/malformed/wrong-typed input — a crash is not a refusal (AC-7 arms (d)/(f3)).
+const ROUTE_ACCEPTED_RISK_TOKEN = 'ROUTE-ACCEPTED-RISK';
+const ACCEPTANCE_REQUIRED_FIELDS = ['provider', 'sensitivity_at_decision', 'posture_at_decision', 'decided', 'authority'];
+function checkAcceptance(routes, seatRow) {
+  const providers = (routes && routes.providers) || {};
+  const rawSensitivity = seatRow && seatRow.data_sensitivity;
+  const provider = seatRow && seatRow.provider;
+  const providerRow = providers[provider];
+  const rawPosture = providerRow && providerRow.data_posture && providerRow.data_posture.class;
+  const records = Array.isArray(seatRow && seatRow.accepted_disclosure) ? seatRow.accepted_disclosure : [];
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) continue; // wrong-type entry -- skip, never throw
+    let hasAllRequired = true;
+    for (const f of ACCEPTANCE_REQUIRED_FIELDS) {
+      if (typeof rec[f] !== 'string' || rec[f].length === 0) { hasAllRequired = false; break; }
+    }
+    if (!hasAllRequired) continue; // missing/blank required field -- invalid record, skip
+    if (rec.provider !== provider) continue; // wrong-provider record -- never leaks across providers
+    if (rec.sensitivity_at_decision !== rawSensitivity) continue; // matched against the RAW string, not the normalised fallback
+    if (rec.posture_at_decision !== rawPosture) continue; // matched against the RAW string, not the normalised fallback
+    return { ok: true, acceptance: rec };
+  }
+  return { ok: false, acceptance: null };
+}
+
+// Model-identity vocabulary query (AC0.9, S4 — the ROOT fix for stack break 1: modelIdToTier() returns '' for
+// any non-claude-* id today). Given a model id, returns its SSOT-declared provider + tier-equivalent; an
+// undeclared id refuses (caller emits nonzero exit + empty stdout, no fabricated match).
+function identifyModel(routes, modelId) {
+  const providers = (routes && routes.providers) || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    const vocab = (row && row.model_vocabulary) || {};
+    if (Object.prototype.hasOwnProperty.call(vocab, modelId)) {
+      const entry = vocab[modelId] || {};
+      return { ok: true, provider: pid, tierEquivalent: entry.tier_equivalent || '' };
+    }
+  }
+  return { ok: false, provider: '', tierEquivalent: '' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1640 M1 (S8-S13) — expected-side expressibility, provider-scoped version pins, the DECLARED-REROUTE
+// contract, the spawn-gate sensor + recorder, and board-badge honesty. Every helper below is a NEW consumer of
+// the M0 primitives above (identifyModel / loadRoutesConfig) — nothing in M0 (S1-S5) or the frozen S6/S7
+// `resolve-role-model` path is edited. See .ai-workspace/plans/2026-07-23-1640-s8-s13.md.
+
+// Best-effort bridge: resolve a model id's SSOT tier_equivalent, or '' on ANY failure (no SSOT resolvable, id
+// undeclared in every provider's vocabulary, read/parse error). Used to WIDEN several pre-existing "claude-*
+// only" tier readers (modelIdOrAliasToTier, resolveEffectiveTier's session-read branch, resolveModelFields)
+// so a genuinely SSOT-declared non-Anthropic id resolves instead of falling through to 'unknown'/absent. Never
+// throws; never invents a match the SSOT does not declare.
+function identifyModelViaSSOT(modelId) {
+  try {
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return '';
+    const ident = identifyModel(rl.routes, modelId);
+    return (ident.ok && ident.tierEquivalent) ? ident.tierEquivalent : '';
+  } catch (e) { return ''; }
+}
+
+// #1640 S10/S11 — resolve a provider id from a base-url via `providers.<id>.endpoint` (a Lane-I FIXTURE-ONLY
+// schema field in this PR — the live config/cc-routes.json provider rows carry no endpoint yet; see the plan's
+// advisory A2 / `## Deferred-follow-ups`, S18 populates the live rows). Returns '' when the url is empty or
+// matches no provider row.
+function resolveProviderByEndpoint(routes, baseUrl) {
+  const url = String(baseUrl == null ? '' : baseUrl).trim();
+  if (!url) return '';
+  const providers = (routes && routes.providers) || {};
+  for (const [pid, row] of Object.entries(providers)) {
+    if (row && typeof row.endpoint === 'string' && row.endpoint && row.endpoint === url) return pid;
+  }
+  return '';
+}
+
+// #1640 S11 — the RUN-TIME reroute SENSOR (the "declared" stamp's ONLY producer). Called EXCLUSIVELY at RUN
+// edges — the PostToolUse spawn-ledger hook and the SubagentStop subagent-ledger hook, via `append
+// --sense-reroute` — NEVER at CHECK time (S10 binding point 1: the completion gate reads only the recorded
+// stamp it produces, never re-senses `process.env.ANTHROPIC_BASE_URL` itself; `cmdCheck` below never calls this
+// function). Reads the CURRENT environment's inherited `ANTHROPIC_BASE_URL` (the two-var gateway switch — see
+// the plan's precondition note) at THIS moment, resolves it to an SSOT provider row, and — ONLY when the role's
+// OWN SSOT seat is BOTH `session-reroutable:true` AND itself provider-non-anthropic (the seat's declared
+// intent) — returns a stamp `{provider, resolvedAt}`. Returns null (no stamp recorded — the role stays
+// UNDECLARED, the correct fail-closed default) on any ineligible/unresolvable combination: no base-url
+// inherited, the SSOT unreadable, the role has no declared seat, the seat is not session-reroutable, the seat's
+// own declared provider IS anthropic (nothing to declare), or the base-url resolves to no provider row.
+function senseReroute(role) {
+  try {
+    const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+    if (!baseUrl) return null;
+    const rl = loadRoutesConfig();
+    if (!rl.ok) return null;
+    const seat = (rl.routes.seats || {})[role];
+    if (!seat || !seat['session-reroutable']) return null;
+    if (!seat.provider || seat.provider === 'anthropic') return null;
+    const pid = resolveProviderByEndpoint(rl.routes, baseUrl);
+    if (!pid) return null;
+    return { provider: pid, resolvedAt: new Date().toISOString() };
+  } catch (e) { return null; }
+}
+
+// #1640 S8 — the completion gate's SSOT-aware EXPECTED-side resolver (the enforce/gate consumer S8 adds — NOT
+// `cmdResolveRoleModel`, which stays frozen; see the file's #1640 S6/S7 section and the plan's "Critical
+// constraints" clause). Mirrors `cmdResolveRoleModel`'s precedence STRUCTURALLY (SSOT-first; an explicit
+// `CC_ROLES_ENV` override is authoritative+terminal so `routesLoaded` is pre-computed by the caller honoring
+// that precedence) but returns a RICHER shape {tier, provider, model, viaSSOT} — S9/S10 need the declared
+// PROVIDER to bind a run-time reroute stamp, not merely a tier token. Falls back to the frozen
+// `roleModelFromCfg` (byte-unchanged legacy resolver) whenever the SSOT is not consulted, the role has no
+// declared seat, or the seat's model is not in any provider's declared vocabulary (S8(b)'s inexpressible-value
+// path) — this is what preserves `roleModelFromCfg`'s existing behavior for every pre-#1640 fixture.
+function resolveExpectedSide(routesLoaded, cfg, role) {
+  if (routesLoaded && routesLoaded.ok) {
+    const seat = (routesLoaded.routes.seats || {})[role];
+    if (seat) {
+      const ident = identifyModel(routesLoaded.routes, seat.model);
+      if (ident.ok && ident.tierEquivalent) {
+        return { tier: ident.tierEquivalent, provider: ident.provider, model: seat.model, viaSSOT: true };
+      }
+    }
+  }
+  return { tier: roleModelFromCfg(cfg, role), provider: '', model: '', viaSSOT: false };
+}
+
+// Seat resolution: look up the seat row, then run BOTH resolve-time guards in order (C-2 then C-3) — both are
+// enforced again at invoke-time in M2 with the resolver out of the loop; this is the resolve-time half only.
+function resolveRoute(routes, seatKey) {
+  const seats = (routes && routes.seats) || {};
+  const seatRow = seats[seatKey];
+  if (!seatRow) return { ok: false, reason: 'ROUTE-SEAT-NOT-FOUND: no seat "' + seatKey + '" in the SSOT' };
+  // #1918 D2/AC7 — SLUG pin overlay, AFTER the seat lookup, BEFORE the C-2/C-3 guards below: those guards
+  // check the SEAT ROW's declared task_class/provider/data_sensitivity (properties of the SEAT, never the
+  // model id), so overlaying ONLY `.model` here means a pinned slug is validated through the exact same C-2/
+  // C-3 gate an unpinned slug would be — never a bypass. Diagnostics go to STDERR ONLY (never stdout — the
+  // caller may be `--json`, and tools/openrouter-role-dispatch.sh forwards this function's stderr separately
+  // from the JSON payload it parses; mixing them would corrupt that JSON.parse).
+  // #3218 D2/D3 — the ROUTE pin overlay sits at the SAME place and is consulted FIRST: a valid route pin
+  // replaces the whole effective row (provider/model/dispatch/agent_tool_fallback, size_models dropped) and
+  // the C-2/C-3 guards below then judge that EFFECTIVE row, so a cross-provider pin can never bypass them.
+  // A refused route entry resolves UNPINNED (byte-identical to no-pin stdout) with SEAT-PIN-REFUSED on
+  // stderr; a route entry (honored or refused) suppresses the slug overlay — one role, one effective pin.
+  announceSeatPinFileProblem();
+  let effectiveSeat = seatRow;
+  const routePin = resolveRoutePin(seatKey, routes);
+  if (routePin.refusalNote) process.stderr.write(routePin.refusalNote + '\n');
+  if (routePin.pinned) {
+    effectiveSeat = routePin.seat;
+    process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' route pinned to "' + routePin.value + '"' +
+      (routePin.reason ? ' reason="' + routePin.reason + '"' : '') + (routePin.set_at ? ' set_at=' + routePin.set_at : '') + '\n');
+  }
+  if (!routePin.present) {
+    const pin = resolveSlugPin(seatKey, routes, seatRow);
+    if (pin.refusalNote) process.stderr.write(pin.refusalNote + '\n');
+    if (pin.pinned) {
+      effectiveSeat = Object.assign({}, seatRow, { model: pin.slug });
+      process.stderr.write('SEAT-PIN-HONORED: seat ' + seatKey + ' slug pinned to "' + pin.slug + '"' +
+        (pin.reason ? ' reason="' + pin.reason + '"' : '') + (pin.set_at ? ' set_at=' + pin.set_at : '') + '\n');
+    }
+  }
+  const cap = checkCapability(routes, effectiveSeat);
+  if (!cap.ok) return { ok: false, reason: cap.reason };
+  const sens = checkDataSensitivity(routes, effectiveSeat);
+  if (sens.ok) return { ok: true, seatKey, seat: effectiveSeat, acceptance: null };
+  // C-3 refused -- C-3W (#1880) gets exactly one more chance, never ahead of C-2, never widening C-3 itself.
+  const acc = checkAcceptance(routes, effectiveSeat);
+  if (acc.ok) return { ok: true, seatKey, seat: effectiveSeat, acceptance: acc.acceptance };
+  return { ok: false, reason: sens.reason };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2985 — z.ai routing policy. ONE resolver (this block) answers three questions for every consumer (the
+// dispatch helper, the route-dispatch gate, `check`) so no caller keeps its own copy (the #2434
+// single-generator discipline):
+//   1. plan-size        — the planner's flush-left `size: S|M|L` line (D1). Missing / duplicated / indented /
+//                         lowercase / any other value is a fail-CLOSED refusal, never a default model.
+//   2. resolve-route --plan — the seat's EFFECTIVE route as a function of (SSOT seat row, plan facts) (D3).
+//                         Only a plan that is a real file under .ai-workspace/plans/, bound to the spawn's
+//                         task, with a valid label can ever yield `agent-tool`.
+//   3. zai-strikes      — how many times THIS round's z.ai plan-review dispatch has failed (D6), derived from
+//                         the dispatch helper's own receipt lines, never a hand-typed number.
+// INPUT-BOUND: a plan file larger than PLAN_MAX_BYTES is `unresolvable` (read is capped before parsing); the
+// receipt scan reads at most STRIKE_TAIL_BYTES from the END of the file (an undercount fails toward z.ai).
+const PLAN_MAX_BYTES = 1024 * 1024;
+const STRIKE_TAIL_BYTES = 4 * 1024 * 1024;
+const PLAN_DATA_CLASSES = ['public', 'operator-private'];
+
+function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Validate a --plan argument. Relative paths resolve against the process cwd (the hook's session cwd).
+// { ok:true, abs, text } | { ok:false, why }.
+function loadPlanFile(planArg, requirePlansDir) {
+  if (typeof planArg !== 'string' || !planArg) return { ok: false, why: 'no plan path' };
+  // A ledger row's reviewed_plan may be stored tilde-anchored (normalizeArtifact); expand it against HOME.
+  const abs = path.resolve(planArg.startsWith('~/') ? path.join(HOME, planArg.slice(2)) : planArg);
+  if (requirePlansDir && abs.split(path.sep).join('/').indexOf('.ai-workspace/plans/') < 0) {
+    return { ok: false, why: 'path is not under .ai-workspace/plans/' };
+  }
+  let st;
+  try { st = fs.statSync(abs); } catch (e) { return { ok: false, why: 'file does not exist' }; }
+  if (!st.isFile()) return { ok: false, why: 'not a regular file' };
+  if (st.size > PLAN_MAX_BYTES) return { ok: false, why: 'file larger than ' + PLAN_MAX_BYTES + ' bytes' };
+  let text;
+  try { text = fs.readFileSync(abs, 'utf8'); } catch (e) { return { ok: false, why: 'unreadable' }; }
+  return { ok: true, abs, text };
+}
+
+// The one flush-left `size:` line. { ok:true, size } | { ok:false, source, token }.
+function parsePlanSize(text) {
+  const hits = String(text).split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => /^size:/.test(l));
+  if (hits.length === 0) return { ok: false, source: 'missing', token: 'SIZE-LABEL-MISSING' };
+  if (hits.length > 1) return { ok: false, source: 'ambiguous', token: 'SIZE-LABEL-AMBIGUOUS' };
+  const m = hits[0].match(/^size: ([SML])[ \t]*$/);
+  if (!m) return { ok: false, source: 'invalid', token: 'SIZE-LABEL-INVALID' };
+  return { ok: true, size: m[1] };
+}
+
+// `data-class:` line. Absent = public; exactly one valid line = that value; anything else = 'invalid'.
+function parsePlanDataClass(text) {
+  const hits = String(text).split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => /^data-class:/.test(l));
+  if (hits.length === 0) return 'public';
+  if (hits.length > 1) return 'invalid';
+  const m = hits[0].match(/^data-class: ([a-z-]+)[ \t]*$/);
+  return (m && PLAN_DATA_CLASSES.includes(m[1])) ? m[1] : 'invalid';
+}
+
+// D4 task binding: basename `YYYY-MM-DD-<task>-...` OR a flush-left `Ticket: #<task>` line.
+function planBoundToTask(abs, text, task) {
+  if (!task || !/^[0-9A-Za-z._-]+$/.test(String(task))) return false;
+  const t = escapeRe(task);
+  if (new RegExp('^\\d{4}-\\d{2}-\\d{2}-' + t + '-').test(path.basename(abs))) return true;
+  return new RegExp('^Ticket: #' + t + '(?![0-9A-Za-z._-])', 'm').test(String(text));
+}
+
+// Plan facts for `seatKey`. { unresolvable:true, why } | { size, size_source, data_class, bound }.
+// With no `task` the binding step is skipped (callers that cannot know the task); every real consumer passes it.
+function resolvePlanFacts(planArg, task) {
+  const lp = loadPlanFile(planArg, true);
+  if (!lp.ok) return { unresolvable: true, why: lp.why };
+  const bound = task === undefined ? true : planBoundToTask(lp.abs, lp.text, task);
+  const sz = parsePlanSize(lp.text);
+  const dc = parsePlanDataClass(lp.text);
+  let size_source;
+  if (!bound) size_source = 'task-mismatch';
+  else size_source = sz.ok ? 'plan' : sz.source;
+  return { size: sz.ok ? sz.size : '', size_source, data_class: dc, bound, abs: lp.abs, task: task === undefined ? '' : String(task) };
+}
+
+// D3/D4/D8: the effective route. Leaving the declared subprocess route needs ALL of: the seat declares an
+// agent_tool_fallback tier, the plan is bound to the task, and a first-class reason —
+//   executor    : valid label AND size L AND (no usable size_models.L OR >= 2 z.ai strikes)
+// #3078 — a `data-class: operator-private` plan label is a RECORDED fact, never a routing input: a private
+// plan routes exactly like a public one for both the executor and plan-review seats (operator directive
+// 2026-10-09). Everything else (missing/ambiguous/invalid label, mismatch, invalid data-class) keeps the
+// declared route; the consumers refuse on size_source / data_class instead (fail closed, no path opened).
+// #3060 — an executor + size L + public plan STAYS on the declared z.ai route with the SSOT's `size_models.L`
+// model (D1) until the task has 2 z.ai strikes (D2: one per failed dispatcher INVOCATION, receipt-derived), then
+// leaves for the fallback tier. A `size_models` key that is absent, or whose value is not in the seat provider's
+// model_vocabulary, is the #2985 rule unchanged (L -> fallback tier): the config-only rollback, failing closed.
+// Additive JSON fields `route_reason` + `zai_strikes` are produced for the EXECUTOR seat only (`zai_strikes`
+// never plan-review; `route_reason` reaches a size_models-declaring plan-review seat too since #3145 D1).
+function executorSizeModel(seat) {
+  const sm = seat && seat.size_models;
+  if (!sm || typeof sm !== 'object' || Array.isArray(sm)) return '';
+  const v = sm.L;
+  if (typeof v !== 'string' || !v) return '';
+  const loaded = loadRoutesConfig();
+  const prov = loaded.ok && loaded.routes && loaded.routes.providers ? loaded.routes.providers[seat.provider] : null;
+  const vocab = prov && prov.model_vocabulary;
+  if (!vocab || typeof vocab !== 'object' || !Object.prototype.hasOwnProperty.call(vocab, v)) return '';
+  return v;
+}
+
+function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
+  const out = { effective_dispatch: seat.dispatch || '', effective_tier: '', effective_model: seat.model || '' };
+  const exec = seatKey === 'executor';
+  if (exec) { out.route_reason = ''; out.zai_strikes = 0; }
+  const fb = seat.agent_tool_fallback;
+  if (!fb || !ROLE_MODELS.includes(fb) || !facts.bound) return out;
+  let leave = false;
+  if (exec) {
+    if (facts.size_source === 'plan') {
+      if (facts.size === 'L') {
+        const sizeModel = executorSizeModel(seat);
+        if (!sizeModel) { leave = true; out.route_reason = 'size-L-no-size-model'; }
+        else {
+          out.zai_strikes = facts.task ? countExecutorStrikes(facts.task) : 0;
+          if (out.zai_strikes >= 2) { leave = true; out.route_reason = 'zai-strikes'; }
+          else { out.effective_model = sizeModel; out.route_reason = 'size-L-zai'; }
+        }
+      } else out.route_reason = 'size-SM';
+    }
+    // #3190 — the dispatcher's needle-lint refusal receipt: a FIRST-CLASS, size-independent route to the
+    // fallback tier for the exact (task, brief bytes) pair the dispatcher refused (the #2888 deadlock: the
+    // dispatcher sends a needle brief to a Claude seat, the route gate sends an S/M plan back to the
+    // dispatcher). Precedence: an ALREADY-agent-tool answer above (zai-strikes, size-L-no-size-model) is
+    // unchanged; otherwise the needle receipt wins over size-SM / size-L-zai — an L brief that names a
+    // needle file has the same deadlock below two strikes. Callers that pass no brief (check, the
+    // dispatcher's own plan check) pass no needleAdmit and get the pre-#3190 answer byte-for-byte.
+    if (needleAdmit && !leave && facts.size_source === 'plan') { leave = true; out.route_reason = 'needle-receipt'; }
+  } else if (seatKey === 'plan-review') {
+    // #3145 D1 — resolve-route's single-plan view of the same rule planReviewRouteFromBrief encodes for
+    // brief text: S/M -> seat model, L -> size_models.L, no valid size -> size_models.L (unsized-full).
+    // NEVER leaves for agent-tool (plan-review strikes route through the dispatcher's existing Opus
+    // fallback, D8) and never reports zai_strikes (still executor-only). Gated on a usable size_models.L —
+    // the same gate the D5 checker branch uses — so a seat WITHOUT size_models (the pre-flip live config,
+    // D7 rollback) returns the #2985 output byte-for-byte: no route_reason field, seat model for every
+    // case (the #3060 AC-3 pin; Leg 1 is behaviour-neutral until the flip, AC-3).
+    const sizeModel = executorSizeModel(seat);
+    if (!sizeModel) return out;
+    if (facts.size_source === 'plan') {
+      if (facts.size === 'L') { out.effective_model = sizeModel; out.route_reason = 'size-L-zai'; }
+      else out.route_reason = 'size-SM';
+    } else {
+      out.effective_model = sizeModel;
+      out.route_reason = 'unsized-full';
+    }
+  }
+  if (!leave) return out;
+  const cfg = loadRoleConfig().cfg || {};
+  out.effective_dispatch = 'agent-tool';
+  out.effective_tier = fb;
+  out.effective_model = cfg['CC_TIER_' + fb.toUpperCase() + '_VERSION'] || fb;
+  return out;
+}
+
+// plan-review-route --brief-text-file <path> [--task T] [--json]  (#3145 D1): the ONE plan-review route
+// resolver as a CLI — the dispatcher's Leg-2 call site. Prints model/size/round/fold_only/route_reason/
+// data_class for the brief TEXT (routing reads the text, the one record the checker can re-derive). The
+// seat row comes from the SSOT with the #1918 slug-pin overlay applied exactly as seatDispatchIsSubprocess
+// applies it (silent overlay — resolve-route already surfaces SEAT-PIN-HONORED where an operator watches).
+// INPUT-BOUND: the brief file is stat'd and refused above PLAN_MAX_BYTES before any read, so an oversized
+// brief cannot loop or balloon the resolver (the same cap briefPlanPaths applies to the text itself).
+function cmdPlanReviewRoute(opts) {
+  const file = opts['brief-text-file'];
+  if (typeof file !== 'string' || !file) { console.log('BLOCK: plan-review-route requires --brief-text-file <path>'); process.exit(2); }
+  let st; try { st = fs.statSync(file); } catch (e) { st = null; }
+  if (!st || !st.isFile()) { console.log('BRIEF-UNREADABLE: --brief-text-file ' + file + ' is not an existing regular file'); process.exit(2); }
+  if (st.size > PLAN_MAX_BYTES) { console.log('BRIEF-TOO-LARGE: --brief-text-file ' + file + ' is larger than ' + PLAN_MAX_BYTES + ' bytes'); process.exit(2); }
+  let text; try { text = fs.readFileSync(file, 'utf8'); } catch (e) { console.log('BRIEF-UNREADABLE: --brief-text-file ' + file + ' cannot be read'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const seatRow = (loaded.routes.seats || {})['plan-review'];
+  if (!seatRow) { console.log('ROUTE-SEAT-NOT-FOUND: no seat "plan-review" in the SSOT'); process.exit(2); }
+  let seat = seatRow;
+  // #3218 D4 site 5 — the SAME shared pin-overlay helpers, never a third copy: a valid ROUTE pin on
+  // plan-review swaps in the D3 effective row wholesale (this is what routes a plan-review brief onto
+  // anthropic or another z.ai model); the slug pin applies only when no route entry exists.
+  const routePin = resolveRoutePin('plan-review', loaded.routes);
+  if (routePin.pinned) seat = routePin.seat;
+  else {
+    const pin = resolveSlugPin('plan-review', loaded.routes, seatRow);
+    if (pin.pinned) seat = Object.assign({}, seatRow, { model: pin.slug });
+  }
+  const task = ('task' in opts && opts.task) ? opts.task : undefined;
+  const route = planReviewRouteFromBrief(text, task, seat, undefined);
+  if ('json' in opts) console.log(JSON.stringify(route));
+  else console.log('model=' + route.model + ' size=' + route.size + ' round=' + route.round + ' fold_only=' + (route.fold_only ? 1 : 0) + ' route_reason=' + route.route_reason + ' data_class=' + (route.data_class || 'none'));
+  process.exit(0);
+}
+
+// plan-size --plan <path> : prints S|M|L, or a SIZE-* token with exit 2.
+function cmdPlanSize(opts) {
+  const lp = loadPlanFile(opts.plan, false);
+  if (!lp.ok) { console.log('SIZE-PLAN-UNRESOLVABLE: --plan ' + (typeof opts.plan === 'string' ? opts.plan : '<none>') + ' is unresolvable (' + lp.why + ')'); process.exit(2); }
+  const sz = parsePlanSize(lp.text);
+  if (!sz.ok) {
+    console.log(sz.token + ': ' + path.basename(lp.abs) + ' must carry exactly one flush-left `size: S`, `size: M` or `size: L` line (' + sz.source + ')');
+    process.exit(2);
+  }
+  console.log(sz.size);
+  process.exit(0);
+}
+
+// The dispatch helper's receipt file (OPENROUTER_DISPATCH_RECEIPT_FILE honoured), read through the STRIKE_TAIL_BYTES
+// cap. '' when absent/unreadable (every caller then counts 0 -- an undercount fails toward z.ai).
+function readReceiptTail() {
+  let file = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  if (!file) {
+    let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+    file = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  }
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const len = Math.min(size, STRIKE_TAIL_BYTES);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      return buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  } catch (e) { return ''; }
+}
+
+function receiptKv(line) {
+  const kv = {};
+  for (const tok of line.split(/\s+/)) { const eq = tok.indexOf('='); if (eq > 0 && !(tok.slice(0, eq) in kv)) kv[tok.slice(0, eq)] = tok.slice(eq + 1); }
+  return kv;
+}
+
+// #3093 D3b — the CONTINUE cap. At most CONTINUE_CAP timeout invocations per window may be classified CONTINUE
+// (a forgive line here, `progress=pushed` on #3073's branch); the cap+1-th and every later one is a STRIKE (fail
+// closed) so the existing 2-strike route-to-Sonnet rule still engages after at most 3 continued legs.
+const CONTINUE_CAP = 3; // #3073 D3b -- a constant in the ledger, not a config key.
+
+// #3093 D1 — the local-clock vs GitHub-clock slack folded into the dispatch-window proof (never a flag).
+const STRIKE_FORGIVE_SKEW_S = 120;
+
+// #3093 ER-r1 F1 — the ONE evidence-key normalization, shared by every writer and reader of the key: the live
+// dispatcher writes POSTMORTEM `evidence=` as a path whose BASENAME is the id, so every comparison (the verb's
+// P1/P5 lookups, the counter's Set, the Set's own build) goes through the basename — never the raw value, or
+// the writer and the reader disagree on the key's shape and a recorded forgive is silently ignored.
+const evBasename = (v) => (v == null ? '' : String(v).split('/').pop());
+
+// #3093 ER-r1 F2 — is the receipt being read the LIVE store? True iff OPENROUTER_DISPATCH_RECEIPT_FILE is
+// unset or resolves to the default the dispatcher writes (the P6 seam guard's own doctrine): a receipt
+// redirected anywhere else is fixture ground, where a seam-made line is the sanctioned proof.
+function receiptIsDefaultStore() {
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const def = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const rf = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  return !rf || path.resolve(rf) === path.resolve(def);
+}
+
+// #3093 D3 — the evidence-basename Set of every non-drill OR-STRIKE-FORGIVE line for this task+executor seat.
+// A Set, deliberately: duplicated forgive lines for one evidence collapse (one key, one CONTINUE — the pairing
+// below still admits each POSTMORTEM only once), and a line whose key matches no POSTMORTEM, or names another
+// task/role, or is a drill row, simply never intersects the pairing and changes nothing. Keys are stored and
+// looked up as basenames (ER-r1 F1); a seam-made `source=events-file` line never forgives on the LIVE store
+// (ER-r1 F2 — on a redirected fixture receipt it is the smoke's own sanctioned proof, and stays honored).
+function forgivenEvidence(task, lines) {
+  const liveStore = receiptIsDefaultStore();
+  const set = new Set();
+  for (const line of lines) {
+    if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (liveStore && kv.source === 'events-file') continue;
+    if (kv.evidence) set.add(evBasename(kv.evidence));
+  }
+  return set;
+}
+
+// #3093 D3 — the companion POSTMORTEM pairing #3073 uses, copied verbatim from its executorStrikeFacts inner
+// loop (ER-r1 F3 stop rule) so the two implementations stay textually identical: for the invocation-opening
+// FALLBACK at lines[i] (its kv passed in), the nearest non-drill timeout POSTMORTEM of the same attempt before
+// the NEXT invocation opener — returns `{progress, evidence}` from that row, or null (no companion) — #3073 reads
+// .progress, #3093 reads .evidence, so one shared pairing serves both CONTINUE routes (merge #3073+#3093).
+function companionPostmortemEvidence(lines, i, task, kv) {
+  let pm = null;
+  for (let j = i + 1; j < lines.length; j++) {
+    // #3073 ER-r1 F3: STOP at the NEXT invocation-opening FALLBACK for this task (attempt=1 or
+    // legacy no-attempt; the emitter writes FALLBACK then POSTMORTEM back to back, so anything past
+    // the next invocation opener belongs to a LATER invocation). A POSTMORTEM row lost to an append
+    // failure must read as "no companion" (strike, fail closed), never borrow a later dispatch's
+    // progress=pushed (fail open by at most one). attempt=2+ FALLBACK rows are the same
+    // invocation's internal retry and do NOT stop the search (their POSTMORTEM pairs by attempt).
+    if (lines[j].startsWith('OR-DISPATCH-FALLBACK ')) {
+      const fkv = receiptKv(lines[j]);
+      if (fkv.role === 'executor' && fkv.task === task && fkv.drill !== '1'
+        && (!('attempt' in fkv) || fkv.attempt === '1')) break;
+      continue;
+    }
+    if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
+    const pkv = receiptKv(lines[j]);
+    if (pkv.role !== 'executor' || pkv.task !== task) continue;
+    if (pkv.drill === '1') continue;
+    if (pkv.reason !== 'timeout') continue;
+    if ((pkv.attempt || '1') !== (kv.attempt || '1')) continue;
+    pm = { progress: pkv.progress || null, evidence: pkv.evidence || null };
+    break;
+  }
+  return pm;
+}
+
+// #3060 D2 / #3073 D3+D3b / #3065 — executor strikes for a task: ONE strike per failed dispatcher INVOCATION. The
+// window is everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor task=T` row that RECORDS A PR — i.e.
+// whose `artifact=` field is PRESENT and does NOT start with `MISSING` (#3065: a hollow exit-0 close never resets;
+// a row with no `artifact=` field at all is MISSING-side, fail closed, the same doctrine as an absent `progress=`).
+// Within the window, forward: a non-drill `OR-DISPATCH-FALLBACK role=executor task=T` line counts
+// iff it opens an invocation (`attempt=1`, or no `attempt=` field at all -- legacy rows); `attempt=2`+ lines are the
+// same invocation's internal retry and add nothing (the emitter writes them only after that invocation's attempt=1
+// line). #3073 D3: a `reason=timeout` invocation is NOT a strike iff its companion non-drill
+// `OR-DISPATCH-POSTMORTEM role=executor task=T` row for the SAME invocation (same `attempt` value, `reason=timeout`,
+// the nearest such row AFTER the FALLBACK row in file order -- the emitter writes FALLBACK then POSTMORTEM back to
+// back) carries `progress=pushed`. Every other case is a strike: no companion row, companion with `progress=none` or
+// `progress=unmeasured`, a missing `progress=` field (every pre-#3073 row), or a FALLBACK reason other than timeout.
+// Fail closed, as the ticket requires. #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
+// classified CONTINUE; the 4th and every later timeout-with-pushed counts as a STRIKE (fail closed) so the existing
+// 2-strike route-to-Sonnet rule engages after at most 3 wasted legs.
+// MERGE #3073+#3093 (fix round 3): a timeout invocation is CONTINUE iff its companion POSTMORTEM carries
+// `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE line
+// (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP, one shared pairing helper.
+// #3065: an exit-0 close row (non-drill executor SMOKE, `attempt=1`-or-attempt-less — the same invocation unit R1
+// applies to FALLBACK rows, so an attempt=2 close's invocation was already classified at its attempt=1 FALLBACK) is
+// classified by (artifact, progress): PR recorded -> SUCCESS (the reset boundary above, nothing counted here);
+// MISSING-side + `progress=pushed` -> PARTIAL: real work, no PR — neutral up to the SHARED CONTINUE_CAP (one
+// `continues` counter consumed in receipt order by pushed timeouts and PARTIAL closes alike, so at most 3 paid
+// kept-going legs per window of EITHER kind; the 4th neutral candidate is a strike, fail closed); MISSING-side +
+// anything else (`none`, `unmeasured`, absent `progress=` -- every pre-#3065 row) -> HOLLOW: one strike, no reset.
+// #3065 — MISSING-side artifact predicate: absent field or MISSING* value. One definition for the
+// boundary scan (executorWindowStart) and the in-window SMOKE classification (executorStrikeFacts), so
+// they can never disagree.
+const execMissingSide = (kv) => !kv.artifact || kv.artifact.startsWith('MISSING');
+
+// #3190 — the task's CURRENT receipt window: everything AFTER the last non-drill `OR-SEAT-SMOKE role=executor
+// task=T` row that RECORDS a PR. The SAME boundary executorStrikeFacts scans from the END, extracted into ONE
+// shared definition so the strike counter and the needle-receipt admission below can never read different
+// windows. `lines` are the receipt tail split on '\n'; returns the first in-window line index (0 = whole file).
+function executorWindowStart(lines, task) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith('OR-SEAT-SMOKE ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (execMissingSide(kv)) continue; // #3065: only a RECORDED PR resets the window.
+    return i + 1;
+  }
+  return 0;
+}
+
+// #3190 — needle-receipt admission (#2888 deadlock): does the task's CURRENT window hold a non-drill
+// `OR-DISPATCH-REFUSED role=executor reason=NEEDLE-LINT task=T` row? With briefId (the 16-hex SHA-256
+// fingerprint of the brief file's bytes) the row must ALSO carry `brief=<briefId>` exactly — the admission
+// is bound to the exact refused bytes, so a later, different brief for the same task never matches; with
+// briefId === null the check is task-keyed alone (the `check` ROUTE-NEEDLE advisory — the brief binding was
+// enforced at spawn time by the route gate). A row can only exist for a brief the dispatcher's lint actually
+// FLAGGED (a clean brief writes no row) and only when the dispatch carried --task; drills never admit.
+function needleReceiptAdmits(task, briefId) {
+  if (!task || !/^[0-9A-Za-z._-]+$/.test(String(task))) return false;
+  const t = String(task);
+  const lines = readReceiptTail().split('\n');
+  const start = executorWindowStart(lines, t);
+  for (let i = start; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-REFUSED ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.reason !== 'NEEDLE-LINT' || kv.task !== t) continue;
+    if (kv.drill === '1') continue;
+    if (briefId === null || kv.brief === briefId) return true;
+  }
+  return false;
+}
+
+function executorStrikeFacts(task) {
+  const lines = readReceiptTail().split('\n');
+  const forgiven = forgivenEvidence(task, lines);
+  let start = executorWindowStart(lines, task);
+  let strikes = 0, continues = 0, hollow = 0, partial = 0;
+  for (let i = start; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) {
+      // #3065 — the exit-0 close row is its own strike evidence (no new FALLBACK line): a dispatcher
+      // that forgot the `progress=` stamp fails closed here (HOLLOW), and none can double-count.
+      if (lines[i].startsWith('OR-SEAT-SMOKE ')) {
+        const kv = receiptKv(lines[i]);
+        if (kv.role !== 'executor' || kv.task !== task) continue;
+        if (kv.drill === '1') continue;
+        if ('attempt' in kv && kv.attempt !== '1') continue;
+        if (!execMissingSide(kv)) continue; // a recorded PR inside the window: not the LAST boundary row's concern.
+        if (kv.progress === 'pushed') {
+          partial++;
+          if (continues < CONTINUE_CAP) { continues++; continue; }
+          strikes++;
+          continue;
+        }
+        strikes++; hollow++;
+      }
+      continue;
+    }
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if ('attempt' in kv && kv.attempt !== '1') continue;
+    if (kv.reason !== 'timeout') { strikes++; continue; }
+    // #3073 D3 + #3093 D3 (merge): the ONE shared pairing helper (with the #3073 ER-r1 F3 stop rule), so
+    // the counter and the forgive verb can never read a row differently. CONTINUE iff the companion
+    // carries `progress=pushed` (#3073 D3) OR its evidence basename carries a non-drill OR-STRIKE-FORGIVE
+    // line for this task (#3093 D3) — one shared `continues` counter under the same CONTINUE_CAP.
+    const pm = companionPostmortemEvidence(lines, i, task, kv);
+    const pushed = pm !== null && pm.progress === 'pushed';
+    const forgivenHit = pm !== null && pm.evidence !== null && forgiven.has(evBasename(pm.evidence));
+    if ((pushed || forgivenHit) && continues < CONTINUE_CAP) { continues++; continue; }
+    strikes++;
+  }
+  return { strikes, continues, cap: CONTINUE_CAP, hollow, partial };
+}
+
+function countExecutorStrikes(task) { return executorStrikeFacts(task).strikes; }
+
+
+// #3093 D1/D2 — repair-strike-progress: the ONE sanctioned repair for a PAST executor timeout invocation that
+// pushed real progress to origin/<task-branch> inside its own dispatch window. Append-only (a new
+// OR-STRIKE-FORGIVE receipt line — never a rewrite of an existing row, so no backup is needed: nothing is
+// destroyed and the AUDIT stderr line plus the self-describing row are the audit trail); idempotent by
+// task+evidence key ("nothing to repair", exit 0); P1-P6 fail closed (BLOCK + exit 3, nothing written, each
+// names the failing leg); --dry-run prints the exact line it would append and writes nothing. The proof legs
+// (D1): a GitHub PushEvent with a SERVER-stamped created_at inside the invocation's window W = [END_TS -
+// latency_s - SKEW, END_TS + SKEW] (both inputs dispatcher-written in the POSTMORTEM's evidence basename and
+// latency_s — the run cannot write its own receipt row), exactly one qualifying event, before != head, and
+// payload.head still reachable from refs/remotes/origin/<branch> after a bounded fetch, adding at least one
+// commit of its own that is not on master (before..head — never an earlier push's commits; a push_head that
+// IS a master commit is the no-work reset/creation shape and is refused, ER-r1 F3; a branch since merged to
+// master fails the same test deliberately — a merged task no longer dispatches, so its line is inert).
+function cmdRepairStrikeProgress(o) {
+  const session = o.session, task = o.task, role = o.role, branch = o.branch, evidence = o.evidence;
+  const cwd = (typeof o.cwd === 'string' && o.cwd) ? o.cwd : '.';
+  const dryRun = ('dry-run' in o);
+  if (!session || !task || !role || !branch || !evidence) {
+    console.error('repair-strike-progress: --session, --task, --role executor, --branch, --evidence are required');
+    process.exit(2);
+  }
+  if (role !== 'executor') {
+    console.error('repair-strike-progress: --role must be executor (the only seat whose strike counter reads OR-STRIKE-FORGIVE)');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, 'repair-strike-progress', 2);
+
+  // The receipt file resolves exactly as readReceiptTail does; the default is recomputed here so the P6 seam
+  // guard can compare the override against it WITHOUT ever running a seam against the live store.
+  const receiptFileEnv = process.env.OPENROUTER_DISPATCH_RECEIPT_FILE;
+  let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const defaultReceiptFile = path.join(selfDir, '..', '.ai-workspace', 'status', '1947-seat-mix-live-smoke.md');
+  const receiptFile = receiptFileEnv || defaultReceiptFile;
+
+  // ── P6 seam guard + seam arming — the ONLY block in this file where the events-file override is consulted
+  //    (AC-10 pins that by grep). The seam is armed ONLY when the receipt is redirected to a NON-default file
+  //    (D2 arming doctrine): a fixture seam must never touch (or prove anything about) the live store. ──
+  let seamEventsFile = null;
+  {
+    const ef = process.env.THREE_ROLE_GH_EVENTS_FILE;
+    if (ef && !(receiptFileEnv && path.resolve(receiptFileEnv) !== path.resolve(defaultReceiptFile))) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P6): the events-file seam is set while the ' +
+        'receipt resolves to its DEFAULT location — a fixture seam must never touch the live store ' +
+        '(#3093 D2 arming doctrine). Nothing written.');
+      process.exit(3);
+    }
+    if (ef) seamEventsFile = ef;
+  }
+
+  let raw;
+  try { raw = fs.readFileSync(receiptFile, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): the receipt file is unreadable — no ' +
+      'POSTMORTEM for evidence ' + sanitize(evidence) + ' can be read. Nothing written.');
+    process.exit(3);
+  }
+  const lines = raw.split('\n');
+
+  // P5 — idempotent by the task+evidence key (the basename, ER-r1 F1): a forgive line this verb (or an
+  // equivalent operator append) already wrote means there is nothing left to repair. But ONLY a line the
+  // counter would itself honor counts as done — a drill=1 line (ignored everywhere) and, on the LIVE store,
+  // a seam-made `source=events-file` line (ER-r1 F2/F6) never do, or the verb would dead-end behind a line
+  // that forgives nothing. Prints nothing new, exits 0.
+  const liveStore = receiptIsDefaultStore();
+  for (const line of lines) {
+    if (!line.startsWith('OR-STRIKE-FORGIVE ')) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== 'executor' || kv.task !== task) continue;
+    if (kv.drill === '1') continue;
+    if (liveStore && kv.source === 'events-file') continue;
+    if (evBasename(kv.evidence) === evidence) {
+      console.log('OK repair-strike-progress: nothing to repair');
+      process.exit(0);
+    }
+  }
+
+  // P1 — the named evidence must be a non-drill timeout POSTMORTEM of this task, opened by a timeout
+  // invocation FALLBACK (attempt=1 or legacy no-attempt). The pairing is the counter's own
+  // companionPostmortemEvidence (#3073 ER-r1 F3 stop rule), so the verb can never forgive a row the
+  // counter would read differently. Parse failures block: an evidence basename that does not parse as
+  // <task>-executor-<END_TS>-a1, or a missing/unparseable latency_s, yields NO window (never a NaN window
+  // that silently matches nothing) — plan-review r1 F5.
+  let fbIdx = -1, fbKv = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith('OR-DISPATCH-FALLBACK ')) continue;
+    const kv = receiptKv(lines[i]);
+    if (kv.role !== 'executor' || kv.task !== task || kv.drill === '1') continue;
+    if ('attempt' in kv && kv.attempt !== '1') continue;
+    if (kv.reason !== 'timeout') continue;
+    const ev = companionPostmortemEvidence(lines, i, task, kv);
+    if (ev !== null && evBasename(ev.evidence) === evidence) { fbIdx = i; fbKv = kv; break; }
+  }
+  let pmKv = null;
+  if (fbIdx >= 0) {
+    for (let j = fbIdx + 1; j < lines.length; j++) {
+      if (!lines[j].startsWith('OR-DISPATCH-POSTMORTEM ')) continue;
+      const pkv = receiptKv(lines[j]);
+      if (pkv.role !== 'executor' || pkv.task !== task || pkv.drill === '1' || pkv.reason !== 'timeout') continue;
+      if ((pkv.attempt || '1') !== (fbKv.attempt || '1')) continue;
+      if (evBasename(pkv.evidence) === evidence) { pmKv = pkv; break; }
+    }
+  }
+  if (fbIdx < 0 || !pmKv) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): no non-drill timeout POSTMORTEM with ' +
+      'evidence=' + sanitize(evidence) + ' opened by a timeout attempt=1 executor FALLBACK for task ' +
+      sanitize(task) + ' in the receipt. Nothing written.');
+    process.exit(3);
+  }
+  const evPrefix = String(task) + '-executor-';
+  const evTail = String(evidence).startsWith(evPrefix) ? String(evidence).slice(evPrefix.length) : '';
+  const evM = evTail.match(/^([0-9]{9,12})-a1$/);
+  const latencyS = parseInt(pmKv.latency_s, 10);
+  if (!evM || !Number.isFinite(latencyS) || latencyS <= 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P1): the invocation cannot yield a window — ' +
+      'evidence must parse as <task>-executor-<END_TS>-a1 and the POSTMORTEM must carry a positive latency_s ' +
+      '(parse failure blocks, never a NaN window). Nothing written.');
+    process.exit(3);
+  }
+  const endTs = parseInt(evM[1], 10);
+  const wStart = endTs - latencyS - STRIKE_FORGIVE_SKEW_S, wEnd = endTs + STRIKE_FORGIVE_SKEW_S;
+
+  // P2 — the branch is named explicitly and is task-scoped (#2462); when the POSTMORTEM carries a cwd= (the
+  // dispatcher's own record of the run's worktree), the branch must be that worktree's basename — a sibling
+  // lane of the same task is not this run's progress (plan-review r1 F3, cheap cross-check).
+  if (!/^[0-9A-Za-z._-]+$/.test(String(branch)) || !String(branch).startsWith(String(task) + '-')) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P2): --branch \'' + sanitize(branch) +
+      '\' must start with \'' + sanitize(task) + '-\' (#2462 task-scoped branch naming). Nothing written.');
+    process.exit(3);
+  }
+  if (pmKv.cwd && path.basename(String(pmKv.cwd)) !== String(branch)) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P2): --branch does not match the POSTMORTEM\'s ' +
+      'own worktree (cwd= basename) — the pushed branch is not this run\'s lane. Nothing written.');
+    process.exit(3);
+  }
+
+  // P3 — exactly one PushEvent for refs/heads/<branch> with a SERVER-stamped created_at inside W (the
+  // forger-resistant leg: a commit's committer date is backdatable, a PushEvent is not). Seam mode reads the
+  // fixture; live mode pages `gh api` NEWEST-FIRST with an early stop once a page's oldest event predates
+  // W.start (plan-review r1 F2 — one page silently defeats the verb once the event scrolls off), bounded at
+  // 4 pages of 100 (the feed itself caps at 300 events / 90 days; the page-4 HTTP 422 that cap answers is
+  // end-of-feed, not an error — ER-r1 F5).
+  let events = null, pagesRead = 0;
+  if (seamEventsFile) {
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(seamEventsFile, 'utf8')); } catch (e) { parsed = null; }
+    if (!Array.isArray(parsed)) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): the events seam file is unreadable or ' +
+        'not a JSON array — no proof can be read (fail closed). Nothing written.');
+      process.exit(3);
+    }
+    events = parsed; pagesRead = 1;
+  } else {
+    const gr = spawnSync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 30000 });
+    const rm = gr.status === 0 ? String(gr.stdout).match(/[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/) : null;
+    if (!rm) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): no origin remote URL parses as ' +
+        '<owner>/<repo> in --cwd — the events feed cannot be named (fail closed, R4). Nothing written.');
+      process.exit(3);
+    }
+    events = [];
+    let ghErr = null;
+    try {
+      for (let page = 1; page <= 4; page++) {
+        const out = spawnSync('gh', ['api', 'repos/' + rm[1] + '/' + rm[2] + '/events?per_page=100&page=' + page],
+          { encoding: 'utf8', timeout: 30000 });
+        if (out.status !== 0) {
+          // #3093 ER-r1 F5: GitHub caps the events feed at 300 events, so page 4 answers HTTP 422 — that is
+          // the END OF THE FEED, not an error: stop paging and judge the events already read (a hit found on
+          // pages 1-3 stands; zero hits still fails closed at the hit check below). Any other failure stays
+          // a hard ghErr.
+          const et = String(out.stderr || out.error || '');
+          if (events.length > 0 && /HTTP 422|pagination is limited/.test(et)) break;
+          ghErr = new Error(et || 'gh api failed'); break;
+        }
+        let arr; try { arr = JSON.parse(out.stdout); } catch (e) { arr = null; }
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        pagesRead = page;
+        events = events.concat(arr);
+        const oldestAt = arr[arr.length - 1].created_at ? Math.floor(Date.parse(arr[arr.length - 1].created_at) / 1000) : null;
+        if (oldestAt !== null && Number.isFinite(oldestAt) && oldestAt < wStart) break;
+      }
+    } catch (e) { ghErr = e; }
+    if (ghErr) {
+      console.error('BLOCK (3role-ledger repair-strike-progress P3): gh api events failed (' +
+        (ghErr.message || 'error') + ') — a network/auth failure is NOT zero events, but both fail closed (R4). ' +
+        'Nothing written.');
+      process.exit(3);
+    }
+  }
+  const refWant = 'refs/heads/' + branch;
+  const hits = [];
+  for (const e of events) {
+    if (!e || e.type !== 'PushEvent' || !e.payload) continue;
+    if (e.payload.ref !== refWant) continue;
+    const at = e.created_at ? Math.floor(Date.parse(e.created_at) / 1000) : NaN;
+    if (!Number.isFinite(at)) continue;
+    if (at < wStart || at > wEnd) continue;
+    hits.push(e);
+  }
+  if (hits.length === 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): no PushEvent for branch ' + sanitize(branch) +
+      ' inside the dispatch window [' + wStart + ',' + wEnd + '] — no proof (events age out of the capped ' +
+      'feed, R1; run the verb promptly). Nothing written.');
+    process.exit(3);
+  }
+  if (hits.length > 1) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): ' + hits.length + ' PushEvents for branch ' +
+      sanitize(branch) + ' inside the dispatch window — ambiguous feed, and the verb forgives ONE row per ' +
+      'invocation (D1 leg 5). Nothing written.');
+    process.exit(3);
+  }
+  const push = hits[0].payload;
+  if (!push.before || !push.head || push.before === push.head) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P3): the PushEvent carries before == head (a ' +
+      'no-op push is not progress). Nothing written.');
+    process.exit(3);
+  }
+
+  // P4 — after a bounded fetch, payload.head must be reachable from refs/remotes/origin/<branch> (a rebase or
+  // force-push later orphans it — the row stays a strike, by design), and the push must carry WORK OF ITS OWN
+  // (ER-r1 F3): a push_head that is itself a master commit (merge-base of head and origin/master == head) is
+  // the reset-to-master / created-at-master no-work shape, and before..head must add at least one commit that
+  // is not on origin/master — THIS push's commits, never an earlier push's. A branch since merged to master
+  // fails the same test deliberately: a merged task no longer dispatches, so its forgive line is inert and
+  // refusing is fail-closed, not a dead end.
+  const fetchR = spawnSync('git', ['-C', cwd, 'fetch', 'origin', String(branch)], { encoding: 'utf8', timeout: 60000 });
+  if (fetchR.status !== 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): git fetch origin ' + sanitize(branch) +
+      ' failed in --cwd (or timed out) — reachability cannot be proven. Nothing written.');
+    process.exit(3);
+  }
+  const ancR = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', String(push.head),
+    'refs/remotes/origin/' + branch], { encoding: 'utf8', timeout: 30000 });
+  if (ancR.status !== 0) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): push_head is not reachable from ' +
+      'refs/remotes/origin/' + sanitize(branch) + ' after fetch (rebased/force-pushed/deleted branch) — the ' +
+      'row stays a strike. Nothing written.');
+    process.exit(3);
+  }
+  const mbR = spawnSync('git', ['-C', cwd, 'merge-base', String(push.head),
+    'refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
+  if (mbR.status === 0 && String(mbR.stdout).trim() === String(push.head).trim()) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): push_head ' + sanitize(push.head) +
+      ' is itself on origin/master (branch reset to, or created at, a master commit) — the push added no ' +
+      'work of its own. Nothing written.');
+    process.exit(3);
+  }
+  const rlR = spawnSync('git', ['-C', cwd, 'rev-list', '--count',
+    String(push.before) + '..' + String(push.head), '^refs/remotes/origin/master'], { encoding: 'utf8', timeout: 30000 });
+  const added = rlR.status === 0 ? parseInt(rlR.stdout, 10) : NaN;
+  if (!Number.isFinite(added) || added < 1) {
+    console.error('BLOCK (3role-ledger repair-strike-progress P4): before..head adds no commit that is not on ' +
+      'origin/master (rev-list empty or unresolvable) — the push is not task progress. Nothing written.');
+    process.exit(3);
+  }
+
+  const pushAt = hits[0].created_at;
+  const src = seamEventsFile ? 'events-file' : 'github-events';
+  const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const outLine = 'OR-STRIKE-FORGIVE role=executor task=' + sanitize(task) + ' attempt=' + (fbKv.attempt || '1') +
+    ' evidence=' + sanitize(evidence) + ' branch=' + sanitize(branch) + ' push_at=' + pushAt +
+    ' push_head=' + sanitize(push.head) + ' push_before=' + sanitize(push.before) +
+    ' source=' + src + ' session=' + sanitize(session) + ' repaired_at=' + nowIso;
+  console.error('AUDIT: repair-strike-progress — session=' + sanitize(session) + ' task=' + sanitize(task) +
+    ' evidence=' + sanitize(evidence) + ' branch=' + sanitize(branch) + ' push_at=' + pushAt +
+    ' push_head=' + sanitize(push.head) + ' push_before=' + sanitize(push.before) +
+    ' source=' + src + ' window=[' + wStart + ',' + wEnd + '] pages=' + pagesRead +
+    (dryRun ? ' dry-run' : ''));
+  if (dryRun) {
+    console.log('DRY-RUN OK repair-strike-progress: would append:');
+    console.log(outLine);
+    process.exit(0);
+  }
+  fs.appendFileSync(receiptFile, (raw.length && !raw.endsWith('\n') ? '\n' : '') + outLine + '\n');
+  console.log('OK repair-strike-progress: appended OR-STRIKE-FORGIVE for task ' + sanitize(task) +
+    ' evidence ' + sanitize(evidence) + ' (source=' + src + ')');
+  process.exit(0);
+}
+
+// zai-strikes --task T --role plan-review --round N : prints the integer. Per task+role+ROUND (D6): the count of
+// consecutive OR-DISPATCH-FALLBACK lines carrying that round= after the last non-drill OR-SEAT-SMOKE with a real
+// verdict in the SAME round. Scans from the END so the scan stops at the reset; lines without round= (legacy),
+// drill=1 lines and retry=attempted sub-attempt lines never count.
+// #3060: `--role executor --task T` (NO --round; executor dispatches are not round-keyed) prints the per-task,
+// per-invocation executor strike count (countExecutorStrikes above); `--round` with the executor role exits 2.
+function cmdZaiStrikes(opts) {
+  const task = opts.task, role = opts.role, round = opts.round;
+  if (typeof task !== 'string' || !/^[0-9A-Za-z._-]+$/.test(task)) { console.error('zai-strikes: --task <id> is required'); process.exit(2); }
+  if (role === 'executor') {
+    if ('round' in opts) { console.error('zai-strikes: --round is not an executor key (executor strikes are per task, per invocation)'); process.exit(2); }
+    const f3073 = executorStrikeFacts(task);
+    // #3073 D3: `--json` prints the CONTINUE side too (strikes/continues/cap) so the orchestrator can see a
+    // CONTINUE happened without re-reading receipts; the plain integer output and exit code are unchanged.
+    // #3065: `hollow` (HOLLOW close rows in the window) and `partial` (PARTIAL closes, neutral or struck)
+    // appended additively — the orchestrator reads them before each size-L dispatch.
+    if ('json' in opts) console.log('{"strikes":' + f3073.strikes + ',"continues":' + f3073.continues + ',"cap":' + f3073.cap + ',"hollow":' + f3073.hollow + ',"partial":' + f3073.partial + '}');
+    else console.log(String(f3073.strikes));
+    process.exit(0);
+  }
+  if (role !== 'plan-review') { console.error('zai-strikes: --role must be plan-review or executor (the only seats with a strike rule)'); process.exit(2); }
+  if (typeof round !== 'string' || !/^[0-9]{1,6}$/.test(round)) { console.error('zai-strikes: --round <n> is required (digits only)'); process.exit(2); }
+  const text = readReceiptTail();
+  const lines = text.split('\n');
+  let n = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const isFb = line.startsWith('OR-DISPATCH-FALLBACK ');
+    const isSm = line.startsWith('OR-SEAT-SMOKE ');
+    if (!isFb && !isSm) continue;
+    const kv = receiptKv(line);
+    if (kv.role !== role || kv.task !== task || kv.round !== round) continue;
+    if (kv.drill === '1') continue;
+    if (isSm) { if (kv.verdict && kv.verdict !== 'MISSING') break; continue; }
+    if ('retry' in kv && kv.retry === 'attempted') continue;
+    n++;
+  }
+  console.log(String(n));
+  process.exit(0);
+}
+
+// resolve-route --seat <domain.seat> [--json] [--plan <path> [--task <id>]] [--brief <path>]
+// (#2985: --plan adds plan-derived fields; #3190: --brief fingerprints the dispatcher-refused brief and, when
+// the task's current window holds a matching NEEDLE-LINT receipt row, adds the first-class needle-receipt route.)
+function cmdResolveRoute(opts) {
+  const seatKey = opts.seat;
+  if (!seatKey) { console.log('BLOCK: resolve-route requires --seat <domain.seat>'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const result = resolveRoute(loaded.routes, seatKey);
+  if (!result.ok) { process.stderr.write(result.reason + '\n'); process.exit(2); }
+  // #2985 D3/L8: --plan is VALIDATED, never silently ignored -- anything that is not an existing regular file
+  // under .ai-workspace/plans/ is unresolvable (exit 2).
+  // #3190 — --brief <path>: the dispatcher-refused brief whose needle-lint receipt row (if any) admits the
+  // first-class agent-tool route for THIS task. VALIDATED, never silently ignored (the #2985 --plan
+  // doctrine): anything that is not an existing regular file, or is over the 1 MiB input bound, is
+  // BRIEF-UNRESOLVABLE (exit 2) — never a pass. Validated BEFORE --plan so a bad brief is never masked by a
+  // plan refusal. The admission itself is executor-only and needs --task (a receipt bound to no task, or a
+  // brief read with no task in scope, admits nothing); a --brief on any other seat is inert metadata.
+  let needleAdmit = false;
+  if ('brief' in opts) {
+    const bArg = opts.brief;
+    let bst = null;
+    if (typeof bArg === 'string' && bArg) { try { bst = fs.statSync(bArg); } catch (e) { bst = null; } }
+    if (!bst || !bst.isFile()) {
+      console.log('BRIEF-UNRESOLVABLE: --brief ' + (typeof bArg === 'string' ? bArg : '<none>') + ' is not an existing regular file');
+      process.exit(2);
+    }
+    if (bst.size > PLAN_MAX_BYTES) {
+      console.log('BRIEF-UNRESOLVABLE: --brief ' + bArg + ' is larger than ' + PLAN_MAX_BYTES + ' bytes');
+      process.exit(2);
+    }
+    if (seatKey === 'executor' && typeof opts.task === 'string' && opts.task) {
+      let bBytes = null;
+      try { bBytes = fs.readFileSync(bArg); } catch (e) { bBytes = null; }
+      if (bBytes !== null) {
+        needleAdmit = needleReceiptAdmits(opts.task, crypto.createHash('sha256').update(bBytes).digest('hex').slice(0, 16));
+      }
+    }
+  }
+  let planFacts = null;
+  if ('plan' in opts) {
+    planFacts = resolvePlanFacts(opts.plan, opts.task);
+    if (planFacts.unresolvable) {
+      console.log('SIZE-PLAN-UNRESOLVABLE: --plan ' + (typeof opts.plan === 'string' ? opts.plan : '<none>') + ' is unresolvable (' + planFacts.why + ')');
+      process.exit(2);
+    }
+  }
+  if (result.acceptance) {
+    // #1880 intent 5 -- a route allowed only because of an acceptance must be observably different from one
+    // that clears normally. Emitted on stderr at exit 0 (breaks no existing consumer -- stdout is unchanged
+    // and the probe/CLI callers that discard stderr on success are unaffected).
+    const a = result.acceptance;
+    process.stderr.write(ROUTE_ACCEPTED_RISK_TOKEN + ': seat ' + seatKey + ' provider ' + a.provider +
+      ' posture-at-decision ' + a.posture_at_decision + ' decided ' + a.decided + ' authority ' + a.authority + '\n');
+  }
+  if ('json' in opts) {
+    const payload = Object.assign({ seat: seatKey }, result.seat);
+    if (result.acceptance) payload.accepted_disclosure_applied = result.acceptance;
+    if (planFacts) {
+      Object.assign(payload, { size: planFacts.size, size_source: planFacts.size_source, data_class: planFacts.data_class },
+        effectiveRouteFor(seatKey, result.seat, planFacts, needleAdmit));
+    }
+    console.log(JSON.stringify(payload));
+  } else {
+    console.log(seatKey + ' -> ' + result.seat.provider + ' / ' + (result.seat.model || ''));
+    if (planFacts) {
+      const eff = effectiveRouteFor(seatKey, result.seat, planFacts, needleAdmit);
+      console.log('size=' + (planFacts.size || '-') + ' size_source=' + planFacts.size_source + ' data_class=' + planFacts.data_class + ' effective_dispatch=' + eff.effective_dispatch);
+    }
+  }
+  process.exit(0);
+}
+
+// identify-model --id <model-id> [--json]
+function cmdIdentifyModel(opts) {
+  const modelId = opts.id;
+  if (!modelId) { console.log('BLOCK: identify-model requires --id <model-id>'); process.exit(2); }
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const result = identifyModel(loaded.routes, modelId);
+  if (!result.ok) {
+    process.stderr.write('ROUTE-MODEL-UNDECLARED: "' + modelId + '" is not in any provider\'s declared vocabulary\n');
+    process.exit(2);
+  }
+  if ('json' in opts) {
+    console.log(JSON.stringify({ id: modelId, provider: result.provider, tierEquivalent: result.tierEquivalent }));
+  } else {
+    console.log(result.provider + ' ' + result.tierEquivalent);
+  }
+  process.exit(0);
+}
+
+// lint-routes — credential-hygiene lint over the resolved routes file (AC0.6). Exit 0 clean; exit 2 + the
+// offending key(s) on stderr otherwise.
+function cmdLintRoutes(opts) {
+  void opts;
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) { process.stderr.write(loaded.error + '\n'); process.exit(2); }
+  const problems = lintRoutesConfig(loaded.routes);
+  if (problems.length) {
+    for (const p of problems) { if (p.startsWith('SIZE-MODEL-')) console.log(p); else process.stderr.write(p + '\n'); }
+    process.exit(2);
+  }
+  console.log('OK: routes lint clean (' + loaded.configPath + ')');
+  process.exit(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #1918 — Operator Seat-Pin Overlay: set-seat-pin / clear-seat-pin / list-seat-pins. A machine-local, never-
+// tracked, sparse pin (~/.config/cc-seat-pins.json, mirroring #2105's cc-mode.json precedent — resolveModePinPath
+// above already cites this ticket's measured-location argument) that lets a permanent seat change (TIER for an
+// ordinary Anthropic role, or SLUG for a subprocess-dispatched OpenRouter seat) apply at the very next
+// spawn/dispatch — no PR, no plugin-sync, no restart — while the committed SSOT (config/cc-routes.json,
+// config/cc-roles.env) stays the only canonical record.
+//
+// D2 (three independent resolution points, ONE contract): seat resolution is NOT behind one shared chokepoint
+// in this file — `cmdResolveRoleModel` (spawn decision + spawn-time gate), `resolveExpectedSide`/
+// `roleModelFromCfg`'s completion-gate call sites, and `resolveRoute`/`checkSubprocessProvenance` (subprocess
+// dispatch + its provenance check) are three separate code paths that never call each other. Every one of them
+// consults the SAME functions below (`resolveTierPin` / `resolveSlugPin`, and since #3218 `resolveRoutePin`
+// for the cross-provider route kind) so honor / refuse / fail-safe /
+// seam-blind behavior cannot diverge across paths (plan-review B1's fix; #1918 plan D2/AC3-AC7). Per execution-
+// review hand-off n2, the SLUG pin is wired at `checkSubprocessProvenance`'s OWN served-model comparison (the
+// path the OBSERVED-model check actually bites for a subprocess seat), never at `resolveExpectedSide`'s
+// tier_equivalent (which a subprocess seat's completion-gate leg never uses for its comparison — the file's own
+// #1947 AC-2/M3 comment already explains why: `resolveExpectedSide`/`resolve-role-model` deliberately read the
+// seat's `agent_tool_fallback` tier for these two seats, never the OpenRouter vocabulary's tier_equivalent).
+//
+// Fail-safe direction (D4, mirrors #2105's D1): EVERY failure shape (absent/unreadable/unparseable pin file,
+// a per-role entry with the wrong shape, an off-vocabulary tier or slug value) resolves UNPINNED — exactly
+// today's behavior for that role/key, never a garbage/partial value, never a silent fail-open to a value the
+// SSOT never declared. A pin can only ever SELECT among values the SSOT already declares (ROLE_MODELS for a
+// tier; any provider's model_vocabulary, same-provider-as-the-seat, for a slug) — it can never invent one.
+//
+// Seam hermeticity (D3b): `seatPinBlind()` makes BOTH `CC_ROLES_ENV` and `CC_ROUTES_JSON` (the two existing
+// AUTHORITATIVE+TERMINAL test seams) pin-blind — a live pin on the machine running a hermetic smoke/fixture can
+// never pollute it. #2401 ordering (execution-review hand-off n4): every pin-consulting call site below sits
+// AFTER cmdResolveRoleModel's own #2401 sparse-omission guard (:3947-3957, which runs unconditionally before
+// Step 1) and AFTER the clean-SSOT resolve it overlays — a pin can never mask a config/ sparse-omission, because
+// the pin logic is never reached until the SSOT has already resolved cleanly.
+//
+// Fixture seam for the pin's OWN storage location (mirrors CC_MODE_FILE): CC_SEAT_PINS_FILE. The real
+// ~/.config/cc-seat-pins.json is NEVER read or written by any smoke arm.
+
+// Resolve the seat-pin file's path. Outside every repo (same #1918 measured-location argument
+// resolveModePinPath already cites) — no git verb can ever see it, so AC8 (lockstep untouched) holds by
+// construction, not by discipline.
+function resolveSeatPinPath() {
+  if ('CC_SEAT_PINS_FILE' in process.env) return process.env.CC_SEAT_PINS_FILE;
+  return path.join(HOME, '.config', 'cc-seat-pins.json');
+}
+
+// Load + shape-validate the WHOLE pin file ONCE per process (memoized — the completion-gate leg queries this
+// once per REQUIRED_ROLE, and re-reading/re-stat'ing the same file 4x per invocation is pointless). Never
+// throws. { ok, pins, error, path, absent }:
+//   ok:true,  absent:true   -> no pin file (the normal, common steady state) -> {} pins, no error.
+//   ok:true,  absent:false  -> valid JSON object -> pins is that object (per-role/per-key values are validated
+//                              lazily by resolveTierPin/resolveSlugPin, which is where the DECLARED VOCABULARY
+//                              needed to validate a value actually lives).
+//   ok:false                -> malformed: unreadable for a non-ENOENT reason, unparseable JSON, or the parsed
+//                              value is not a plain object. `error` names the pin file. Every caller must treat
+//                              this exactly like "no valid pin for any role" (fail SAFE, never partial).
+let __seatPinsFileCache = null;
+function loadSeatPinsFile() {
+  if (__seatPinsFileCache) return __seatPinsFileCache;
+  const p = resolveSeatPinPath();
+  let result;
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') { result = { ok: true, pins: {}, error: '', path: p, absent: true }; }
+    else { result = { ok: false, pins: {}, error: 'SEAT-PIN-READ-ERROR: ' + p + ': ' + (e && e.message ? e.message : e) +
+      ' -- resolving UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false }; }
+  }
+  if (!result) {
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      result = { ok: false, pins: {}, error: 'SEAT-PIN-PARSE-ERROR: ' + p + ': ' + (e && e.message ? e.message : e) +
+        ' -- pin file is malformed, resolving UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false };
+    }
+    if (!result) {
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        result = { ok: false, pins: {}, error: 'SEAT-PIN-SHAPE-ERROR: ' + p + ' is not a JSON object -- resolving ' +
+          'UNPINNED for every role (fail-safe, #1918 D4)', path: p, absent: false };
+      } else {
+        result = { ok: true, pins: parsed, error: '', path: p, absent: false };
+      }
+    }
+  }
+  __seatPinsFileCache = result;
+  return result;
+}
+
+// Is pin resolution reachable AT ALL right now? False under either existing terminal test seam (D3b) — a live
+// pin on the machine must never pollute a hermetic CC_ROLES_ENV/CC_ROUTES_JSON-scoped smoke or fixture run.
+function seatPinBlind() {
+  return ('CC_ROLES_ENV' in process.env) || ('CC_ROUTES_JSON' in process.env);
+}
+
+// Print the WHOLE-FILE-level pin diagnostic (malformed/unreadable/wrong-shape) ONCE per process, only when pin
+// resolution is reachable (not seam-blind) and the file genuinely has a problem (never for the normal
+// absent/ENOENT case). Per-role/per-key off-vocabulary refusals are a SEPARATE, per-call-site diagnostic
+// (resolveTierPin/resolveSlugPin's own `refusalNote`) — this only covers "the whole file could not be read".
+let __seatPinFileProblemAnnounced = false;
+function announceSeatPinFileProblem() {
+  if (__seatPinFileProblemAnnounced) return;
+  if (seatPinBlind()) return;
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) {
+    process.stderr.write(loaded.error + '\n');
+    __seatPinFileProblemAnnounced = true;
+  }
+}
+
+// TIER pin: resolve role's tier override against the declared tier vocabulary (ROLE_MODELS — the SAME
+// vocabulary roleModelFromCfg's own fail-safe already uses, D4). Returns:
+//   { pinned:false }                                    -- no eligible pin (seam-blind, file absent/broken, no
+//                                                           entry for this role, entry has no `tier` field).
+//   { pinned:true, tier, reason, set_at }                -- a VALID pin -- caller overlays it.
+//   { pinned:false, refused:'<value>', refusalNote }     -- an entry exists but is off-vocabulary -- caller
+//                                                           MUST resolve UNPINNED; refusalNote is stderr text.
+function resolveTierPin(role) {
+  if (seatPinBlind()) return { pinned: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false };
+  const roleEntry = loaded.pins[role];
+  const field = (roleEntry && typeof roleEntry === 'object' && !Array.isArray(roleEntry)) ? roleEntry.tier : null;
+  if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) return { pinned: false };
+  const tier = String(field.value);
+  if (!ROLE_MODELS.includes(tier)) {
+    return { pinned: false, refused: tier, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.tier "' + tier + '" is not a declared tier (' + ROLE_MODELS.join('|') + ') -- resolving UNPINNED ' +
+      '(fail-safe, #1918 D4)' };
+  }
+  return { pinned: true, tier, reason: field.reason ? String(field.reason) : '', set_at: field.set_at ? String(field.set_at) : '' };
+}
+
+// SLUG pin (a subprocess seat's OpenRouter model id): validated against the declared vocabulary of the SAME
+// provider the seat is already declared on (identifyModel — the same check resolve-route/identify-model already
+// use for an ordinary seat model, D4; same-provider is a deliberate extra safety net beyond the plan's literal
+// text — a slug pin that resolves to a DIFFERENT provider's vocabulary would silently send that provider's
+// model id to the wrong endpoint). `routes` must already be a loaded, valid SSOT object (never a 2nd load here
+// — a caller under CC_ROUTES_JSON validates against that fixture's OWN vocabulary; seatPinBlind() already
+// refuses before this is reached in that case, so this codepath only ever sees the real file).
+function resolveSlugPin(role, routes, seatRow) {
+  if (seatPinBlind()) return { pinned: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false };
+  const roleEntry = loaded.pins[role];
+  const field = (roleEntry && typeof roleEntry === 'object' && !Array.isArray(roleEntry)) ? roleEntry.slug : null;
+  if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) return { pinned: false };
+  const slug = String(field.value);
+  const ident = identifyModel(routes, slug);
+  const seatProvider = seatRow && seatRow.provider;
+  if (!ident.ok || (seatProvider && ident.provider !== seatProvider)) {
+    return { pinned: false, refused: slug, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.slug "' + slug + '" is not a declared model for provider "' + (seatProvider || '<unknown>') + '" (' +
+      (ident.ok ? 'it is declared under provider ' + ident.provider + ' instead' : 'not in any declared provider model_vocabulary') +
+      ') -- resolving UNPINNED (fail-safe, #1918 D4)' };
+  }
+  return { pinned: true, slug, provider: ident.provider, tierEquivalent: ident.tierEquivalent,
+    reason: field.reason ? String(field.reason) : '', set_at: field.set_at ? String(field.set_at) : '' };
+}
+
+// #3218 — ROUTE pin: the cross-provider seat move. Value grammar "<provider>/<model>", split at the FIRST
+// '/' (D2 amendment F4): provider = the text before the first '/', model = the WHOLE remainder (so
+// `openrouter/z-ai/glm-5.2` is provider `openrouter`, model `z-ai/glm-5.2`; a value with no '/' — or an
+// empty side — is malformed). Valid only when (a) the provider is declared in the SSOT, (b) the model is
+// in that provider's model_vocabulary, (c) the SSOT already declares the dispatch route somewhere (some
+// seat declares `dispatch: subprocess-<provider>` for a non-anthropic provider; the Agent-tool route — a
+// seat with no `dispatch` field — exists for anthropic), and (d) the role is in the closed route-pinnable
+// list planner|plan-review|executor|research|ship-tail (execution-review excluded by the operator's 2026-10-17
+// "keep Opus final review" decision). The SAME validator runs at SET time (cmdSetSeatPin, loud BLOCK
+// naming the failing rule) and at RESOLVE time (resolveRoutePin, SEAT-PIN-REFUSED + resolve UNPINNED) —
+// one grammar, never two copies. #3249 (operator 2026-10-17): ship-tail joins the closed route-pinnable
+// list — the 5th operational seat, moved by the same operator cost lever (merges stop spending Claude
+// usage; still never a REQUIRED_ROLE). The list stays CLOSED: the next seat needs its own operator sign-off.
+const ROUTE_PIN_ROLES = ['planner', 'plan-review', 'executor', 'research', 'ship-tail'];
+function validateRoutePinValue(routes, role, value) {
+  const refuse = (rule, note) => ({ ok: false, rule, note });
+  if (!ROUTE_PIN_ROLES.includes(role)) {
+    return refuse('role', 'role "' + role + '" is not route-pinnable (closed list ' + ROUTE_PIN_ROLES.join('|') +
+      '; execution-review is excluded by the operator\'s 2026-10-17 "keep Opus final review" decision; ship-tail was added by the operator\'s 2026-10-17 #3249 cost choice)');
+  }
+  if (typeof value !== 'string') {
+    return refuse('malformed', 'route value is not a string');
+  }
+  const slash = value.indexOf('/');
+  if (slash < 1 || slash === value.length - 1) {
+    return refuse('malformed', '"' + value + '" is not a <provider>/<model> value (split at the FIRST "/"; no "/" — or an empty side — is malformed)');
+  }
+  const provider = value.slice(0, slash);
+  const model = value.slice(slash + 1);
+  const providers = (routes && routes.providers) || {};
+  if (!Object.prototype.hasOwnProperty.call(providers, provider)) {
+    return refuse('provider', 'provider "' + provider + '" is not declared in the routes SSOT');
+  }
+  const vocab = (providers[provider] || {}).model_vocabulary;
+  if (!vocab || typeof vocab !== 'object' || Array.isArray(vocab) || !Object.prototype.hasOwnProperty.call(vocab, model)) {
+    return refuse('vocabulary', '"' + model + '" is not in provider "' + provider + '"\'s declared model_vocabulary');
+  }
+  const seats = (routes && routes.seats) || {};
+  if (provider === 'anthropic') {
+    // rule (c), anthropic arm: the Agent-tool route (a seat with no dispatch field) must exist in the SSOT.
+    const agentToolRouteExists = Object.values(seats).some((s) => s && typeof s === 'object' && !s.dispatch);
+    if (!agentToolRouteExists) {
+      return refuse('declared-route', 'no seat declares the Agent-tool route (a seat with no dispatch field) for provider "anthropic"');
+    }
+  } else {
+    // rule (c), subprocess arm: some seat must already declare dispatch=subprocess-<provider>.
+    const marker = 'subprocess-' + provider;
+    const declared = Object.values(seats).some((s) => s && typeof s === 'object' && s.dispatch === marker);
+    if (!declared) {
+      return refuse('declared-route', 'no seat declares dispatch="' + marker + '" anywhere in the SSOT — a pin never invents a route');
+    }
+  }
+  return { ok: true, provider, model };
+}
+
+// The seat's OWN SSOT Anthropic tier — the landing value an accidental Agent-tool spawn of a
+// subprocess-pinned seat resolves to (#3218 D3, the #1947 AC-2/M3 rule): the row's explicit
+// agent_tool_fallback when it declares a valid one, else the tier_equivalent of the row's own model,
+// else the opus fail-safe.
+function seatOwnAnthropicTier(seatRow, routes) {
+  if (seatRow && seatRow.agent_tool_fallback && ROLE_MODELS.includes(seatRow.agent_tool_fallback)) {
+    return seatRow.agent_tool_fallback;
+  }
+  const ident = seatRow ? identifyModel(routes, seatRow.model) : { ok: false };
+  return (ident.ok && ROLE_MODELS.includes(ident.tierEquivalent)) ? ident.tierEquivalent : 'opus';
+}
+
+// The #3218 D3 EFFECTIVE seat row under a valid route pin: provider+model from the pin; dispatch =
+// `subprocess-<provider>` (non-anthropic) or ABSENT (anthropic); agent_tool_fallback = the pinned
+// model's tier_equivalent for a pin onto anthropic (so resolve-role-model answers with it, R4), or the
+// seat's own SSOT Anthropic tier for a pin onto a subprocess provider (a z.ai-pinned planner's accidental
+// Agent-tool spawn lands on Opus, never Fable); effort and every guard-bearing field (task_class,
+// data_sensitivity) carried from the SSOT row so C-2/C-3 still run on the EFFECTIVE row; size_models
+// DROPPED (a pin wins over the size rule, #3140 D3 / #3218 R2).
+function routePinnedSeatRow(seatRow, routes, provider, model) {
+  const next = Object.assign({}, seatRow);
+  delete next.size_models;
+  next.provider = provider;
+  next.model = model;
+  if (provider === 'anthropic') {
+    delete next.dispatch;
+    const pinnedTier = identifyModel(routes, model).tierEquivalent;
+    next.agent_tool_fallback = (ROLE_MODELS.includes(pinnedTier)) ? pinnedTier : seatOwnAnthropicTier(seatRow, routes);
+  } else {
+    next.dispatch = 'subprocess-' + provider;
+    next.agent_tool_fallback = seatOwnAnthropicTier(seatRow, routes);
+  }
+  return next;
+}
+
+// ROUTE pin resolve (the #3218 sibling of resolveTierPin/resolveSlugPin, same contract shape). `routes`
+// must already be a loaded, valid SSOT object. Returns:
+//   { pinned:false, present:false }                      -- no route entry for this role (the normal case).
+//   { pinned:false, present:true, refused, refusalNote } -- an entry exists but fails a rule -> resolve
+//     UNPINNED; refusalNote is stderr text naming the key and the failing rule.
+//   { pinned:true, present:true, value, provider, model, seat, reason, set_at } -- a VALID pin; `seat` is
+//     the D3 effective row every caller overlays wholesale (never a second hand-built copy).
+// `present` lets resolveRoute/cmdPlanReviewRoute skip the slug pin when a route entry exists (one role,
+// one effective pin, #3218 D1 — set-time replacement makes coexistence hand-planted-only, and a refused
+// route entry never silently falls back to a coexisting slug).
+function resolveRoutePin(role, routes) {
+  if (seatPinBlind()) return { pinned: false, present: false };
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) return { pinned: false, present: false };
+  const roleEntry = loaded.pins[role];
+  if (!roleEntry || typeof roleEntry !== 'object' || Array.isArray(roleEntry) || !('route' in roleEntry)) {
+    return { pinned: false, present: false };
+  }
+  const field = roleEntry.route;
+  const value = (field && typeof field === 'object' && !Array.isArray(field) && field.value != null) ? String(field.value) : null;
+  if (value === null) {
+    return { pinned: false, present: true, refused: '<malformed entry>', refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path +
+      ' role ' + role + '.route entry is not a {value,reason,set_at} object -- resolving UNPINNED (fail-safe, #3218 D2 rule malformed)' };
+  }
+  const v = validateRoutePinValue(routes, role, value);
+  if (!v.ok) {
+    return { pinned: false, present: true, refused: value, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path + ' role ' + role +
+      '.route "' + value + '" fails rule (' + v.rule + '): ' + v.note + ' -- resolving UNPINNED (fail-safe, #3218 D2)' };
+  }
+  const seatRow = ((routes && routes.seats) || {})[role];
+  if (!seatRow) return { pinned: false, present: true, refused: value, refusalNote: 'SEAT-PIN-REFUSED: ' + loaded.path +
+    ' role ' + role + '.route "' + value + '" has no SSOT seat row to overlay -- resolving UNPINNED (fail-safe, #3218 D2)' };
+  return { pinned: true, present: true, value, provider: v.provider, model: v.model,
+    seat: routePinnedSeatRow(seatRow, routes, v.provider, v.model),
+    reason: (field.reason != null) ? String(field.reason) : '', set_at: (field.set_at != null) ? String(field.set_at) : '' };
+}
+
+// set-seat-pin --role <role> (--tier <t> | --slug <s>) --reason "<text>" [--task T]
+// #2189-style discipline (D5): --reason is REQUIRED on every write — a reason-less flip is refused BEFORE the
+// pin file is read or touched (mirrors cmdSetMode's #2189 AC-1(c) fix). Validates the value against the SAME
+// declared vocabulary the resolvers themselves enforce, so a bad pin is refused loudly AT SET-TIME too, not
+// only silently ignored later at resolve-time. Merges into (never replaces) the role's existing entry, so
+// setting `slug` never drops a pre-existing `tier` pin for the same role and vice versa. #3218 D1: a ROUTE
+// pin is the ONE exception to that merge — setting it REPLACES the role's tier+slug entries (one role, one
+// effective pin, no precedence puzzle), and setting a tier/slug replaces a route entry for the same reason;
+// the OK line says so on stdout whenever a replacement happened. Atomic write
+// (temp-file-plus-rename in the pin's own directory) mirrors cmdSetMode's AC-19 discipline.
+function cmdSetSeatPin(o) {
+  const role = o.role;
+  if (!role) { console.log('BLOCK: set-seat-pin requires --role <role>'); process.exit(2); }
+  const hasTier = ('tier' in o) && o.tier;
+  const hasSlug = ('slug' in o) && o.slug;
+  const hasRoute = ('route' in o) && o.route;
+  if (!hasTier && !hasSlug && !hasRoute) { console.log('BLOCK: set-seat-pin requires --tier <t>, --slug <s> or --route <provider/model>'); process.exit(2); }
+  const kindCount = (hasTier ? 1 : 0) + (hasSlug ? 1 : 0) + (hasRoute ? 1 : 0);
+  if (kindCount > 1) {
+    console.log('BLOCK: set-seat-pin: pass exactly one of --tier, --slug or --route per call (tier/slug merge into the same role entry across separate calls; a route pin replaces them, #3218 D1)');
+    process.exit(2);
+  }
+  if (!o.reason) {
+    console.log('BLOCK: set-seat-pin: --reason is required (a reason-less pin write is refused, #1918 D5 mirrors #2189/#2105)');
+    process.exit(2);
+  }
+
+  const routesLoaded = loadRoutesConfig();
+  if (hasTier) {
+    const tier = String(o.tier);
+    if (!ROLE_MODELS.includes(tier)) {
+      console.log('BLOCK: set-seat-pin: "' + tier + '" is not a declared tier (' + ROLE_MODELS.join('|') + ')');
+      process.exit(2);
+    }
+  }
+  let slugIdent = null;
+  if (hasSlug) {
+    if (!routesLoaded.ok) {
+      console.log('BLOCK: set-seat-pin: cannot validate --slug -- ' + routesLoaded.error);
+      process.exit(2);
+    }
+    const seatRow = (routesLoaded.routes.seats || {})[role];
+    const ident = identifyModel(routesLoaded.routes, String(o.slug));
+    if (!ident.ok || (seatRow && seatRow.provider && ident.provider !== seatRow.provider)) {
+      console.log('BLOCK: set-seat-pin: "' + o.slug + '" is not a declared model for provider "' +
+        (seatRow && seatRow.provider || '<unknown>') + '" (config/cc-routes.json model_vocabulary)');
+      process.exit(2);
+    }
+    slugIdent = ident;
+  }
+  if (hasRoute) {
+    if (!routesLoaded.ok) {
+      console.log('BLOCK: set-seat-pin: cannot validate --route -- ' + routesLoaded.error);
+      process.exit(2);
+    }
+    const v = validateRoutePinValue(routesLoaded.routes, role, String(o.route));
+    if (!v.ok) {
+      console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails rule (' + v.rule + '): ' + v.note);
+      process.exit(2);
+    }
+    // #3218 R5 — pre-check the C-2/C-3 resolve-time guards on the EFFECTIVE row, so a guard refusal is
+    // loud AT SET TIME too (the same guards run again on every resolve; this never widens them).
+    const seatRow = (routesLoaded.routes.seats || {})[role];
+    const eff = routePinnedSeatRow(seatRow, routesLoaded.routes, v.provider, v.model);
+    const cap = checkCapability(routesLoaded.routes, eff);
+    if (!cap.ok) { console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails the capability guard: ' + cap.reason); process.exit(2); }
+    const sens = checkDataSensitivity(routesLoaded.routes, eff);
+    if (!sens.ok) {
+      const acc = checkAcceptance(routesLoaded.routes, eff);
+      if (!acc.ok) { console.log('BLOCK: set-seat-pin: --route "' + o.route + '" fails the data-sensitivity guard: ' + sens.reason); process.exit(2); }
+    }
+  }
+
+  const pinPath = resolveSeatPinPath();
+  let existingRaw;
+  try { existingRaw = fs.readFileSync(pinPath, 'utf8'); } catch (e) { existingRaw = ''; }
+  let existing = {};
+  if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- overwrite cleanly below */ } }
+  const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
+  // #3218 D1 — one role, one effective pin: a route set replaces tier+slug; a tier/slug set replaces route.
+  const replaced = [];
+  if (hasRoute) {
+    for (const k of ['tier', 'slug']) if (k in roleEntry) { delete roleEntry[k]; replaced.push(k); }
+  } else if ('route' in roleEntry) {
+    delete roleEntry.route;
+    replaced.push('route');
+  }
+  const nowIso = new Date().toISOString();
+  const fieldObj = { value: hasTier ? String(o.tier) : (hasSlug ? String(o.slug) : String(o.route)), reason: String(o.reason), set_at: nowIso };
+  if (o.task) fieldObj.task = String(o.task);
+  if (hasTier) roleEntry.tier = fieldObj; else if (hasSlug) roleEntry.slug = fieldObj; else roleEntry.route = fieldObj;
+  const next = Object.assign({}, existing, { [role]: roleEntry });
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort; write below surfaces a real error */ }
+  const tmpPath = path.join(dir, '.cc-seat-pins.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: set-seat-pin: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+  try {
+    writeBypassLog('3role-ledger-set-seat-pin', 'CC_SEAT_PIN', 'PERMIT',
+      { task: sanitize(o.task || ''), role, provider: slugIdent ? slugIdent.provider : '' });
+  } catch (e) { /* best-effort -- audit failure must never un-do an already-committed pin write */ }
+  console.log('OK: seat pin set -- role=' + role + ' ' + (hasTier ? 'tier=' + o.tier : (hasSlug ? 'slug=' + o.slug : 'route=' + o.route)) +
+    ' reason="' + o.reason + '"' + (replaced.length ? ' (replaced this role\'s existing ' + replaced.join('+') + ' pin entr' + (replaced.length > 1 ? 'ies' : 'y') + ' — one role, one effective pin, #3218 D1)' : ''));
+  process.exit(0);
+}
+
+// clear-seat-pin --role <role> [--tier] [--slug] [--route] --reason "<text>"  -- none of --tier/--slug/
+// --route clears ALL keys for the role. --reason required (D5, same discipline as the set verb).
+// #3218 D5/R1: clearing a ROUTE pin warns (never refuses) when the ledger holds an OPEN row for this role
+// whose dispatch marker only the pin made admissible — that row turns into an agentId-arm block at the next
+// check until the pin is re-set or the chain closes; the honest recovery is to re-set the pin.
+function seatPinOrphanedOpenRows(role) {
+  // INPUT-BOUND: at most 500 ledger files, 512 KiB read per file. Past either bound the scan STOPS and the
+  // caller still warns about what it found (over-warn, never silent) plus a truncation note — this scan can
+  // never loop, balloon, or fail open on an oversized store.
+  const found = [];
+  let truncated = false;
+  const routesLoaded = loadRoutesConfig();
+  const ssotDispatch = routesLoaded.ok ? (((routesLoaded.routes.seats || {})[role] || {}).dispatch || '') : '';
+  let files = [];
+  try {
+    for (const sess of fs.readdirSync(LEDGER_DIR)) {
+      const sessDir = path.join(LEDGER_DIR, sess);
+      let st; try { st = fs.statSync(sessDir); } catch (e) { continue; }
+      if (!st.isDirectory()) continue;
+      for (const f of fs.readdirSync(sessDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        if (files.length >= 500) { truncated = true; break; }
+        files.push(path.join(sessDir, f));
+      }
+      if (truncated) break;
+    }
+  } catch (e) { return { found, truncated }; }
+  for (const file of files) {
+    let raw;
+    try {
+      const fd = fs.openSync(file, 'r');
+      try {
+        const size = Math.min(fs.fstatSync(fd).size, 512 * 1024);
+        const buf = Buffer.alloc(size);
+        fs.readSync(fd, buf, 0, size, 0);
+        raw = buf.toString('utf8');
+      } finally { fs.closeSync(fd); }
+    } catch (e) { continue; }
+    const lines = raw.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i].trim();
+      if (!ln) continue;
+      let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+      if (!j || j.role !== role || j.closedAt || !isSubprocessDispatch(j.dispatch)) continue;
+      // "only the pin made it admissible": the SSOT-without-pin does not declare this dispatch for the seat.
+      if (ssotDispatch === j.dispatch) continue;
+      found.push(path.relative(LEDGER_DIR, file) + ':' + (i + 1) + ' dispatch=' + j.dispatch);
+    }
+  }
+  return { found, truncated };
+}
+
+function cmdClearSeatPin(o) {
+  const role = o.role;
+  if (!role) { console.log('BLOCK: clear-seat-pin requires --role <role>'); process.exit(2); }
+  if (!o.reason) {
+    console.log('BLOCK: clear-seat-pin: --reason is required (#1918 D5)');
+    process.exit(2);
+  }
+  const clearTier = ('tier' in o);
+  const clearSlug = ('slug' in o);
+  const clearRoute = ('route' in o);
+  const pinPath = resolveSeatPinPath();
+  let existingRaw;
+  try { existingRaw = fs.readFileSync(pinPath, 'utf8'); } catch (e) { existingRaw = ''; }
+  let existing = {};
+  if (existingRaw) { try { const p = JSON.parse(existingRaw); if (p && typeof p === 'object' && !Array.isArray(p)) existing = p; } catch (e) { /* corrupt -- clear writes a clean file below */ } }
+  const roleEntry = Object.assign({}, (existing[role] && typeof existing[role] === 'object' && !Array.isArray(existing[role])) ? existing[role] : {});
+  // #3218 D5/R1 — the open-row warning fires only when a route pin is ACTUALLY being cleared now.
+  if ((clearRoute || (!clearTier && !clearSlug)) && roleEntry.route) {
+    const scan = seatPinOrphanedOpenRows(role);
+    if (scan.found.length) {
+      const shown = scan.found.slice(0, 3).join(', ') + (scan.found.length > 3 ? ', … (' + scan.found.length + ' total)' : '');
+      process.stderr.write('SEAT-PIN-CLEAR-WARN: ' + scan.found.length + ' open ' + role + ' row(s) whose dispatch only this route pin made ' +
+        'admissible — they will block on the agentId arm at the next check until the pin is re-set (R1, #3218 D5; honest recovery: re-set the pin)' +
+        ': ' + shown + (scan.truncated ? ' (scan truncated at the 500-file/512KiB input bound — over-warn, never silent)' : '') + '\n');
+    }
+  }
+  if (clearTier || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.tier;
+  if (clearSlug || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.slug;
+  if (clearRoute || (!clearTier && !clearSlug && !clearRoute)) delete roleEntry.route;
+  const next = Object.assign({}, existing);
+  if (Object.keys(roleEntry).length) next[role] = roleEntry; else delete next[role];
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort */ }
+  const tmpPath = path.join(dir, '.cc-seat-pins.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: clear-seat-pin: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+  try { writeBypassLog('3role-ledger-clear-seat-pin', 'CC_SEAT_PIN', 'PERMIT', { task: sanitize(o.task || ''), role }); } catch (e) { /* best-effort */ }
+  console.log('OK: seat pin cleared -- role=' + role + (clearTier ? ' tier' : '') + (clearSlug ? ' slug' : '') + (clearRoute ? ' route' : '') +
+    (!clearTier && !clearSlug && !clearRoute ? ' (all keys)' : ''));
+  process.exit(0);
+}
+
+// list-seat-pins [--json] [--one-line] -- D5 standing visibility: role, value, reason, and AGE for every
+// active pin, so a silent permanent shadow pin is impossible. Never fails -- a broken pin file is reported,
+// not crashed on. #3218 D6: `route` rows list like tier/slug rows, and --one-line prints EXACTLY one line,
+// `SEAT-PINS: <role>=<kind>:<value> ...` (roles in the pin file's own order) or `SEAT-PINS: none` -- the
+// shape render-route-views follow-ups and one-glance operator checks consume.
+function cmdListSeatPins(o) {
+  const loaded = loadSeatPinsFile();
+  if (!loaded.ok) {
+    console.log('SEAT-PIN-FILE-PROBLEM: ' + loaded.error);
+    process.exit(0);
+  }
+  const rows = [];
+  const nowMs = Date.now();
+  for (const [role, entry] of Object.entries(loaded.pins || {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const key of ['tier', 'slug', 'route']) {
+      const field = entry[key];
+      if (!field || typeof field !== 'object' || Array.isArray(field) || field.value == null) continue;
+      const setAt = field.set_at ? String(field.set_at) : '';
+      let ageStr = 'unknown';
+      const setMs = setAt ? Date.parse(setAt) : NaN;
+      if (!Number.isNaN(setMs)) {
+        const ageH = Math.max(0, (nowMs - setMs) / 3600000);
+        ageStr = ageH < 48 ? ageH.toFixed(1) + 'h' : (ageH / 24).toFixed(1) + 'd';
+      }
+      rows.push({ role, key, value: String(field.value), reason: field.reason ? String(field.reason) : '', set_at: setAt, age: ageStr });
+    }
+  }
+  if ('json' in o) {
+    console.log(JSON.stringify({ path: loaded.path, absent: !!loaded.absent, pins: rows }));
+  } else if ('one-line' in o) {
+    if (!rows.length) console.log('SEAT-PINS: none');
+    else console.log('SEAT-PINS: ' + rows.map((r) => r.role + '=' + r.key + ':' + r.value).join(' '));
+  } else if (!rows.length) {
+    console.log('OK: no active seat pins (' + loaded.path + (loaded.absent ? ' absent' : '') + ')');
+  } else {
+    for (const r of rows) {
+      console.log('PIN role=' + r.role + ' key=' + r.key + ' value=' + r.value + ' reason="' + r.reason + '" set_at=' + r.set_at + ' age=' + r.age);
+    }
+  }
+  process.exit(0);
+}
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// #2105, redesigned 2026-08-29 (work/ship-tail pool split); #2518 (2026-09-26) added a THIRD provider axis —
+// Mode switch SSOT: resolve-mode / set-mode. A tiny operator posture pin (~/.config/cc-mode.json,
+// machine-local, never tracked/synced) governs FOUR axes read from the tracked table below:
+//   - lanes.{work_base,opportunist,work_ceiling,ship_tail_ceiling}: the per-pool caps a NEW lane-start may
+//     not exceed (hooks/lane-ceiling-gate.sh, hooks/mode-pin-lane-gate.sh) — work_ceiling is a HARD cap, the
+//     work_base->work_ceiling band is a block-once opportunist advisory, ship_tail_ceiling is a HARD cap.
+//   - openrouter_dispatch: whether tools/openrouter-*-dispatch.sh may reach OpenRouter at all.
+//   - local_dispatch:      whether a seat may be dispatched to the local LLM (conservative-mode offload).
+//   - zai_dispatch (#2518): whether a seat may be dispatched to z.ai direct (hybrid-mode GLM offload) —
+//     `permitted` ONLY in the new `hybrid` mode; every other mode (incl. conservative) keeps it `forbidden`,
+//     so `hybrid` never re-opens OpenRouter or local and `conservative` never opens z.ai.
+// Fail-safe direction (D1): EVERY failure shape (absent/unreadable/unparseable pin, unknown mode value,
+// broken/absent tracked table) resolves to `normal` — the harm asymmetry is that an accidental non-Anthropic
+// dispatch violates the operator's directive AND a data-posture boundary, while 4 work / 2 ship-tail is the
+// operator's own declared normal-mode default (#2824 — 3 quiet lanes + 1 block-once opportunist). Garbage
+// state can never resolve to boost and can never
+// resolve to openrouter_dispatch=permitted, local_dispatch=permitted, or zai_dispatch=permitted — a mode row
+// with no zai_dispatch key at all (every pre-#2518 fixture table) resolves the axis to forbidden too, never
+// undefined (#2518 AC-4 fail-closed arm).
+// Fixture seams (mirrors CC_ROUTES_JSON): CC_MODE_FILE (the pin) and CC_MODE_POLICY_JSON (the tracked table).
+// No smoke may ever omit both — the real ~/.config/cc-mode.json is NEVER read or written by any test arm.
+
+const MODE_FALLBACK = Object.freeze({
+  mode: 'normal',
+  work_base: 3,
+  opportunist: 1,
+  work_ceiling: 4,
+  ship_tail_ceiling: 2,
+  openrouter_dispatch: 'forbidden',
+  local_dispatch: 'forbidden',
+  zai_dispatch: 'forbidden',
+});
+
+// Redesign (2026-08-29, work/ship-tail pool split; #2518 added zai_dispatch) — builds the full v2
+// resolveMode() return shape for any fallback arm. `ceiling` is the LEGACY field, kept equal to work_ceiling
+// so an un-migrated reader degrades to "work ceiling governs" instead of failing open on a missing key
+// (never a garbage/permitting value).
+function fallbackResolved(source, reason) {
+  return {
+    mode: MODE_FALLBACK.mode,
+    work_base: MODE_FALLBACK.work_base,
+    opportunist: MODE_FALLBACK.opportunist,
+    work_ceiling: MODE_FALLBACK.work_ceiling,
+    ship_tail_ceiling: MODE_FALLBACK.ship_tail_ceiling,
+    ceiling: MODE_FALLBACK.work_ceiling,
+    openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch,
+    local_dispatch: MODE_FALLBACK.local_dispatch,
+    zai_dispatch: MODE_FALLBACK.zai_dispatch,
+    source, reason, set_at: '', task: '',
+  };
+}
+
+function resolveModePolicyPath() {
+  if ('CC_MODE_POLICY_JSON' in process.env) {
+    const p = process.env.CC_MODE_POLICY_JSON;
+    return (p && fileExists(p)) ? p : '';
+  }
+  let selfDir;
+  try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); }
+  catch (e) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+  const cand = path.join(selfDir, '..', 'config', 'cc-mode-policy.json');
+  return fileExists(cand) ? cand : '';
+}
+
+// The pin lives OUTSIDE every repo (#1918's measured location argument — no git verb, no PR, Rule 12 can
+// never fire, and every consumer below is a fresh process per event so an edit is live on the next spawn).
+function resolveModePinPath() {
+  if ('CC_MODE_FILE' in process.env) return process.env.CC_MODE_FILE;
+  return path.join(HOME, '.config', 'cc-mode.json');
+}
+
+// Load + validate the tracked mode-policy table. Never throws: { ok, policy, error, path }. A missing file,
+// an unreadable file, unparseable JSON, or a shape that lacks a resolvable default_mode/modes entry are all
+// treated as "broken table" -> the caller falls back to MODE_FALLBACK in-code constants (AC 3(g)).
+function loadModePolicy() {
+  const p = resolveModePolicyPath();
+  if (!p) return { ok: false, policy: null, error: 'MODE-POLICY-NOT-FOUND', path: '' };
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) { return { ok: false, policy: null, error: 'MODE-POLICY-READ-ERROR: ' + (e && e.message ? e.message : e), path: p }; }
+  let policy;
+  try { policy = JSON.parse(raw); }
+  catch (e) { return { ok: false, policy: null, error: 'MODE-POLICY-PARSE-ERROR: ' + (e && e.message ? e.message : e), path: p }; }
+  if (!policy || typeof policy !== 'object' || !policy.modes || typeof policy.modes !== 'object' ||
+      !policy.default_mode || !policy.modes[policy.default_mode]) {
+    return { ok: false, policy: null, error: 'MODE-POLICY-SHAPE-ERROR: missing modes/default_mode', path: p };
+  }
+  return { ok: true, policy, error: '', path: p };
+}
+
+// Resolve a mode-id string (possibly an alias, e.g. #2035's "token-conservative") against the loaded policy
+// table. Returns '' if unresolvable (unknown mode, unknown alias).
+function resolveModeAlias(policy, rawMode) {
+  const m = String(rawMode == null ? '' : rawMode).trim();
+  if (!m) return '';
+  if (policy.modes[m]) return m;
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const aliased = aliases[m];
+  if (aliased && policy.modes[aliased]) return aliased;
+  return '';
+}
+
+// #2189 AC-4(e1)/D6 — same resolution, but reports WHETHER the match went through an alias spelling
+// (vs the literal canonical mode key). Used ONLY by the read path (resolveMode()); the write path
+// (cmdSetMode) refuses an alias outright rather than needing this distinction. Returns
+// { resolved: '' | <canonical mode key>, viaAlias: boolean }.
+function resolveModeAliasDetailed(policy, rawMode) {
+  const m = String(rawMode == null ? '' : rawMode).trim();
+  if (!m) return { resolved: '', viaAlias: false };
+  if (policy.modes[m]) return { resolved: m, viaAlias: false };
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const aliased = aliases[m];
+  if (aliased && policy.modes[aliased]) return { resolved: aliased, viaAlias: true };
+  return { resolved: '', viaAlias: false };
+}
+
+// The single choke point (D1). Never throws — every failure shape resolves to a SAFE mode, loudly labeled
+// via `source`. Returns { mode, ceiling, openrouter_dispatch, source, reason, set_at, task }.
+function resolveMode() {
+  const loaded = loadModePolicy();
+  if (!loaded.ok) {
+    // AC 3(g) — a broken/absent TRACKED TABLE can neither brick the resolver nor widen anything: the
+    // fallback constants (the directive's own numbers) live in code, never in a file a bad edit can corrupt.
+    return fallbackResolved('invalid-pin-fallback', 'broken-mode-policy-table');
+  }
+  const policy = loaded.policy;
+  const pinPath = resolveModePinPath();
+  let pinRaw;
+  try { pinRaw = fs.readFileSync(pinPath, 'utf8'); }
+  catch (e) {
+    // Absent pin (ENOENT) is the NORMAL, expected steady state -> source=default. Any OTHER read error
+    // (permission, a directory in its place, ...) is treated the same as unparseable -> invalid-pin-fallback,
+    // never silently promoted to "default".
+    const isAbsent = e && e.code === 'ENOENT';
+    if (isAbsent) {
+      const dm = policy.default_mode;
+      const row = policy.modes[dm];
+      const lanes = (row && row.lanes) || {};
+      return { mode: dm,
+               work_base: lanes.work_base, opportunist: lanes.opportunist,
+               work_ceiling: lanes.work_ceiling, ship_tail_ceiling: lanes.ship_tail_ceiling,
+               ceiling: lanes.work_ceiling,
+               openrouter_dispatch: row.openrouter_dispatch, local_dispatch: row.local_dispatch,
+               zai_dispatch: row.zai_dispatch === 'permitted' ? 'permitted' : 'forbidden',
+               source: 'default', reason: '', set_at: '', task: '' };
+    }
+    return fallbackResolved('invalid-pin-fallback', 'unreadable-pin');
+  }
+  let pin;
+  try { pin = JSON.parse(pinRaw); }
+  catch (e) {
+    // AC 3(a)/(f) — unparseable JSON, INCLUDING a torn/truncated prefix an aborted flip can leave, resolves
+    // to normal. No partial write can ever land in a permitting state.
+    return fallbackResolved('invalid-pin-fallback', 'unparseable-pin');
+  }
+  if (!pin || typeof pin !== 'object') {
+    return fallbackResolved('invalid-pin-fallback', 'unparseable-pin');
+  }
+  const { resolved, viaAlias } = resolveModeAliasDetailed(policy, pin.mode);
+  if (!resolved) {
+    // AC 3(b) — an unknown mode value in the pin resolves the same as unparseable.
+    return fallbackResolved('invalid-pin-fallback', 'unknown-mode-value');
+  }
+  const row = policy.modes[resolved];
+  const lanes = (row && row.lanes) || {};
+  // #2189 AC-4(e1)/D6 — ALIASES MAY DESCRIBE, NEVER UNLOCK. A pin whose `mode` field is an ALIAS
+  // spelling (never producible by set-mode any more, per AC-4(e2) — but a hand-edited or legacy pin
+  // file can still carry one, e.g. #2035's token-conservative or the retired speed-boost) may still
+  // inform the READING axis (the mapped row's real lane numbers), but ALL THREE authorisation axes
+  // (openrouter_dispatch, local_dispatch, AND #2518's zai_dispatch) are clamped to 'forbidden' regardless
+  // of the row's own values: the operator never selected the literal canonical mode, so the road never
+  // opens on an alias click (#2518 AC-4 hold-one-out clamp: an alias pointing AT hybrid must never unlock
+  // zai_dispatch, even though pinning canonical hybrid does).
+  const dispatchAxis = viaAlias ? 'forbidden' : row.openrouter_dispatch;
+  const localAxis = viaAlias ? 'forbidden' : row.local_dispatch;
+  // Fail-closed on a missing/garbage zai_dispatch key (#2518 AC-4): only a LITERAL 'permitted' value on a
+  // non-alias resolution ever unlocks it — anything else (absent key, any other string, alias clamp) is
+  // 'forbidden', never 'undefined'.
+  const zaiAxis = (!viaAlias && row.zai_dispatch === 'permitted') ? 'permitted' : 'forbidden';
+  const reasonText = String(pin.reason == null ? '' : pin.reason);
+  return { mode: resolved,
+           work_base: lanes.work_base, opportunist: lanes.opportunist,
+           work_ceiling: lanes.work_ceiling, ship_tail_ceiling: lanes.ship_tail_ceiling,
+           ceiling: lanes.work_ceiling,
+           openrouter_dispatch: dispatchAxis, local_dispatch: localAxis, zai_dispatch: zaiAxis,
+           source: 'pin', reason: viaAlias ? (reasonText ? reasonText + ' [alias-non-authorizing]' : 'alias-non-authorizing') : reasonText,
+           set_at: String(pin.set_at == null ? '' : pin.set_at), task: String(pin.task == null ? '' : pin.task) };
+}
+
+function cmdResolveMode(opts) {
+  void opts;
+  const r = resolveMode();
+  console.log('mode=' + r.mode);
+  // Redesign (2026-08-29) v2 keys — the two-pool lane numbers, printed BEFORE the legacy `ceiling=` line so
+  // a migrated reader sees them first; an un-migrated reader still finds `ceiling=` unchanged in value
+  // (== work_ceiling) and degrades to "work ceiling governs" rather than failing open on a missing key.
+  console.log('work_base=' + r.work_base);
+  console.log('opportunist=' + r.opportunist);
+  console.log('work_ceiling=' + r.work_ceiling);
+  console.log('ship_tail_ceiling=' + r.ship_tail_ceiling);
+  console.log('ceiling=' + r.ceiling);
+  console.log('openrouter_dispatch=' + r.openrouter_dispatch);
+  console.log('local_dispatch=' + r.local_dispatch);
+  console.log('zai_dispatch=' + r.zai_dispatch);
+  console.log('source=' + r.source);
+  console.log('reason=' + r.reason);
+  // AC 20(b) (#2197) — `set_at=` is emitted ONLY on the source=pin arm, and only when the pin actually
+  // carries a timestamp. This is the PAIRED ABSENCE contract both consumers already state in their own
+  // comments (tools/openrouter-role-dispatch.sh:158-160 and tools/openrouter-research-dispatch.sh:565-568):
+  // "a source=default refusal carries NEITHER field, never an empty placeholder". Before this line the
+  // command emitted exactly five keys and NO set_at at all, so the consumers' `grep -m1 '^set_at='`
+  // resolved to the empty string and every conservative-mode MODE line shipped a bare `set_at=` with no
+  // value -- the provenance half of AC 20(b) was permanently unmet. resolveMode() has always COMPUTED
+  // set_at correctly (:4099); only the print path dropped it.
+  if (r.source === 'pin' && r.set_at) console.log('set_at=' + r.set_at);
+  process.exit(0);
+}
+
+// Redesign (2026-08-29) — spawn-intent marker store CLI (list/clear repair path). The markers themselves are
+// WRITTEN only by hooks/lane-ceiling-gate.sh's own permit path (never by this file) — this subcommand is a
+// manual operator repair tool for a phantom marker (spawn permitted, then denied/crashed downstream) that
+// would otherwise only self-heal at TTL. Store shape: <dir>/<session>/<task>.json ==
+// {task, role, pool, session, written_at_ms}. NEVER the 3role ledger (hooks/three-role-spawn-ledger.sh's
+// own fail-closed PreToolUse restriction to research/ship-tail is untouched by this store's existence).
+function resolveLaneIntentDir() {
+  if ('LANE_INTENT_DIR' in process.env) return process.env.LANE_INTENT_DIR;
+  return path.join(HOME, '.claude', '.lane-intents');
+}
+
+function cmdLaneIntents(o) {
+  // Guard fires only when --session was EXPLICITLY passed (D3: "lane-intents (when --session is
+  // given)"). When omitted, sid falls back to ambientIdentity()'s CLAUDE_CODE_SESSION_ID/'unknown'
+  // path below, which derives no new dir and is attribution-by-record, not this guard's concern
+  // (see "Not in this change").
+  if (o.session) enforceSessionShape(o.session, o.task || null, 'lane-intents', 2);
+  const dir = resolveLaneIntentDir();
+  const sid = sanitize(o.session || ambientIdentity(o)) || 'default';
+  const sessDir = path.join(dir, sid);
+  if (o.clear) {
+    const task = sanitize(o.task || '');
+    if (!task) { console.log('BLOCK: lane-intents --clear requires --task <id>'); process.exit(2); }
+    const p = path.join(sessDir, task + '.json');
+    try { fs.unlinkSync(p); console.log('OK: cleared lane-intent marker for session=' + sid + ' task=' + task); }
+    catch (e) { console.log('OK: no lane-intent marker to clear for session=' + sid + ' task=' + task); }
+    process.exit(0);
+  }
+  let files = [];
+  try { files = fs.readdirSync(sessDir).filter((f) => f.endsWith('.json')); } catch (e) { files = []; }
+  if (!files.length) { console.log('(no lane-intent markers for session=' + sid + ')'); process.exit(0); }
+  const nowMs = Date.now();
+  for (const f of files.sort()) {
+    let line = f.replace(/\.json$/, '') + ': <unreadable>';
+    try {
+      const obj = JSON.parse(fs.readFileSync(path.join(sessDir, f), 'utf8'));
+      const ageMs = nowMs - Number(obj.written_at_ms || 0);
+      line = f.replace(/\.json$/, '') + ': pool=' + obj.pool + ' role=' + obj.role +
+        ' written_at_ms=' + obj.written_at_ms + ' age_ms=' + ageMs;
+    } catch (e) { /* keep default unreadable line */ }
+    console.log(line);
+  }
+  process.exit(0);
+}
+
+// Best-effort ambient invoking-identity resolution (D1, round 3 — attribution-BY-RECORD, never
+// authentication): an explicit --session/--agent-id/--agent flag wins; else the harness's own ambient
+// CLAUDE_CODE_SESSION_ID env var (set inside a live Claude Code Bash tool call — see
+// hooks/openrouter-role-dispatch-smoke-test.sh:194-198 for the same convention); else the literal
+// 'unknown' — NEVER an absent/omitted field.
+function ambientIdentity(o) {
+  const explicit = o.session || o['agent-id'] || o.agent;
+  if (explicit) { const s = sanitize(explicit); if (s) return s; }
+  const envSid = process.env.CLAUDE_CODE_SESSION_ID;
+  if (envSid && String(envSid).trim()) { const s = sanitize(envSid); if (s) return s; }
+  return 'unknown';
+}
+
+// set-mode --mode <m> --reason <text> [--task <id>] [--session <id>] — validates against the tracked
+// table, refuses an unknown mode with the pin file BYTE-UNCHANGED (AC 3(c)), and writes ATOMICALLY
+// (temp-file-plus-rename in the pin's OWN directory, AC 19) so the pin is, at every instant, either the
+// prior valid state or the new valid state — never a torn intermediate. Every SUCCESSFUL flip appends one
+// audit line to the unified override/audit log (never on a refusal, AC 20(a)).
+function cmdSetMode(o) {
+  // #2189 AC-1(c) — `--reason` is REQUIRED, not optional (closes the #2240-class reason-blanking write:
+  // a reason-less flip used to be silently ACCEPTED). Refused before the policy table is even loaded, so
+  // the pin file is byte-unchanged on every path through this refusal.
+  if (!o.reason) {
+    console.log('BLOCK: set-mode: --reason is required (a reason-less mode change is refused, #2240/#2189)');
+    process.exit(2);
+  }
+  const loaded = loadModePolicy();
+  if (!loaded.ok) {
+    console.log('BLOCK: set-mode: ' + loaded.error);
+    process.exit(2);
+  }
+  const policy = loaded.policy;
+  const requested = String(o.mode == null ? '' : o.mode).trim();
+  // #2189 AC-4(e2)/D6 — ALIASES MAY DESCRIBE, NEVER UNLOCK: `set-mode` is the AUTHORISATION-axis
+  // writer, so it accepts ONLY a literal canonical mode key from the tracked table — never an alias
+  // spelling (e.g. #2035's `token-conservative`). Resolving the alias here (as this code used to) would
+  // write-time-expand an operator's click on the alias LABEL into the literal permitted mode without the
+  // operator ever having selected it. Refusing the alias at this single choke point closes BOTH measured
+  // live paths (D7 FINDING 1 — the CLI ships no evidence input; this is a validation refusal, not one).
+  const aliases = (policy && policy.aliases && typeof policy.aliases === 'object') ? policy.aliases : {};
+  const isCanonical = Object.prototype.hasOwnProperty.call(policy.modes, requested);
+  const isAlias = !isCanonical && Object.prototype.hasOwnProperty.call(aliases, requested);
+  if (isAlias) {
+    console.log('BLOCK: set-mode: "' + requested + '" is an ALIAS, not an operator-selectable mode — ' +
+      'aliases may describe a reading surface (lane vocabulary) but can never author the pin\'s ' +
+      'authorisation axis (#2189 D6). Select the literal mode instead: ' + Object.keys(policy.modes).join(', '));
+    process.exit(2);
+  }
+  if (!isCanonical) {
+    console.log('BLOCK: set-mode: unknown mode "' + requested + '" — valid: ' + Object.keys(policy.modes).join(', '));
+    process.exit(2);
+  }
+  const resolved = requested;
+  const pinPath = resolveModePinPath();
+  // Read the PRIOR mode for the audit line's transition= field (best-effort; unresolvable -> 'unknown').
+  let priorMode = 'unknown';
+  try { priorMode = resolveMode().mode; } catch (e) { /* best-effort */ }
+
+  const nowIso = new Date().toISOString();
+  const pinObj = { mode: resolved, set_at: nowIso };
+  if (o.reason) pinObj.reason = String(o.reason);
+  if (o.task) pinObj.task = String(o.task);
+
+  const dir = path.dirname(pinPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort; write below surfaces a real error */ }
+  const tmpPath = path.join(dir, '.cc-mode.json.tmp-' + process.pid + '-' + Date.now());
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(pinObj, null, 2) + '\n');
+    fs.renameSync(tmpPath, pinPath);
+  } catch (e) {
+    // AC 19 — a write-protected directory (temp-file create/rename needs dir-write perms) must fail
+    // WITHOUT mutating the real pin. Clean up any partial temp file, never touch pinPath.
+    try { fs.unlinkSync(tmpPath); } catch (e2) { /* best-effort */ }
+    console.log('BLOCK: set-mode: could not write pin atomically: ' + (e && e.message ? e.message : e));
+    process.exit(2);
+  }
+
+  // AC 20(a) — audit ONLY on success, into the SAME unified log as every other bypass/override record
+  // (rule12LogPath(), the ledger's existing env override RULE12_LOG). Additive `kind: 'mode-flip'` record —
+  // never replaces the base 8-key shape any other writer emits (mirrors #1640 S10's own additive keys).
+  try {
+    const record = {
+      ts: nowIso,
+      session: '',
+      agent: '',
+      task: sanitize(o.task || ''),
+      role: 'orchestrator',
+      hook: 'mode-flip',
+      var: 'CC_MODE',
+      decision: 'PERMIT',
+      kind: 'mode-flip',
+      transition: priorMode + '->' + resolved,
+      reason: o.reason ? String(o.reason) : '',
+      actor: ambientIdentity(o),
+    };
+    const logPath = rule12LogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify(record) + '\n');
+  } catch (e) { /* best-effort — audit failure must never un-do an already-committed pin write */ }
+
+  console.log('OK: mode set to ' + resolved + ' (' + priorMode + ' -> ' + resolved + ')');
+  process.exit(0);
+}
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+const [, , cmd, ...rest] = process.argv;
+const opts = parseArgs(rest);
+// #2189 D7 L1 (c2) — refuse the WHOLE invocation on any ambiguous (repeated-name) flag, BEFORE any
+// subcommand dispatch, argv-RESOLVED occurrences only (never raw text-token counts). Nothing is written
+// by any subcommand on this path — the refusal happens before cmdSetMode/cmdAppend/etc. ever run.
+if (opts.__dupFlags && opts.__dupFlags.length) {
+  console.log('BLOCK: ' + (cmd || '') + ': ambiguous flag(s) ' +
+    opts.__dupFlags.map((k) => '--' + k).join(', ') +
+    ' — each occurs more than once; refusing rather than picking a reading (cause=ambiguous-flag)');
+  process.exit(2);
+}
+try {
+  if (cmd === 'append') cmdAppend(opts);
+  else if (cmd === 'check') cmdCheck(opts);
+  else if (cmd === 'heartbeat') cmdHeartbeat(opts);
+  else if (cmd === 'refresh-models') cmdRefreshModels(opts);
+  else if (cmd === 'reconcile-spawns') cmdReconcileSpawns(opts);
+  else if (cmd === 'repair-crosswire') cmdRepairCrosswire(opts);
+  else if (cmd === 'repair-subprocess-models') cmdRepairSubprocessModels(opts);
+  else if (cmd === 'repair-split-run') cmdRepairSplitRun(opts);
+  else if (cmd === 'repair-strike-progress') cmdRepairStrikeProgress(opts);
+  else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
+  else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
+  else if (cmd === 'carried-key') cmdCarriedKey(opts);
+  else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
+  else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
+  else if (cmd === 'resolve-published-verdict') cmdResolvePublishedVerdict(opts);
+  else if (cmd === 'resolve-role-model') cmdResolveRoleModel(opts);
+  else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
+  else if (cmd === 'inherit-plan-review') cmdInherit(opts);
+  else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
+  else if (cmd === 'size-s-exempt') cmdSizeSExempt(opts);
+  else if (cmd === 'log-bypass') cmdLogBypass(opts);
+  else if (cmd === 'resolve-route') cmdResolveRoute(opts);
+  else if (cmd === 'plan-size') cmdPlanSize(opts);
+  else if (cmd === 'plan-review-route') cmdPlanReviewRoute(opts);
+  else if (cmd === 'zai-strikes') cmdZaiStrikes(opts);
+  else if (cmd === 'identify-model') cmdIdentifyModel(opts);
+  else if (cmd === 'lint-routes') cmdLintRoutes(opts);
+  else if (cmd === 'provenance-kind') cmdProvenanceKind(opts);
+  else if (cmd === 'resolve-mode') cmdResolveMode(opts);
+  else if (cmd === 'set-mode') cmdSetMode(opts);
+  else if (cmd === 'lane-intents') cmdLaneIntents(opts);
+  else if (cmd === 'set-seat-pin') cmdSetSeatPin(opts);
+  else if (cmd === 'clear-seat-pin') cmdClearSeatPin(opts);
+  else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
+  else if (cmd === 'usage-backfill') cmdBackfill(opts);
+  else {
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|plan-review-route|zai-strikes|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+      '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
+      '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
+      '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
+      '[--session S --task T --role R [--merge-head R] (resolve-published-verdict, review-seat-publish-verdict backstop primitive) — prints row: ref-hit: ref: decision-line: affirmative:] ' +
+      '[--merge-head R (check, widens the DEFAULT-ON ref-scoped resolution arm, #2088/#2462)] ' +
+      '[--enforce-tracked-artifacts [--perf-log P] (check, #1509 + #1544)] ' +
+      '[--enforce-artifact-role-kind (check, #1532)] ' +
+      '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
+      '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
+      '[--session S --task T (gate-plan-review, #1575)] ' +
+      '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
+      '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--brief-text-file P [--task T] [--json] (plan-review-route, #3145 D1)] [--task T --role plan-review --round N | --task T --role executor (zai-strikes, #2985/#3060)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
+      '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
+      '[(resolve-mode, #2105) — prints mode= ceiling= openrouter_dispatch= source= reason=] ' +
+      '[--mode M [--reason "..."] [--task T] [--session S] (set-mode, #2105)] ' +
+      '[--role R (--tier T | --slug S | --route <provider/model>) --reason "..." [--task T] (set-seat-pin, #1918/#3218)] ' +
+      '[--role R [--tier] [--slug] [--route] --reason "..." (clear-seat-pin, #1918/#3218)] ' +
+      '[[--json] [--one-line] (list-seat-pins, #1918/#3218)]' +
+      ' [--session S [--dry-run] (usage-backfill, #1709 W2 — per-agent, idempotent; never opens a ledger file)]' +
+      ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]' +
+      ' [--session S [--task T] [--dry-run] (repair-subprocess-models, #2782 — rewrites modelVersion/modelTier/provider on subprocess-provenance rows ONLY, from each row\'s own transcript_path; backed up, idempotent, dry-run first)]' +
+      ' [--session S --task T --run-id ID [--dry-run] [--allow-pending] (repair-split-run, #2902 — merges a split dispatcher run, P1-P6 fail-closed, backed up, idempotent)]' +
+      ' [--session S --task T --role executor --branch B --evidence E [--cwd D] [--dry-run] (repair-strike-progress, #3093 — proves a past timeout pushed to origin/<task-branch> in its dispatch window and appends an OR-STRIKE-FORGIVE receipt line, P1-P6 fail-closed, append-only, idempotent)]');
+    process.exit(2);
+  }
+} catch (e) {
+  console.log('BLOCK: ledger helper error: ' + (e && e.message ? e.message : e));
+  process.exit(2);
+}
+
+// #1494 frozen contract for #1497 Key-1 (role eligibility) — a future direct-JS consumer imports these
+// instead of shelling out to the CLI. Exporting does not change this file's own CLI-dispatch behavior above
+// (a plain `resolve-effective-tier` CLI invocation, unqualified by path, is unaffected).
+export { resolveEffectiveTier, lastAssistantModelFromFile };
