@@ -77,6 +77,13 @@
 # the resolver's 1 MiB cap) -> BRIEF-UNRESOLVABLE repeat-block. Both fail closed, no marker. Zero BRIEF: lines
 # -> byte-identical to the pre-#3190 gate.
 #
+# #3344 — CROSS-REPO PLAN:/BRIEF:. A relative PLAN: or BRIEF: path that does not exist under this hook's cwd (the
+# ai-brain primary) is resolved against the SPAWN TICKET'S OWN repo: the ticket's metadata.repo primary, the
+# worktree(s) the prompt names (<projects>/<repo>/.claude/worktrees/<slug>, <= 3), and that repo's <task>-*
+# worktrees. The gate only TRANSPORTS the session + worktree hints (--session/--worktrees); the bounded base set,
+# and every size/bound check, live in the resolver (3role-ledger.mjs xrepoResolveRel). Not found anywhere ->
+# the same SIZE-PLAN-UNRESOLVABLE / BRIEF-UNRESOLVABLE repeat-block as before (fail closed).
+#
 # Env overrides (for the smoke): CC_ROUTE_DISPATCH_STATE_DIR (default
 # ~/.claude/.three-role-route-dispatch-state); CC_ROUTES_JSON points resolve-route at a fixture config (the
 # same fixture mechanism 3role-ledger-smoke-test.sh already uses 15x). No `set -e` (a non-block non-zero must
@@ -262,6 +269,20 @@ prompt_briefs() {
     process.stdout.write(seen.join("\n"));
   ' 2>/dev/null
 }
+# #3344 — prompt_worktrees: distinct absolute .../.claude/worktrees/<slug> paths the prompt names (max 3), one per
+# line. Transported to the resolver as cross-repo hints; the resolver accepts only <projects>/<repo>/.claude/
+# worktrees/<slug> shapes (and the ticket's own repo when it names one). Never echoed into stderr (N5).
+prompt_worktrees() {
+  HOOK_INPUT="$INPUT" node -e '
+    let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){ process.exit(0); }
+    const ti=d.tool_input||{};
+    const prompt=[ti.prompt, ti.description, ti.message].map(x=>(x==null?"":String(x))).join("\n").slice(0,1048576);
+    const re=/\/[^\s"\x27`)]*\/\.claude\/worktrees\/[0-9A-Za-z._-]+/g;
+    const seen=[]; let m;
+    while((m=re.exec(prompt))!==null){ if(!seen.includes(m[0])){ seen.push(m[0]); if(seen.length>=3) break; } }
+    process.stdout.write(seen.join("\n"));
+  ' 2>/dev/null
+}
 json_field() { ROUTE_PAYLOAD="$2" node -e 'try{const j=JSON.parse(process.env.ROUTE_PAYLOAD||"");const v=j[process.argv[1]];process.stdout.write(v===undefined?"":String(v));}catch(e){}' "$1" 2>/dev/null; }
 
 if [ "$PROVIDER" = "zai" ] && [ "$ROLE" = "plan-review" ]; then
@@ -302,16 +323,18 @@ if [ "$PROVIDER" = "zai" ] && [ "$ROLE" = "executor" ]; then
   NBR=0; [ -n "$BRIEFS_EX" ] && NBR=$(printf '%s
 ' "$BRIEFS_EX" | command grep -c .)
   [ "$NBR" -le 1 ] || emit_repeat_block "BRIEF-AMBIGUOUS" "the spawn prompt names ${NBR}+ distinct BRIEF: paths -- ambiguous; name exactly one (the refused brief the dispatcher's needle-lint receipt was written for)"
+  # #3344: --session + --worktrees let the resolver look in the ticket's own repo when a relative path is absent here.
+  WT_HINTS="$(prompt_worktrees)"
   if [ "$NBR" -eq 1 ]; then
-    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --brief "$BRIEFS_EX" --json 2>/dev/null); RJRC=$?
+    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --brief "$BRIEFS_EX" --session "$SESSION" --worktrees "$WT_HINTS" --json 2>/dev/null); RJRC=$?
   else
-    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --json 2>/dev/null); RJRC=$?
+    RJ=$(node "$LEDGER_HELPER" resolve-route --seat executor --plan "$PLANS_EX" --task "$TASKID" --session "$SESSION" --worktrees "$WT_HINTS" --json 2>/dev/null); RJRC=$?
   fi
   { [ "$RJRC" -eq 0 ] && [ -n "$RJ" ]; } || {
     # The resolver validated --brief BEFORE --plan (#3190): a nonexistent/oversized brief is BRIEF-UNRESOLVABLE,
     # never masked by the plan verdict. The brief path itself is never echoed into stderr (N5 home-path rule).
     printf '%s' "$RJ" | command grep -q 'BRIEF-UNRESOLVABLE' && emit_repeat_block "BRIEF-UNRESOLVABLE" "the BRIEF: line names no existing readable brief file at or under the resolver's 1 MiB input bound (fail closed; re-issue naming the exact brief the dispatcher refused)"
-    emit_repeat_block "SIZE-PLAN-UNRESOLVABLE" "${PLANS_EX} is unresolvable (not an existing file under .ai-workspace/plans/)"
+    emit_repeat_block "SIZE-PLAN-UNRESOLVABLE" "${PLANS_EX} is unresolvable (not an existing file under .ai-workspace/plans/ here, in the ticket's metadata.repo, or in a worktree the prompt names)"
   }
   SZ_SRC="$(json_field size_source "$RJ")"; DCLS="$(json_field data_class "$RJ")"; EFFD="$(json_field effective_dispatch "$RJ")"
   [ "$DCLS" != "invalid" ] || emit_repeat_block "DATA-CLASS-INVALID" "${PLANS_EX} carries a malformed data-class line (public|operator-private only)"
