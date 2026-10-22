@@ -7606,4 +7606,108 @@ for BADT in "../escape" "a/b" "bad shape!" "$D4LONG"; do
     && ok "b3 research append with a bad task shape is still refused (${#BADT} chars)" || bad "b3 research bad shape (rc=$RC out=$OUT)"
 done
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3337 — ROUTE AT RUN: a PAST subprocess row is judged by the route in force WHEN IT RAN (proven by its
+# own receipt: nonce-bound transcript + served model + nonce-bearing artifact), never by today's seat pin.
+# Pins go blind under CC_ROUTES_JSON, so this block runs a SCRATCH COPY of the ledger next to its own
+# fixture config/cc-routes.json (resolved beside the script, no env seam) with a sandbox CC_SEAT_PINS_FILE
+# and an isolated THREE_ROLE_LEDGER_DIR. The live ledger, live pin file and live SSOT are never touched:
+# rar_run refuses (fail closed) unless every one of the three targets sits under this suite's $TMP.
+# Probe = `provenance-kind` (E2 = the subprocess row is admitted by checkSubprocessProvenance; none = it is
+# not, and `check` falls to the agentId arm and BLOCKs, the #3337 symptom).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+RAR="$TMP/rar"; mkdir -p "$RAR/hooks" "$RAR/config" "$RAR/ledger" "$RAR/tx" "$RAR/art"
+cp "$LED" "$RAR/hooks/3role-ledger.mjs"
+cat > "$RAR/config/cc-routes.json" <<'RARROUTES'
+{ "providers": {
+    "anthropic": { "model_vocabulary": { "claude-opus-5-5": { "tier_equivalent": "opus" } } },
+    "zai": { "model_vocabulary": { "glm-5.3": { "tier_equivalent": "opus" } } } },
+  "seats": {
+    "planner": { "provider": "anthropic", "model": "claude-opus-5-5" },
+    "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai", "agent_tool_fallback": "opus" },
+    "execution-review": { "provider": "anthropic", "model": "claude-opus-5-5" } } }
+RARROUTES
+RAR_SID="sess-3337"; RAR_PINS="$RAR/pins.json"
+rar_run() { # fail closed when any target is unset or outside this suite's $TMP
+  case "$RAR/ledger|$RAR_PINS|$RAR/hooks/3role-ledger.mjs" in "$TMP"/*"|$TMP"/*"|$TMP"/*) ;; *) echo "RAR-REFUSED"; return 9 ;; esac
+  [ -n "$TMP" ] || { echo "RAR-REFUSED"; return 9; }
+  env -u CC_ROUTES_JSON -u CC_ROLES_ENV THREE_ROLE_LEDGER_DIR="$RAR/ledger" CC_SEAT_PINS_FILE="$RAR_PINS" \
+    node "$RAR/hooks/3role-ledger.mjs" "$@" 2>/dev/null
+}
+rar_pin() { # zai | anthropic | none
+  case "$1" in
+    zai) printf '{"planner":{"route":{"value":"zai/glm-5.3","reason":"fixture","set_at":"2026-01-01T00:00:00Z"}}}\n' > "$RAR_PINS" ;;
+    anthropic) printf '{"planner":{"route":{"value":"anthropic/claude-opus-5-5","reason":"fixture","set_at":"2026-01-02T00:00:00Z"}}}\n' > "$RAR_PINS" ;;
+    none) rm -f "$RAR_PINS" ;;
+  esac
+}
+rar_tx() { # <path> <task> <role> <nonce> <served-model> [untagged]
+  node -e '
+    const fs = require("fs");
+    const [ , p, t, r, n, m, untagged ] = process.argv;
+    const head = untagged ? "an unrelated session" : ("3ROLE_TASK:" + t + " ROLE:" + r + "\nDISPATCH-NONCE:" + n + "\n\nplan");
+    const L = [];
+    L.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z", sessionId: "rartx", content: head }));
+    L.push(JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:01.000Z", cwd: "/", message: { role: "user", content: head } }));
+    L.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:02.000Z", message: { model: m, content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(p, L.join("\n") + "\n");
+  ' "$1" "$2" "$3" "$4" "$5" "${6:-}"
+}
+rar_row() { # <task> <role> <nonce> <transcript> <model> [provider]
+  mkdir -p "$RAR/ledger/$RAR_SID"
+  printf 'plan\nDISPATCH-NONCE:%s\n## Review\nDecision: PASS\n' "$3" > "$RAR/art/$1-$2.md"
+  printf '{"role":"%s","session_id":"%s","ts":"2026-01-01T00:00:03Z","dispatch":"subprocess-zai","run_id":"%s","run_kind":"bound","run_source":"dispatch-helper","artifact_path":"%s","closedAt":"2026-01-01T00:00:03Z","modelVersion":"%s","provider":"%s","transcript_path":"%s","nonce":"%s"}\n' \
+    "$2" "$RAR_SID" "$3" "$RAR/art/$1-$2.md" "$5" "${6:-zai}" "$4" "$3" > "$RAR/ledger/$RAR_SID/$1.jsonl"
+}
+rar_kind() { rar_run provenance-kind --session "$RAR_SID" --task "$1" --role "$2"; }
+
+# Shared good row: z.ai planner row with a full receipt.
+rar_tx "$RAR/tx/good.jsonl" 3337a planner OR-NONCE-3337a glm-5.3
+rar_row 3337a planner OR-NONCE-3337a "$RAR/tx/good.jsonl" glm-5.3
+
+# ---- must-pass (RED on origin/master for P1/P2/P3-after-flip) ----
+rar_pin anthropic; K=$(rar_kind 3337a planner)
+[ "$K" = "E2" ] && ok "#3337 P1: z.ai planner row + planner route-pinned to anthropic NOW -> admitted by its own receipt (kind=$K)" \
+  || bad "#3337 P1: z.ai row judged by today's anthropic pin (kind=$K, want E2)"
+rar_pin none; K=$(rar_kind 3337a planner)
+[ "$K" = "E2" ] && ok "#3337 P2: z.ai planner row + NO pin (SSOT planner = anthropic) -> admitted by its own receipt (kind=$K)" \
+  || bad "#3337 P2: z.ai row with no live pin (kind=$K, want E2)"
+RAR_SEQ=""
+for st in zai anthropic none zai anthropic; do rar_pin "$st"; RAR_SEQ="$RAR_SEQ $st=$(rar_kind 3337a planner)"; done
+[ "$RAR_SEQ" = " zai=E2 anthropic=E2 none=E2 zai=E2 anthropic=E2" ] \
+  && ok "#3337 P3: pin flipped zai->anthropic->none->zai->anthropic mid-life never changes the existing row's verdict ($RAR_SEQ)" \
+  || bad "#3337 P3: verdict moved with the live pin ($RAR_SEQ)"
+# P4: the full `check` on a planner-only task no longer prints the agentId "" planner BLOCK (no pin).
+rar_pin none; OUT=$(rar_run check --session "$RAR_SID" --task 3337a)
+! printf '%s' "$OUT" | command grep -q 'planner agentId "" does not resolve' \
+  && ok "#3337 P4: check no longer BLOCKs the receipted z.ai planner row on the agentId arm" \
+  || bad "#3337 P4: check still sends the receipted planner row to the agentId arm ($OUT)"
+
+# ---- must-block (fail closed; same verdict under every pin state) ----
+rar_row 3337b planner OR-NONCE-3337b "$RAR/tx/missing.jsonl" glm-5.3
+rar_tx "$RAR/tx/forged.jsonl" 3337c planner OR-NONCE-3337c glm-5.3 untagged
+rar_row 3337c planner OR-NONCE-3337c "$RAR/tx/forged.jsonl" glm-5.3
+rar_tx "$RAR/tx/other.jsonl" 9999 planner OR-NONCE-other glm-5.3
+rar_row 3337d planner OR-NONCE-3337d "$RAR/tx/other.jsonl" glm-5.3
+rar_tx "$RAR/tx/badmodel.jsonl" 3337e planner OR-NONCE-3337e claude-opus-5-5
+rar_row 3337e planner OR-NONCE-3337e "$RAR/tx/badmodel.jsonl" glm-5.3
+rar_tx "$RAR/tx/er.jsonl" 3337f execution-review OR-NONCE-3337f glm-5.3
+rar_row 3337f execution-review OR-NONCE-3337f "$RAR/tx/er.jsonl" glm-5.3
+rar_tx "$RAR/tx/vocab.jsonl" 3337g planner OR-NONCE-3337g glm-9
+rar_row 3337g planner OR-NONCE-3337g "$RAR/tx/vocab.jsonl" glm-9
+for st in anthropic none zai; do
+  rar_pin "$st"
+  for case in "3337b planner no-receipt(transcript-missing)" "3337c planner forged-dispatch(untagged-transcript)" \
+              "3337d planner receipt-for-other-task+nonce" "3337e planner served-model!=claimed" \
+              "3337f execution-review never-route-pinnable-role" "3337g planner model-not-in-vocabulary"; do
+    set -- $case
+    K=$(rar_kind "$1" "$2")
+    [ "$K" = "none" ] && ok "#3337 B pin=$st $3: not admitted (kind=$K)" || bad "#3337 B pin=$st $3: admitted without a valid receipt (kind=$K)"
+  done
+done
+rar_pin none; OUT=$(rar_run check --session "$RAR_SID" --task 3337b)
+printf '%s' "$OUT" | command grep -q 'BLOCK' && printf '%s' "$OUT" | command grep -q 'transcript_path' \
+  && ok "#3337 B-check: check BLOCKs a z.ai planner row whose transcript is missing (names transcript_path)" \
+  || bad "#3337 B-check: missing-receipt row not blocked by check ($OUT)"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
