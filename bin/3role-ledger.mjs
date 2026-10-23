@@ -1738,9 +1738,11 @@ function transcriptRecordsAppend(content, task, role, verdict) {
 // #2309 clause 3 relies on when it proves a reviewer's in-flight self-append), so the calling seat is the
 // one candidate whose transcript holds an IN-FLIGHT Bash tool_use (no tool_result yet) that EXECUTES this
 // exact `3role-ledger.mjs append <argv>` at command position. Candidates are ONLY the agentIds already on
-// this (task, role)'s ledger rows AND spawn-record-bound to the tag (agentBoundToTag) — so a seat can never
-// be resolved onto a row outside this lane, and one agent can never write another's row (only the caller's
-// transcript holds the caller's in-flight command). Exactly one proving candidate -> that agentId; 2+ ->
+// this (task, role)'s ledger rows whose OWN transcript's first record carries the `3ROLE_TASK:<task>
+// ROLE:<role>` tag (checked directly on the transcript file found below, not through agentBoundToTag) — so
+// a seat can never be resolved onto a row outside this lane. The same proof also guards an EXPLICIT
+// `--agent X` (see the append site): a caller proven to be a different seat Y != X is refused, so one
+// agent can never write another's row either way. Exactly one proving candidate -> that agentId; 2+ ->
 // ambiguous -> fail closed (refuse); 0 -> unresolved (the caller's existing refusal paths decide).
 // INPUT-BOUND: at most SELF_ID_MAX_CANDIDATES candidates (more -> unresolved), only the last
 // SELF_ID_TAIL_BYTES of each transcript are read, and any command over SELF_ID_MAX_CMD chars is skipped.
@@ -4783,6 +4785,22 @@ function cmdAppend(o) {
   // seat never needs to know its agentId and the write never bounces to the orchestrator. Unresolved
   // (no proof) leaves the write bare, so fix-A / clause 1-3 below still decide exactly as before; two or
   // more proving transcripts is ambiguous and refused (fail closed, nothing written).
+  // #3364 B1 — an EXPLICIT `--agent X` must not let one seat write another's row. Run the same proof: if
+  // the caller is proven to be a bound seat (its own transcript holds this exact append in flight) and X is
+  // not among the proving seats, refuse with nothing written. A caller that proves as no seat (the
+  // orchestrator's main-session re-append) is left alone, so that path is unchanged.
+  if ('agent' in o && o.agent !== true && String(o.agent || '') !== '') {
+    const claimed3364 = String(o.agent);
+    const proof3364 = resolveSelfAgent3364(session, spawnSession, task, role, process.argv.slice(3));
+    if (proof3364.matches.length && !proof3364.matches.includes(claimed3364)) {
+      console.error('BLOCK (3role-ledger #3364 cross-seat write): --agent ' + sanitize(claimed3364) +
+        ' names another seat, but the caller is proven to be seat ' + proof3364.matches.join(', ') +
+        ' (3ROLE_TASK:' + sanitize(task) + ' ROLE:' + role + '; its own transcript holds this exact append ' +
+        'in flight). One agent may not write another agent\'s row; nothing written. Append your own row ' +
+        '(drop --agent, or pass your own agentId).');
+      process.exit(2);
+    }
+  }
   if (!('agent' in o) && !('run-id' in o)) {
     let sameRole3364 = 0;
     try {
