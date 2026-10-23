@@ -8256,6 +8256,12 @@ function cmdLogBypass(o) {
     var: varName,
     decision,
   };
+  // #3357: optional --spawn <task>:<role> names the spawn target a permit was honoured for (the caller
+  // already parsed it; this helper never reads tool_input -- see readStdinJSON). The override-used
+  // detector counts one permit per (var, spawn): a retried spawn that a LATER hook blocked logs a
+  // permit per attempt (10 rows for one executor spawn) but is ONE use.
+  const spawnKey = String(o.spawn || '').replace(/[^0-9A-Za-z._:-]/g, '').slice(0, 96);
+  if (spawnKey) record.spawn = spawnKey;
   const logPath = rule12LogPath();
   try {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
