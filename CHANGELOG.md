@@ -9,6 +9,15 @@
   `ROLE:`; otherwise the old anywhere scan applies, so nothing blocked before becomes allowed. A header
   `ROLE:research` spawn is no longer treated as an executor. The policy gate never tier-checks a non-chain role.
 
+## [0.18.2] - 2026-10-23
+
+### Changed
+- **sync (#3405): fast-track seats count as lanes.** Regenerated `bin/3role-ledger.mjs` and
+  `hooks/three-role-subagent-ledger.sh` from the ai-brain branch via `scripts/sync-three-role-plugin.mjs write`
+  (never hand-edited). The lane-intent reconciler learns the `fast-track` role (refreshes the marker while the
+  transcript is fresh; releases it when the transcript is gone, crashed or silent past the 90-minute intent TTL),
+  and the hand-back hook clears the fast-track marker and leaves an agent-keyed ended-tombstone.
+
 ## [0.18.1] - 2026-10-23
 
 ### Changed

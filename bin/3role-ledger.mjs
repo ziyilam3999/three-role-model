@@ -7405,6 +7405,7 @@ const LANE_POOL_ROLE_MAP = {
   executor: 'work',
   'execution-review': 'work',
   'ship-tail': 'ship_tail',
+  'fast-track': 'work', // #3405 D1: a FAST-TRACK:<n> seat (no 3ROLE_TASK tag) is one work-pool lane
 };
 // NR-3 (registered, deferred) — this is a JS TWIN of hooks/sole_lane_math.py's own POOL_ROLE_MAP. A code
 // comment marks the twin in BOTH sites; single-sourcing is deferred until a THIRD start-boundary consumer
@@ -7546,6 +7547,28 @@ function ledgerRowForRoleAgent(sess, task, role, agentId) {
   return row;
 }
 
+// #3405 D1/D4: a fast-track subagent brief carries FAST-TRACK:<n> (numeric ids only -- the grammar
+// plan-review-before-execute.sh and hooks/lane-ceiling-gate.sh use) and NO 3ROLE_TASK tag. Parsed ONLY by
+// refresh-lane-intents, never by extractTagsFromText: reconcile-spawns must keep writing no ledger row for a
+// fast-track seat (named risk N2).
+function fastTrackDiscoveryFromText(text) {
+  const t = String(text == null ? '' : text);
+  if (!t || /3ROLE_TASK:/i.test(t)) return null;
+  const m = t.match(/FAST-TRACK:([0-9]+)/i);
+  if (!m) return null;
+  const task = sanitize(m[1]);
+  return task ? { task, role: 'fast-track' } : null;
+}
+// The hand-back hook (three-role-subagent-ledger.sh) leaves <intent dir>/<session>/.ended-<agentId> for a
+// handed-back fast-track agent; keyed by AGENT, never by task (named risk N1).
+function fastTrackTombstoneName(agentId) {
+  return '.ended-' + String(agentId).replace(/[^0-9A-Za-z_-]/g, '');
+}
+function resolveLaneIntentTtlMs() {
+  const n = Number(process.env.LANE_INTENT_TTL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5400000;
+}
+
 function cmdRefreshLaneIntents(o) {
   const freshMs = resolveLaneTranscriptFreshMs();
   const slackMs = resolveLaneClosedActivitySlackMs();
@@ -7582,6 +7605,18 @@ function cmdRefreshLaneIntents(o) {
       }
     }
     if (transcripts.length === 0) {
+      // #3405 D2(b): the projects root IS readable but this session has no transcript left -- a fast-track
+      // marker already bound to an agent whose transcript is gone is released. Every other marker is left
+      // byte-identical (AC-6).
+      try {
+        const sd0 = path.join(resolveLaneIntentDir(), sess);
+        for (const fn of fs.readdirSync(sd0).filter((f) => f.endsWith('.json') && !f.startsWith('.'))) {
+          try {
+            const mk = JSON.parse(fs.readFileSync(path.join(sd0, fn), 'utf8'));
+            if (mk && mk.role === 'fast-track' && mk.agentId) fs.unlinkSync(path.join(sd0, fn));
+          } catch (e) { /* best-effort */ }
+        }
+      } catch (e) { /* no marker dir -- nothing to do */ }
       console.log('OK refresh-lane-intents: session=' + sess + ' no subagent transcripts, marker store untouched freshMs=' + freshMs);
       process.exit(0);
     }
@@ -7594,6 +7629,9 @@ function cmdRefreshLaneIntents(o) {
     // reconcile-spawns itself uses; the fresh-unmapped set is small by construction, so cost stays bounded
     // and this command never depends on reconcile-spawns' own scheduling.
     const checkpoint = readReconcileCheckpoint(sess);
+    const intentDir = resolveLaneIntentDir();
+    const sessDir = path.join(intentDir, sess);
+    const ttlMs = resolveLaneIntentTtlMs();
     let selfDerived = 0;
     const resolved = []; // {task, role, agentId, mtimeMs}
     for (const t of transcripts) {
@@ -7605,11 +7643,18 @@ function cmdRefreshLaneIntents(o) {
         if (age <= freshMs) {
           const line = readFirstNonEmptyLine(t.file);
           const text = firstRecordTextFromLine(line);
-          discovery = extractTagsFromText(text).discovery;
+          discovery = extractTagsFromText(text).discovery || fastTrackDiscoveryFromText(text);
           selfDerived++;
         }
       }
       if (discovery && discovery.task && discovery.role) {
+        // #3405 D3: a handed-back fast-track AGENT (tombstone keyed by agentId) is never re-listed from its
+        // still-fresh transcript; a NEW agent for the same task has its own agentId and is unaffected.
+        if (discovery.role === 'fast-track') {
+          let ended = false;
+          try { ended = fs.existsSync(path.join(sessDir, fastTrackTombstoneName(t.agentId))); } catch (e) { /* none */ }
+          if (ended) continue;
+        }
         resolved.push({ task: discovery.task, role: discovery.role, agentId: t.agentId, mtimeMs: t.mtimeMs });
       }
     }
@@ -7623,9 +7668,6 @@ function cmdRefreshLaneIntents(o) {
       const cur = winners.get(r.task);
       if (!cur || r.mtimeMs > cur.mtimeMs) winners.set(r.task, { role: r.role, pool, agentId: r.agentId, mtimeMs: r.mtimeMs });
     }
-
-    const intentDir = resolveLaneIntentDir();
-    const sessDir = path.join(intentDir, sess);
 
     // REFRESH (LIVE): write/recreate the marker for every task whose winner is FRESH and not yet closed.
     // "Closed" is decided by closedAtIsTerminal(), NOT raw closedAt presence (stall-check-liveness-window-
@@ -7644,10 +7686,14 @@ function cmdRefreshLaneIntents(o) {
       if (closedAt0 && closedAtIsTerminal(closedAt0, w.mtimeMs, slackMs)) { skippedClosed++; continue; } // AC-3
 
       let priorWrittenAtMs = 0;
+      let priorRole = '';
       try {
         const priorRaw = JSON.parse(fs.readFileSync(path.join(sessDir, task + '.json'), 'utf8'));
         priorWrittenAtMs = Number(priorRaw && priorRaw.written_at_ms) || 0;
+        priorRole = String((priorRaw && priorRaw.role) || '');
       } catch (e) { /* absent/unreadable prior — treated as none */ }
+      // #3405 D4 monotonicity: a fast-track winner never downgrades or re-binds a CHAIN lane's marker.
+      if (w.role === 'fast-track' && priorRole && priorRole !== 'fast-track') continue;
 
       // F6 — pre-write re-check: re-read the ledger IMMEDIATELY before the write and abort if a closedAt
       // landed since the check above (closes the race to a single re-check; the symmetric unlink below is
@@ -7681,7 +7727,7 @@ function cmdRefreshLaneIntents(o) {
     // this reconciler has never yet bound (TaskUpdate-origin, zero-transcript, the spawn->first-beat race, or
     // a still-unbound transcript-invisible subprocess seat) — is NEVER touched here; it rides the pre-existing
     // TTL/GC backstop untouched, exactly as today (AC-9/AC-11). Staleness alone NEVER counts as death (AC-7c).
-    let unlinkedClosed = 0, unlinkedCrashed = 0, survivedStale = 0, survivedNoAgent = 0;
+    let unlinkedClosed = 0, unlinkedCrashed = 0, survivedStale = 0, survivedNoAgent = 0, unlinkedGone = 0, unlinkedIdle = 0;
     let existingFiles = [];
     try { existingFiles = fs.readdirSync(sessDir).filter((f) => f.endsWith('.json') && !f.startsWith('.')); }
     catch (e) { existingFiles = []; }
@@ -7708,6 +7754,12 @@ function cmdRefreshLaneIntents(o) {
         }
         continue;
       }
+      if (role === 'fast-track' && !tr) {
+        // #3405 D2(b): the bound agent's transcript file is gone -- a fast-track seat is always an
+        // in-process Agent-tool spawn with a transcript (never the invisible subprocess seat), so gone = ended.
+        try { fs.unlinkSync(fp); unlinkedGone++; } catch (e) { /* best-effort */ }
+        continue;
+      }
       if (tr) {
         const crash = transcriptCrashInfo(tr.file);
         if (crash.hasCrash) {
@@ -7723,6 +7775,13 @@ function cmdRefreshLaneIntents(o) {
           continue;
         }
       }
+      if (role === 'fast-track' && tr && (nowMs - tr.mtimeMs) > ttlMs) {
+        // #3405 D2(c): no write for longer than LANE_INTENT_TTL_MS (90 min, above the measured 79-min p99
+        // max gap) = ended. Scoped to fast-track ONLY: chain roles keep R3-1 (staleness is never death).
+        // NO tombstone: a seat that writes again is recreated by the refresh pass on the next beat.
+        try { fs.unlinkSync(fp); unlinkedIdle++; } catch (e) { /* best-effort */ }
+        continue;
+      }
       survivedStale++; // stale-but-open, no crash evidence, or the agentId's transcript is gone (can't-tell) — never death (R3-1)
     }
 
@@ -7731,6 +7790,7 @@ function cmdRefreshLaneIntents(o) {
       ' selfDerived=' + selfDerived + ' tasksResolved=' + winners.size +
       ' refreshed=' + refreshed + ' skippedClosed=' + skippedClosed + ' skippedStale=' + skippedStale +
       ' unlinkedClosed=' + unlinkedClosed + ' unlinkedCrashed=' + unlinkedCrashed +
+      ' unlinkedGone=' + unlinkedGone + ' unlinkedIdle=' + unlinkedIdle +
       ' survivedStale=' + survivedStale + ' survivedNoAgent=' + survivedNoAgent +
       ' resumed=' + resumed +
       ' freshMs=' + freshMs + ' slackMs=' + slackMs

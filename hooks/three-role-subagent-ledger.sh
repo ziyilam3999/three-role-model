@@ -111,6 +111,41 @@ else
 fi
 [ -n "$AGENTID" ] || exit 0
 
+# #3405 D3: a FAST-TRACK:<n> seat (brief carries FAST-TRACK:<n>, numeric, and NO 3ROLE_TASK tag) holds a
+# work-pool spawn-intent marker (role "fast-track", written by hooks/lane-ceiling-gate.sh at spawn). At
+# hand-back: (1) unlink THAT marker only when it is role-matched (role "fast-track") and either unbound or
+# bound to THIS agent -- never a chain lane's marker, never a newer re-spawn's marker; (2) leave an
+# ended-tombstone keyed by this AGENT (its agentId, never the task) so the lane-intent reconciler does not
+# resurrect the marker from this still-fresh transcript. A fast-track seat writes no role-ledger row: stop.
+FT_TASK="$(TRANSCRIPT_PATH="$TRANSCRIPT" node -e '
+  const fs=require("fs");
+  let txt=""; try{ txt=fs.readFileSync(process.env.TRANSCRIPT_PATH,"utf8"); }catch(e){ process.exit(0); }
+  for (const ln of txt.split("\n")) {
+    if (!ln.trim()) continue;
+    let j; try{ j=JSON.parse(ln); }catch(e){ continue; }
+    if (!(j && (j.type==="user" || (j.message && j.message.role==="user")))) continue;
+    const c=j.message && j.message.content;
+    const brief=typeof c==="string" ? c : (Array.isArray(c) ? c.map(b=>(b && typeof b.text==="string") ? b.text : "").join("\n") : "");
+    if (/3ROLE_TASK:/i.test(brief)) process.exit(0);
+    const m=brief.match(/FAST-TRACK:([0-9]+)/i);
+    if (m) process.stdout.write(m[1]);
+    process.exit(0);
+  }
+' 2>/dev/null)"
+if [ -n "$FT_TASK" ]; then
+  FT_SID="$(printf '%s' "$SESSION" | tr -cd '0-9A-Za-z._-')"
+  FT_DIR="${LANE_INTENT_DIR:-$HOME/.claude/.lane-intents}/$FT_SID"
+  FT_MARKER="$FT_DIR/$FT_TASK.json"
+  if [ -n "$FT_SID" ]; then
+    if [ -f "$FT_MARKER" ]; then
+      FT_OWN="$(node -e 'try{const m=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const a=m.agentId?String(m.agentId):"";process.stdout.write(String(m.role||"")==="fast-track" && (a===""||a===process.argv[2]) ? "yes":"no")}catch(e){process.stdout.write("no")}' "$FT_MARKER" "$AGENTID" 2>/dev/null)"
+      [ "$FT_OWN" = "yes" ] && rm -f "$FT_MARKER" 2>/dev/null
+    fi
+    mkdir -p "$FT_DIR" 2>/dev/null && : > "$FT_DIR/.ended-$AGENTID" 2>/dev/null
+  fi
+  exit 0
+fi
+
 # (b) read the brief (first type:user message) + classify the role, AND scan the transcript for the agent's OWN
 # self-append (provenance, #1100 item 3). Emits: "<taskId> <role> <selfAuthored 0|1>" or "" (no tag).
 read -r TASKID ROLE SELFAUTH < <(
