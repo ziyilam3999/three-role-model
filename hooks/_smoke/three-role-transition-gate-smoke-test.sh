@@ -843,4 +843,224 @@ run "$(agent "3ROLE_TASK:$TA ROLE:executor" "$SA")"
 [ "$RC" = "2" ] && ok "alias-6 admitting alias past the 8-line bound -> BLOCK" || bad "alias-6 (rc=$RC out=$CAP)"
 mv "$LEDGERDIR/.session-alias/$SA" "$TMP/alias-$SA.bak"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3422 — the spawn's role is read from the HEADER pair (first non-empty line carrying 3ROLE_TASK + ROLE), never
+# from a quoted ROLE: in the body. Both-ends: a PINNED pre-#3422 snapshot of this hook vs the live hook, in one run.
+# The snapshot is materialized next to the live hook (its LED_HELPER sibling resolution must find the real ledger).
+# Do NOT regenerate the snapshot from the live hook — the non-decay guard fails if they are byte-identical.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+BASE3422_HOOK="$(dirname "$HOOK")/.smoke-3422-base-$$.sh"
+trap 'rm -rf "$TMP" "$BASE3422_HOOK"' EXIT
+cat > "$BASE3422_HOOK" <<'PREFIX3422_EOF'
+#!/usr/bin/env bash
+# PreToolUse(Agent|Task) hook — THREE-ROLE TRANSITION GATE (#851 PR2, Phase 3b; hardened #1575). Enforces
+# SEQUENCING of the 3-role model at SPAWN time: you cannot spawn the EXECUTOR for a task before the PLAN has
+# been REVIEWED — and "reviewed" now means a COMPLETED review carrying an AFFIRMATIVE verdict, not merely a
+# ledger LINE.
+#
+# Mechanism: the orchestrator prepends "3ROLE_TASK:<id> ROLE:<role>" to every role subagent's prompt (the same
+# tag PR1's ledger + Phase 3a read). When an Agent/Task spawn carries ROLE:executor for task <id>, this gate
+# shells out to `node hooks/3role-ledger.mjs gate-plan-review --session <session> --task <id>` — the SAME
+# evaluator a node-level smoke exercises directly, so there is ONE implementation of the admission contract,
+# not two. That evaluator reads the LAST PARSEABLE plan-review line, fail-closes on trailing junk, runs a
+# universal verdict ALLOWLIST screen, then dispatches to exactly three sanctioned arms (the #2051 subprocess
+# arm consulted FIRST after the verdict screen, mirroring checkRole's own consult-order):
+#   (3) subprocess-openrouter (#2051) — affirmative verdict + a `dispatch=subprocess-openrouter` marker whose
+#       SSOT seat is declared subprocess-dispatched, verified by the SAME checkSubprocessProvenance the
+#       completion gate already trusts (a per-dispatch nonce stamped into the transcript's FIRST record AND
+#       the artifact, the served model == the SSOT seat model, the transcript exists). A forged/replayed
+#       nonce, a missing transcript, or an SSOT mismatch blocks `subprocess-unverified`. A bare marker with
+#       the SSOT silent admits NOTHING (falls through to arms 1/2). Never a hand-typed ledger append — the
+#       sanctioned route is re-running the dispatch via tools/openrouter-role-dispatch.sh.
+#   (1) completed-review — affirmative verdict + closedAt (the SubagentStop punch-out) + an agentId whose
+#       transcript is SPAWN-RECORD-bound (its FIRST record, not merely a later mention) to
+#       `3ROLE_TASK:<id> ROLE:plan-review`;
+#   (2) inherited-review — `inherited_from` + agentId + artifact_path, with the agentId PARENT-bound the same
+#       way, keyed on the row's own `inherited_from`.
+# #1575 (operator decision, round 3): there is NO skip arm at this gate any more — a `skip_reason`-only line,
+# however specific, does NOT satisfy the executor precondition. A genuinely session-coupled lane runs its
+# executor INLINE (untagged; see the honest limitation below) and never meets this gate.
+#
+# #1575 D1/round-4: the "bound" test opens ONLY the CITED agentId's own transcript and reads its SPAWN
+# RECORD — never a whole-file substring scan (which binds to MENTIONS, e.g. a plan-review tag arriving in a
+# planner's transcript via the plan's own required `## Review` byline — measured 4-of-7 on a real session) and
+# never a newest-mtime "winner" search (a contaminated, newer sibling transcript must never decide another
+# row's binding).
+#
+# HONEST LIMITATION (stated, not hidden): an UNTAGGED spawn (no 3ROLE_TASK / no ROLE) FAIL-OPENS (allow) — the
+# gate cannot classify it, so it cannot sequence it. This is deliberate: the per-transition gate raises the
+# floor, it does not make untagged bypass impossible. The COMPLETION gate (three-role-instrumentation-gate.sh,
+# PR1) is the backstop — an untagged executor still cannot get the task marked done without a resolvable
+# execution-review ledger line. Tagging is orchestrator-discipline; this gate enforces the ORDER once tagged.
+# Nothing in the ledger is unforgeable (every field has a plain CLI flag) — this gate closes the one-command
+# SHORTCUTS (the backgrounded-dispatch race, the convenience skip, the quiet downgrade via skip/inherit/flip,
+# the mention-borrowed agentId), never a determined forger who actually spawns a real reviewer and forges its
+# verdict before it returns (the named residual — see the #1575 plan's `Deferred-follow-ups:`).
+#
+# Only the EXECUTOR transition is gated. planner / plan-review / execution-review spawns are always ALLOWED
+# (planner has no precondition; reviewer spawns must be free to run). Kill-switches: THREE_ROLE_INSTRUMENT_OFF=1,
+# SHIP_PIPELINE=1. Fail-open on any missing/unparseable state. No `set -e` (a non-block non-zero must not be
+# read as a permission decision — #749 fail-closed-smoke lesson).
+# #3154: a size-S ticket (ticket metadata.size S AND the plan's `size: S`, no plan-review row) is admitted by the SAME
+# gate-plan-review evaluator (its size-s-exempt arm) -- this hook stays a thin caller and the block text names the S rule.
+# Reference: parent-claude.md Invariant #2 ("the plan is reviewed by a STATELESS reviewer before execution"),
+# hooks/3role-ledger.mjs (ledger format + THREE_ROLE_LEDGER_DIR + gate-plan-review), the plan #851 Phase 3b,
+# and .ai-workspace/plans/2026-07-11-1575-spawn-gate-integrity.md (the hardening).
+
+# #1543 — source the shared write-time bypass-audit writer (hook_log_bypass), if not already.
+# This file is ALSO ported to the public three-role-model plugin (Population B), which does NOT ship
+# lib-hook-override.sh — every call site below is `type`-guarded so a plugin install (no wrapper lib
+# present) silently no-ops instead of erroring; ai-brain installs (lib present) log normally.
+OVERRIDE_LIB="$(dirname "${BASH_SOURCE[0]}")/lib-hook-override.sh"
+[ -f "$OVERRIDE_LIB" ] && . "$OVERRIDE_LIB"
+INPUT=$(cat)
+
+# Kill-switches.
+if [ "${THREE_ROLE_INSTRUMENT_OFF:-}" = "1" ]; then
+  type hook_log_bypass >/dev/null 2>&1 && hook_log_bypass "three-role-transition-gate" "THREE_ROLE_INSTRUMENT_OFF" "PERMIT" "${INPUT:-}"
+  exit 0
+fi
+[ "${SHIP_PIPELINE:-}" = "1" ] && exit 0
+
+# Parse tool_input.prompt (Agent) / fall back to tool_input.description (some Task shapes) + session_id, and
+# extract the 3ROLE_TASK + ROLE tags. Emits: "<taskId> <role>" or "" when untagged (-> fail-open allow).
+read -r TASKID ROLE SESSION < <(
+  HOOK_INPUT="$INPUT" node -e '
+    let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
+    const ti=d.tool_input||{};
+    const prompt=[ti.prompt, ti.description, ti.message].map(x=> (x==null?"":String(x))).join("\n");
+    const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
+    const mTask=prompt.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
+    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
+    if(!mTask || !mRole){ process.stdout.write("- - "+(session||"-")); process.exit(0); }
+    process.stdout.write(mTask[1] + " " + mRole[1].toLowerCase() + " " + (session||"-"));
+  ' 2>/dev/null
+)
+
+# Untagged spawn -> FAIL-OPEN (allow). Honest limitation documented in the header + block msg.
+[ -n "$TASKID" ] && [ "$TASKID" != "-" ] && [ -n "$ROLE" ] && [ "$ROLE" != "-" ] || exit 0
+
+# Only the executor transition is sequenced. Other roles always allowed.
+[ "$ROLE" = "executor" ] || exit 0
+
+# A tagged executor spawn with no usable session cannot have its precondition verified — but a missing session
+# on a real spawn is anomalous; fail-OPEN here (allow) and let the completion gate (which fails CLOSED on a
+# tagged completion with no session) be the backstop. The transition gate only ever ADDS ordering on tagged
+# spawns that carry a session.
+[ -n "$SESSION" ] && [ "$SESSION" != "-" ] || exit 0
+
+# #1575 — the ENTIRE plan-review-admission decision lives in `gate-plan-review` (hooks/3role-ledger.mjs):
+# last-parseable-line semantics, trailing-junk fail-closed, the universal verdict allowlist screen, and the
+# three sanctioned arms (subprocess-openrouter / completed-review / inherited-review), each verified by the
+# SAME checkSubprocessProvenance + spawn-record-bound to the CITED agentId (never a whole-file mention scan,
+# never a newest-mtime "winner"). This hook is a thin caller so there is exactly ONE implementation of the
+# contract — node-level smokes exercise `gate-plan-review` directly, and this bash smoke exercises it through
+# the real hook.
+# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
+  LED_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
+else
+  LED_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
+fi
+GATE_STDERR=$(node "$LED_HELPER" gate-plan-review --session "$SESSION" --task "$TASKID" 2>&1 >/dev/null)
+GATE_RC=$?
+
+if [ "$GATE_RC" = "0" ]; then
+  exit 0
+fi
+
+# #3333 (2026-10-22): one chat can own a ticket's rows under more than one ledger session (z.ai dispatches
+# under the carried ledger session, Agent-tool seats under the chat's own). `<ledger>/.session-alias/<session>`
+# lists those other sessions (same file + bound as hooks/sole_lane_math.py session_aliases). Re-run the SAME
+# gate-plan-review under each alias: only a real COMPLETED, AFFIRMATIVE plan-review for THIS task, passing every
+# check that evaluator applies, admits. Missing/unreadable alias file -> no retry (the pre-alias answer).
+ALIAS_FILE="${THREE_ROLE_LEDGER_DIR:-$HOME/.claude/3role-ledger}/.session-alias/${SESSION}"
+if [ -f "$ALIAS_FILE" ] && [ -r "$ALIAS_FILE" ]; then
+  ALIAS_N=0
+  while IFS= read -r ALIAS_SID || [ -n "$ALIAS_SID" ]; do
+    ALIAS_SID="$(printf '%s' "$ALIAS_SID" | tr -cd '0-9A-Za-z._-')"
+    [ -n "$ALIAS_SID" ] && [ "$ALIAS_SID" != "$SESSION" ] || continue
+    ALIAS_N=$((ALIAS_N + 1))
+    [ "$ALIAS_N" -le 8 ] || break
+    if node "$LED_HELPER" gate-plan-review --session "$ALIAS_SID" --task "$TASKID" >/dev/null 2>&1; then
+      exit 0
+    fi
+    GATE_STDERR="${GATE_STDERR} | alias session ${ALIAS_SID}: no admitting plan-review either"
+  done < "$ALIAS_FILE"
+fi
+
+# BLOCK: the ledger has no COMPLETED, AFFIRMATIVE plan-review for this task yet. $GATE_STDERR names the
+# specific evidence class that failed (not-finished / no-verdict / negative-verdict / no-bound-reviewer-spawn /
+# inherited-row-unbound-to-parent / deliberate-skip-closed / junk-line / subprocess-unverified) plus the
+# ledger file + line evaluated (a misconfigured THREE_ROLE_LEDGER_DIR is otherwise silently permissive-looking
+# and undiagnosable).
+{
+  echo "THREE-ROLE TRANSITION GATE (three-role-transition-gate): cannot spawn the EXECUTOR for task #${TASKID} yet."
+  echo "  No COMPLETED, AFFIRMATIVE plan-review verdict is recorded for #${TASKID} in this session (${SESSION})."
+  echo "  ${GATE_STDERR}"
+  echo "  The 3-role model requires the PLAN to be reviewed by a STATELESS reviewer BEFORE execution, and that"
+  echo "  review must FINISH with an affirmative verdict (parent-claude.md Invariant #2). The reviewer — not the"
+  echo "  orchestrator — records its verdict. Run the plan-review role and let it complete honestly."
+  echo "  If the plan-review seat is dispatched via the subprocess-openrouter route (the #1947 norm — e.g. Kimi K3"
+  echo "    via OpenRouter), the SANCTIONED route is to RE-RUN that dispatch, never a hand-typed ledger append for a"
+  echo "    subprocess row (a hand-append is the very forgery this gate exists to block):"
+  echo "    bash tools/openrouter-role-dispatch.sh --role plan-review --brief <brief-path> --task ${TASKID} --session ${SESSION}"
+  echo "    (the dispatch self-stamps dispatch/transcript_path/nonce; the gate verifies them via the SAME"
+  echo "    checkSubprocessProvenance the completion gate already trusts.)"
+  echo "  Otherwise, run an Agent-tool-dispatched plan-review and let it complete honestly:"
+  echo "    node hooks/3role-ledger.mjs append --session ${SESSION} --task ${TASKID} --role plan-review \\"
+  echo "      --agent <agentId> --artifact <plan-or-review-path> --verdict PASS --closed-at <ISO-8601-timestamp>"
+  echo "  If #${TASKID} is a LEG of a parent plan whose plan-review already PASSED, inherit it instead (fails"
+  echo "  closed unless the parent has a real, transcript-backed, AFFIRMATIVE plan-review that names this leg):"
+  echo "    node hooks/3role-ledger.mjs inherit-plan-review --session ${SESSION} --task ${TASKID} --parent <parentTaskId>"
+  echo "  then re-spawn the executor. There is NO skip path for plan-review at this gate (operator decision) —"
+  echo "  a deliberate skip cannot satisfy this precondition, however specific the reason."
+  echo "  The ONE exemption is size-S (#3154): a ticket whose metadata.size is S AND whose plan says \`size: S\`, with no"
+  echo "    plan-review row yet, is admitted without a plan-review. The \`size-s: <reason>\` text above says why #${TASKID}"
+  echo "    is NOT size-S here (a ticket stamped M/L, a plan saying anything but S, an unresolvable plan, or an existing review row)."
+  echo "  Honest limitation: an UNTAGGED spawn dodges this gate (it can't be classified) — the completion gate"
+  echo "    (three-role-instrumentation-gate.sh) is the backstop. Kill-switch: THREE_ROLE_INSTRUMENT_OFF=1 (or SHIP_PIPELINE=1)."
+} >&2
+exit 2
+PREFIX3422_EOF
+if cmp -s "$BASE3422_HOOK" "$HOOK"; then
+  bad "#3422 non-decay: pinned pre-#3422 snapshot is BYTE-IDENTICAL to the live hook (the base arms are vacuous)"
+else
+  ok "#3422 non-decay: pinned pre-#3422 snapshot differs from the live hook"
+fi
+run_base() { CAP=$(printf '%s' "$1" | THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$BASE3422_HOOK" 2>&1 >/dev/null); RC=$?; }
+# both-ends helper: <label> <prompt-with-\n-escapes> <expected base rc> <expected head rc> [stderr-needle-at-base]
+both() {
+  local label="$1" prompt="$2" erb="$3" erh="$4" needle="${5:-}" rb ob rh oh
+  run_base "$(agent "$prompt" "34220000-0000-4000-8000-000000000001")"; rb=$RC; ob=$CAP
+  run "$(agent "$prompt" "34220000-0000-4000-8000-000000000001")"; rh=$RC; oh=$CAP
+  local good=1
+  [ "$rb" = "$erb" ] || good=0
+  [ "$rh" = "$erh" ] || good=0
+  [ -z "$needle" ] || printf '%s' "$ob" | command grep -q "$needle" || good=0
+  [ "$erh" != "0" ] || [ -z "$oh" ] || good=0
+  [ "$good" = "1" ] && ok "#3422 $label: base rc=$rb head rc=$rh" || bad "#3422 $label (base rc=$rb/$erb out=$ob; head rc=$rh/$erh out=$oh)"
+}
+# AC-6 positive control: the needle used by the hero arm matches a known synthetic stderr line.
+[ "$(grep_ctrl 'cannot spawn the EXECUTOR for task #3422' 'x cannot spawn the EXECUTOR for task #3422 y')" = "1" ] && ok "#3422 AC-6 grep_ctrl: block-text needle matches a known line" || bad "#3422 AC-6 grep_ctrl failed"
+# AC-1 hero: header research + quoted executor in the body, no plan-review -> blocked at BASE, allowed at HEAD.
+both "AC-1 hero header research + body ROLE:executor" 'FT-CHECK:3422 3ROLE_TASK:3422 ROLE:research\n\nquoted: 3ROLE_TASK:<id> ROLE:executor\n' 2 0 'cannot spawn the EXECUTOR for task #3422'
+# AC-2 control: header executor, no plan-review -> blocked at both ends.
+both "AC-2 control header executor" '3ROLE_TASK:3422 ROLE:executor\nGo.' 2 2 'cannot spawn the EXECUTOR for task #3422'
+# AC-2b monotone: header line has NO ROLE; executor only on a later line -> fallback scan -> blocked at both ends.
+both "AC-2b header without ROLE, executor on line 4" '3ROLE_TASK:3422 build it\n\n\nROLE:executor\n' 2 2
+# AC-2c first-pair-wins dodge: prose line 1, a quoted research pair, then the real executor pair -> blocked at both ends.
+both "AC-2c line 1 prose, research pair then executor pair" 'please build\n3ROLE_TASK:3422 ROLE:research\n3ROLE_TASK:3422 ROLE:executor\n' 2 2
+# AC-2c control: pair on line 1 + quoted executor pair below -> allowed at HEAD (blocked at base).
+both "AC-2c control pair on line 1, quoted executor below" '3ROLE_TASK:3422 ROLE:research\n3ROLE_TASK:3422 ROLE:executor\n' 2 0
+# AC-4 real FT-CHECK brief shape: template header line + an Oracle smoke section quoting ROLE:executor.
+both "AC-4 real FT-CHECK shape" 'FT-CHECK:3415 3ROLE_TASK:3415 ROLE:research\n\n## Oracle smoke\nrun(agent 3ROLE_TASK:3415 ROLE:executor)\n' 2 0
+# named risk 3422-pr-r2-header-role-case: an upper-case header role is lowercased, so EXECUTOR still blocks.
+both "risk r2-header-role-case header ROLE:EXECUTOR" '3ROLE_TASK:3422 ROLE:EXECUTOR\nGo.' 2 2
+# header ROLE:planner / plan-review are not executors -> allowed (as base).
+both "control header planner" '3ROLE_TASK:3422 ROLE:planner\nGo.' 0 0
+# blank leading lines are skipped; header research, body executor.
+both "leading blank lines then header research" '\n\n3ROLE_TASK:3422 ROLE:research\nROLE:executor\n' 2 0
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

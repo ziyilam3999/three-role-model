@@ -1,3 +1,14 @@
+## [0.19.0] - 2026-10-23
+
+### Changed
+- **sync (#3422): a spawn's role is read from its header pair, never from a quoted `ROLE:` in the body.**
+  Regenerated `bin/3role-ledger.mjs`, `hooks/three-role-transition-gate.sh`,
+  `hooks/three-role-model-policy-gate.sh` and their `_smoke` copies from the ai-brain branch via
+  `scripts/sync-three-role-plugin.mjs write` (never hand-edited). New `3role-ledger.mjs spawn-tag` subcommand
+  (one shared parser): task and role come from the first non-empty line when it carries both `3ROLE_TASK:` and
+  `ROLE:`; otherwise the old anywhere scan applies, so nothing blocked before becomes allowed. A header
+  `ROLE:research` spawn is no longer treated as an executor. The policy gate never tier-checks a non-chain role.
+
 ## [0.18.1] - 2026-10-23
 
 ### Changed

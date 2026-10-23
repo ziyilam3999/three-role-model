@@ -72,18 +72,16 @@ fi
 
 # Parse tool_input.prompt (Agent) / fall back to tool_input.description (some Task shapes) + session_id, and
 # extract the 3ROLE_TASK + ROLE tags. Emits: "<taskId> <role>" or "" when untagged (-> fail-open allow).
-read -r TASKID ROLE SESSION < <(
-  HOOK_INPUT="$INPUT" node -e '
-    let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){}
-    const ti=d.tool_input||{};
-    const prompt=[ti.prompt, ti.description, ti.message].map(x=> (x==null?"":String(x))).join("\n");
-    const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
-    const mTask=prompt.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
-    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
-    if(!mTask || !mRole){ process.stdout.write("- - "+(session||"-")); process.exit(0); }
-    process.stdout.write(mTask[1] + " " + mRole[1].toLowerCase() + " " + (session||"-"));
-  ' 2>/dev/null
-)
+# #3422: the task+role come from the shared header-pair parser in 3role-ledger.mjs (`spawn-tag`), never from a
+# quoted ROLE: in the prompt body. Emits "<taskId> <role> <session>" ('-' = absent -> fail-open allow below).
+# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
+# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
+  LED_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
+else
+  LED_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
+fi
+read -r TASKID ROLE SESSION < <(HOOK_INPUT="$INPUT" node "$LED_HELPER" spawn-tag 2>/dev/null)
 
 # Untagged spawn -> FAIL-OPEN (allow). Honest limitation documented in the header + block msg.
 [ -n "$TASKID" ] && [ "$TASKID" != "-" ] && [ -n "$ROLE" ] && [ "$ROLE" != "-" ] || exit 0
@@ -104,13 +102,6 @@ read -r TASKID ROLE SESSION < <(
 # never a newest-mtime "winner"). This hook is a thin caller so there is exactly ONE implementation of the
 # contract — node-level smokes exercise `gate-plan-review` directly, and this bash smoke exercises it through
 # the real hook.
-# Resolve the ledger helper: prefer ${CLAUDE_PLUGIN_ROOT}/bin; fall back to a repo-relative ../bin path
-# (R1: ${CLAUDE_PLUGIN_ROOT} may be unset in some hook shells — the fallback keeps it portable).
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs" ]; then
-  LED_HELPER="${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"
-else
-  LED_HELPER="$(dirname "${BASH_SOURCE[0]}")/../bin/3role-ledger.mjs"
-fi
 GATE_STDERR=$(node "$LED_HELPER" gate-plan-review --session "$SESSION" --task "$TASKID" 2>&1 >/dev/null)
 GATE_RC=$?
 
