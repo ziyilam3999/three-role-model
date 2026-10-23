@@ -1,3 +1,11 @@
+## [0.18.0] - 2026-10-23
+
+### Changed
+- **sync (#3399): `3role-ledger.mjs ledger-session` (read-only).** Regenerated `bin/3role-ledger.mjs` from the
+  ai-brain branch via `scripts/sync-three-role-plugin.mjs write` (never hand-edited). The new subcommand prints
+  `carriedAliasTarget3342(session, task)`, the ledger session `append` writes to, so the FT-CHECK reader looks in
+  the same ledger file. No other synced file changed.
+
 ## [0.17.0] - 2026-10-17
 
 ### Changed
