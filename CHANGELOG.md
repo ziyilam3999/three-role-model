@@ -1,3 +1,12 @@
+## [0.18.1] - 2026-10-23
+
+### Changed
+- **sync (#3373): route-dispatch gate smoke is hermetic.** Regenerated
+  `hooks/_smoke/three-role-route-dispatch-gate-smoke-test.sh` from the ai-brain branch via
+  `scripts/sync-three-role-plugin.mjs write` (never hand-edited). The suite now pins HOME, the dispatch receipt
+  and the z.ai tier state to fixtures, so AC-12a no longer reads the live quota window, and the 28
+  `| grep -q` pipefail sites became here-strings. Test-only; no gate or ledger change.
+
 ## [0.18.0] - 2026-10-23
 
 ### Changed
