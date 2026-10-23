@@ -6440,6 +6440,20 @@ function cmdCarriedKey(o) {
   process.exit(0);
 }
 
+// #3399: ledger-session --session S --task T -> prints carriedAliasTarget3342(S, T), the SAME resolver the
+// explicit append path uses to pick its write target. READ-ONLY (never seeds/rewrites a record). Missing or
+// empty --session/--task -> exit 2, nothing on stdout. Used by tools/fastpath-verify.mjs ftCheckVerdict so
+// the FT-CHECK reader looks in the ledger file append wrote (one implementation, not a copy).
+function cmdLedgerSession(o) {
+  const session = o.session, task = o.task;
+  if (!session || !task || session === true || task === true || !sanitize(session) || !sanitize(task)) {
+    console.error('ledger-session: --session and --task are required');
+    process.exit(2);
+  }
+  console.log(sanitize(carriedAliasTarget3342(session, task)));
+  process.exit(0);
+}
+
 // #860: resolve-agent --session S --task T --role R -> newest-mtime tagged transcript's agentId on stdout.
 function cmdResolveAgent(o) {
   const session = o.session, task = o.task, role = o.role;
@@ -10597,6 +10611,7 @@ try {
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
   else if (cmd === 'carried-key') cmdCarriedKey(opts);
+  else if (cmd === 'ledger-session') cmdLedgerSession(opts);
   else if (cmd === 'resolve-artifact') cmdResolveArtifact(opts);
   else if (cmd === 'resolve-artifacts-for-task') cmdResolveArtifactsForTask(opts);
   else if (cmd === 'resolve-published-verdict') cmdResolvePublishedVerdict(opts);
@@ -10624,7 +10639,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|ledger-session|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -10634,7 +10649,7 @@ try {
       '[--enforce-artifact-role-kind (check, #1532)] ' +
       '[--enforce-artifact-privacy [--perf-log P] (check, #1537)] ' +
       '[--model M --subagent-type T --transcript P [--agents-dir D] [--projects-root R] (resolve-effective-tier)] ' +
-      '[--session S --task T (gate-plan-review, #1575)] ' +
+      '[--session S --task T (gate-plan-review, #1575)] [--session S --task T (ledger-session, #3399) — prints the ledger session append writes to] ' +
       '[--hook H --var V --decision PERMIT|DENY [--session S --agent-id A --agent-type T] (log-bypass, #1543)] ' +
       '[--seat S [--json] [--plan P [--task T]] (resolve-route, #1640 M0; --plan #2985)] [--plan P (plan-size, #2985)] [--brief-text-file P [--task T] [--json] (plan-review-route, #3145 D1)] [--task T --role plan-review --round N | --task T --role executor (zai-strikes, #2985/#3060)] [--id ID [--json] (identify-model, #1640 M0)] [(lint-routes, #1640 M0)] ' +
       '[--session S --task T --role R (provenance-kind, #2075 AC-1) — prints E1|E2|E3|none[ legacy]] ' +
