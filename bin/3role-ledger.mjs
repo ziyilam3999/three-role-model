@@ -1731,6 +1731,187 @@ function transcriptRecordsAppend(content, task, role, verdict) {
   return false;
 }
 
+// #3364 — SEAT SELF-IDENTIFICATION. A subagent seat does not know its own agentId (the harness exposes no
+// agent-id env var to its Bash tool), so on a task with 2+ same-role rows its bare self-append could only
+// be refused (fix-A) or bounced to the orchestrator. The seat's identity is PROVEN, never claimed: the
+// harness writes every assistant tool_use to the seat's own transcript BEFORE running it (the same fact
+// #2309 clause 3 relies on when it proves a reviewer's in-flight self-append), so the calling seat is the
+// one candidate whose transcript holds an IN-FLIGHT Bash tool_use (no tool_result yet) that EXECUTES this
+// exact `3role-ledger.mjs append <argv>` at command position. Candidates are ONLY the agentIds already on
+// this (task, role)'s ledger rows AND spawn-record-bound to the tag (agentBoundToTag) — so a seat can never
+// be resolved onto a row outside this lane, and one agent can never write another's row (only the caller's
+// transcript holds the caller's in-flight command). Exactly one proving candidate -> that agentId; 2+ ->
+// ambiguous -> fail closed (refuse); 0 -> unresolved (the caller's existing refusal paths decide).
+// INPUT-BOUND: at most SELF_ID_MAX_CANDIDATES candidates (more -> unresolved), only the last
+// SELF_ID_TAIL_BYTES of each transcript are read, and any command over SELF_ID_MAX_CMD chars is skipped.
+const SELF_ID_MAX_CANDIDATES = 16;
+const SELF_ID_TAIL_BYTES = 4 * 1024 * 1024;
+const SELF_ID_MAX_CMD = 65536;
+
+// Split a shell command into simple-command segments of words. A word holding a parameter expansion
+// ($X / ${X}) is kept but MARKED dynamic (a leading \u0000) — its runtime value is unknown, so it may name
+// the script (`node "${CLAUDE_PLUGIN_ROOT}/bin/3role-ledger.mjs"`, the plugin layout) but never match an
+// argv word. Returns null (can't tell -> no match) on a command substitution ($( or backtick), a heredoc
+// or an unbalanced quote. Redirections (`2>&1`, `> f`, `>> f`, `< f`) are dropped with their targets.
+function shellSegments3364(cmd) {
+  const s = String(cmd == null ? '' : cmd);
+  const segs = [];
+  let words = [];
+  let cur = null;
+  let dyn = false;
+  const endWord = () => { if (cur !== null) { words.push((dyn ? '\u0000' : '') + cur); } cur = null; dyn = false; };
+  // Read a $-expansion starting at index j; returns [rawText, nextIndex] or null for a $( substitution.
+  const readParam = (j) => {
+    if (s[j + 1] === '(') return null;
+    if (s[j + 1] === '{') { const e = s.indexOf('}', j + 2); return e === -1 ? null : [s.slice(j, e + 1), e + 1]; }
+    let e = j + 1;
+    while (e < s.length && /[A-Za-z0-9_?@*#!$-]/.test(s[e])) { e++; if (!/[A-Za-z0-9_]/.test(s[e - 1])) break; }
+    return [s.slice(j, e), e];
+  };
+  const endSeg = () => { endWord(); if (words.length) segs.push(words); words = []; };
+  let i = 0;
+  let dropNext = false;
+  const pushWord = () => { if (cur === null) return; if (dropNext) { cur = null; dyn = false; dropNext = false; } else endWord(); };
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '\\') {
+      if (s[i + 1] === '\n') { i += 2; continue; }
+      if (i + 1 >= s.length) return null;
+      cur = (cur || '') + s[i + 1]; i += 2; continue;
+    }
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      if (j === -1) return null;
+      cur = (cur || '') + s.slice(i + 1, j); i = j + 1; continue;
+    }
+    if (ch === '"') {
+      let j = i + 1; let buf = '';
+      for (;;) {
+        if (j >= s.length) return null;
+        const c = s[j];
+        if (c === '"') break;
+        if (c === '`') return null;
+        if (c === '$') { const p = readParam(j); if (!p) return null; buf += p[0]; dyn = true; j = p[1]; continue; }
+        if (c === '\\' && j + 1 < s.length && '"\\$`\n'.includes(s[j + 1])) { if (s[j + 1] !== '\n') buf += s[j + 1]; j += 2; continue; }
+        buf += c; j++;
+      }
+      cur = (cur || '') + buf; i = j + 1; continue;
+    }
+    if (ch === '`') return null;
+    if (ch === '$') { const p = readParam(i); if (!p) return null; cur = (cur || '') + p[0]; dyn = true; i = p[1]; continue; }
+    if (ch === '<' && s[i + 1] === '<') return null;
+    if (ch === '<' || ch === '>') {
+      if (cur !== null && !dyn && /^[0-9]*$/.test(cur)) cur = null; else pushWord();
+      i++;
+      if (s[i] === '>' || s[i] === '|') i++;
+      if (s[i] === '&') { i++; while (i < s.length && /[0-9-]/.test(s[i])) i++; continue; }
+      dropNext = true;
+      while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
+      continue;
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '\n' || ch === '(' || ch === ')') {
+      pushWord(); dropNext = false; endSeg(); i++; continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r') { pushWord(); i++; continue; }
+    cur = (cur || '') + ch; i++;
+  }
+  if (dropNext) { cur = null; dyn = false; }
+  endSeg();
+  return segs;
+}
+
+// The argv after `append` when WORDS executes `[node [opts]] <path>/3role-ledger.mjs append ...` at command
+// position (leading VAR=value assignments and `command`/`exec`/`env` prefixes allowed); else null.
+function ledgerAppendArgv3364(words) {
+  let k = 0;
+  const assign = /^\u0000?[A-Za-z_][A-Za-z0-9_]*=/;
+  while (k < words.length && (assign.test(words[k]) || words[k] === 'command' || words[k] === 'exec' || words[k] === 'env')) k++;
+  const base = (w) => String(w || '').replace(/^\u0000/, '').split('/').pop();
+  if (base(words[k]) === 'node') {
+    k++;
+    while (k < words.length && words[k].startsWith('-')) k++;
+  }
+  if (base(words[k]) !== '3role-ledger.mjs') return null;
+  if (words[k + 1] !== 'append') return null;
+  const argv = words.slice(k + 2);
+  return argv.some((w) => w.startsWith('\u0000')) ? null : argv;
+}
+
+// Read at most the last SELF_ID_TAIL_BYTES of a file ('' on any error). A partial first line simply fails
+// JSON.parse below and is skipped.
+function readTail3364(file) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch (e) { return ''; }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, SELF_ID_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString('utf8');
+  } catch (e) { return ''; } finally { try { fs.closeSync(fd); } catch (e) { /* ignore */ } }
+}
+
+// Does this transcript content hold an IN-FLIGHT Bash tool_use (an id with no tool_result yet) whose
+// command executes `3role-ledger.mjs append` with EXACTLY argv WANT at command position?
+function transcriptHasInflightAppend3364(content, want) {
+  const uses = [];
+  const done = new Set();
+  for (const ln of String(content || '').split('\n')) {
+    if (!ln.trim()) continue;
+    let j; try { j = JSON.parse(ln); } catch (e) { continue; }
+    const c = j && j.message && j.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const blk of c) {
+      if (!blk) continue;
+      if (blk.type === 'tool_result' && blk.tool_use_id) done.add(String(blk.tool_use_id));
+      if (blk.type === 'tool_use' && blk.id && String(blk.name || '').toLowerCase() === 'bash') {
+        uses.push({ id: String(blk.id), cmd: String((blk.input && blk.input.command) || '') });
+      }
+    }
+  }
+  const wantKey = JSON.stringify(want);
+  for (const u of uses) {
+    if (done.has(u.id)) continue;
+    if (u.cmd.length > SELF_ID_MAX_CMD) continue;
+    const segs = shellSegments3364(u.cmd);
+    if (!segs) continue;
+    for (const words of segs) {
+      const argv = ledgerAppendArgv3364(words);
+      if (argv && JSON.stringify(argv) === wantKey) return true;
+    }
+  }
+  return false;
+}
+
+// Resolve the CALLING seat's agentId for (task, role). Returns {agentId, matches[], reason}.
+function resolveSelfAgent3364(ledgerSession, spawnSession, task, role, argv) {
+  const out = { agentId: '', matches: [], reason: '' };
+  const rows = [];
+  try {
+    const raw = fs.readFileSync(ledgerFile(ledgerSession, task), 'utf8').split('\n').filter(l => l.trim());
+    for (const ln of raw) { try { const j = JSON.parse(ln); if (j && j.role === role) rows.push(j); } catch (e) { /* skip */ } }
+  } catch (e) { out.reason = 'no-ledger'; return out; }
+  const cands = [];
+  for (const r of rows) {
+    const aid = String(r.agentId || '').replace(/[^0-9A-Za-z_-]/g, '');
+    if (!aid || cands.some((c) => c.aid === aid)) continue;
+    cands.push({ aid, sess: String(r.session_id || '') });
+  }
+  if (!cands.length) { out.reason = 'no-candidates'; return out; }
+  if (cands.length > SELF_ID_MAX_CANDIDATES) { out.reason = 'too-many-candidates'; return out; }
+  for (const c of cands) {
+    let file = findAgentTranscriptFile(spawnSession, c.aid);
+    if (!file && c.sess) file = findAgentTranscriptFile(c.sess, c.aid);
+    if (!file) { const x = xsessionFirstTranscript(c.aid); file = x && x.path ? x.path : ''; }
+    if (!file) continue;
+    if (!firstRecordTextFromLine(readFirstNonEmptyLine(file)).includes('3ROLE_TASK:' + sanitize(task) + ' ROLE:' + sanitize(role))) continue;
+    if (transcriptHasInflightAppend3364(readTail3364(file), argv)) out.matches.push(c.aid);
+  }
+  if (out.matches.length === 1) out.agentId = out.matches[0];
+  out.reason = out.matches.length === 1 ? 'resolved' : (out.matches.length ? 'ambiguous' : 'no-proof');
+  return out;
+}
+
 // #2701 D4 P5 — fail-closed on ANY ledger-CLI append mention the command-position parser cannot read
 // plainly. Scans the RAW (pre-stripQuotedAndHeredocBodies) text of every Bash tool_use command in the
 // LIFTED agent's own transcript (resolved from row.agentId + row.session_id, exactly as
@@ -4596,6 +4777,35 @@ function cmdAppend(o) {
       '(role=' + role + ' task=' + sanitize(task) + ')');
     writeBypassLog('3role-ledger-execreview-artifact-shape', 'THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF',
       'PERMIT', { task: sanitize(task), role: sanitize(role) });
+  }
+  // #3364 — a bare self-append (no --agent, no --run-id) on a lane with 2+ same-role rows resolves the
+  // CALLING seat's agentId from its own in-flight transcript call (resolveSelfAgent3364 above), so the
+  // seat never needs to know its agentId and the write never bounces to the orchestrator. Unresolved
+  // (no proof) leaves the write bare, so fix-A / clause 1-3 below still decide exactly as before; two or
+  // more proving transcripts is ambiguous and refused (fail closed, nothing written).
+  if (!('agent' in o) && !('run-id' in o)) {
+    let sameRole3364 = 0;
+    try {
+      for (const ln of fs.readFileSync(ledgerFile(session, task), 'utf8').split('\n')) {
+        if (!ln.trim()) continue;
+        try { const j = JSON.parse(ln); if (j && j.role === role) sameRole3364++; } catch (e) { /* skip */ }
+      }
+    } catch (e) { /* no ledger yet */ }
+    if (sameRole3364 >= 2) {
+      const self3364 = resolveSelfAgent3364(session, spawnSession, task, role, process.argv.slice(3));
+      if (self3364.reason === 'ambiguous') {
+        console.error('BLOCK (3role-ledger #3364 self-identity ambiguous): ' + self3364.matches.length +
+          ' seats bound to 3ROLE_TASK:' + sanitize(task) + ' ROLE:' + role + ' (agentIds: ' +
+          self3364.matches.join(', ') + ') each have this exact append in flight — cannot tell which seat ' +
+          'is calling; nothing written. Re-run from one seat only, or pass --agent.');
+        process.exit(2);
+      }
+      if (self3364.agentId) {
+        o.agent = self3364.agentId;
+        console.error('NOTE (3role-ledger #3364): resolved the calling seat as agentId ' + self3364.agentId +
+          ' (its own transcript holds this exact append in flight) — writing as if --agent was passed.');
+      }
+    }
   }
   // Map the CLI flag names onto the canonical entry field names overlayAppend overlays.
   const fields = {};
