@@ -8266,6 +8266,40 @@ function tagFromSubagentTranscript(session, agentId) {
   return null;
 }
 
+// #3422 -- ONE parser for a spawn prompt's task+role (the two plugin-synced PreToolUse gates call it through the
+// `spawn-tag` subcommand). HEADER PAIR: the FIRST non-empty line of the prompt surface, when that same line carries
+// `3ROLE_TASK:<id>` AND a `ROLE:<tok>`; the role token is read as-is (lowercased, as the old gates did), so a
+// header ROLE:research never becomes an executor and a quoted ROLE: later in the body never reclassifies the spawn.
+// No complete pair on that line -> FALLBACK to the pre-#3422 behaviour (task = first 3ROLE_TASK: anywhere, role = first
+// 4-chain-role match anywhere), so nothing a gate blocked before becomes allowed. Returns {task, role}; "-" = absent.
+function parseSpawnTag(text) {
+  const surface = text == null ? '' : String(text);
+  const first = surface.split('\n').find((l) => l.trim() !== '');
+  if (first !== undefined) {
+    const mt = first.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
+    const mr = first.match(/(?<![0-9A-Za-z_])ROLE:\s*([A-Za-z-]+)/i);
+    if (mt && mr) return { task: mt[1], role: mr[1].toLowerCase() };
+  }
+  const mTask = surface.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
+  const mRole = surface.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
+  return { task: mTask ? mTask[1] : '-', role: mRole ? mRole[1].toLowerCase() : '-' };
+}
+
+// `spawn-tag`: reads a PreToolUse payload from HOOK_INPUT (or stdin), joins prompt/description/message exactly as the
+// gates did, prints "<task> <role> <session>" ('-' for a missing field). Malformed JSON -> "- - -", exit 0.
+function cmdSpawnTag() {
+  let raw = process.env.HOOK_INPUT;
+  if (raw == null) { try { raw = process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8'); } catch (e) { raw = ''; } }
+  let d = null;
+  try { d = JSON.parse(raw || '{}'); } catch (e) { d = null; }
+  if (d === null || typeof d !== 'object') { console.log('- - -'); return; }
+  const ti = d.tool_input || {};
+  const surface = [ti.prompt, ti.description, ti.message].map((x) => (x == null ? '' : String(x))).join('\n');
+  const session = (d.session_id || '').toString().replace(/[^0-9A-Za-z._-]/g, '');
+  const t = parseSpawnTag(surface);
+  console.log(t.task + ' ' + t.role + ' ' + (session || '-'));
+}
+
 function rule12LogPath() {
   return process.env.RULE12_LOG || path.join(HOME, '.claude', '.rule-12-overrides.log');
 }
@@ -10679,6 +10713,7 @@ try {
   else if (cmd === 'resolve-effective-tier') cmdResolveEffectiveTier(opts);
   else if (cmd === 'inherit-plan-review') cmdInherit(opts);
   else if (cmd === 'gate-plan-review') cmdGatePlanReview(opts);
+  else if (cmd === 'spawn-tag') cmdSpawnTag();
   else if (cmd === 'size-s-exempt') cmdSizeSExempt(opts);
   else if (cmd === 'log-bypass') cmdLogBypass(opts);
   else if (cmd === 'resolve-route') cmdResolveRoute(opts);
@@ -10699,7 +10734,7 @@ try {
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|ledger-session|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|ledger-session|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|spawn-tag|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -10733,4 +10768,4 @@ try {
 // #1494 frozen contract for #1497 Key-1 (role eligibility) — a future direct-JS consumer imports these
 // instead of shelling out to the CLI. Exporting does not change this file's own CLI-dispatch behavior above
 // (a plain `resolve-effective-tier` CLI invocation, unqualified by path, is unaffected).
-export { resolveEffectiveTier, lastAssistantModelFromFile };
+export { resolveEffectiveTier, lastAssistantModelFromFile, parseSpawnTag };

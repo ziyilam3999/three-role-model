@@ -104,6 +104,11 @@ fi
 # somehow contained a space). "" on line 1 on a fatal parse error (-> fail-open). Reads the joined
 # prompt+description+message field set (same bypass-form coverage as the attribution gate — #749).
 ROLE=""; SESSION=""; TASKID=""; REQMODEL=""; BYPASS=""; SIG=""; TXPATH=""; SUBAGENT=""
+# #3422: task+role come from the shared header-pair parser (`spawn-tag` in 3role-ledger.mjs), never from a quoted
+# ROLE: in the prompt body. A non-chain role (research, ship-tail, ...) is never tier-checked (gated below).
+SPAWN_TASK="-"; SPAWN_ROLE="-"
+[ -f "$LEDGER_HELPER" ] && read -r SPAWN_TASK SPAWN_ROLE _ < <(HOOK_INPUT="$INPUT" node "$LEDGER_HELPER" spawn-tag 2>/dev/null)
+export SPAWN_TASK SPAWN_ROLE
 {
   read -r ROLE SESSION TASKID REQMODEL BYPASS SIG
   IFS= read -r TXPATH
@@ -115,10 +120,8 @@ ROLE=""; SESSION=""; TASKID=""; REQMODEL=""; BYPASS=""; SIG=""; TXPATH=""; SUBAG
     const ti=d.tool_input||{};
     const prompt=[ti.prompt, ti.description, ti.message].map(x=> (x==null?"":String(x))).join("\n");
     const session=(d.session_id||"").toString().replace(/[^0-9A-Za-z._-]/g,"");
-    const mTask=prompt.match(/3ROLE_TASK:\s*([0-9A-Za-z._-]+)/i);
-    const mRole=prompt.match(/ROLE:\s*(planner|plan-review|execution-review|executor)/i);
-    const role = mRole ? mRole[1].toLowerCase() : "-";
-    const taskId = mTask ? mTask[1] : "-";
+    const role = process.env.SPAWN_ROLE || "-";
+    const taskId = process.env.SPAWN_TASK || "-";
     const model = (ti.model==null?"":String(ti.model)).trim().toLowerCase().replace(/[^0-9a-z._-]/g,"") || "-";
     const bypass = /\[model-policy-ok\]/i.test(prompt) ? "1" : "0";
     const sig=crypto.createHash("sha1").update((session||"-")+":"+(taskId||"-")+":"+role).digest("hex");
@@ -134,6 +137,8 @@ ROLE=""; SESSION=""; TASKID=""; REQMODEL=""; BYPASS=""; SIG=""; TXPATH=""; SUBAG
 [ "$BYPASS" = "1" ] && exit 0
 # Not a tagged role spawn -> fail-open (the norm). Need BOTH the role AND a real task tag to attribute a policy.
 [ "$ROLE" != "-" ] || exit 0
+# #3422: this gate's scope is the 4 chain roles only; a parsed header role outside them is never tier-checked.
+case "$ROLE" in planner|plan-review|execution-review|executor) ;; *) exit 0 ;; esac
 [ "$TASKID" != "-" ] || exit 0
 # No usable session cannot be keyed reliably -> fail-open (the completion gate is the backstop).
 [ -n "$SESSION" ] && [ "$SESSION" != "-" ] || exit 0

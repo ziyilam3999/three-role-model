@@ -7710,4 +7710,31 @@ printf '%s' "$OUT" | command grep -q 'BLOCK' && printf '%s' "$OUT" | command gre
   && ok "#3337 B-check: check BLOCKs a z.ai planner row whose transcript is missing (names transcript_path)" \
   || bad "#3337 B-check: missing-receipt row not blocked by check ($OUT)"
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #3422 AC-5 — `spawn-tag` parser unit arms: the spawn's task+role come from the HEADER pair (first non-empty line
+# carrying 3ROLE_TASK + ROLE); no complete pair there -> the pre-#3422 anywhere scan (4 chain roles).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+SPSID="34220000-0000-4000-8000-000000000001"
+sptag() { # <prompt with real newlines> -> stdout "<task> <role> <session>"
+  node -e 'process.stdout.write(JSON.stringify({session_id: process.argv[1], tool_input: {prompt: process.argv[2]}}))' "$SPSID" "$1" \
+    | node "$LED" spawn-tag 2>&1
+}
+spcase() { # <label> <expected> <prompt>
+  local got; got="$(sptag "$3")"
+  [ "$got" = "$2" ] && ok "#3422 AC-5 $1 -> $2" || bad "#3422 AC-5 $1 expected [$2] got [$got]"
+}
+[ "$(printf 'x 3415 research\n' | command grep -Ec '^x 3415 research$')" = "1" ] && ok "#3422 AC-6 grep_ctrl: exact-line pattern matches a known line" || bad "#3422 AC-6 grep_ctrl failed"
+spcase "(a) header research + quoted executor" "3415 research $SPSID" "$(printf 'FT-CHECK:3415 3ROLE_TASK:3415 ROLE:research\nquoted: 3ROLE_TASK:<id> ROLE:executor\n')"
+spcase "(b) preamble then pair on line 1" "851 executor $SPSID" "preamble 3ROLE_TASK:851 ROLE:executor trailing"
+spcase "(c) split pair -> fallback scan" "851 executor $SPSID" "$(printf '3ROLE_TASK:851\nROLE:executor')"
+spcase "(d) header without ROLE, later executor -> fallback" "851 executor $SPSID" "$(printf '3ROLE_TASK:851 build it\n\nROLE:executor')"
+spcase "(d2) prose line 1, research pair then executor pair -> fallback" "851 executor $SPSID" "$(printf 'prose\n3ROLE_TASK:851 ROLE:research\n3ROLE_TASK:851 ROLE:executor')"
+spcase "(d3) task only, no role anywhere" "851 - $SPSID" "3ROLE_TASK:851 build it"
+spcase "(e) untagged prompt" "- - $SPSID" "just do some research"
+spcase "(f) ship-tail header token passes through" "851 ship-tail $SPSID" "3ROLE_TASK:851 ROLE:ship-tail"
+spcase "(h) leading blank lines skipped" "851 research $SPSID" "$(printf '\n\n3ROLE_TASK:851 ROLE:research\nROLE:executor')"
+spcase "(i) upper-case header role is lowercased (named risk 3422-pr-r2-header-role-case)" "851 executor $SPSID" "3ROLE_TASK:851 ROLE:EXECUTOR"
+SPG="$(printf 'not json' | node "$LED" spawn-tag 2>&1; echo "rc=$?")"
+[ "$SPG" = "$(printf -- '- - -\nrc=0')" ] && ok "#3422 AC-5 (g) malformed JSON -> '- - -' exit 0" || bad "#3422 AC-5 (g) got [$SPG]"
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
