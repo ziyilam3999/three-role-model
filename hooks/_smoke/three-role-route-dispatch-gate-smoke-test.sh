@@ -731,4 +731,192 @@ A3=$(OPENROUTER_DISPATCH_RECEIPT_FILE="$RW_NEAR" ZAI_TIER_STATE_FILE="$TIER3349"
 { [ "$A1" = "admit=1 state=CLOSED reset=$RESET3349 until=$RESET3349" ] && [ "$A2" = "admit=0 state=OPEN" ] && [ "$A3" = "admit=0 state=NEAR" ]; } \
   && ok "#3349 W9: zai-window-admit -> CLOSED admit=1 / OPEN admit=0 / NEAR admit=0" || bad "#3349 W9 (a1=$A1 a2=$A2 a3=$A3)"
 fi
+
+
+echo "== SECTION 3520: the z.ai execution-review seat — advisory tier fresh-read, safety-area first-class silence =="
+
+# #3520 both-ends arms. HEAD fixture: the flipped ER seat row (subprocess-zai, agent_tool_fallback opus,
+# the safety_areas carve-out as seat data) beside the other z.ai seats, so the advisory's tier parenthetical
+# renders from fresh resolve-route reads. BASE fixture: the same file with the ER row's dispatch/fallback/
+# safety_areas removed (the pre-flip shape) — neither the advisory nor the carve-out silence is reachable.
+ROUTES_ER_ZAI="$TMP/routes-er-zai-3520.json"
+cat > "$ROUTES_ER_ZAI" <<'ERZ3520'
+{
+  "providers": {
+    "zai": { "auth": "env:ZAI_API_KEY", "endpoint": "https://api.z.ai/api/anthropic",
+             "data_posture": { "class": "no-training-default" } }
+  },
+  "task_classes": { "sustained-agentic": { "allowed_providers": ["anthropic", "zai"] } },
+  "seats": {
+    "plan-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai",
+                     "agent_tool_fallback": "opus", "task_class": "sustained-agentic", "data_sensitivity": "public" },
+    "execution-review": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai",
+                     "agent_tool_fallback": "opus", "task_class": "sustained-agentic", "data_sensitivity": "public",
+                     "safety_areas": ["4", "4b", "12", "15", "22", "26"] },
+    "executor": { "provider": "zai", "model": "glm-5.3-flash", "dispatch": "subprocess-zai",
+                     "agent_tool_fallback": "sonnet", "task_class": "sustained-agentic", "data_sensitivity": "public" },
+    "research": { "provider": "zai", "model": "glm-5.3", "dispatch": "subprocess-zai",
+                     "agent_tool_fallback": "sonnet", "task_class": "sustained-agentic", "data_sensitivity": "public" }
+  }
+}
+ERZ3520
+ROUTES_ER_BASE="$TMP/routes-er-base-3520.json"
+node -e '
+  const fs = require("fs");
+  const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const er = r.seats["execution-review"];
+  delete er.dispatch; delete er.agent_tool_fallback; delete er.safety_areas;
+  er.provider = "anthropic"; er.model = "claude-opus-5-5";
+  fs.writeFileSync(process.argv[2], JSON.stringify(r, null, 2) + "\n");
+' "$ROUTES_ER_ZAI" "$ROUTES_ER_BASE"
+ST3520="$TMP/state3520"; mkdir -p "$ST3520"
+mk3520() { printf '{"session_id":"%s","tool_input":{"prompt":"%s"}}' "$1" "$2"; }
+: > "$TMP/receipts-3520-open.md"
+nmark3520() { ls "$ST3520" 2>/dev/null | grep -c '.notified'; }
+g3520() {   # <payload> [env KEY=VAL ...] -> RC, CAP on the HEAD fixture (hybrid, window OPEN)
+  local payload="$1"; shift
+  CAP=$(printf '%s' "$payload" | env CC_ROUTES_JSON="$ROUTES_ER_ZAI" CC_MODE_FILE="$HYB_PIN" \
+    OPENROUTER_DISPATCH_RECEIPT_FILE="$TMP/receipts-3520-open.md" "$@" CC_ROUTE_DISPATCH_STATE_DIR="$ST3520" bash "$HOOK" 2>&1); RC=$?
+}
+
+# E1 (head): a tagged NON-safety ER spawn gets the per-signature advisory EXACTLY ONCE, and the advisory
+# names model:opus for the ER — the tier read fresh from the seat row's agent_tool_fallback through the
+# #3520 tier-map render (opus group: plan-review + execution-review; sonnet group: executor + research).
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520a "3ROLE_TASK:3521 ROLE:execution-review\nArea: 35\nreview the diff")
+g3520 "$P"; rc1=$RC; o1="$CAP"; m1=$(nmark3520)
+g3520 "$P"; rc2=$RC
+{ [ "$rc1" = "2" ] && [ "$m1" = "1" ] && [ "$rc2" = "0" ] \
+    && grep -q "tools/openrouter-role-dispatch.sh" <<<"$o1" \
+    && grep -qF 'model:opus (plan-review, execution-review) / model:sonnet (executor, research)' <<<"$o1" \
+    && ! grep -q "/Users/" <<<"$o1"; } \
+  && ok "#3520 E1: non-safety ER spawn (Area: 35) -> advisory exit 2 ONCE (marker, re-issue silent), tier parenthetical read fresh names model:opus with execution-review in the opus group" \
+  || bad "#3520 E1 (rc1=$rc1 m1=$m1 rc2=$rc2 out=$o1)"
+
+# E2 (head): a SAFETY-area ER spawn in the SAME run exits 0 SILENTLY with no marker written — the
+# first-class route (the carve-out read fresh from the SSOT seat row; every carve-out area probed).
+e2_bad=0
+for e2_area in 4 4b 12 15 22 26; do
+  rm -rf "$ST3520"; mkdir -p "$ST3520"
+  P=$(mk3520 "e3520s$e2_area" "3ROLE_TASK:3521 ROLE:execution-review\nArea: $e2_area\nreview the diff")
+  g3520 "$P"
+  { [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark3520)" = "0" ]; } \
+    || { e2_bad=1; bad "#3520 E2: safety area $e2_area not first-class-silent (rc=$RC markers=$(nmark3520) out=$CAP)"; }
+done
+[ "$e2_bad" = "0" ] \
+  && ok "#3520 E2: all six carve-out areas (4 4b 12 15 22 26; string ids, fix1 B1) -> exit 0 silent, no marker (first-class; carve-out-scoped silence, proven by E1's advisory in the same run)" \
+  || true
+
+# E3 (head): a spawn binding NO resolvable Area line fails CLOSED to the advisory (exit 2), never a guess.
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520n "3ROLE_TASK:3521 ROLE:execution-review\nreview the diff")
+g3520 "$P"
+{ [ "$RC" = "2" ] && grep -q "tools/openrouter-role-dispatch.sh" <<<"$CAP"; } \
+  && ok "#3520 E3: ER spawn with no Area line -> the per-signature advisory (exit 2, fail closed)" \
+  || bad "#3520 E3 (rc=$RC out=$CAP)"
+
+# E3b (head, #3520 fix1 B1): a letter-suffixed NON-carve-out area (4c) is non-safety -> the advisory
+# (exit 2 once), the same E1 shape: the carve-out keys on the exact string id, never a prefix match.
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520f4c "3ROLE_TASK:3521 ROLE:execution-review\nArea: 4c\nreview the diff")
+g3520 "$P"; e3b_rc=$RC
+{ [ "$e3b_rc" = "2" ] && [ "$(nmark3520)" = "1" ]; } \
+  && ok "#3520 E3b (fix1 B1): Area: 4c (not in the carve-out) -> the per-signature advisory (exit 2 once, marker) -- string compare, never a prefix match on 4" \
+  || bad "#3520 E3b (rc=$e3b_rc markers=$(nmark3520) out=$CAP)"
+
+# E3c (head, #3520 fix1 N1): with safety_areas REMOVED from the seat row the gate fails CLOSED -- a
+# tagged NON-safety area (35) is silent (every area treated as safety), never the advisory.
+ROUTES_ER_NOSA="$TMP/routes-er-nosa-3520.json"
+node -e '
+  const fs = require("fs");
+  const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  delete r.seats["execution-review"].safety_areas;
+  fs.writeFileSync(process.argv[2], JSON.stringify(r, null, 2) + "\n");
+' "$ROUTES_ER_ZAI" "$ROUTES_ER_NOSA"
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520fna "3ROLE_TASK:3521 ROLE:execution-review\nArea: 35\nreview the diff")
+CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_NOSA" CC_MODE_FILE="$HYB_PIN" \
+  OPENROUTER_DISPATCH_RECEIPT_FILE="$TMP/receipts-3520-open.md" CC_ROUTE_DISPATCH_STATE_DIR="$ST3520" bash "$HOOK" 2>&1); e3c_rc=$?
+{ [ "$e3c_rc" = "0" ] && [ -z "$CAP" ] && [ "$(nmark3520)" = "0" ]; } \
+  && ok "#3520 E3c (fix1 N1): safety_areas removed -> Area: 35 spawn is SILENT exit 0 (fail closed, every area treated as safety), no marker" \
+  || bad "#3520 E3c (rc=$e3c_rc markers=$(nmark3520) out=$CAP)"
+
+# E3d (head, #3520 fix2 B1-r2): a zero-padded SAFETY-area id normalises through the ONE shared helper
+# (area-id-normalize.cjs, resolved beside this hook) -> the carve-out silence (exit 0, no marker), so an
+# Opus ER spawn tagged "Area: 04" stays the sanctioned primary and never gets bounced to z.ai. A
+# zero-padded NON-safety spelling (035) -> the advisory. An all-zero id (0) is malformed -> the advisory
+# (fail closed; the dispatcher then refuses it at its bind).
+e3d_bad=0
+for e3d_area in 04 026 004b; do
+  rm -rf "$ST3520"; mkdir -p "$ST3520"
+  P=$(mk3520 "e3520f2$e3d_area" "3ROLE_TASK:3521 ROLE:execution-review\nArea: $e3d_area\nreview the diff")
+  g3520 "$P"
+  { [ "$RC" = "0" ] && [ -z "$CAP" ] && [ "$(nmark3520)" = "0" ]; } \
+    || { e3d_bad=1; bad "#3520 E3d: zero-padded safety id $e3d_area must be first-class SILENT (rc=$RC markers=$(nmark3520) out=$CAP)"; }
+done
+[ "$e3d_bad" = "0" ] \
+  && ok "#3520 E3d (fix2 B1-r2): Area: 04 / 026 / 004b (zero-padded safety ids) -> exit 0 silent, no marker -- normalised through the shared helper, never a list miss" \
+  || true
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520f2035 "3ROLE_TASK:3521 ROLE:execution-review\nArea: 035\nreview the diff")
+g3520 "$P"; e3d_ns_rc=$RC; e3d_ns_m=$(nmark3520)
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520f2z0 "3ROLE_TASK:3521 ROLE:execution-review\nArea: 0\nreview the diff")
+g3520 "$P"; e3d_z_rc=$RC; e3d_z_m=$(nmark3520)
+{ [ "$e3d_ns_rc" = "2" ] && [ "$e3d_ns_m" = "1" ] && [ "$e3d_z_rc" = "2" ] && [ "$e3d_z_m" = "1" ]; } \
+  && ok "#3520 E3d (fix2 B1-r2): Area: 035 (zero-padded non-safety) -> advisory once; Area: 0 (all-zero, malformed) -> advisory (fail closed, the dispatcher refuses it at the bind)" \
+  || bad "#3520 E3d advisory arms (035 rc=$e3d_ns_rc m=$e3d_ns_m; 0 rc=$e3d_z_rc m=$e3d_z_m)"
+
+# E3e (head, #3520 fix2 N2-r2): the gate's carve-out matcher crashing (a shim node that dies ONLY on the
+# matcher's own -e program -- the one argv carrying safety_areas -- everything else real) still fails
+# CLOSED: a NON-safety area (35) is SILENT (exit 0, no marker) -- never the z.ai advisory on an
+# undecided carve-out.
+CRASHBIN_3520G="$TMP/crashnode-3520gate"; mkdir -p "$CRASHBIN_3520G"
+REAL_NODE_3520G="$(command -v node)"
+cat > "$CRASHBIN_3520G/node" <<'CRASHNODE3520G'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in *safety_areas*) exit 70 ;; esac
+done
+exec "$REAL_NODE_3520G" "$@"
+CRASHNODE3520G
+chmod +x "$CRASHBIN_3520G/node"
+export REAL_NODE_3520G
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+P=$(mk3520 e3520f2crash "3ROLE_TASK:3521 ROLE:execution-review\nArea: 35\nreview the diff")
+CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_ZAI" CC_MODE_FILE="$HYB_PIN" \
+  OPENROUTER_DISPATCH_RECEIPT_FILE="$TMP/receipts-3520-open.md" CC_ROUTE_DISPATCH_STATE_DIR="$ST3520" \
+  PATH="$CRASHBIN_3520G:$PATH" bash "$HOOK" 2>&1); e3e_rc=$?
+{ [ "$e3e_rc" = "0" ] && [ -z "$CAP" ] && [ "$(nmark3520)" = "0" ]; } \
+  && ok "#3520 E3e (fix2 N2-r2): the gate's matcher crashing -> Area: 35 (non-safety!) is SILENT exit 0, no marker (fail closed toward the Opus ER, the sanctioned route) -- never the advisory" \
+  || bad "#3520 E3e (rc=$e3e_rc markers=$(nmark3520) out=$CAP)"
+
+# E4 (base arms): under the PRE-FLIP seat row (no dispatch field) neither route is reachable — both a
+# safety-area and a non-safety tagged ER spawn fail open silently, no marker, no advisory text at all.
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+for e4_area in 4 35; do
+  P=$(mk3520 "e3520b$e4_area" "3ROLE_TASK:3521 ROLE:execution-review\nArea: $e4_area\nreview the diff")
+  CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_BASE" CC_MODE_FILE="$HYB_PIN" \
+    OPENROUTER_DISPATCH_RECEIPT_FILE="$TMP/receipts-3520-open.md" CC_ROUTE_DISPATCH_STATE_DIR="$ST3520" bash "$HOOK" 2>&1); e4_rc=$?
+  { [ "$e4_rc" = "0" ] && [ -z "$CAP" ]; } \
+    || bad "#3520 E4: pre-flip ER row, Area: $e4_area should fail open silently (rc=$e4_rc out=$CAP)"
+done
+{ [ "$(nmark3520)" = "0" ]; } \
+  && ok "#3520 E4 (base): pre-flip ER seat row (no dispatch field) -> every tagged ER spawn fails open silently, no marker — neither the advisory nor the carve-out silence is reachable" \
+  || bad "#3520 E4 base markers=$(nmark3520)"
+
+# E5 (head): a CLOSED window admits the ER's first-class Claude fallback naming the SSOT-read opus tier.
+rm -rf "$ST3520"; mkdir -p "$ST3520"
+NOW3520=$(date +%s); RESET3520=$((NOW3520 + 7200))
+printf 'OR-ZAI-WINDOW-CLOSE ts=%s reset=%s role=executor task=1 session=none\n' "$NOW3520" "$RESET3520" > "$TMP/rw-3520-closed.md"
+P=$(mk3520 e3520w "3ROLE_TASK:3521 ROLE:execution-review\nArea: 35\nreview the diff")
+CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_ZAI" CC_MODE_FILE="$HYB_PIN" \
+  OPENROUTER_DISPATCH_RECEIPT_FILE="$TMP/rw-3520-closed.md" ZAI_TIER_STATE_FILE="$TMP/no-tier-3520.json" \
+  CC_ROUTE_DISPATCH_STATE_DIR="$ST3520" bash "$HOOK" 2>&1); RC=$?
+{ [ "$RC" = "0" ] && grep -q "quota window CLOSED" <<<"$CAP" && grep -q "model:opus" <<<"$CAP" \
+    && ! grep -q "model:sonnet" <<<"$CAP" && [ "$(nmark3520)" = "0" ]; } \
+  && ok "#3520 E5: CLOSED window -> ER's first-class fallback admission names model:opus (the seat row's agent_tool_fallback, read fresh), never sonnet" \
+  || bad "#3520 E5 (rc=$RC out=$CAP)"
+
+
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

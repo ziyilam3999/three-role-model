@@ -6382,9 +6382,13 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json" ]; then
     OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat "$seat" --json 2>/dev/null)
     { [ "$(printf '%s' "$OUT" | JF2985 effort)" = "medium" ]; } && ok "#2985 AC-10: real SSOT $seat effort=medium" || bad "#2985 AC-10 real SSOT $seat effort should be medium (out=$OUT)"
   done
+  # Re-pinned #3520 (2026-10-24): this arm guarded the #2985 "ER stays Opus" decision; the operator's
+  # 2026-10-24 "Unlock z.ai reviews now" directive supersedes it for the non-safety route -- the conscious
+  # re-pin below IS the relaxed policy arriving (never a quiet break). Safety areas keep the Opus ER via the
+  # seat row's safety_areas carve-out.
   OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat execution-review --json 2>/dev/null)
-  { [ "$(printf '%s' "$OUT" | JF2985 provider)" = "anthropic" ] && [ "$(printf '%s' "$OUT" | JF2985 model)" = "claude-opus-5-5" ]; } \
-    && ok "#2985 AC-10: execution-review stays anthropic claude-opus-5-5" || bad "#2985 AC-10 execution-review (out=$OUT)"
+  { [ "$(printf '%s' "$OUT" | JF2985 provider)" = "zai" ] && [ "$(printf '%s' "$OUT" | JF2985 model)" = "glm-5.3" ] && [ "$(printf '%s' "$OUT" | JF2985 dispatch)" = "subprocess-zai" ]; } \
+    && ok "#2985 AC-10 (re-pinned #3520, operator 2026-10-24 'Unlock z.ai reviews now'): execution-review -> zai glm-5.3 subprocess-zai" || bad "#2985 AC-10 execution-review (out=$OUT)"
 else
   skip "#2985 AC-10: real config/cc-routes.json absent (plugin install)"
 fi
@@ -6550,8 +6554,8 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/../config/cc-routes.json" ]; then
   OUT=$(unset CC_ROUTES_JSON; node "$LED" lint-routes 2>&1); RC=$?
   { [ "$RC" = "0" ]; } && ok "#3060 AC-5: lint-routes clean on the real SSOT" || bad "#3060 AC-5 real SSOT lint (rc=$RC out=$OUT)"
   { [ "$(jq -r '.seats.executor.size_models.L' "$RT")" = "glm-5.3" ] && [ "$(jq -r '.providers.zai.model_vocabulary["glm-5.3"].tier_equivalent' "$RT")" = "opus" ] \
-    && [ "$(jq -r '.seats.executor.model' "$RT")" = "glm-5.3-flash" ] && [ "$(jq -r '.seats["execution-review"].model' "$RT")" = "claude-opus-5-5" ]; } \
-    && ok "#3060 AC-5: real SSOT size_models.L=glm-5.3, flash default, vocab tier opus, execution-review opus all unchanged" || bad "#3060 AC-5 real SSOT values"
+    && [ "$(jq -r '.seats.executor.model' "$RT")" = "glm-5.3-flash" ] && [ "$(jq -r '.seats["execution-review"].model' "$RT")" = "glm-5.3" ]; } \
+    && ok "#3060 AC-5 (ER conjunct re-pinned #3520, operator 2026-10-24 'Unlock z.ai reviews now'): real SSOT size_models.L=glm-5.3, flash default, vocab tier opus, execution-review glm-5.3" || bad "#3060 AC-5 real SSOT values"
   # ---- AC-9: research seat on z.ai (real SSOT) ----
   OUT=$(unset CC_ROUTES_JSON CC_ROLES_ENV; node "$LED" resolve-route --seat research --json 2>/dev/null)
   MODEL9="$(printf '%s' "$OUT" | JF2985 model)"
