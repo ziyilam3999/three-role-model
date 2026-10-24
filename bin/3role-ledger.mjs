@@ -9953,12 +9953,20 @@ function resolveSlugPin(role, routes, seatRow) {
 // one grammar, never two copies. #3249 (operator 2026-10-17): ship-tail joins the closed route-pinnable
 // list — the 5th operational seat, moved by the same operator cost lever (merges stop spending Claude
 // usage; still never a REQUIRED_ROLE). The list stays CLOSED: the next seat needs its own operator sign-off.
+// #3520 (operator 2026-10-24, "Unlock z.ai reviews now" + the standing "Opus reviews only for safety
+// areas"): the non-safety execution-review SEAT itself now runs on z.ai glm-5.3 via the SSOT seats row
+// (subprocess-zai), so the 2026-10-17 "keep Opus final review" exclusion RATIONALE is SUPERSEDED for the
+// non-safety route — the governance trail here no longer contradicts the SSOT. LIST MEMBERSHIP IS
+// DELIBERATELY UNCHANGED in that slice: execution-review joining the route-pinnable list is its own
+// operator sign-off (and the #3520 flip needs no pin — resolve-route reads the seats row directly,
+// round-1 verified). Safety-area reviews and the quota fallback still resolve Opus through the seat
+// row's agent_tool_fallback.
 const ROUTE_PIN_ROLES = ['planner', 'plan-review', 'executor', 'research', 'ship-tail'];
 function validateRoutePinValue(routes, role, value) {
   const refuse = (rule, note) => ({ ok: false, rule, note });
   if (!ROUTE_PIN_ROLES.includes(role)) {
     return refuse('role', 'role "' + role + '" is not route-pinnable (closed list ' + ROUTE_PIN_ROLES.join('|') +
-      '; execution-review is excluded by the operator\'s 2026-10-17 "keep Opus final review" decision; ship-tail was added by the operator\'s 2026-10-17 #3249 cost choice)');
+      '; execution-review is excluded from the PIN LIST pending its own operator sign-off -- its 2026-10-17 "keep Opus final review" exclusion rationale was superseded 2026-10-24 by #3520 for the non-safety SEAT route (the SSOT row itself is z.ai now), but pin-list membership is a separate decision; ship-tail was added by the operator\'s 2026-10-17 #3249 cost choice)');
   }
   if (typeof value !== 'string') {
     return refuse('malformed', 'route value is not a string');

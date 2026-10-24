@@ -189,14 +189,18 @@ fi
 # empty output.
 [ -f "$LEDGER_HELPER" ] || fail_open
 ROUTE_JSON=$(node "$LEDGER_HELPER" resolve-route --seat "$ROLE" --json 2>/dev/null)
-SEAT_MODEL=""; SEAT_DISPATCH=""
-read -r SEAT_MODEL SEAT_DISPATCH < <(
+SEAT_MODEL=""; SEAT_DISPATCH=""; SEAT_FALLBACK=""
+# #3520 -- SEAT_FALLBACK: the seat's agent_tool_fallback tier, read from the SAME fresh payload (used by
+# the #3349 admission's fallback tier and the per-signature advisory's tier parenthetical below, so
+# neither text stays a memorized copy of the SSOT).
+read -r SEAT_MODEL SEAT_DISPATCH SEAT_FALLBACK < <(
   ROUTE_PAYLOAD="$ROUTE_JSON" node -e '
     let r=""; try{ r=JSON.parse(process.env.ROUTE_PAYLOAD||""); }catch(e){ process.exit(0); }
     const model = (r && typeof r.model === "string") ? r.model : "";
     const dispatch = (r && typeof r.dispatch === "string") ? r.dispatch : "";
+    const fallback = (r && typeof r.agent_tool_fallback === "string") ? r.agent_tool_fallback : "";
     // model may contain a provider slash (e.g. moonshotai/kimi-k3, z-ai/glm-5.2); keep it, strip whitespace.
-    process.stdout.write(model.replace(/\s/g,"") + " " + dispatch.replace(/[^0-9A-Za-z._-]/g,"") + "\n");
+    process.stdout.write(model.replace(/\s/g,"") + " " + dispatch.replace(/[^0-9A-Za-z._-]/g,"") + " " + fallback.replace(/[^a-z]/g,"") + "\n");
   ' 2>/dev/null
 )
 # Any seat declared `subprocess-<provider>` is in scope (#2518 generalization of the #1989 openrouter-only
@@ -244,11 +248,75 @@ if [ "$PROVIDER" = "zai" ]; then
     "admit=1 state=CLOSED reset="*" until="*)
       WIN_RESET="$(printf '%s' "$WIN_LINE" | sed -n 's/.* reset=\([0-9a-z]*\) until=.*/\1/p')"
       WIN_UNTIL="$(printf '%s' "$WIN_LINE" | sed -n 's/.* until=\([0-9]*\)$/\1/p')"
-      case "$ROLE" in plan-review) WIN_MODEL="opus" ;; *) WIN_MODEL="sonnet" ;; esac
+      # #3520 -- the fallback tier is the seat's OWN agent_tool_fallback, read FRESH from the same
+      # resolve-route payload this gate already resolved (never the memorized plan-review/other-role
+      # split). Byte-identical for every existing z.ai seat (plan-review opus; executor/research/
+      # fast-track sonnet, verified at HEAD); an unresolvable tier fails to "unknown", never a guess.
+      WIN_MODEL="${SEAT_FALLBACK:-unknown}"
       WIN_MSG="THREE-ROLE ROUTE-DISPATCH GATE (#3349): z.ai quota window CLOSED (reset=${WIN_RESET} until=${WIN_UNTIL}) -- ROLE:${ROLE} for 3ROLE_TASK:${TASKID} takes its first-class Claude fallback (model:${WIN_MODEL}) with 0 strikes; the 2-strike rule is skipped because every z.ai dispatch is refused before spend until the window reopens (tools/zai-window.sh status). z.ai-first resumes by itself when the window reopens."
       printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"%s"}}\n' "$WIN_MSG"
       exit 0 ;;
   esac
+fi
+
+# --- #3520: a SAFETY-area tagged Agent-tool ER spawn is the SANCTIONED PRIMARY, not a fallback -----------
+# The dispatcher refuses the z.ai ER dispatch for carve-out areas BEFORE any spend (its ER-SAFETY-AREA
+# exit 20), so the Opus Agent-tool ER spawn IS that review's primary route: silent exit 0, no marker, no
+# advisory, no audit row -- the same first-class shape as the #2985 L-at-fallback and #3349 CLOSED-window
+# admission routes above (firing on every sanctioned spawn would train every routine spawn to carry the
+# bypass token, the deadening failure the mode-awareness comment above names). The carve-out list is read
+# FRESH from the SSOT seat row this gate already resolved (its safety_areas field, spread by resolve-route
+# --json; NEVER a hardcoded area list in this hook). A spawn binding NO resolvable flush-left `Area: <area-id>`
+# line (an area id is 1-3 digits plus an optional lowercase-letter suffix, e.g. 4b) fails closed to the
+# per-signature advisory below, never a guess. #3520 fix1: ids compare AS STRINGS (the SSOT list carries
+# them as strings), and a missing, empty or unreadable safety_areas list fails CLOSED here too (every area
+# treated as safety -> silence), never open (N1). #3520 fix2 (B1-r2): BOTH sides of the compare are
+# normalised through the ONE shared helper area-id-normalize.cjs (resolved beside this hook; leading zeros
+# stripped from the digit part, letter kept: "04" names area 4, "04b" names 4b), so a zero-padded spelling
+# of a safety area can never miss the carve-out and dispatch to z.ai via the advisory; an all-zero id
+# ("0", "00") is malformed and fails closed to the advisory (the dispatcher then refuses it at its bind).
+# #3520 fix2 (N1-r2): the silence is keyed on PROVIDER=zai, verified EXHAUSTIVE 2026-10-24 -- no other
+# non-Opus provider can serve the ER seat today (SSOT row zai; the overlay's execution-review refs that
+# same row with the local slot kept off the ER; no openrouter ER row). Widen to "provider != anthropic"
+# in the same PR as any future ER route change, never let the carve-out silently stop applying.
+if [ "$ROLE" = "execution-review" ] && [ "$PROVIDER" = "zai" ]; then
+  # ABSOLUTE (the dispatcher's SCRIPT_DIR idiom): a relative path here would make the node -e require()
+  # below treat it as a bare module specifier and fail to load the helper whenever the hook is invoked
+  # repo-relatively (measured: `bash hooks/three-role-route-dispatch-gate.sh` from the repo root) -- the
+  # silence parse then crashes to the advisory instead of staying the sanctioned safety silence.
+  AREA_ID_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/area-id-normalize.cjs"
+  ER_GA_AREA="$(AREA_ID_HELPER="$AREA_ID_HELPER" HOOK_INPUT="$INPUT" node -e '
+    let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){ process.exit(0); }
+    const ti=d.tool_input||{};
+    const prompt=[ti.prompt, ti.description, ti.message].map(x=>(x==null?"":String(x))).join("\n").slice(0,1048576);
+    // #3520 fix3 (N2-r3): the Area: bind parses through the ONE shared helper parseAreaBind -- the SAME
+    // parse the dispatcher uses -- so a prompt carrying MORE than one flush-left `Area:` line resolves to
+    // NO id (fail closed to the advisory below; the dispatcher refuses duplicates at its bind), never
+    // classified by the first line.
+    try {
+      const b = require(process.env.AREA_ID_HELPER).parseAreaBind(prompt);
+      if (b.status === "ok") process.stdout.write(b.area);
+    }
+    catch (e) { process.exit(1); }   // helper unreadable: no id -> the advisory below (fail closed; the dispatcher refuses too)
+  ' 2>/dev/null)"
+  if [ -n "$ER_GA_AREA" ]; then
+    ER_GA_MATCH="$(AREA_ID_HELPER="$AREA_ID_HELPER" ROUTE_PAYLOAD="$ROUTE_JSON" AREA_VAL="$ER_GA_AREA" node -e '
+      const { normaliseAreaId } = require(process.env.AREA_ID_HELPER);
+      let j; try { j=JSON.parse(process.env.ROUTE_PAYLOAD||""); } catch(e){ process.stdout.write("yes"); process.exit(0); }
+      const raw=j.safety_areas;
+      const areas=Array.isArray(raw)&&raw.length>0?raw:null;
+      if (areas===null) { process.stdout.write("yes"); process.exit(0); }        // missing/empty list: every area safety (fix1 N1)
+      const want=normaliseAreaId(process.env.AREA_VAL);
+      if (want===null) { process.stdout.write("yes"); process.exit(0); }         // unnormalisable: fail closed to silence
+      const norms=areas.map(normaliseAreaId);
+      process.stdout.write(norms.some(n=>n===null)||norms.indexOf(want)>=0?"yes":"no");  // malformed entry: closed
+    ' 2>/dev/null)"
+    # #3520 fix2 (N2-r2): the ONLY non-silence is a DECIDED non-match ("no"). A missing/empty list, an
+    # unparseable payload AND any matcher error (node crash, unreadable helper -> empty) all stay SILENT
+    # (fail closed toward the Opus Agent-tool ER, the sanctioned route) -- the gate never fails open to
+    # the z.ai advisory on an undecided carve-out.
+    [ "$ER_GA_MATCH" != "no" ] && exit 0
+  fi
 fi
 
 # --- #2985: z.ai seats are routed by the plan (executor) / the strike rule (plan-review) -----------------------
@@ -388,6 +456,34 @@ MARKER="$STATE_DIR/$SIG.notified"
 [ -f "$MARKER" ] && exit 0
 : > "$MARKER" 2>/dev/null
 
+# #3520 — the advisory's fallback-tier parenthetical is rendered from FRESH resolve-route reads of every
+# subprocess-dispatchable seat's agent_tool_fallback (never the memorized "model:opus (plan-review) /
+# model:sonnet (executor, research)" split): seats are grouped opus-first in the fixed order below.
+# Pre-flip this rendered BYTE-IDENTICAL to the old hardcoded text (plan-review opus; executor+research
+# sonnet; execution-review resolved no dispatch/fallback so it dropped out). A seat whose resolve fails,
+# carries no dispatch field or no fallback tier is OMITTED, never guessed; if the render itself fails the
+# parenthetical names THIS seat's own fresh tier alone. Runs once per session:task:role (after the marker
+# write), so the extra resolve calls never sit on the hot path of a routine spawn.
+ADV_TIER_TXT="$(LEDGER_HELPER_ARG="$LEDGER_HELPER" node -e '
+  const cp = require("child_process");
+  const order = ["plan-review", "execution-review", "executor", "research"];
+  const groups = { opus: [], sonnet: [] };
+  for (const role of order) {
+    let j = null;
+    try {
+      j = JSON.parse(cp.execFileSync("node", [process.env.LEDGER_HELPER_ARG, "resolve-route", "--seat", role, "--json"],
+        { encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "ignore"] }));
+    } catch (e) { continue; }
+    const d = (j && typeof j.dispatch === "string") ? j.dispatch : "";
+    const fb = (j && typeof j.agent_tool_fallback === "string") ? j.agent_tool_fallback : "";
+    if (d.indexOf("subprocess-") === 0 && groups[fb]) groups[fb].push(role);
+  }
+  const parts = [];
+  for (const tier of ["opus", "sonnet"]) if (groups[tier].length) parts.push("model:" + tier + " (" + groups[tier].join(", ") + ")");
+  process.stdout.write(parts.join(" / "));
+' 2>/dev/null)"
+[ -n "$ADV_TIER_TXT" ] || ADV_TIER_TXT="model:${SEAT_FALLBACK:-unknown} (${ROLE})"
+
 cat >&2 <<EOF
 <system-reminder>
 THREE-ROLE ROUTE-DISPATCH GATE (three-role-route-dispatch-gate hook, #1989/#2518): the seat ROLE:${ROLE} for
@@ -405,8 +501,8 @@ fallback, no inline token): if tools/openrouter-role-dispatch.sh refused this ta
 (#2888, exit 9), re-issue the spawn carrying PLAN: <the plan> AND BRIEF: <the refused brief's path> -- the
 refusal's receipt row admits exactly that task+brief pair on the seat's agent_tool_fallback tier. If this spawn IS a sanctioned
 fallback, re-issue it carrying the inline token [route-dispatch-fallback-ok] in the prompt (it is
-audit-logged as a deliberate bypass, never silent) and pass model:opus (plan-review) / model:sonnet (executor, research)
-explicitly. This is ADVISORY + block-once PER session:task:role: you will see this ONCE for this spawn.
+audit-logged as a deliberate bypass, never silent) and pass ${ADV_TIER_TXT}
+explicitly (each tier read fresh from that seat's SSOT agent_tool_fallback, #3520). This is ADVISORY + block-once PER session:task:role: you will see this ONCE for this spawn.
 Escapes: inline bypass token [route-dispatch-fallback-ok] in the prompt for a deliberate one-off, or
 kill-switch CC_ROUTE_DISPATCH_GATE_OFF=1 (or THREE_ROLE_INSTRUMENT_OFF=1 / SHIP_PIPELINE=1).
 </system-reminder>
