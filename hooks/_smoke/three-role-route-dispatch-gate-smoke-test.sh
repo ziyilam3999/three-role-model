@@ -927,5 +927,23 @@ CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_ZAI" CC_MODE_FILE="$HYB_
   || bad "#3520 E5 (rc=$RC out=$CAP)"
 fi
 
+# E6 (head, #3520 fix3 N2-r3): a prompt carrying MORE than one flush-left `Area:` line resolves to NO id
+# (the ONE shared parseAreaBind, the same parse the dispatcher's bind uses) -> the per-signature advisory
+# (exit 2 once, marker), NEVER classified by the first line (the pre-fix3 gate silently classed "4 then 35"
+# as safety area 4). Both orders must behave identically, and the dispatcher refuses the duplicate at its
+# own bind (exit 2) -- every consumer treats a duplicated Area: line the same fail-closed way.
+e6_bad=0
+for e6_pair in "4 35" "35 4" "4 not-an-id"; do
+  set -- $e6_pair
+  rm -rf "$ST3520"; mkdir -p "$ST3520"
+  P=$(mk3520 "e3520f3dup$1" "3ROLE_TASK:3521 ROLE:execution-review\nArea: $1\nArea: $2\nreview the diff")
+  g3520 "$P"
+  { [ "$RC" = "2" ] && [ "$(nmark3520)" = "1" ] && grep -q "tools/openrouter-role-dispatch.sh" <<<"$CAP"; } \
+    || { e6_bad=1; bad "#3520 E6: dup Area lines (Area: $1 + Area: $2) must hit the advisory, not a first-line class (rc=$RC markers=$(nmark3520) out=$CAP)"; }
+done
+[ "$e6_bad" = "0" ] \
+  && ok "#3520 E6 (fix3 N2-r3): two flush-left Area: lines (4+35, 35+4, safety+malformed) -> the advisory exit 2 once each (marker) -- parseAreaBind refuses duplicates, never classifies the first line" \
+  || true
+
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

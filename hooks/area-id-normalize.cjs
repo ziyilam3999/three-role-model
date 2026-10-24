@@ -25,7 +25,29 @@ function normaliseAreaId(raw) {
   if (digits === "0") return null;              // all-zero id ("0", "00", "0b"): malformed, never a guess
   return digits + (m[2] || "");
 }
-module.exports = { AREA_ID_RE, normaliseAreaId };
+
+// #3520 fix3 (N2-r3): parse the Area: BIND the ONE way. The dispatcher's bind contract requires
+// exactly one flush-left `Area:` line; the route gate used to classify by the FIRST well-formed
+// match, so a prompt carrying two `Area:` lines was classified by whichever came first. The class is
+// "area-id parsing is identical in every consumer": both parsers now call THIS function and treat a
+// duplicated `Area:` line the way the dispatcher always did — refused, never classified, never a guess.
+// Dup detection is SHAPE-BLIND (any flush-left `Area:` line counts, well-formed or not), matching the
+// dispatcher's PR:/Repo: bind discipline. Returns one of:
+//   { status: "none" }                      zero flush-left `Area:` lines
+//   { status: "dup", count }                more than one (count included for refusal text)
+//   { status: "malformed" }                 exactly one, but off the grammar or an all-zero id
+//   { status: "ok", area }                  exactly one well-formed line; area is the CANONICAL id
+function parseAreaBind(text) {
+  const lines = String(text == null ? "" : text).split(/\r?\n/);
+  const areaLines = lines.filter(l => /^Area:[^\n]*$/.test(l));
+  if (areaLines.length === 0) return { status: "none" };
+  if (areaLines.length > 1) return { status: "dup", count: areaLines.length };
+  const m = areaLines[0].match(/^Area:\s*([0-9]{1,3}[a-z]?)\s*$/);
+  if (!m) return { status: "malformed" };
+  const area = normaliseAreaId(m[1]);
+  return area === null ? { status: "malformed" } : { status: "ok", area };
+}
+module.exports = { AREA_ID_RE, normaliseAreaId, parseAreaBind };
 if (require.main === module) {
   const norm = normaliseAreaId(process.argv[2]);
   if (norm === null) process.exit(1);

@@ -289,9 +289,14 @@ if [ "$ROLE" = "execution-review" ] && [ "$PROVIDER" = "zai" ]; then
     let d={}; try{ d=JSON.parse(process.env.HOOK_INPUT||"{}"); }catch(e){ process.exit(0); }
     const ti=d.tool_input||{};
     const prompt=[ti.prompt, ti.description, ti.message].map(x=>(x==null?"":String(x))).join("\n").slice(0,1048576);
-    const m=prompt.match(/^Area:[ \t]*([0-9]{1,3}[a-z]?)[ \t]*$/m);
-    if (!m) process.exit(0);
-    try { process.stdout.write(require(process.env.AREA_ID_HELPER).normaliseAreaId(m[1]) || ""); }
+    // #3520 fix3 (N2-r3): the Area: bind parses through the ONE shared helper parseAreaBind -- the SAME
+    // parse the dispatcher uses -- so a prompt carrying MORE than one flush-left `Area:` line resolves to
+    // NO id (fail closed to the advisory below; the dispatcher refuses duplicates at its bind), never
+    // classified by the first line.
+    try {
+      const b = require(process.env.AREA_ID_HELPER).parseAreaBind(prompt);
+      if (b.status === "ok") process.stdout.write(b.area);
+    }
     catch (e) { process.exit(1); }   // helper unreadable: no id -> the advisory below (fail closed; the dispatcher refuses too)
   ' 2>/dev/null)"
   if [ -n "$ER_GA_AREA" ]; then
