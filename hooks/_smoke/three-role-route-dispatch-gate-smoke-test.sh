@@ -906,6 +906,14 @@ done
   || bad "#3520 E4 base markers=$(nmark3520)"
 
 # E5 (head): a CLOSED window admits the ER's first-class Claude fallback naming the SSOT-read opus tier.
+# #3520 fix3 (B1-r3): this arm drives the #3349 admission, which reaches the ledger's zai-window-admit and
+# through it tools/zai-window.sh -- a repo-only tool the plugin install does not ship (the plugin tree has
+# neither tools/ nor the #3349 fixtures, the same dependency class the #3349 section already guards). So E5
+# takes the SAME plugin-install skip as the #3349 section (same detection, same skip shape): the arm never
+# asserts in a tree that cannot run it (plugin CI measured red without this guard).
+if [ ! -d "$FX2985/.ai-workspace/plans" ]; then
+  echo "SKIP: #3520 E5 gate arm: fixture dir '$FX2985' absent (plugin install) — arm not run"
+else
 rm -rf "$ST3520"; mkdir -p "$ST3520"
 NOW3520=$(date +%s); RESET3520=$((NOW3520 + 7200))
 printf 'OR-ZAI-WINDOW-CLOSE ts=%s reset=%s role=executor task=1 session=none\n' "$NOW3520" "$RESET3520" > "$TMP/rw-3520-closed.md"
@@ -917,6 +925,7 @@ CAP=$(printf '%s' "$P" | env CC_ROUTES_JSON="$ROUTES_ER_ZAI" CC_MODE_FILE="$HYB_
     && ! grep -q "model:sonnet" <<<"$CAP" && [ "$(nmark3520)" = "0" ]; } \
   && ok "#3520 E5: CLOSED window -> ER's first-class fallback admission names model:opus (the seat row's agent_tool_fallback, read fresh), never sonnet" \
   || bad "#3520 E5 (rc=$RC out=$CAP)"
+fi
 
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }
