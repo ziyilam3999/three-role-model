@@ -446,7 +446,9 @@ const REQUIRED_ROLES = ['planner', 'plan-review', 'executor', 'execution-review'
 // cmdRefreshModels) MUST keep iterating REQUIRED_ROLES, never this superset — that is what keeps a
 // research OR ship-tail row non-gating (G1). cc-ship-tail-lane (2026-08-23) added 'ship-tail' here
 // ONLY — never to REQUIRED_ROLES, which would brick every completion gate lacking a ship-tail row.
-const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research', 'ship-tail'];
+// #3468 added 'fast-track' the same way: the z.ai FT builder seat self-appends its row keyed by
+// --run-id (the spawn/merge/verify gates read it), still never a REQUIRED/gating role.
+const RECORDABLE_ROLES = [...REQUIRED_ROLES, 'research', 'ship-tail', 'fast-track'];
 // A plan is recognized by a MARKDOWN HEADING (2-4 `#`) naming an acceptance-criteria / ELI5 section.
 // Anchored to a heading-line start (`^#{2,4}` + `m` flag) so prose that merely contains the word
 // "acceptance" ("we await acceptance from QA") can NEVER match — only a real heading does. Accepts the
