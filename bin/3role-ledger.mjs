@@ -4040,27 +4040,20 @@ function printSessionScanResolveAllow(task, cand) {
 // <= SESSION_ALIAS_MAX_3342 lines read; carried-key record <= 256 bytes — past a bound, no redirect.
 const SESSION_ALIAS_MAX_3342 = 8;
 const SESSION_ID_RE_3342 = /^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/;
+// #3520 A1: the alias reader is the ONE shared resolver, hooks/lib-session-resolve.mjs (same #3342 rules: alias
+// file <= 4 KiB / <= 8 lines, token-safe ids naming real ledger session dirs; plus the job-state
+// sessionId/resumeSessionId pair under the same filter). Found beside this file (hooks/) or, in the plugin
+// layout, at ../hooks/. Absent -> no aliases at all (fail closed: every alias use only ever WIDENS a lookup).
+let SESSION_LIB_3520 = null;
+for (const rel3520 of ['./lib-session-resolve.mjs', '../hooks/lib-session-resolve.mjs']) {
+  try { SESSION_LIB_3520 = await import(new URL(rel3520, import.meta.url).href); break; } catch (e) { /* next candidate */ }
+}
 function isLedgerSessionDir3342(sid) {
-  if (!SESSION_ID_RE_3342.test(sid)) return false;
-  try { return fs.statSync(path.join(LEDGER_DIR, sid)).isDirectory(); } catch (e) { return false; }
+  return SESSION_LIB_3520 ? SESSION_LIB_3520.isLedgerSessionDir(sid, LEDGER_DIR) : false;
 }
 function sessionAliases3342(session) {
-  const s = sanitize(session);
-  if (!s || !SESSION_ID_RE_3342.test(s)) return [];
-  const out = [];
-  try {
-    const f = path.join(LEDGER_DIR, '.session-alias', s);
-    const st = fs.statSync(f);
-    if (!st.isFile() || st.size <= 0 || st.size > 4096) return [];   // INPUT-BOUND: fail closed (no aliases)
-    const lines = fs.readFileSync(f, 'utf8').split('\n');
-    for (let i = 0; i < lines.length && i < SESSION_ALIAS_MAX_3342; i++) {
-      const a = lines[i].trim();
-      if (!a || a === s || a !== sanitize(a)) continue;   // a line that is not a clean session token is ignored
-      if (!isLedgerSessionDir3342(a)) continue;           // ...and so is one naming no real ledger session
-      if (!out.includes(a)) out.push(a);
-    }
-  } catch (e) { return []; }
-  return out;
+  if (!SESSION_LIB_3520) return [];
+  try { return SESSION_LIB_3520.sessionAliases(sanitize(session), { ledgerDir: LEDGER_DIR }); } catch (e) { return []; }
 }
 function sessionsAliasLinked3342(a, b) {
   const sa = sanitize(a), sb = sanitize(b);
@@ -7907,13 +7900,10 @@ function configDirSparseOmissionProblem(repoRoot) {
 // (sessionAliases3342: <= 8 lines, <= 4 KiB, token-safe ids naming real ledger session dirs). Returns the
 // first path that is a regular file, else the session's own path (callers' stat then fails -> '' as before).
 function ticketJsonPath3350(root, s, t) {
-  const own = path.join(root, s, t + '.json');
-  try { if (fs.statSync(own).isFile()) return own; } catch (e) { /* not under the session -> try aliases */ }
-  for (const a of sessionAliases3342(s)) {
-    const cand = path.join(root, a, t + '.json');
-    try { if (fs.statSync(cand).isFile()) return cand; } catch (e) { /* next alias */ }
-  }
-  return own;
+  // #3520 A1: the shared resolver's ticketJsonPath (own dir first, then each alias) -- the SAME function
+  // tools/ft-stamp-execution.mjs and tools/fastpath-verify.mjs read the ticket through.
+  if (!SESSION_LIB_3520) return path.join(root, s, t + '.json');
+  return SESSION_LIB_3520.ticketJsonPath(root, s, t, { ledgerDir: LEDGER_DIR });
 }
 
 // #3140 Leg 2 -- size-aware PLANNER tier. ONE implementation, three callers (cmdResolveRoleModel, the
@@ -9052,7 +9042,28 @@ function cmdSpawnTicket(opts) {
   if (!plan) plan = xrepoTaskPlan(session, task, hints);
   console.log('execution=' + readTicketExecution(session, task));
   console.log('plan=' + plan);
+  console.log('own_plan=' + ticketOwnPlan3442(session, task, hints, typeof opts.plan === 'string' ? opts.plan : ''));
   process.exit(0);
+}
+// #3442 (folded into #3520 A1) -- the plan in the ticket's OWN repo, found WITHOUT consulting the process cwd:
+// the same bounded base set xrepoTaskPlan walks (metadata.repo primary via the alias-aware ticket reader, the
+// prompt's worktree hints, the repo's <task>-* worktrees). A --plan rel that names a YYYY-MM-DD-<task>-*.md file
+// under .ai-workspace/plans/ wins in the first base holding it; else the newest such plan in the bases. '' when
+// none. The plan-review hook uses it as the ticket-repo answer when the cwd repo's copy carries no review
+// marker (the #3442 stale-copy false block); the found plan still needs its own review marker.
+function ticketOwnPlan3442(session, task, hints, rel) {
+  if (!task || !/^[0-9A-Za-z._-]{1,128}$/.test(String(task))) return '';
+  const re = new RegExp('^\\d{4}-\\d{2}-\\d{2}-' + escapeRe(task) + '-.*\\.md$');
+  if (typeof rel === 'string' && rel && !path.isAbsolute(rel) && !rel.startsWith('~') && !rel.split(/[\\/]/).includes('..')) {
+    const norm = path.normalize(rel).split(path.sep).join('/');
+    if (norm.indexOf('.ai-workspace/plans/') === 0 && re.test(path.basename(norm))) {
+      for (const b of xrepoBases(session, task, hints)) {
+        const cand = path.join(b, norm);
+        try { if (fs.statSync(cand).isFile()) return cand; } catch (e) { /* next base */ }
+      }
+    }
+  }
+  return xrepoTaskPlan(session, task, hints);
 }
 
 // plan-size --plan <path> : prints S|M|L, or a SIZE-* token with exit 2.
