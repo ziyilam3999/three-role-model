@@ -10,6 +10,9 @@
 # overlayAppend guard only, with no gate-side sub-check (the gate reads plan-review lines only).
 #
 # No `set -e` (a non-block non-zero must not be read as a permission decision — #749 fail-closed-smoke lesson).
+# #3441: never pipe captured output into `grep -q` — under `set -o pipefail` grep's early exit
+# SIGPIPEs the echo under load (base stress: 2 of 24 runs red on R8/R5). Every match below uses a
+# here-string (`grep -q "..." <<<"$CAP"`), which cannot SIGPIPE.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$DIR/../.." && pwd)}"
@@ -152,11 +155,11 @@ run 'not json at all {{{'
 
 # ---- R5. BYPASS-FORM: tag delivered via tool_input.description (not prompt) -> still BLOCK executor ----
 run '{"tool_name":"Task","session_id":"sR5","tool_input":{"description":"3ROLE_TASK:851 ROLE:executor build it"}}'
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "cannot spawn the EXECUTOR"; } && ok "R5 tag via description field -> BLOCK executor (bypass-form closed)" || bad "R5 description-field executor should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "cannot spawn the EXECUTOR" <<<"$CAP"; } && ok "R5 tag via description field -> BLOCK executor (bypass-form closed)" || bad "R5 description-field executor should block (rc=$RC out=$CAP)"
 
 # ---- R6. BYPASS-FORM: tag mid-prompt with surrounding noise -> still BLOCK executor ----
 run "$(agent 'preamble text ... 3ROLE_TASK:851 ROLE:executor ... trailing instructions here' sR6)"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "cannot spawn the EXECUTOR"; } && ok "R6 tag mid-prompt+noise -> BLOCK executor (bypass-form closed)" || bad "R6 mid-prompt executor should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "cannot spawn the EXECUTOR" <<<"$CAP"; } && ok "R6 tag mid-prompt+noise -> BLOCK executor (bypass-form closed)" || bad "R6 mid-prompt executor should block (rc=$RC out=$CAP)"
 
 # ---- R7. executor tagged but NO session -> documented fail-open ALLOW (completion gate is the backstop) ----
 run '{"tool_name":"Agent","tool_input":{"prompt":"3ROLE_TASK:851 ROLE:executor"}}'
@@ -165,7 +168,7 @@ run '{"tool_name":"Agent","tool_input":{"prompt":"3ROLE_TASK:851 ROLE:executor"}
 # ---- R8. a COMPLETED plan-review for a DIFFERENT task does NOT satisfy 851's executor -> BLOCK (per-task isolation) ----
 add_planreview sR8 999
 run "$(agent '3ROLE_TASK:851 ROLE:executor' sR8)"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "cannot spawn the EXECUTOR"; } && ok "R8 plan-review for task 999 does NOT unlock 851 executor -> BLOCK" || bad "R8 cross-task plan-review must not satisfy (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "cannot spawn the EXECUTOR" <<<"$CAP"; } && ok "R8 plan-review for task 999 does NOT unlock 851 executor -> BLOCK" || bad "R8 cross-task plan-review must not satisfy (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # AC-1 (HERO) — backgrounded dispatch no longer satisfies. Also satisfies AC-9(a): the run_in_background
@@ -175,7 +178,7 @@ S="s-ac1"; T="1575"
 DISPATCH_PAYLOAD='{"hook_event_name":"PostToolUse","tool_name":"Agent","session_id":"'"$S"'","run_in_background":true,"tool_input":{"prompt":"3ROLE_TASK:'"$T"' ROLE:plan-review -- review the plan"}}'
 printf '%s' "$DISPATCH_PAYLOAD" | THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" bash "$SPAWN_LEDGER" >/dev/null 2>&1
 run "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "verdict"; } && ok "AC-1 (HERO) backgrounded dispatch line no longer satisfies -> BLOCK" || bad "AC-1 dispatch-only should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "verdict" <<<"$CAP"; } && ok "AC-1 (HERO) backgrounded dispatch line no longer satisfies -> BLOCK" || bad "AC-1 dispatch-only should block (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # AC-1b (HERO) — CONTAMINATED planner transcript does not bind (D1 realistic fixture).
@@ -184,7 +187,7 @@ S="s-ac1b"; T="1b-task"
 mk_contaminated_planner "$S" "AGPLANNER" "$T"
 appendL --session "$S" --task "$T" --role plan-review --agent "AGPLANNER" --artifact "$TMP/rev.md" --verdict PASS --closed-at "2026-07-11T00:00:00.000Z"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not spawn-record-bound"; } && ok "AC-1b (HERO) contaminated planner transcript does not bind -> BLOCK (names failed spawn-record binding)" || bad "AC-1b should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "not spawn-record-bound" <<<"$CAP"; } && ok "AC-1b (HERO) contaminated planner transcript does not bind -> BLOCK (names failed spawn-record binding)" || bad "AC-1b should block (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # AC-1c — unbound-form sub-checks: (i) absent agentId; (ii) ghost agentId.
@@ -234,7 +237,7 @@ run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 S="s-ac4"; T="4-task"
 appendL --session "$S" --task "$T" --role plan-review --agent "agX4" --closed-at "2026-07-11T00:00:00.000Z" --verdict BLOCK
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "did not pass"; } && ok "AC-4 negative verdict (BLOCK) -> BLOCK, distinct re-plan/re-review message" || bad "AC-4 should block with a distinct message (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "did not pass" <<<"$CAP"; } && ok "AC-4 negative verdict (BLOCK) -> BLOCK, distinct re-plan/re-review message" || bad "AC-4 should block with a distinct message (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # AC-4b (HERO) — downgrade-to-skip REFUSED, three sub-checks.
@@ -245,7 +248,7 @@ appendL --session "$S" --task "$T" --role plan-review --agent "ag1-4b" --artifac
 SKIP_OUT=$(appendL_out --session "$S" --task "$T" --role plan-review --skip-reason "design tightly coupled to live session state"); SKIP_RC=$?
 LEDFILE="$LEDGERDIR/$S/$T.jsonl"
 vcount=$(grep -Ec '"verdict":"BLOCK"' "$LEDFILE"); ctrl=$(grep_ctrl '"verdict":"BLOCK"' '{"role":"plan-review","verdict":"BLOCK","agentId":"x"}')
-{ [ "$SKIP_RC" != "0" ] && echo "$SKIP_OUT" | grep -qi "completed verdict"; } && ok "AC-4b(i) skip-append exits NONZERO, names the existing BLOCK verdict" || bad "AC-4b(i) failed (rc=$SKIP_RC out=$SKIP_OUT)"
+{ [ "$SKIP_RC" != "0" ] && grep -qi "completed verdict" <<<"$SKIP_OUT"; } && ok "AC-4b(i) skip-append exits NONZERO, names the existing BLOCK verdict" || bad "AC-4b(i) failed (rc=$SKIP_RC out=$SKIP_OUT)"
 { [ "$vcount" = "1" ] && [ "$ctrl" = "1" ]; } && ok "AC-4b(ii) ledger line STILL carries the verdict (positive control included)" || bad "AC-4b(ii) verdict not retained (count=$vcount ctrl=$ctrl)"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 { [ "$RC" = "2" ]; } && ok "AC-4b(iii) executor spawn still BLOCKed" || bad "AC-4b(iii) should block (rc=$RC out=$CAP)"
@@ -261,7 +264,7 @@ INH_OUT=$(inheritL_out --session "$S" --task "$LEG" --parent "$P"); INH_RC=$?
 LEGFILE="$LEDGERDIR/$S/$LEG.jsonl"
 vcount=$(grep -Ec '"verdict":"BLOCK"' "$LEGFILE"); icount=$(grep -Ec '"inherited_from"' "$LEGFILE")
 ctrl_v=$(grep_ctrl '"verdict":"BLOCK"' '{"verdict":"BLOCK"}'); ctrl_i=$(grep_ctrl '"inherited_from"' '{"inherited_from":"x"}')
-{ [ "$INH_RC" != "0" ] && echo "$INH_OUT" | grep -qi "completed plan-review verdict"; } && ok "AC-4c(i) inherit exits NONZERO, names the existing BLOCK verdict" || bad "AC-4c(i) failed (rc=$INH_RC out=$INH_OUT)"
+{ [ "$INH_RC" != "0" ] && grep -qi "completed plan-review verdict" <<<"$INH_OUT"; } && ok "AC-4c(i) inherit exits NONZERO, names the existing BLOCK verdict" || bad "AC-4c(i) failed (rc=$INH_RC out=$INH_OUT)"
 { [ "$vcount" = "1" ] && [ "$icount" = "0" ] && [ "$ctrl_v" = "1" ] && [ "$ctrl_i" = "1" ]; } && ok "AC-4c(ii) verdict retained, nothing laundered (positive controls included)" || bad "AC-4c(ii) failed (v=$vcount i=$icount ctrl_v=$ctrl_v ctrl_i=$ctrl_i)"
 run "$(agent "3ROLE_TASK:$LEG ROLE:executor" "$S")"
 { [ "$RC" = "2" ]; } && ok "AC-4c(iii) executor spawn for the leg still BLOCKed" || bad "AC-4c(iii) should block (rc=$RC out=$CAP)"
@@ -303,7 +306,7 @@ FLIP_OUT=$(appendL_out --session "$S" --task "$T" --role plan-review --verdict P
 LEDFILE="$LEDGERDIR/$S/$T.jsonl"
 bcount=$(grep -Ec '"verdict":"BLOCK"' "$LEDFILE"); pcount=$(grep -Ec '"verdict":"PASS"' "$LEDFILE")
 ctrl_b=$(grep_ctrl '"verdict":"BLOCK"' '{"verdict":"BLOCK"}'); ctrl_p=$(grep_ctrl '"verdict":"PASS"' '{"verdict":"PASS"}')
-{ [ "$FLIP_RC" != "0" ] && echo "$FLIP_OUT" | grep -qi "completed verdict"; } && ok "AC-4f(i) bare verdict flip refused (exits NONZERO, names the existing BLOCK)" || bad "AC-4f(i) failed (rc=$FLIP_RC out=$FLIP_OUT)"
+{ [ "$FLIP_RC" != "0" ] && grep -qi "completed verdict" <<<"$FLIP_OUT"; } && ok "AC-4f(i) bare verdict flip refused (exits NONZERO, names the existing BLOCK)" || bad "AC-4f(i) failed (rc=$FLIP_RC out=$FLIP_OUT)"
 { [ "$bcount" = "1" ] && [ "$pcount" = "0" ] && [ "$ctrl_b" = "1" ] && [ "$ctrl_p" = "1" ]; } && ok "AC-4f(ii) BLOCK survives, PASS never lands (positive controls included)" || bad "AC-4f(ii) failed (b=$bcount p=$pcount ctrl_b=$ctrl_b ctrl_p=$ctrl_p)"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
 { [ "$RC" = "2" ]; } && ok "AC-4f(iii) executor spawn still BLOCKed" || bad "AC-4f(iii) should block (rc=$RC out=$CAP)"
@@ -396,7 +399,7 @@ icount=0; [ -f "$LEGFILE" ] && icount=$(grep -Ec '"inherited_from"' "$LEGFILE")
 S="s-ac7"; T="7-task"
 appendL --session "$S" --task "$T" --role plan-review --skip-reason "design tightly coupled to live session state, reviewed inline per Invariant 6 carve-out"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "no skip path"; } && ok "AC-7 the strongest legal-looking skip -> BLOCK (no skip path at this gate)" || bad "AC-7 should block (rc=$RC out=$CAP)"
+{ [ "$RC" = "2" ] && grep -qi "no skip path" <<<"$CAP"; } && ok "AC-7 the strongest legal-looking skip -> BLOCK (no skip path at this gate)" || bad "AC-7 should block (rc=$RC out=$CAP)"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # AC-8 — fail-closed on corrupt evidence: (i) pure substring-rich junk; (ii) trailing junk after a VALID line.
@@ -465,7 +468,7 @@ mk_bound "$S" "ag2701B" "$T" "plan-review"
 appendL --session "$S" --task "$T" --role plan-review --agent ag2701B --artifact "$TMP/rev.md" --verdict FAIL --closed-at "2026-01-01T02:00:00.000Z"
 appendL --session "$S" --task "$T" --role plan-review --agent ag2701A --artifact "$TMP/rev.md"
 run "$(agent "3ROLE_TASK:$T ROLE:executor" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "did not pass" && echo "$CAP" | grep -q "ag2701B"; } \
+{ [ "$RC" = "2" ] && grep -qi "did not pass" <<<"$CAP" && grep -q "ag2701B" <<<"$CAP"; } \
   && ok "#2701 AC-4: D3 latest-round pre-screen through the REAL bash gate -- an M2 same-agent re-touch reorder must not resurrect an older PASS over a newer FAIL (base: ALLOW)" \
   || bad "#2701 AC-4 FAILED (rc=$RC out=$CAP)"
 
@@ -508,7 +511,7 @@ printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC7R-2051\n' > "$OR_FIX/arti
 or_append "$S" "$T" --dispatch subprocess-openrouter --transcript "$OR_FIX/transcripts/f-ac7r.jsonl" \
   --nonce "N-AC7R-2051" --artifact "$OR_FIX/artifacts/p-ac7r.md" --verdict PASS
 run_routes "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "subprocess-unverified"; } \
+{ [ "$RC" = "2" ] && grep -qi "subprocess-unverified" <<<"$CAP"; } \
   && ok "#2051 AC-7 red: forged-nonce subprocess row through the real bash hook -> BLOCK, names subprocess-unverified (third-arm class flows through unchanged)" \
   || bad "#2051 AC-7 red should BLOCK naming subprocess-unverified (rc=$RC out=$CAP)"
 
@@ -523,7 +526,7 @@ printf '## Review\nDecision: PASS\nDISPATCH-NONCE:N-AC7H-2051\n' > "$OR_FIX/arti
 or_append "$S" "$T" --dispatch subprocess-openrouter --transcript "$OR_FIX/transcripts/f-ac7h.jsonl" \
   --nonce "N-AC7H-2051" --artifact "$OR_FIX/artifacts/p-ac7h.md" --verdict PASS
 run_routes_none "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not-finished"; } \
+{ [ "$RC" = "2" ] && grep -qi "not-finished" <<<"$CAP"; } \
   && ok "#2051 AC-7 hermeticity: the green-arm row under fixture SSOT-SILENT routes -> BLOCK not-finished (the same row ALLOWs under the fixture subprocess routes via run_routes); CC_ROUTES_JSON is genuinely delivered + consulted, the green arm is hermetic" \
   || bad "#2051 AC-7 hermeticity discriminator FAILED: the green-arm row did NOT block not-finished under the SSOT-silent fixture routes (rc=$RC out=$CAP) — the green arm may be riding the shipped config, not the fixture"
 
@@ -595,7 +598,7 @@ mk_or_transcript "$F2700/transcripts/f-ac2a.jsonl" "$T" "N-AC2A-2700" "moonshota
 or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2a.jsonl" \
   --nonce "N-AC2A-2700" --artifact ".ai-workspace/plans/p-ac2a.md" --verdict PASS
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "subprocess-unverified" && echo "$CAP" | grep -qi "not found"; } \
+{ [ "$RC" = "2" ] && grep -qi "subprocess-unverified" <<<"$CAP" && grep -qi "not found" <<<"$CAP"; } \
   && ok "#2700 AC-2a: artifact missing at every candidate -> BLOCK not found" \
   || bad "#2700 AC-2a should BLOCK not found (rc=$RC out=$CAP)"
 
@@ -607,7 +610,7 @@ or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --tra
   --nonce "N-AC2B-2700" --artifact ".ai-workspace/plans/p-ac2b.md" --verdict PASS
 printf '## Review\nDISPATCH-NONCE:SOME-OTHER-NONCE\nDecision: PASS\n' > "$F2700/wt/.ai-workspace/plans/p-ac2b.md"
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "does not contain this dispatch's nonce"; } \
+{ [ "$RC" = "2" ] && grep -qi "does not contain this dispatch's nonce" <<<"$CAP"; } \
   && ok "#2700 AC-2b: vantage copy exists but lacks this dispatch's nonce -> BLOCK names the nonce (not 'not found')" \
   || bad "#2700 AC-2b should BLOCK naming the nonce (rc=$RC out=$CAP)"
 
@@ -618,7 +621,7 @@ mk_or_transcript "$F2700/transcripts/f-ac2c.jsonl" "$T" "N-AC2C-2700" "moonshota
 or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2c.jsonl" \
   --nonce "N-AC2C-2700" --artifact ".ai-workspace/plans/p-ac2c.md" --verdict PASS
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+{ [ "$RC" = "2" ] && grep -qi "not found" <<<"$CAP"; } \
   && ok "#2700 AC-2c: recorded cwd is an absent directory -> BLOCK not found (fail-closed)" \
   || bad "#2700 AC-2c should BLOCK not found (rc=$RC out=$CAP)"
 
@@ -632,7 +635,7 @@ printf '## Review\nDISPATCH-NONCE:N-AC2D1-2700\nDecision: PASS\n' > "$F2700/wt/.
 or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2d1.jsonl" \
   --nonce "N-AC2D1-2700" --artifact ".ai-workspace/plans/p-ac2d1.md" --verdict PASS
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+{ [ "$RC" = "2" ] && grep -qi "not found" <<<"$CAP"; } \
   && ok "#2700 AC-2d (bare-relative recorded cwd 'wt'): ignored, never joined -> BLOCK not found" \
   || bad "#2700 AC-2d (bare-relative) should BLOCK not found (rc=$RC out=$CAP)"
 
@@ -642,7 +645,7 @@ printf '## Review\nDISPATCH-NONCE:N-AC2D2-2700\nDecision: PASS\n' > "$F2700/wt/.
 or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac2d2.jsonl" \
   --nonce "N-AC2D2-2700" --artifact ".ai-workspace/plans/p-ac2d2.md" --verdict PASS
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "not found"; } \
+{ [ "$RC" = "2" ] && grep -qi "not found" <<<"$CAP"; } \
   && ok "#2700 AC-2d (tilde-form recorded cwd '~/wt'): ignored, never joined -> BLOCK not found" \
   || bad "#2700 AC-2d (tilde-form) should BLOCK not found (rc=$RC out=$CAP)"
 
@@ -654,7 +657,7 @@ printf '## Review\nDISPATCH-NONCE:N-AC3B-2700\nDecision: PASS\n' > "$F2700/wt/.a
 or_append_from "$F2700/primary" "$S" "$T" --dispatch subprocess-openrouter --transcript "$F2700/transcripts/f-ac3b.jsonl" \
   --nonce "N-AC3B-2700" --artifact ".ai-workspace/plans/p-ac3b.md" --verdict PASS
 run_or_vantage "$(agent "3ROLE_TASK:$T ROLE:executor -- implement it" "$S")" "$F2700/primary"
-{ [ "$RC" = "2" ] && echo "$CAP" | grep -qi "first record does"; } \
+{ [ "$RC" = "2" ] && grep -qi "first record does" <<<"$CAP"; } \
   && ok "#2700 AC-3b: bound record (enqueue) lacks the nonce -> BLOCK, never reaches artifact resolution (M2)" \
   || bad "#2700 AC-3b should BLOCK on the binding check (rc=$RC out=$CAP)"
 
