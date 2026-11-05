@@ -25,6 +25,13 @@
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
       "zai_dispatch": "permitted"
+    },
+    "hybrid-local-trial": {
+      "_comment_222": "#222 local-Orchestrator shadow trial (plan .ai-workspace/plans/2026-11-05-222-local-orchestrator-trial.md D8): a copy of hybrid with local_dispatch permitted -- the ONE mode that opens the local door without closing z.ai or dropping a lane (conservative does both; an alias spelling would be clamped to forbidden by the hooks/3role-ledger.mjs alias clamp, so a new canonical row is the only spelling that works). On ONLY while the #222 trial runs; the operator flips it back with set-mode --mode hybrid (plan Operator step 5). While on, tools/local-role-dispatch.sh would also pass its mode gate, but no live seat calls it (tools/launch-seat.sh dispatches via the openrouter dispatcher, plan D8).",
+      "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
+      "openrouter_dispatch": "forbidden",
+      "local_dispatch": "permitted",
+      "zai_dispatch": "permitted"
     }
   },
   "aliases": {
