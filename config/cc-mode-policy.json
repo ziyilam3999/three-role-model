@@ -1,37 +1,42 @@
 {
-  "_composition_contract": "#2105/redesign-lane-mode-caps-work-shiptail-pools-enforced (2026-08-29) — this file is one of TWO disjoint lane-policy tables (the other is #1939's config/lane-modes.json, which stays single-ceiling — see the plan's Lockstep §(a) for why the two now legitimately encode DIFFERENT semantics). TWO-POOL LANE axis (v2): each mode carries lanes.{work_base, opportunist, work_ceiling, ship_tail_ceiling} — work_ceiling MUST equal work_base+opportunist (mechanically checked by scripts/check-mode-policy-lane-ceiling-parity.mjs against the plan's Target-state table, the new parity authority). The two doormen (hooks/lane-ceiling-gate.sh and hooks/mode-pin-lane-gate.sh) are INDEPENDENT CONJUNCT PreToolUse gates registered at the same start edges — each refuses on its own predicate over the SAME shared pool-aware membership math (hooks/sole_lane_math.py live_pool_members), so the effective per-pool ceiling any spawn actually experiences is min(pin-ceiling, computed-ceiling) BY CONSTRUCTION (tighten-only). WORK pool roles = planner|plan-review|executor|execution-review; SHIP-TAIL pool role = ship-tail; research is never a lane. Within the WORK pool, work_ceiling is a HARD cap (repeats on re-issue); the work_base->work_ceiling band is a block-once ADVISORY (the opportunist judgment surface); ship_tail_ceiling is a HARD cap with no advisory band. PROVIDER axis: openrouter_dispatch (permitted|forbidden), local_dispatch (permitted|forbidden, mirroring openrouter_dispatch — authorizes the conservative-mode local-LLM offload option, forbidden everywhere else in v1), and the NEW #2518 zai_dispatch axis (permitted|forbidden — authorizes a z.ai-direct GLM dispatch; permitted ONLY in the new hybrid mode, forbidden everywhere else, including conservative/normal/boost, so hybrid never re-opens OpenRouter or local — it opens ONLY the z.ai door) are pure functions of (this table, the operator pin at ~/.config/cc-mode.json) ALONE. #2189 D2/D3's downstream OpenRouter-credits ONE-WAY veto (can only SUBTRACT permission, never grant it) is unchanged by this redesign and does not apply to zai_dispatch (z.ai is a subscription seat, not a metered-credits one). Canonical mode ids are the operator's own words: conservative, normal, boost (renamed from speed-boost — speed-boost is now an ALIAS, never operator-selectable via set-mode, #2189 D6 'aliases may describe, never unlock'), and #2518's hybrid (z.ai GLM only — never reuse conservative, which also opens the local-LLM and OpenRouter doors); #1939/#2035's spelling token-conservative remains an input ALIAS for conservative. This file never gains a T/nudge-target column — that lives exclusively in #1939's own config/lane-modes.json table, which keeps its own speed-boost vocabulary (resolved via scripts/lane-mode/lib/pin-to-lane-band.mjs's reverse-alias bridge, zero edits needed there); hybrid resolves the same lane band as normal there (#2518 R7, acceptable — the token is observable via fallback=true, never silent). lane_ceiling (the pre-v2 single-number field) is REMOVED — no dual encoding to drift.",
+  "_composition_contract": "#2105/redesign-lane-mode-caps-work-shiptail-pools-enforced (2026-08-29) — this file is one of TWO disjoint lane-policy tables (the other is #1939's config/lane-modes.json, which stays single-ceiling — see the plan's Lockstep §(a) for why the two now legitimately encode DIFFERENT semantics). TWO-POOL LANE axis (v2): each mode carries lanes.{work_base, opportunist, work_ceiling, ship_tail_ceiling} — work_ceiling MUST equal work_base+opportunist (mechanically checked by scripts/check-mode-policy-lane-ceiling-parity.mjs against the plan's Target-state table, the new parity authority). The two doormen (hooks/lane-ceiling-gate.sh and hooks/mode-pin-lane-gate.sh) are INDEPENDENT CONJUNCT PreToolUse gates registered at the same start edges — each refuses on its own predicate over the SAME shared pool-aware membership math (hooks/sole_lane_math.py live_pool_members), so the effective per-pool ceiling any spawn actually experiences is min(pin-ceiling, computed-ceiling) BY CONSTRUCTION (tighten-only). WORK pool roles = planner|plan-review|executor|execution-review; SHIP-TAIL pool role = ship-tail; research is never a lane. Within the WORK pool, work_ceiling is a HARD cap (repeats on re-issue); the work_base->work_ceiling band is a block-once ADVISORY (the opportunist judgment surface); ship_tail_ceiling is a HARD cap with no advisory band. PROVIDER axis: openrouter_dispatch (permitted|forbidden), local_dispatch (permitted|forbidden, mirroring openrouter_dispatch — authorizes the conservative-mode local-LLM offload option, forbidden everywhere else in v1), and the NEW #2518 zai_dispatch axis (permitted|forbidden — authorizes a z.ai-direct GLM dispatch; permitted ONLY in the new hybrid mode, forbidden everywhere else, including conservative/normal/boost, so hybrid never re-opens OpenRouter or local — it opens ONLY the z.ai door) are pure functions of (this table, the operator pin at ~/.config/cc-mode.json) ALONE. #3576 adds the anthropic_dispatch axis (permitted|forbidden; permitted in EVERY mode row and in the in-code fail-safe: anthropic is the baseline provider and the fail-safe asymmetry's own safe side, so garbage state must never BLOCK it, and equally never MINT a permission -- the axis keeps the zai axis's literal-'permitted'-only clamp at every resolveMode row arm, so a partially-written mode row or an alias pin resolves forbidden, never undefined). #2189 D2/D3's downstream OpenRouter-credits ONE-WAY veto (can only SUBTRACT permission, never grant it) is unchanged by this redesign and does not apply to zai_dispatch (z.ai is a subscription seat, not a metered-credits one). Canonical mode ids are the operator's own words: conservative, normal, boost (renamed from speed-boost — speed-boost is now an ALIAS, never operator-selectable via set-mode, #2189 D6 'aliases may describe, never unlock'), and #2518's hybrid (z.ai GLM only — never reuse conservative, which also opens the local-LLM and OpenRouter doors); #1939/#2035's spelling token-conservative remains an input ALIAS for conservative. This file never gains a T/nudge-target column — that lives exclusively in #1939's own config/lane-modes.json table, which keeps its own speed-boost vocabulary (resolved via scripts/lane-mode/lib/pin-to-lane-band.mjs's reverse-alias bridge, zero edits needed there); hybrid resolves the same lane band as normal there (#2518 R7, acceptable — the token is observable via fallback=true, never silent). lane_ceiling (the pre-v2 single-number field) is REMOVED — no dual encoding to drift.",
   "default_mode": "normal",
   "modes": {
     "conservative": {
       "lanes": { "work_base": 2, "opportunist": 1, "work_ceiling": 3, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "permitted",
       "local_dispatch": "permitted",
-      "zai_dispatch": "forbidden"
+      "zai_dispatch": "forbidden",
+      "anthropic_dispatch": "permitted"
     },
     "normal": {
       "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
-      "zai_dispatch": "forbidden"
+      "zai_dispatch": "forbidden",
+      "anthropic_dispatch": "permitted"
     },
     "boost": {
       "lanes": { "work_base": 5, "opportunist": 0, "work_ceiling": 5, "ship_tail_ceiling": 3 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
-      "zai_dispatch": "forbidden"
+      "zai_dispatch": "forbidden",
+      "anthropic_dispatch": "permitted"
     },
     "hybrid": {
       "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "forbidden",
-      "zai_dispatch": "permitted"
+      "zai_dispatch": "permitted",
+      "anthropic_dispatch": "permitted"
     },
     "hybrid-local-trial": {
       "_comment_222": "#222 local-Orchestrator shadow trial (plan .ai-workspace/plans/2026-11-05-222-local-orchestrator-trial.md D8): a copy of hybrid with local_dispatch permitted -- the ONE mode that opens the local door without closing z.ai or dropping a lane (conservative does both; an alias spelling would be clamped to forbidden by the hooks/3role-ledger.mjs alias clamp, so a new canonical row is the only spelling that works). On ONLY while the #222 trial runs; the operator flips it back with set-mode --mode hybrid (plan Operator step 5). While on, tools/local-role-dispatch.sh would also pass its mode gate, but no live seat calls it (tools/launch-seat.sh dispatches via the openrouter dispatcher, plan D8).",
       "lanes": { "work_base": 3, "opportunist": 1, "work_ceiling": 4, "ship_tail_ceiling": 2 },
       "openrouter_dispatch": "forbidden",
       "local_dispatch": "permitted",
-      "zai_dispatch": "permitted"
+      "zai_dispatch": "permitted",
+      "anthropic_dispatch": "permitted"
     }
   },
   "aliases": {

@@ -1638,18 +1638,28 @@ if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
   appendL --session s3140g --task 9005 --role plan-review --agent agR --artifact "$LART_REV"
   appendL --session s3140g --task 9005 --role executor --agent agE --artifact "branch feat/x"
   appendL --session s3140g --task 9005 --role execution-review --agent agV --artifact "$LART_REV"
-  # control: with NO pin the live size-L overlay expects fable, so the opus planner is a MODEL-POLICY block
-  # (proves this arm is discriminating on the live config, not passing on an opus fail-safe).
+  # TICKET 302 RE-ARM (2026-11-07): the live planner row is zai glm-5.3 subprocess-zai with
+  # agent_tool_fallback opus, and its size_models key is REMOVED (no size-L -> fable overlay any
+  # more). The live expected side for planner is therefore opus on EVERY ticket size. The control
+  # stays discriminating two ways: an opus transcript now passes (the old fable overlay is gone),
+  # and a sonnet transcript still blocks (the expected side really is opus, not a vacuous pass);
+  # the pin-wins leg moves the expected side to sonnet so the same sonnet transcript passes.
   env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "3140 AC-2.7 fixture control" >/dev/null 2>&1
   OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" PROGRESS_TASKS_DIR="$T3140/tasks" \
     node "$LED" check --session s3140g --task 9005 --enforce-role-models 2>&1); RC=$?
+  { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
+    && ok "#3140 AC-2.7 (live config, control): unpinned size-L ticket + opus planner -> exit 0 (the #302 zai row answers opus; the size-L fable overlay is removed)" || bad "#3140 live control (rc=$RC out=$OUT)"
+  mk_sub_model s3140g agS claude-sonnet-5-5
+  appendL --session s3140g --task 9005 --role planner --agent agS --artifact "$LART_PLAN"
+  OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" PROGRESS_TASKS_DIR="$T3140/tasks" \
+    node "$LED" check --session s3140g --task 9005 --enforce-role-models 2>&1); RC=$?
   { [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
-    && ok "#3140 AC-2.7 (live config, control): unpinned size-L ticket + opus planner -> MODEL-POLICY block" || bad "#3140 live control (rc=$RC out=$OUT)"
-  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier opus --reason "3140 AC-2.7 fixture pin" >/dev/null 2>&1
+    && ok "#3140 AC-2.7 (live config, must-fire): the same ticket + sonnet planner -> MODEL-POLICY block (the expected side is the fallback tier opus)" || bad "#3140 live sonnet control should block (rc=$RC out=$OUT)"
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier sonnet --reason "3140 AC-2.7 fixture pin" >/dev/null 2>&1
   OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON THREE_ROLE_LEDGER_DIR="$LEDGERDIR" THREE_ROLE_PROJECTS_ROOT="$PROJROOT" CLAUDE_PROJECT_DIR="$PROJ" PROGRESS_TASKS_DIR="$T3140/tasks" \
     node "$LED" check --session s3140g --task 9005 --enforce-role-models 2>&1); RC=$?
   { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
-    && ok "#3140 AC-2.5/D3 (live config): a planner seat pin (opus) wins on the completion gate for a size-L ticket" || bad "#3140 pin-wins on the completion gate (rc=$RC out=$OUT)"
+    && ok "#3140 AC-2.5/D3 (live config): a planner seat pin (sonnet) wins on the completion gate -- the same sonnet transcript now passes" || bad "#3140 pin-wins on the completion gate (rc=$RC out=$OUT)"
   env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "3140 AC-2.7 fixture cleanup" >/dev/null 2>&1
   unset CC_SEAT_PINS_FILE
 else
