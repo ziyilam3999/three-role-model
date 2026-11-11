@@ -6721,6 +6721,100 @@ fi
 
 
 # ============================================================================================================
+# #178 — builder-tier M: size M joins L on size_models.M (route_reason size-M-zai, the SAME shared
+# 2-strike agent-tool fallback), the config-only rollback (NO M key -> the size-SM flash answer
+# BYTE-IDENTICAL to HEAD), the lint closed set {L, M} (S stays refused), and the #3145 D5 mirror for M
+# rows (a closedAt strictly before the seat's size_route_since also admits the pre-change flash model).
+# Fixtures: hooks/fixtures/2985-size-label/{routes-zai-3060-m.json,routes-zai-3060-m-since.json,
+# head-exec-M.json}; the #3085 machinery above (mk_z85_plan / mk_z85_transcript / z85_session / z85_check /
+# JF2985) is reused with a fresh M plan; the transition arms rewrite closedAt on the SYNTHETIC fixture rows
+# only (fake task 3085x, nonces NNN-*, the $TMP store — never a real row).
+# ============================================================================================================
+if [ -d "$FX2985/.ai-workspace/plans" ]; then   # #3585: Z85 + the fixtures exist only when the 2985 fixture dir does
+mk_z85_plan "$Z85/.ai-workspace/plans/2026-01-01-3085x-plan-M.md" M "data-class: public"
+R178M="$FX2985/routes-zai-3060-m.json"
+R178S="$FX2985/routes-zai-3060-m-since.json"
+z178_closedAt() {  # $1=session $2=ISO closedAt — rewrite the SYNTHETIC executor dispatch row only
+  node -e '
+    const fs = require("fs");
+    const [ , f, iso ] = process.argv;
+    const out = fs.readFileSync(f, "utf8").split("\n").filter((l) => l.trim()).map((l) => {
+      const j = JSON.parse(l);
+      if (j.role === "executor" && j.dispatch === "subprocess-zai") j.closedAt = iso;
+      return JSON.stringify(j);
+    });
+    fs.writeFileSync(f, out.join("\n") + "\n");
+  ' "$Z85/ledger/$1/3085x.jsonl" "$2"
+}
+
+# ---- #178 AC-2: M routes on size_models.M with the shared strike fallback ----
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-M.md "$R178M")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "subprocess-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-M-zai" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "0" ]; } \
+  && ok "#178 AC-2: M plan + size_models.M -> subprocess-zai glm-5.3 route_reason=size-M-zai zai_strikes=0" || bad "#178 AC-2 flip (out=$OUT)"
+OUT=$(RR3060 receipts-exec-2.md 2026-10-03-777-plan-M.md "$R178M")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_dispatch)" = "agent-tool" ] && [ "$(printf '%s' "$OUT" | JF2985 effective_tier)" = "sonnet" ] \
+  && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "zai-strikes" ] && [ "$(printf '%s' "$OUT" | JF2985 zai_strikes)" = "2" ]; } \
+  && ok "#178 AC-2: M plan + 2 strikes -> agent-tool sonnet route_reason=zai-strikes (the SAME fallback as L)" || bad "#178 AC-2 strikes (out=$OUT)"
+
+# ---- #178 AC-3: rollback byte-identity (NO M key -> HEAD's size-SM answer field-for-field) + L untouched ----
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-M.md)
+printf '%s\n' "$OUT" | diff - "$FX2985/head-exec-M.json" >/dev/null \
+  && ok "#178 AC-3: M plan on the L-only fixture -> the resolve-route JSON is byte-identical to the committed HEAD golden (size-SM flash, config-only rollback)" \
+  || bad "#178 AC-3 rollback JSON drifted from the committed golden (out=$OUT)"
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-S.md "$R178M")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3-flash" ] && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-SM" ]; } \
+  && ok "#178 AC-3 held-out: an S plan on the flipped fixture still routes size-SM flash (S never sizes)" || bad "#178 AC-3 S held-out (out=$OUT)"
+OUT=$(RR3060 receipts-exec-0.md 2026-10-03-777-plan-L.md "$R178M")
+{ [ "$(printf '%s' "$OUT" | JF2985 effective_model)" = "glm-5.3" ] && [ "$(printf '%s' "$OUT" | JF2985 route_reason)" = "size-L-zai" ]; } \
+  && ok "#178 AC-3 held-out: the L arm is untouched on the flipped fixture (size-L-zai glm-5.3)" || bad "#178 AC-3 L held-out (out=$OUT)"
+
+# ---- #178 AC-4: the lint closed set {L, M} ----
+OUT=$(CC_ROUTES_JSON="$R178M" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" = "0" ]; } && ok "#178 AC-4: lint-routes clean on the L+M fixture" || bad "#178 AC-4 clean (rc=$RC out=$OUT)"
+V178="$TMP/178-lint-mutants"; mkdir -p "$V178"
+node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));j.seats.executor.size_models.M="glm-9.9";fs.writeFileSync(process.argv[2],JSON.stringify(j,null,1));' "$R178M" "$V178/m-bad.json"
+OUT=$(CC_ROUTES_JSON="$V178/m-bad.json" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'SIZE-MODEL-UNDECLARED' && printf '%s' "$OUT" | command grep -q 'size_models.M'; } \
+  && ok "#178 AC-4: lint-routes refuses an off-vocabulary M value (exit 2 SIZE-MODEL-UNDECLARED size_models.M)" || bad "#178 AC-4 m-bad (rc=$RC out=$OUT)"
+node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));j.seats.executor.size_models={L:"glm-5.3",S:"glm-5.3-flash"};fs.writeFileSync(process.argv[2],JSON.stringify(j,null,1));' "$R178M" "$V178/m-s.json"
+OUT=$(CC_ROUTES_JSON="$V178/m-s.json" node "$LED" lint-routes 2>&1); RC=$?
+{ [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'size_models.S'; } \
+  && ok "#178 AC-4 held-out: lint-routes still refuses an S key (the closed set is {L, M})" || bad "#178 AC-4 s-key (rc=$RC out=$OUT)"
+
+# ---- #178 AC-5: the checker's M arm + the size_route_since pre-change admission ----
+mk_z85_transcript "$Z85/transcripts/ac178-pf.jsonl" "NNN-178PF" "glm-5.3" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-M.md"
+z85_session z85ac178pf "$Z85/transcripts/ac178-pf.jsonl" "NNN-178PF" "glm-5.3"
+z85_check z85ac178pf "$R178S"
+{ [ "$ZRC" = "0" ] && ! printf '%s' "$ZOUT" | command grep -q '^BLOCK:'; } \
+  && ok "#178 AC-5: post-flip M row + served glm-5.3 -> check exits 0, no BLOCK" || bad "#178 AC-5 pf-clean (rc=$ZRC out=$ZOUT)"
+mk_z85_transcript "$Z85/transcripts/ac178-pfbad.jsonl" "NNN-178PFB" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-M.md"
+z85_session z85ac178pfb "$Z85/transcripts/ac178-pfbad.jsonl" "NNN-178PFB" "glm-5.3-flash"
+z85_check z85ac178pfb "$R178S"
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3"' && printf '%s' "$ZOUT" | command grep -q 'size=M'; } \
+  && ok "#178 AC-5: post-flip M row + served flash -> exit 2, route-expected model \"glm-5.3\" size=M" || bad "#178 AC-5 pf-block (rc=$ZRC out=$ZOUT)"
+mk_z85_transcript "$Z85/transcripts/ac178-pr.jsonl" "NNN-178PR" "glm-5.3-flash" "PLAN: .ai-workspace/plans/2026-01-01-3085x-plan-M.md"
+z85_session z85ac178pr "$Z85/transcripts/ac178-pr.jsonl" "NNN-178PR" "glm-5.3-flash"
+z178_closedAt z85ac178pr "2026-01-01T12:00:00.000Z"
+z85_check z85ac178pr "$R178S"
+{ [ "$ZRC" = "0" ] && ! printf '%s' "$ZOUT" | command grep -q '^BLOCK:'; } \
+  && ok "#178 AC-5: pre-flip M row (closedAt strictly before size_route_since) + served flash -> exits 0 (the #3145 D5 admission)" || bad "#178 AC-5 pr-admit (rc=$ZRC out=$ZOUT)"
+z178_closedAt z85ac178pfb "2026-01-01T12:00:00.000Z"
+z85_check z85ac178pfb "$R178S"
+{ [ "$ZRC" = "0" ]; } \
+  && ok "#178 AC-5 held-out: the SAME flash-served row admitted once its closedAt pre-dates the pin (the arm above is closedAt-gated, not model-gated)" || bad "#178 AC-5 held-out closedAt gate (rc=$ZRC out=$ZOUT)"
+z85_check z85ac178pfb "$R178M"
+{ [ "$ZRC" = "2" ] && printf '%s' "$ZOUT" | command grep -q 'route-expected model "glm-5.3"'; } \
+  && ok "#178 AC-5 held-out: served flash still BLOCKS when the routes carry NO size_route_since (the admission is pin-gated)" || bad "#178 AC-5 held-out no-pin (rc=$ZRC out=$ZOUT)"
+z85_check z85ac178pfb "$R3060"
+{ [ "$ZRC" = "0" ]; } \
+  && ok "#178 AC-5 held-out: M row + served flash on the L-only rollback fixture -> exits 0 (no M arm at all: the seat model is expected)" || bad "#178 AC-5 held-out rollback checker (rc=$ZRC out=$ZOUT)"
+else
+  skip "#178 builder-tier M arms: fixture dir '$FX2985' absent (plugin install) — section not run"
+fi
+
+
+# ============================================================================================================
 # #3190 — receipt-based needle admission (the #2888 dispatcher-vs-gate deadlock fix): resolve-route --brief,
 # the zai-strikes precedence, and the check ROUTE-NEEDLE advisory. ENTIRELY mktemp-self-contained (routes +
 # roles + plans + briefs + receipts all under $TMP): runs unchanged in BOTH populations -- the plugin ships
@@ -7740,5 +7834,274 @@ spcase "(h) leading blank lines skipped" "851 research $SPSID" "$(printf '\n\n3R
 spcase "(i) upper-case header role is lowercased (named risk 3422-pr-r2-header-role-case)" "851 executor $SPSID" "3ROLE_TASK:851 ROLE:EXECUTOR"
 SPG="$(printf 'not json' | node "$LED" spawn-tag 2>&1; echo "rc=$?")"
 [ "$SPG" = "$(printf -- '- - -\nrc=0')" ] && ok "#3422 AC-5 (g) malformed JSON -> '- - -' exit 0" || bad "#3422 AC-5 (g) got [$SPG]"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# #328 — the S fast-track's gate-readable skip rows: (AC-1) a skip append keeps a SAME-WRITE
+# --artifact (a bare skip still erases the inherited one); (AC-2) a skip plan-review row no
+# longer kills the size-S waiver while a REAL plan-review row still does; (AC-3) every
+# size-s refusal names the exact flush-left line/shape. Fixture ids are synthetic (FIXTURE RULE);
+# every plan lives ONLY at a fixture ref (the real B1 shape), never on the cwd's disk.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+S328_LEDGER="$TMP/s328-ledger"; S328_TASKS="$TMP/s328-tasks"; S328_SUBS="$TMP/s328-projects"
+mkdir -p "$S328_LEDGER/s328" "$S328_TASKS/s328"
+export THREE_ROLE_LEDGER_DIR="$S328_LEDGER" PROGRESS_TASKS_DIR="$S328_TASKS" THREE_ROLE_PROJECTS_ROOT="$S328_SUBS"
+# r328_json <file> <node-assert>: parse ONE ledger line and assert on it (exit 0 = holds)
+r328_json() { printf '%s' "$1" | node -e "$2"; }
+sz_ticket "s328" 990328 S
+
+# --- AC-1 must-fire: a skip append that names --artifact in the SAME write keeps artifact_path beside skip_reason ---
+R328="$TMP/s328-repo"; sz_mk_repo "$R328" "$LED" 990328 S ".ai-workspace/plans/2099-01-01-990328-x.md"
+sz_run "$R328/hooks/3role-ledger.mjs" "$R328" append --session s328 --task 990328 --role planner \
+  --skip-reason "size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" \
+  --artifact .ai-workspace/plans/2099-01-01-990328-x.md
+AC1_RC=$SZ_RC
+AC1_ROW="$(tail -1 "$S328_LEDGER/s328/990328.jsonl")"
+if r328_json "$AC1_ROW" 'const j=JSON.parse(require("fs").readFileSync(0,"utf8"));process.exit(j.skip_reason==="size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" && j.artifact_path===".ai-workspace/plans/2099-01-01-990328-x.md" ? 0 : 1)'; then
+  ok "#328 AC-1: skip append with a same-write --artifact keeps artifact_path AND skip_reason on ONE row" || true
+else
+  bad "#328 AC-1: same-write artifact erased by the skip clear-list (rc=$AC1_RC row=$AC1_ROW)"
+fi
+# --- AC-1 green-pin (must-not-fire): a bare skip over that row still erases the INHERITED artifact ---
+sz_run "$R328/hooks/3role-ledger.mjs" "$R328" append --session s328 --task 990328 --role planner \
+  --skip-reason "operator reclaim: the seat was never dispatched"
+AC1B_ROW="$(tail -1 "$S328_LEDGER/s328/990328.jsonl")"
+if r328_json "$AC1B_ROW" 'const j=JSON.parse(require("fs").readFileSync(0,"utf8"));process.exit(j.skip_reason==="operator reclaim: the seat was never dispatched" && j.artifact_path===undefined ? 0 : 1)'; then
+  ok "#328 AC-1 pin: a bare skip (no same-write --artifact) still erases the inherited artifact (stale-evidence rule kept)" || true
+else
+  bad "#328 AC-1 pin: inherited artifact survived a bare skip (row=$AC1B_ROW)"
+fi
+
+# --- AC-2 must-fire: planner skip row (with same-write artifact) + plan-review SKIP row -> EXEMPT rc 0 ---
+sz_ticket "s328" 990330 S
+R328B="$TMP/s328-repo-330"; sz_mk_repo "$R328B" "$LED" 990330 S
+sz_run "$R328B/hooks/3role-ledger.mjs" "$R328B" append --session s328 --task 990330 --role planner \
+  --skip-reason "size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" \
+  --artifact "$(sz_plan_name 990330)"
+sz_run "$R328B/hooks/3role-ledger.mjs" "$R328B" append --session s328 --task 990330 --role plan-review \
+  --skip-reason "size S fast-track: contract-only plan; plan review not required for S (tools/render-seat-brief.mjs)"
+sz_run "$R328B/hooks/3role-ledger.mjs" "$R328B" size-s-exempt --session s328 --task 990330
+A2_RC=$SZ_RC; A2_OUT=$SZ_OUT
+{ [ "$A2_RC" = "0" ] && printf '%s' "$A2_OUT" | command grep -q '^EXEMPT'; } \
+  && ok "#328 AC-2: skip plan-review row no longer kills the waiver (size-s-exempt EXEMPT rc 0)" \
+  || bad "#328 AC-2 (rc=$A2_RC out=$A2_OUT)"
+# --- AC-2 green-pin (must-not-fire): a REAL plan-review row still disables the waiver (#3154 contract) ---
+sz_review_row "$R328B/hooks/3role-ledger.mjs" "s328" 990330 "$TMP/s3154-rev.md" PASS
+sz_run "$R328B/hooks/3role-ledger.mjs" "$R328B" size-s-exempt --session s328 --task 990330
+A2B_RC=$SZ_RC; A2B_OUT=$SZ_OUT
+{ [ "$A2B_RC" = "1" ] && printf '%s' "$A2B_OUT" | command grep -q '^NOT-EXEMPT review-row-present'; } \
+  && ok "#328 AC-2 pin: a REAL plan-review row still answers review-row-present (review governs)" \
+  || bad "#328 AC-2 pin (rc=$A2B_RC out=$A2B_OUT)"
+
+# --- AC-3 must-fire: a plan without a size label -> plan-size-missing whose detail names the flush-left line ---
+sz_ticket "s328" 990331 S
+R328C="$TMP/s328-repo-331"; sz_mk_repo "$R328C" "$LED" 990331 nosize
+sz_run "$R328C/hooks/3role-ledger.mjs" "$R328C" append --session s328 --task 990331 --role planner \
+  --skip-reason "size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" \
+  --artifact "$(sz_plan_name 990331)"
+sz_run "$R328C/hooks/3role-ledger.mjs" "$R328C" size-s-exempt --session s328 --task 990331
+A3_RC=$SZ_RC; A3_OUT=$SZ_OUT
+{ [ "$A3_RC" = "1" ] && printf '%s' "$A3_OUT" | command grep -q 'plan-size-missing' \
+  && [ "$(printf '%s' "$A3_OUT" | command grep -c 'flush-left')" -ge 1 ] \
+  && [ "$(printf '%s' "$A3_OUT" | command grep -cF '`size: S`')" -ge 1 ]; } \
+  && ok "#328 AC-3: plan-size-missing detail names the flush-left \`size: S\` line (item d)" \
+  || bad "#328 AC-3 (rc=$A3_RC out=$A3_OUT)"
+# --- AC-3 held-outs (invented, none from any review round): ambiguous, unbound ---
+# ambiguous: two flush-left size lines -> the seen shape is quoted in the detail
+sz_ticket "s328" 990334 S
+R328D="$TMP/s328-repo-334"; sz_mk_repo "$R328D" "$LED" 990334 twosize
+sz_run "$R328D/hooks/3role-ledger.mjs" "$R328D" append --session s328 --task 990334 --role planner \
+  --skip-reason "size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" \
+  --artifact "$(sz_plan_name 990334)"
+sz_run "$R328D/hooks/3role-ledger.mjs" "$R328D" size-s-exempt --session s328 --task 990334
+A3B_RC=$SZ_RC; A3B_OUT=$SZ_OUT
+{ [ "$A3B_RC" = "1" ] && printf '%s' "$A3B_OUT" | command grep -q 'plan-size-ambiguous' \
+  && printf '%s' "$A3B_OUT" | command grep -qF 'seen: size: S | size: S'; } \
+  && ok "#328 AC-3 held-out: ambiguous size label quotes the seen shape" \
+  || bad "#328 AC-3 held-out ambiguous (rc=$A3B_RC out=$A3B_OUT)"
+# unbound: plan at a ref whose basename carries no task id and whose text has no Ticket line
+sz_ticket "s328" 990332 S
+R328E="$TMP/s328-repo-332"; sz_mk_repo "$R328E" "$LED" 990332 unbound ".ai-workspace/plans/unbound-fixture-plan.md"
+sz_run "$R328E/hooks/3role-ledger.mjs" "$R328E" append --session s328 --task 990332 --role planner \
+  --skip-reason "size S fast-track: contract plan rendered by tools/render-seat-brief.mjs; no planner seat run" \
+  --artifact .ai-workspace/plans/unbound-fixture-plan.md
+sz_run "$R328E/hooks/3role-ledger.mjs" "$R328E" size-s-exempt --session s328 --task 990332
+A3C_RC=$SZ_RC; A3C_OUT=$SZ_OUT
+{ [ "$A3C_RC" = "1" ] && printf '%s' "$A3C_OUT" | command grep -q 'plan-unbound' \
+  && printf '%s' "$A3C_OUT" | command grep -qF '`Ticket: #990332`'; } \
+  && ok "#328 AC-3 held-out: plan-unbound detail names the Ticket-line/basename binding" \
+  || bad "#328 AC-3 held-out unbound (rc=$A3C_RC out=$A3C_OUT)"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# #351 — the subprocess (zai) planner arm gains the ref resolution the ordinary planner arm already had
+# (#2088/#2462): a plan committed in the build PR but not checked out in the primary clone used to block
+# the merge on one line (#344 / PR 2244), because checkSubprocessProvenance resolved the artifact on DISK
+# only. The arms below re-create that shape on throw-away repos (FIXTURE RULE: fake session ids, fake
+# nonces, scratch repos under $TMP — no real ledger row, receipt or transcript is ever copied). The new
+# ref fallback is PLANNER-ONLY and TRIPLE-bound: the blob must exist AT the bounded ref (merge head when
+# --merge-head is passed, plus the DEFAULT-ON refs/remotes/origin/<task>(-*) + origin/master set), carry
+# THIS dispatch's nonce (M2's replay defense preserved at the ref), and carry a PLAN_RE plan marker.
+# RED-first: both must-fire arms are shown failing against the pre-#351 binary in the #351 plan's red
+# record (exit 2, BLOCK: planner dispatch=subprocess-zai artifact_path "…" not found) — the standard
+# red/green discipline, re-created per §The change at base; no base snapshot fixture is committed.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+S351="$TMP/351-fixtures"; mkdir -p "$S351"
+cat > "$S351/routes.json" <<'R351JSON'
+{ "seats": { "planner": { "provider": "zai", "model": "zai-fx/planner-351", "dispatch": "subprocess-zai" } } }
+R351JSON
+export CC_ROUTES_JSON="$S351/routes.json"   # the #351 fixtures' SSOT: planner is subprocess-zai
+N351="N-351-SMOKE"; T351=997351
+
+# 351_plan_text <full|nononce|nomarker>: the fixture plan. full = markers + nonce; nononce = markers but
+# NO nonce line; nomarker = nonce line but NO PLAN_RE heading (the two held-control shapes).
+351_plan_text() {
+  case "$1" in
+    nononce)  printf '# Plan\n\nsize: S\nTicket: #%s\n\n## ELI5\na fixture plan\n### Binary AC\n- AC1\n' "$T351" ;;
+    nomarker) printf '# Fixture plan body\n\nsize: S\nTicket: #%s\n\nno plan-marker heading lives in this body\nDISPATCH-NONCE:%s\n' "$T351" "$N351" ;;
+    *)        printf '# Plan\n\nsize: S\nTicket: #%s\n\n## ELI5\na fixture plan\n### Binary AC\n- AC1\nDISPATCH-NONCE:%s\n' "$T351" "$N351" ;;
+  esac
+}
+
+# 351_plan_commit <repo> <full|nononce|nomarker> <exec-review-blob yes|no> -> echoes the DANGLING commit
+# sha carrying the plan blob (plumbing only, never checked out), optionally plus the exec-review artifact
+# the merge-head-bound review arm demands. The caller either passes the sha as --merge-head or pushes it
+# at a refs/remotes/origin/<task>-* shaped ref.
+351_plan_commit() {
+  local repo="$1" variant="$2" xr="$3" tmpf blob base t_plans t_ws t_root c seed rb
+  tmpf="$(mktemp)"
+  351_plan_text "$variant" > "$tmpf"
+  blob="$(git -C "$repo" hash-object -w "$tmpf")"
+  base="$(sz_plan_name "$T351")"; base="${base##*/}"
+  t_plans="$(printf '100644 blob %s\t%s\n' "$blob" "$base" | git -C "$repo" mktree)"
+  if [ "$xr" = "yes" ]; then
+    printf '## Review\nverdict: PASS\n' > "$tmpf"
+    rb="$(git -C "$repo" hash-object -w "$tmpf")"
+    t_ws="$(printf '100644 blob %s\texec-review-%s.md\n040000 tree %s\tplans\n' "$rb" "$T351" "$t_plans" | git -C "$repo" mktree)"
+  else
+    t_ws="$(printf '040000 tree %s\tplans\n' "$t_plans" | git -C "$repo" mktree)"
+  fi
+  t_root="$(printf '040000 tree %s\t.ai-workspace\n' "$t_ws" | git -C "$repo" mktree)"
+  rm -f "$tmpf"
+  seed="$(git -C "$repo" rev-parse HEAD)"
+  c="$(git -C "$repo" commit-tree "$t_root" -p "$seed" -m '351 fixture')"
+  printf '%s' "$c"
+}
+
+# mk_351_planner_transcript <path> <task> <nonce> — the FIRST record carries BOTH the spawn tag and the
+# nonce, and the assistant record serves the SSOT-declared planner model: the exact signals the
+# subprocess arm binds on before its artifact check ever runs.
+mk_351_planner_transcript() {
+  node -e '
+    const fs = require("fs");
+    const [ , outPath, task, nonce ] = process.argv;
+    const lines = [];
+    lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
+      sessionId: "fx-351", content: "3ROLE_TASK:" + task + " ROLE:planner\nDISPATCH-NONCE:" + nonce + "\n\nplan the work" }));
+    lines.push(JSON.stringify({ type: "assistant", message: { model: "zai-fx/planner-351", content: [ { type: "text", text: "ok" } ] } }));
+    fs.writeFileSync(outPath, lines.join("\n") + "\n");
+  ' "$1" "$2" "$3"
+}
+
+# 351_planner_row <repo> <session> <nonce> — the subprocess-zai planner row; artifact_path is the stable
+# repo-relative plan path, which does NOT exist on disk in the fixture repo (the #344 shape).
+351_planner_row() {
+  CC_ROUTES_JSON="$S351/routes.json" node "$1/hooks/3role-ledger.mjs" append --session "$2" --task "$T351" \
+    --role planner --dispatch subprocess-zai --transcript "$S351/t-$2.jsonl" --nonce "$3" \
+    --artifact "$(sz_plan_name "$T351")" >/dev/null 2>&1
+}
+
+# 351_review_disk <repo> — the review-pair artifacts ON DISK in the fixture repo's working tree
+# (untracked), so ONLY the planner row's resolution is under test in each arm (plan-review keeps
+# disk-first unconditionally — M5; execution-review consults disk absent a merge head).
+351_review_disk() {
+  mkdir -p "$1/.ai-workspace"
+  printf '## Review\nverdict: PASS\n' > "$1/.ai-workspace/exec-review-$T351.md"
+}
+
+# 351_tail_rows <repo> <session> — executor + execution-review rows (the executor's artifact is a PR
+# string; the execution-review artifact is the on-disk review file, or the merge-head blob in the
+# --merge-head arm).
+351_tail_rows() {
+  sz_sub "$2" "sze$T351"; sz_sub "$2" "szr$T351"
+  node "$1/hooks/3role-ledger.mjs" append --session "$2" --task "$T351" --role executor --agent "sze$T351" --artifact "PR #$T351" >/dev/null 2>&1
+  THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF=1 node "$1/hooks/3role-ledger.mjs" append --session "$2" --task "$T351" --role execution-review --agent "szr$T351" --artifact ".ai-workspace/exec-review-$T351.md" --verdict PASS --closed-at 2026-07-11T00:00:00.000Z >/dev/null 2>&1
+}
+
+# ---- 351-ref-merge-head (MUST-FIRE; red at base: exit 2, the subprocess-arm disk-only block). The plan
+# exists ONLY at a dangling commit passed as --merge-head -> check exits 0 with the subprocess DISPATCH
+# label. ----
+R351A="$TMP/351-repo-merge"; sz_mk_repo "$R351A" "$LED" "$T351" -
+C351A="$(351_plan_commit "$R351A" full yes)"
+mk_351_planner_transcript "$S351/t-sess-351a.jsonl" "$T351" "$N351"
+351_planner_row "$R351A" "sess-351a" "$N351"
+sz_review_row "$R351A/hooks/3role-ledger.mjs" "sess-351a" "$T351" ".ai-workspace/exec-review-$T351.md" PASS
+351_tail_rows "$R351A" "sess-351a"
+sz_run "$R351A/hooks/3role-ledger.mjs" "$R351A" check --session "sess-351a" --task "$T351" --merge-head "$C351A"
+{ [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q 'role=planner dispatch=subprocess-zai'; } \
+  && ok "#351 ref-merge-head: plan only at the merge-head sha -> the subprocess planner row passes (exit 0, DISPATCH label printed)" \
+  || bad "#351 ref-merge-head (rc=$SZ_RC out=$SZ_OUT)"
+
+# ---- 351-ref-task-branch (MUST-FIRE; red at base): the plan exists ONLY at a pushed-shaped
+# refs/remotes/origin/<task>-plan; NO --merge-head -> the DEFAULT-ON task-bound candidate resolves it,
+# exit 0. ----
+R351B="$TMP/351-repo-taskref"; sz_mk_repo "$R351B" "$LED" "$T351" -
+C351B="$(351_plan_commit "$R351B" full no)"
+git -C "$R351B" update-ref "refs/remotes/origin/$T351-plan" "$C351B"
+mk_351_planner_transcript "$S351/t-sess-351b.jsonl" "$T351" "$N351"
+351_planner_row "$R351B" "sess-351b" "$N351"
+351_review_disk "$R351B"
+sz_review_row "$R351B/hooks/3role-ledger.mjs" "sess-351b" "$T351" ".ai-workspace/exec-review-$T351.md" PASS
+351_tail_rows "$R351B" "sess-351b"
+sz_run "$R351B/hooks/3role-ledger.mjs" "$R351B" check --session "sess-351b" --task "$T351"
+{ [ "$SZ_RC" = "0" ] && printf '%s' "$SZ_OUT" | command grep -q 'role=planner dispatch=subprocess-zai'; } \
+  && ok "#351 ref-task-branch: plan only at origin/<task>-plan -> the default-on task-bound candidate passes (exit 0, no --merge-head)" \
+  || bad "#351 ref-task-branch (rc=$SZ_RC out=$SZ_OUT)"
+
+# ---- 351-ref-no-nonce (HELD control, green BOTH ends): a blob at the ref WITHOUT the dispatch's nonce
+# never admits — the check still blocks, with the BYTE-IDENTICAL base message (no smoke grep breaks). ----
+R351C="$TMP/351-repo-nononce"; sz_mk_repo "$R351C" "$LED" "$T351" -
+C351C="$(351_plan_commit "$R351C" nononce no)"
+git -C "$R351C" update-ref "refs/remotes/origin/$T351-nononce" "$C351C"
+mk_351_planner_transcript "$S351/t-sess-351c.jsonl" "$T351" "$N351"
+351_planner_row "$R351C" "sess-351c" "$N351"
+351_review_disk "$R351C"
+sz_review_row "$R351C/hooks/3role-ledger.mjs" "sess-351c" "$T351" ".ai-workspace/exec-review-$T351.md" PASS
+351_tail_rows "$R351C" "sess-351c"
+sz_run "$R351C/hooks/3role-ledger.mjs" "$R351C" check --session "sess-351c" --task "$T351"
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -qF "BLOCK: planner dispatch=subprocess-zai artifact_path \"$(sz_plan_name "$T351")\" not found"; } \
+  && ok "#351 ref-no-nonce: blob at the ref without the nonce -> still blocks with the byte-identical base message (held)" \
+  || bad "#351 ref-no-nonce (rc=$SZ_RC out=$SZ_OUT)"
+
+# ---- 351-ref-no-marker (HELD control, green BOTH ends): nonce present at the ref but NO PLAN_RE
+# heading -> still blocks with the byte-identical base message (the ordinary arm's plan-marker bar). ----
+R351D="$TMP/351-repo-nomarker"; sz_mk_repo "$R351D" "$LED" "$T351" -
+C351D="$(351_plan_commit "$R351D" nomarker no)"
+git -C "$R351D" update-ref "refs/remotes/origin/$T351-nomarker" "$C351D"
+mk_351_planner_transcript "$S351/t-sess-351d.jsonl" "$T351" "$N351"
+351_planner_row "$R351D" "sess-351d" "$N351"
+351_review_disk "$R351D"
+sz_review_row "$R351D/hooks/3role-ledger.mjs" "sess-351d" "$T351" ".ai-workspace/exec-review-$T351.md" PASS
+351_tail_rows "$R351D" "sess-351d"
+sz_run "$R351D/hooks/3role-ledger.mjs" "$R351D" check --session "sess-351d" --task "$T351"
+{ [ "$SZ_RC" = "2" ] && printf '%s' "$SZ_OUT" | command grep -qF "BLOCK: planner dispatch=subprocess-zai artifact_path \"$(sz_plan_name "$T351")\" not found"; } \
+  && ok "#351 ref-no-marker: nonce at the ref without a plan marker -> still blocks with the byte-identical base message (held)" \
+  || bad "#351 ref-no-marker (rc=$SZ_RC out=$SZ_OUT)"
+
+# ---- 351-disk-still-first (HELD regression guard for #2700's ordering, green BOTH ends): a nonce-bound
+# DISK copy passes with NO ref consulted — the fixture repo carries the plan at NO ref at all, so a pass
+# can only have come from the disk vantage arm. ----
+R351E="$TMP/351-repo-disk"; sz_mk_repo "$R351E" "$LED" "$T351" -
+mkdir -p "$R351E/.ai-workspace/plans"
+351_plan_text full > "$R351E/$(sz_plan_name "$T351")"
+mk_351_planner_transcript "$S351/t-sess-351e.jsonl" "$T351" "$N351"
+351_planner_row "$R351E" "sess-351e" "$N351"
+351_review_disk "$R351E"
+sz_review_row "$R351E/hooks/3role-ledger.mjs" "sess-351e" "$T351" ".ai-workspace/exec-review-$T351.md" PASS
+351_tail_rows "$R351E" "sess-351e"
+sz_run "$R351E/hooks/3role-ledger.mjs" "$R351E" check --session "sess-351e" --task "$T351"
+REF351E="$(git -C "$R351E" cat-file -e "refs/remotes/origin/master:$(sz_plan_name "$T351")" 2>/dev/null; echo $?)"
+{ [ "$SZ_RC" = "0" ] && [ "$REF351E" != "0" ] && printf '%s' "$SZ_OUT" | command grep -q 'role=planner dispatch=subprocess-zai'; } \
+  && ok "#351 disk-still-first: nonce-bound disk copy passes with NO matching ref anywhere (disk vantage answered; #2700 ordering intact)" \
+  || bad "#351 disk-still-first (rc=$SZ_RC refprobe=$REF351E out=$SZ_OUT)"
 
 [ "$fail" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "SMOKE FAILED"; exit 1; }

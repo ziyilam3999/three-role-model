@@ -537,6 +537,29 @@ function isIsoTimestamp(v) {
 
 const SESSION_SHAPE_GUARD_ARMED = !process.env.THREE_ROLE_LEDGER_DIR;
 
+// #277 — later-round PASS route constants. The launch-log TEST SEAM is honored ONLY under a redirected
+// store (THREE_ROLE_LEDGER_DIR set — the same arming predicate family as the session-shape and shape
+// guards): production (THREE_ROLE_LEDGER_DIR unset) IGNORES the variable entirely, so a fixture log can
+// never bless a production append or check. Production proof candidates stay bounded to the ai-brain
+// repo family: the launcher log at the ONE path tools/launch-seat.sh writes, in EVERY checkout `git
+// worktree list --porcelain` of the ai-brain repo names (the SAME log set the launcher's own
+// multi-checkout pass reads — #277 exec-review r1 B1: a launch row proving a real reviewer seat lives
+// in whichever checkout LAUNCHED it, and that is routinely neither the cwd nor where the ledger file
+// itself sits). Never the cwd repo: a hand-written log in an unrelated git-init folder must prove
+// nothing (#277 exec-review r1 minor 1).
+const LATER_ROUND_LOG_REL_277 = '.ai-workspace/launch-seat-run/launch.log';
+const LATER_ROUND_LOG_CAP_277 = 16 * 1024 * 1024;   // the same 16 MiB input bound the launcher's readers use
+const LATER_ROUND_LOG_PRESENT_CAP_277 = 64;         // the same >64-present-logs bound the launcher's multi-checkout pass fails closed on
+const LATER_ROUND_RE_277 = /^[1-9][0-9]{0,5}$/;     // 1-6 digits, no leading zero
+// #290 — a --head-sha must LOOK like a sha: exactly 40 lowercase hex characters, the full form git
+// itself prints. A resolvable REF name (HEAD, a branch tip) is refused by SHAPE before any resolution
+// is attempted — the same fail-closed shape discipline the --round and --reviewer-session guards in
+// cmdAppend apply to the route's other two flags.
+const HEAD_SHA_RE_290 = /^[0-9a-f]{40}$/;
+const LAUNCH_LOG_FIXTURE_277 = process.env.THREE_ROLE_LEDGER_DIR
+  ? (process.env.THREE_ROLE_LEDGER_LAUNCH_LOG || '')
+  : '';
+
 // D6 — one audited kill-switch, same discipline as THREE_ROLE_LEDGER_EXECREVIEW_ARTIFACT_SHAPE_OFF below.
 function sessionShapeGuardOff() { return process.env.THREE_ROLE_LEDGER_SESSION_SHAPE_OFF === '1'; }
 
@@ -2624,10 +2647,82 @@ function zaiExecutorRouteExpected(e, info, task, decl) {
       return { model: sizeModel, size: 'L' };
     }
   }
+  if (facts.size === 'M' && decl.seat.agent_tool_fallback && ROLE_MODELS.includes(decl.seat.agent_tool_fallback)) {
+    // #178 — the builder-tier twin of the L branch above: a post-flip M row must have been served the
+    // SSOT's size_models.M. WITHOUT a usable size_models.M (the config-only rollback) there is NO M arm
+    // at all — the fall-through below expects the seat model, exactly the pre-flip rule.
+    const sizeModelM = executorSizeModelFor(decl.seat, 'M');
+    if (sizeModelM) {
+      // #3145 D5 mirror — the transition arm: a row whose closedAt STRICTLY pre-dates the seat's
+      // committed size_route_since also admits the pre-change model (the seat model, glm-5.3-flash).
+      // Without it every M executor row stamped pre-flip would re-derive to expected glm-5.3 at the
+      // post-flip merge gates and BLOCK its own task's merge — the exact #3145 deadlock class.
+      const since = decl.seat.size_route_since;
+      const closed = e && e.closedAt;
+      let preChange = '';
+      if (typeof since === 'string' && !isNaN(Date.parse(since)) && closed && !isNaN(Date.parse(String(closed)))
+        && Date.parse(String(closed)) < Date.parse(since)) {
+        const pre = decl.seat.model;
+        if (typeof pre === 'string' && pre && pre !== sizeModelM) preChange = pre;
+      }
+      const out = { model: sizeModelM, size: 'M' };
+      out.pre_change_model = preChange;
+      return out;
+    }
+  }
   return { model: decl.seat.model, size: facts.size };   // S/M always; L only when the seat cannot size (mirror)
 }
 
-// #3145 D1 — the ONE plan-review route resolver (the #2434 single-generator discipline, sibling of the
+// #3576 — the expected served model for a size_routes seat's subprocess row: the resolver's own
+// effective route for the plan named in the row's OWN nonce-bound transcript first record (the
+// #3085 D1/D2/D4 pattern, re-derived through the SAME resolver, never the row's claim), PLUS the
+// #3145 D5 transition generalized: when the row's dispatch class does NOT match the seat's current
+// declared provider (the seat moved providers under a live/in-flight row) or the row closedAt
+// strictly precedes the seat's routed_since, the row's OWN recorded modelVersion is also admitted
+// as the pre-change model of record (it was verified under the OLD row's rule at its own time);
+// the dispatch spelling is taken from the row's own dispatch field against the seat's declared
+// provider — no new hard-coded provider literal here. Returns {block:true,reason} |
+// {model, size, pre_change_model?}.
+function sizeRoutesRouteExpected(e, info, task, decl) {
+  if (e.dispatch === 'subprocess-' + decl.seat.provider) {
+    const paths = briefPlanPaths(info.firstText);
+    if (paths.length === 0) return { block: true, reason: 'the brief text names no .ai-workspace/plans/<file>.md path' };
+    if (paths.length > 1) return { block: true, reason: 'the brief text names ' + paths.length + ' distinct plan paths' };
+    const rel = paths[0];
+    const cands = [];
+    if (typeof info.dispatchCwd === 'string' && info.dispatchCwd.startsWith('/')) cands.push(path.join(info.dispatchCwd, rel));
+    cands.push(rel);
+    if (!path.isAbsolute(rel)) {
+      let selfDir; try { selfDir = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))); } catch (er) { selfDir = path.dirname(fileURLToPath(import.meta.url)); }
+      cands.push(path.join(selfDir, '..', rel));
+    }
+    let facts = null;
+    for (const c of cands) {
+      const f = resolvePlanFacts(c, task);
+      if (!f.unresolvable) { facts = f; break; }
+    }
+    if (!facts) return { block: true, reason: 'plan "' + rel + '" is unresolvable from the transcript vantage or the checker chain' };
+    if (facts.size_source !== 'plan') return { block: true, reason: 'plan "' + rel + '" size_source=' + facts.size_source };
+    const entry = sizeRoutesEntryFor(decl.seat, facts.size);
+    const out = { model: entry ? entry.model : decl.seat.model, size: facts.size };
+    const since = decl.seat.routed_since;
+    const closed = e && e.closedAt;
+    if (typeof since === 'string' && !isNaN(Date.parse(since)) && closed && !isNaN(Date.parse(String(closed)))
+      && Date.parse(String(closed)) < Date.parse(since)) {
+      const pre = e.modelVersion == null ? '' : String(e.modelVersion);
+      if (pre && pre !== out.model) out.pre_change_model = pre;
+    }
+    return out;
+  }
+  // the row ran on a DIFFERENT dispatch class than the seat's current declaration (the #3337
+  // route-at-run doctrine for a seat that is not route-pinnable): the row's own recorded
+  // modelVersion is the model of record; an empty one blocks (fail closed, never a guess).
+  const atRun = e.modelVersion == null ? '' : String(e.modelVersion);
+  if (!atRun) return { block: true, reason: 'row dispatch=' + e.dispatch + ' names a different provider than the seat\'s declared ' + decl.seat.provider + ' and carries no modelVersion to judge it by' };
+  return { model: atRun, size: '' };
+}
+
+// #3145 D1 — the ONE plan-review route resolver (the #2434 single-generator discipline, sibling of
 // executor block above): a plan-review brief's TEXT alone decides {model, size, round, fold_only,
 // route_reason, data_class}. Called by the `plan-review-route` CLI (the dispatcher's Leg-2 call site) and
 // by the D5 checker branch below — never a second copy of the rule. INPUT-BOUND: the brief text is read
@@ -2802,7 +2897,13 @@ function rowSeatDeclAtRun(role, row) {
 // new class is recognized with a targeted branch here, not a rewrite of the shared logic below, which stays
 // dispatch-class-agnostic — the same transcript-exists/nonce-bound/servedModel/artifact checks apply either
 // way, only WHERE `decl.seat` comes from differs).
-function checkSubprocessProvenance(role, e, session, task) {
+// #351 — the optional 5th param `opts` carries `mergeHead` (the caller's --merge-head value, when it
+// knows one). Call sites that pass nothing keep today's behavior: an undefined mergeHead leaves the
+// merge-head candidate inside resolveArtifactAtRef inert (exactly like every other caller of that
+// helper); the task-bound-ref candidates are DEFAULT-ON, so a planner row's plan still resolves at
+// refs/remotes/origin/<task>(-*) + origin/master. The plan-review inherited-gate arm-3 call site and
+// the other verifier call sites deliberately stay 4-arg (planner-only scope, below).
+function checkSubprocessProvenance(role, e, session, task, opts) {
   if (!e || !isSubprocessDispatch(e.dispatch)) return null;
   const decl = rowSeatDeclAtRun(role, e);
   if (!decl.ok) return null;   // M1 forged-marker control: SSOT silent -> marker ignored, fall through.
@@ -2841,7 +2942,12 @@ function checkSubprocessProvenance(role, e, session, task) {
       return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
         route.reason;
     }
-    if (!info.servedModel || info.servedModel !== route.model) {
+    // #178 — the #3145 D5 mirror reaches the executor comparison the same way it reaches plan-review's:
+    // a pre-flip M row (closedAt strictly before size_route_since) also admits the pre-change model.
+    // Without a pre_change_model this is the single-model comparison, byte-identical to pre-#178.
+    const okExecModels = [route.model];
+    if (route.pre_change_model) okExecModels.push(route.pre_change_model);
+    if (!info.servedModel || !okExecModels.includes(info.servedModel)) {
       return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
     }
@@ -2862,6 +2968,22 @@ function checkSubprocessProvenance(role, e, session, task) {
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size +
         (route.fold_only ? ' fold_only' : '') + ')';
     }
+  } else if (decl.seat.size_routes && isSubprocessDispatch(e.dispatch)) {
+    // #3576 — a size_routes seat is expected to have served the resolver's EFFECTIVE model for
+    // the row's own plan facts (size re-derived from the nonce-bound transcript first record),
+    // never the bare seat default; the pre-change model admission (a provider move or a
+    // closedAt strictly before routed_since) keeps in-flight rows from false-BLOCKing.
+    const route = sizeRoutesRouteExpected(e, info, task, decl);
+    if (route.block) {
+      return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" SIZE-ROUTE-UNRESOLVABLE: ' +
+        route.reason;
+    }
+    const okSrModels = [route.model];
+    if (route.pre_change_model) okSrModels.push(route.pre_change_model);
+    if (!info.servedModel || !okSrModels.includes(info.servedModel)) {
+      return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
+        (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
+    }
   } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
     return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
       (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
@@ -2870,6 +2992,25 @@ function checkSubprocessProvenance(role, e, session, task) {
   // chain; the FIRST candidate that carries the nonce wins. `ap` below is that winner (or '' if none did).
   const vantageResolved = resolveArtifactVantage(e.artifact_path || '', info.dispatchCwd, e.nonce);
   const ap = vantageResolved.winner;
+  // #351 — planner-only, nonce-bound ref fallback (the #2088/#2462 trick the ordinary planner arm
+  // already had): when NO disk copy carries this dispatch's nonce, consult the SAME bounded ref set
+  // (the merge head when the caller passed one, plus refs/remotes/origin/<task>(-*) + origin/master,
+  // default-on) BEFORE either `!ap` message below. Admission is TRIPLE-bound: the blob must exist AT
+  // the ref, carry THIS dispatch's nonce (M2's replay defense preserved at the ref — a nonce-less or
+  // nonce-mismatched blob never admits), and carry a plan marker (PLAN_RE — the same content bar the
+  // ordinary planner ref arm applies, hooks/3role-ledger.mjs #2088 block). Scope is PLANNER ONLY: the
+  // review roles' ref arms enforce W3's flush-left affirmative bar (#2480), which this arm deliberately
+  // does not carry — admitting subprocess review rows here would skip that bar (deferred follow-up).
+  // On a miss, the two existing `!ap` messages below fire BYTE-IDENTICAL to pre-#351 (existing smokes
+  // pin them), so this is a pure additive fallback, never a message change.
+  if (!ap && role === 'planner') {
+    const hit351 = resolveArtifactAtRef(e.artifact_path, opts && opts.mergeHead, task, session);   // #3325: + the ticket's own repo (bounded pair)
+    if (hit351) {
+      const blob351 = readBlobAtRef(hit351.repoDir, hit351.ref, hit351.relPath);
+      const n351 = String(e.nonce == null ? '' : e.nonce);
+      if (n351 && blob351 !== null && blob351.indexOf(n351) !== -1 && PLAN_RE.test(blob351)) return '';
+    }
+  }
   if (!ap && vantageResolved.existing) {
     // a candidate exists (vantage or today's chain) but none carried this dispatch's nonce — block, naming
     // the first EXISTING candidate (never silently prefer a nonce-less copy over a nonce-bound one, #1590).
@@ -3086,7 +3227,7 @@ function checkRole(role, e, session, opts, task) {
   }
   // #1947 M1/M2 — try the subprocess-openrouter arm FIRST. It returns null (not admissible for this row/SSOT
   // state) for every ordinary Agent-tool-dispatched role, so this is a pure addition for everyone else.
-  const sub = checkSubprocessProvenance(role, e, session, task);
+  const sub = checkSubprocessProvenance(role, e, session, task, opts);   // #351: + mergeHead via opts
   if (sub !== null) return sub || null;
   const sk = classifySkip(e);
   if (role === 'execution-review') {
@@ -3122,7 +3263,19 @@ function checkRole(role, e, session, opts, task) {
       return null;
     }
     if (!agentResolves(session, e.agentId)) {
-      return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
+      // #277 — a launch-proven later-round PASS row (round + reviewer_session + head_sha, all stored at
+      // append time through the ONE evaluator) skips the agentId requirement here ONLY after the SAME
+      // proof re-runs on the stored fields, against the FAIL row checkOpts hands in (negRow277). Typed
+      // fields alone — a hand-seeded row with no matching launch-log row — never pass, and the negative
+      // verdict then stays effective (Lane B runs its own re-proof and refuses the same way).
+      let laterRoundOk277 = false;
+      if (e.round != null && e.reviewer_session && e.head_sha) {
+        const prior277 = (opts && opts.negRow277) ? opts.negRow277 : null;
+        laterRoundOk277 = laterRoundPass277('execution-review', prior277, e, task, session, 'stored').ok;
+      }
+      if (!laterRoundOk277) {
+        return 'execution-review agentId "' + (e.agentId || '') + '" does not resolve to a real subagent transcript (forged or no spawn)';
+      }
     }
     // #2480 O1 — when a merge head is known (opts.mergeHead truthy), the bare on-disk hit no longer
     // satisfies THIS row: review evidence must be bound to the commit actually being merged, so only
@@ -4203,6 +4356,11 @@ function overlayAppend(session, task, role, fields, opts) {
   // a genuinely FRESH row (no deletion — the superseded E1 row is retained verbatim as history) instead of
   // Frankensteining the new E2 evidence onto the old E1 row's stale agentId/model fields.
   let divertRouteChange = false;
+  // #277 — set by the later-round PASS route below (allow-arm only); consumed by the isNewRound
+  // computation further down: a launch-proven round-N PASS starts a genuinely FRESH row and the
+  // superseded FAIL row is retained VERBATIM as history (no deletion — same mechanic as the R-C
+  // route-change and the ordinary distinct-agent round boundary).
+  let divertLaterRoundPass = false;
   // #1575 1a / #1580 Fix A — TERMINAL-EVIDENCE guard, TWO clauses, ONE principle: terminal evidence is
   // EVIDENCE, a bare re-append is an ASSERTION, and the weak must never erase the strong. #1580 widens the
   // outer TRIGGER from "prior carries a verdict" to "prior carries ANY terminal evidence"
@@ -4256,18 +4414,62 @@ function overlayAppend(session, task, role, fields, opts) {
             ' — prior row (closedAt ' + prior.closedAt + ', verdict "' + prior.verdict + '") superseded by a ' +
             'verified subprocess (E2) write per the R-C route-change clause (#2169 slice 3, design decision 3).');
         } else {
-          throw new GuardRejection(
-            'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
-            prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
-            ' — superseding it requires EITHER a NEW, ATTRIBUTED review in the SAME command (an --agent whose ' +
-            'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
-            'prior agentId, AND a --closed-at strictly newer than the prior closedAt) OR a sanctioned R-C ' +
-            'route-change supersession (' + rc.reason + '). A bare or same-agent verdict flip is refused; ' +
-            'spawn a genuinely NEW plan-review/review subagent and cite it, or satisfy R-C\'s SSOT-gated terms.'
-          );
+          // #277 — the later-round PASS route: a Claude background execution-review seat launched for
+          // round N >= 2 proves itself through the ONE evaluator (round, reviewer session, launch-log
+          // row, newer head, newer close time). On allow the write is diverted to a NEW row; the FAIL
+          // row stays byte for byte. On refusal the clause-2 text is unchanged (plus, ONLY when the
+          // write already carried a route flag, a named-reason line that lists the required flags so a
+          // reviewer that meets the rule can self-correct without a brief change — it names no override).
+          const lr277 = laterRoundPass277(role, prior, fields, task, session, 'append');
+          if (lr277.ok) {
+            divertLaterRoundPass = true;
+            console.error('LATER-ROUND-PASS: role ' + role + ' round ' + fields.round +
+              ' — the prior FAIL row (verdict "' + prior.verdict + '"' +
+              (prior.closedAt ? ', closedAt ' + prior.closedAt : '') + ') is superseded by a launch-proven ' +
+              'round-' + fields.round + ' PASS (#277); the FAIL row is retained verbatim as history.');
+          } else {
+            const routeFlags277 = ('round' in fields) || ('reviewer_session' in fields) || ('head_sha' in fields);
+            throw new GuardRejection(
+              'terminal-evidence guard (1a clause 2): role ' + role + ' already carries a completed verdict "' +
+              prior.verdict + '"' + (prior.agentId ? ' (agentId ' + prior.agentId + ')' : '') +
+              ' — superseding it requires EITHER a NEW, ATTRIBUTED review in the SAME command (an --agent whose ' +
+              'transcript is spawn-record-bound to 3ROLE_TASK:' + task + ' ROLE:' + role + ', distinct from the ' +
+              'prior agentId, AND a --closed-at strictly newer than the prior closedAt) OR a sanctioned R-C ' +
+              'route-change supersession (' + rc.reason + '). A bare or same-agent verdict flip is refused; ' +
+              'spawn a genuinely NEW plan-review/review subagent and cite it, or satisfy R-C\'s SSOT-gated terms.' +
+              (routeFlags277
+                ? '\nLATER-ROUND-PASS (#277): the later-round PASS route refused this write — it needs ALL of: ' +
+                  '--round N (1-6 digits, no leading zero, >= 2 and above the FAIL row\'s round), ' +
+                  '--reviewer-session <the calling seat\'s own $CLAUDE_CODE_SESSION_ID>, --head-sha <a commit ' +
+                  'newer than the FAIL>, and --closed-at strictly newer than the FAIL, with the launcher\'s ' +
+                  'launch-log row (task/role/seat/name -r<N>-/job) proving the seat. Reason: ' + lr277.reason
+                : ''));
+          }
         }
       }
     }
+  }
+  // #290 (the five #277 ledger minors, 3+5 as ONE gate) — ROUTE-FLAG GATE. The route identity fields
+  // (round / reviewer_session / head_sha, from --round / --reviewer-session / --head-sha) are
+  // WRITE-ONCE and belong to the later-round PASS route ALONE. The only write that may introduce them
+  // is the sanctioned route append itself (divertLaterRoundPass above: an execution-review PASS
+  // superseding a FAIL through the ONE evaluator — a write that always starts a FRESH row, so the
+  // superseded row's fields are retained verbatim and immutably). Every OTHER append carrying any of
+  // the three flags is refused here, BEFORE the overlays below run: an executor/planner self-append
+  // brandishing the flags, a non-route execution-review append (no FAIL prior), and — the write-once
+  // half — any second append against a row that already stores the fields (whose prior is a PASS, not
+  // a FAIL, so the route can never re-fire for it). This closes the last-writer-wins hole where the
+  // ordinary own-key overlay below silently re-stored whatever a later call sent over the identity of
+  // a proven PASS. Fail-closed: thrown before the entry is built or the file is written, named token.
+  if ((('round' in fields) || ('reviewer_session' in fields) || ('head_sha' in fields)) && !divertLaterRoundPass) {
+    throw new GuardRejection(
+      'BLOCK (3role-ledger route-flags): --round, --reviewer-session and --head-sha are the later-round ' +
+      'PASS route\'s identity fields (#277) — write-once, and gated to that route. The ONLY append that may ' +
+      'carry them is an execution-review PASS superseding a FAIL row through the route\'s full proof (round, ' +
+      'reviewer session, launch-log row, newer head sha, newer close time), which starts a NEW row; a stored ' +
+      'route row\'s identity is never rewritten by a later append. This append is not that route, so the ' +
+      'flags are refused and nothing was written.'
+    );
   }
   // #2309 (R3.1/R4.1/R5.3) — CLAUSE 3: a verdict-INTRODUCING write landing on a BOUND row that carries no
   // verdict yet. Clause 1/2 above (both keyed on priorHasTerminalEvidence()/prior.verdict) protect a row
@@ -4379,7 +4581,7 @@ function overlayAppend(session, task, role, fields, opts) {
   // this exclusion that close opened a new round and split every z.ai run into two rows.
   const degradedStamp2701 = !!(prior && !incomingAgentId && !incomingRunId2701 && !prior.agentId && prior.run_id &&
     fields.effort_source === 'assigned');
-  const isNewRound = divertNewRound3 || divertRouteChange || identityBoundary2701 || degradedStamp2701;
+  const isNewRound = divertNewRound3 || divertRouteChange || divertLaterRoundPass || identityBoundary2701 || degradedStamp2701;
   for (const ln of olderRoundLines) kept.push(ln);
   if (isNewRound) kept.push(JSON.stringify(prior));
   // Start from the prior line for this role (SAME round: merge) or an empty base (NEW round: fresh row) and
@@ -4479,6 +4681,12 @@ function overlayAppend(session, task, role, fields, opts) {
   // E2 -> nonce, E3 -> absent. run_source is diagnostic-only, same discipline, never consulted by a gate.
   if ('run_id' in fields) entry.run_id = fields.run_id;
   if ('run_source' in fields) entry.run_source = fields.run_source;
+  // #277 — the later-round PASS identity fields. Ordinary own-key overlay (same discipline as every
+  // field above); they are stored on the FRESH row the route starts (the FAIL row is retained verbatim),
+  // and every gate re-proves them through the ONE evaluator — typing them alone never passes a gate.
+  if ('round' in fields) entry.round = fields.round;
+  if ('reviewer_session' in fields) entry.reviewer_session = fields.reviewer_session;
+  if ('head_sha' in fields) entry.head_sha = fields.head_sha;
   // #2075 D1/§D5(a) round-4 storage-layer fix (R3-B1/R3-B2) — run_kind is WRITE-ONCE / monotone-non-
   // decreasing, NOT an ordinary last-writer-wins overlay: `entry.run_kind` at this point already carries the
   // PRIOR line's stored value (composed onto `entry` from `prior` above, for a same-round merge) or nothing
@@ -4554,7 +4762,18 @@ function overlayAppend(session, task, role, fields, opts) {
     delete entry.skip_reason;
   }
   if ('skip_reason' in fields) {
-    delete entry.agentId; delete entry.artifact_path; delete entry.oracle; delete entry.verdict; delete entry.self_authored;
+    delete entry.agentId;
+    // #328 intent 1 — a skip write that NAMES its artifact in the SAME write keeps it: the
+    // clear-list below erases only an INHERITED artifact_path, never one THIS call itself
+    // provided (the overlay above already set it from this same write's --artifact; the
+    // unconditional delete used to undo the very write it was merging). `--ledger-skip-s
+    // --artifact` (#328) is the sanctioned same-write caller: the S fast-track's planner skip
+    // row must carry the plan path or sizeSExempt answers no-planner-row and the waiver the
+    // skip row exists to enable never applies. A bare skip (no --artifact on THIS write)
+    // still erases the inherited artifact — the stale-evidence rationale of the
+    // mutual-exclusion guard is unchanged, only same-write evidence survives.
+    if (!('artifact_path' in fields)) delete entry.artifact_path;
+    delete entry.oracle; delete entry.verdict; delete entry.self_authored;
     // #2782 fix-1 (execution-review F1, #2823 fix-contract RULE) — provider joins every clear that
     // clears modelVersion/modelTier: a skip line must not leave a stale provider stamp beside an
     // erased model.
@@ -4636,6 +4855,7 @@ const APPEND_KNOWN_FLAGS = [
   'transcript', 'nonce', 'dispatch-nonce', 'receipt', 'pending', 'run-kind', 'run-id', 'run-source',
   'self-authored', 'effort', 'effort-source', 'model-version', 'model-tier', 'closed-at', 'sense-reroute',
   'provider',   // #2782 — the served-provider stamp (validated against the SSOT provider ids below).
+  'round', 'reviewer-session', 'head-sha',   // #277 — the later-round PASS route identity flags.
 ];
 
 function cmdAppend(o) {
@@ -4690,6 +4910,36 @@ function cmdAppend(o) {
       console.error('BLOCK (3role-ledger unknown-flag): append refuses unrecognized flag(s) ' +
         unknown.map((k) => '--' + k).join(', ') + ' — nothing written. Known flags: ' +
         APPEND_KNOWN_FLAGS.map((k) => '--' + k).join(', ') + '.');
+      process.exit(2);
+    }
+  }
+  // #277 — flag-SHAPE guards for the later-round PASS route. Fail-closed, BEFORE any ledger file
+  // read/write, armed for EVERY store (including smoke redirects): a malformed claim must never reach
+  // the evaluator, whatever the ledger state.
+  if ('round' in o) {
+    const roundRaw = String(o.round == null ? '' : o.round);
+    if (!LATER_ROUND_RE_277.test(roundRaw)) {
+      console.error('BLOCK (3role-ledger round-shape): --round "' + roundRaw +
+        '" is not 1-6 digits with no leading zero (a meaningful round here is 2..999999). Nothing was written.');
+      process.exit(2);
+    }
+  }
+  if ('reviewer-session' in o) {
+    const sessRaw = String(o['reviewer-session'] == null ? '' : o['reviewer-session']);
+    if (!SESSION_UUID_RE.test(sessRaw)) {
+      console.error('BLOCK (3role-ledger reviewer-session-shape): --reviewer-session "' + sessRaw +
+        '" is not a canonical Claude Code session id (8-4-4-4-12 lowercase hexadecimal). Read the real ' +
+        'id from $CLAUDE_CODE_SESSION_ID. Nothing was written.');
+      process.exit(2);
+    }
+  }
+  if ('head-sha' in o) {
+    const shaRaw = String(o['head-sha'] == null ? '' : o['head-sha']);
+    if (!HEAD_SHA_RE_290.test(shaRaw)) {
+      console.error('BLOCK (3role-ledger head-sha-shape): --head-sha "' + shaRaw +
+        '" is not a 40-character lowercase hexadecimal commit sha. Pass the full sha of the commit this ' +
+        'PASS covers (git rev-parse prints it) — never a resolvable ref name like HEAD or a branch, which ' +
+        'names a moving target, not the reviewed commit. Nothing was written.');
       process.exit(2);
     }
   }
@@ -4910,6 +5160,12 @@ function cmdAppend(o) {
   // #1516 — explicit close-stamp flag. ONLY three-role-subagent-ledger.sh (SubagentStop) passes this; every
   // other caller omits it, so overlayAppend's per-key "provided" discipline leaves an unstamped line alone.
   if ('closed-at' in o) fields.closedAt = o['closed-at'];
+  // #277 — the later-round PASS route identity fields (flag SHAPES validated at the top of cmdAppend;
+  // the full proof runs in the ONE evaluator at the terminal-evidence clause-2 boundary). round is
+  // stored as a number; reviewer_session/head_sha verbatim.
+  if ('round' in o) fields.round = parseInt(String(o.round), 10);
+  if ('reviewer-session' in o) fields.reviewer_session = o['reviewer-session'];
+  if ('head-sha' in o) fields.head_sha = o['head-sha'];
   // #1465 — CENTRALIZED best-effort MODEL capture (unchanged by #1466 — only the effort half below moved).
   // Runs on EVERY append (both a role's own self-append AND the SubagentStop hook's later --agent
   // re-append), so the stop-time re-append automatically backfills modelVersion/modelTier from the
@@ -5408,10 +5664,19 @@ function sizeSExempt(session, task) {
     let j; try { j = JSON.parse(ln); } catch (e) { return no('ledger-junk', 'an unparseable ledger line was found'); }
     rows.push(j);
   }
-  if (rows.some((j) => j && j.role === 'plan-review')) return no('review-row-present');
+  // #328 intent 2 — a skip ASSERTION is not a review: the review-row-present arm counts only
+  // NON-skip plan-review rows (classifySkip, the same classifier checkRole itself uses), so
+  // the S fast-track's own plan-review skip row no longer defeats the waiver it was written
+  // to enable. A REAL plan-review row still disables the waiver (#3154: once any review has
+  // started, the review governs — a completed review is stronger than the waiver).
+  if (rows.some((j) => j && j.role === 'plan-review' && !classifySkip(j).skip)) return no('review-row-present');
   let plannerRow = null;
   for (const j of rows) { if (j && j.role === 'planner') plannerRow = j; }
-  if (!plannerRow || typeof plannerRow.artifact_path !== 'string' || !plannerRow.artifact_path.trim()) return no('no-planner-row');
+  // #328 item d — the refusal names the exact shape and the sanctioned command, never a bare
+  // reason token: the operator sees WHAT to write, not just that the waiver refused.
+  if (!plannerRow || typeof plannerRow.artifact_path !== 'string' || !plannerRow.artifact_path.trim()) {
+    return no('no-planner-row', 'the planner row must carry the plan path as its artifact_path; a skip write keeps a same-write --artifact: node tools/render-seat-brief.mjs --ledger-skip-s --session <sid> --task <task> --artifact <plan>');
+  }
   // #3325 -- the bounded repo set: the ai-brain toplevel (unchanged, first) plus the TICKET'S OWN repo
   // when the ticket names one (exactly one sibling dir -- ticketRepoDirFor; never a scan). Each repo is
   // consulted at its own task-bound ref set with the SAME per-repo bars; the FIRST repo whose ref holds
@@ -5444,10 +5709,26 @@ function sizeSExempt(session, task) {
   if (text === null || text.length > PLAN_MAX_BYTES) {
     return no('plan-unresolvable', probs.join('; '));
   }
-  if (!planBoundToTask(path.join('/', rel), text, task)) return no('plan-unbound');
+  if (!planBoundToTask(path.join('/', rel), text, task)) {
+    // #328 item d — the refusal names the exact binding line/shape.
+    return no('plan-unbound', 'the plan needs a flush-left `Ticket: #' + task + '` line or a `YYYY-MM-DD-' + task + '-...` basename binding it to this task');
+  }
   const sz = parsePlanSize(text);
-  if (!sz.ok) return no('plan-size-' + sz.source);
-  if (sz.size !== 'S') return no('plan-size-' + sz.size);
+  if (!sz.ok) {
+    // #328 item d — every plan-size-* refusal carries the exact flush-left line shape; for an
+    // invalid/ambiguous label the seen shape is quoted (bounded to 200 chars — the plan blob
+    // is already capped at PLAN_MAX_BYTES, this only bounds the quoted excerpt).
+    const base = 'the plan needs ONE flush-left `size: S` line (exactly `size: <S|M|L>`, column 0)';
+    let detail = base;
+    if (sz.source === 'invalid' || sz.source === 'ambiguous') {
+      const seen = String(text).split('\n').map((l) => l.trim()).filter((l) => /^size:/.test(l)).join(' | ');
+      detail = base + '; seen: ' + (seen ? seen.slice(0, 200) : 'a size: line that is not exactly `size: <S|M|L>`');
+    }
+    return no('plan-size-' + sz.source, detail);
+  }
+  if (sz.size !== 'S') {
+    return no('plan-size-' + sz.size, 'the plan says `size: ' + sz.size + '`; the size-S plan-review waiver applies only to a plan whose flush-left size line says `size: S`');
+  }
   return { exempt: true, reason: 'ticket=S plan=S', detail: '', plan: rel };
 }
 
@@ -5672,6 +5953,162 @@ function verdictRows(rows) {
   return rows.filter((r) => r && r.verdict);
 }
 
+// ── #277 — the later-round PASS rule (ONE evaluator, no second copy) ────────────────────────────────
+// A Claude background execution-review seat, launched for round N >= 2, may self-append a PASS over the
+// ticket's FAIL row — and `check` (including --merge-head) and the negative-verdict read then treat that
+// PASS as the effective verdict. Every condition below is REQUIRED and fails closed; nothing else about
+// clause 1, clause 2, the R-C route or the bound-agent route changes. All THREE call sites run THIS
+// function and never a paraphrase:
+//   1. overlayAppend's terminal-evidence clause 2 (append-side escape; mode 'append'),
+//   2. checkRole's execution-review agentId arm (check-side re-proof on the STORED fields; mode 'stored'),
+//   3. supersedesNegative (the negative-verdict read; mode 'stored').
+// mode 'append' additionally demands that the reviewer session equals the CALLER's own
+// $CLAUDE_CODE_SESSION_ID; mode 'stored' skips only that one leg (at check time the caller is the
+// orchestrator, never the reviewer — the equality was proven when the row was written).
+function laterRoundLaunchLogCandidates277() {
+  if (LAUNCH_LOG_FIXTURE_277) return [LAUNCH_LOG_FIXTURE_277];
+  const top = aiBrainToplevel();
+  if (!top) return [];   // not inside any repo -> no candidate (fail closed)
+  // Every checkout of the ai-brain repo family, per git's own worktree list (checkoutRootsFor — the
+  // SAME bounded, local, listing-only source the artifact path normalizer and the launcher's
+  // multi-checkout pass use; falls back to [top] alone on spawn trouble — can't-tell -> narrowest).
+  // The cwd repo is deliberately NOT a candidate: a log in an unrelated git-init folder proves nothing
+  // (#277 exec-review r1 minor 1); when cwd IS an ai-brain checkout it is already in the list.
+  const seen = new Set();
+  const out = [];
+  for (const root of checkoutRootsFor(top)) {
+    let key = root;
+    try { key = fs.realpathSync(root); } catch (e) { /* vanished/prunable root: keep git's raw spelling */ }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(path.join(root, LATER_ROUND_LOG_REL_277));
+  }
+  return out;
+}
+
+// True only when SOME readable, within-cap launch-log candidate holds a row whose TAB fields carry
+// task=<task>, role=execution-review, seat=claude, a name= holding -r<round>-, and job= equal to the
+// first 8 characters of the reviewer session. A missing, unreadable or over-cap log proves nothing
+// (fail closed — the input bounds are launch-seat.sh's own: the fixed 16 MiB cap per log over the
+// ai-brain worktree list, and more than 64 PRESENT logs reads as no proof at all, the launcher's
+// multi-checkout bound). INPUT-BOUND: one bounded git listing, one stat per listed checkout, at most
+// 64 log reads each capped at 16 MiB; a MISSING log in a listed checkout is fine (a checkout that
+// never launched the task). The present-log count runs over the WHOLE candidate list BEFORE any scan
+// — a proof must never short-circuit the bound (an over-bound family refuses even when the first
+// log matched, the launcher's own fail-closed reading of the same situation).
+function launchLogProves277(task, round, sess) {
+  const job8 = String(sess == null ? '' : sess).slice(0, 8);
+  const needle = '-r' + round + '-';
+  const cands = laterRoundLaunchLogCandidates277();
+  let present = 0;
+  for (const f of cands) {
+    let st;
+    try { st = fs.statSync(f); } catch (e) { continue; }
+    if (st.isFile() && st.size <= LATER_ROUND_LOG_CAP_277) present++;
+  }
+  if (present > LATER_ROUND_LOG_PRESENT_CAP_277) return false;   // fail closed past the bound
+  for (const f of cands) {
+    let st;
+    try { st = fs.statSync(f); } catch (e) { continue; }
+    if (!st.isFile() || st.size > LATER_ROUND_LOG_CAP_277) continue;
+    let text;
+    try { text = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    for (const ln of text.split('\n')) {
+      if (!ln) continue;
+      const tok = (pfx) => {
+        const t = ln.split('\t').find((s) => s.startsWith(pfx));
+        return t == null ? null : t.slice(pfx.length);
+      };
+      if (tok('task=') !== String(task)) continue;
+      if (tok('role=') !== 'execution-review') continue;
+      if (tok('seat=') !== 'claude') continue;
+      const nm = tok('name=');
+      if (nm === null || !nm.includes(needle)) continue;
+      if (tok('job=') !== job8) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Committer time (epoch ms) of a sha that resolves to a commit in the cwd repo or the ticket's own repo
+// (the same bounded pair resolveArtifactAtRef uses). null when it resolves nowhere (fail closed).
+function commitCommitterMs277(sha) {
+  const dirs = [];
+  try {
+    const r = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    if (r.status === 0 && r.stdout && r.stdout.trim()) dirs.push(r.stdout.trim());
+  } catch (e) { /* no cwd repo */ }
+  const top = aiBrainToplevel();
+  if (top) dirs.push(top);
+  for (const d of [...new Set(dirs)]) {
+    try {
+      const e = spawnSync('git', ['-C', d, 'cat-file', '-e', String(sha) + '^{commit}'], { encoding: 'utf8' });
+      if (e.status !== 0) continue;
+      const c = spawnSync('git', ['-C', d, 'show', '-s', '--format=%ct', String(sha)], { encoding: 'utf8' });
+      if (c.status !== 0) continue;
+      const secs = parseInt(String(c.stdout).trim(), 10);
+      if (Number.isFinite(secs)) return secs * 1000;
+    } catch (err) { /* try the next repo */ }
+  }
+  return null;
+}
+
+// The ONE evaluator. prior = the FAIL row this write/row supersedes; fields = the incoming overlay fields
+// (append) or the stored row itself (stored). Returns {ok:true} or {ok:false, reason} — the reason names
+// the required flags so a reviewer that meets the rule can self-correct without a brief change; it names
+// no override.
+function laterRoundPass277(role, prior, fields, task, session, mode) {
+  const fail = (reason) => ({ ok: false, reason: reason });
+  if (role !== 'execution-review') return fail('the route role is execution-review only');
+  if (!fields || fields.verdict !== 'PASS') return fail('the incoming verdict must be exactly PASS');
+  if (!prior || prior.verdict !== 'FAIL') return fail('there is no FAIL verdict row to supersede');
+  const roundRaw = fields.round == null ? '' : String(fields.round);
+  if (!LATER_ROUND_RE_277.test(roundRaw)) return fail('--round is required: 1-6 digits, no leading zero, >= 2');
+  const round = parseInt(roundRaw, 10);
+  if (round < 2) return fail('--round must be >= 2');
+  const priorRound = (prior.round != null && LATER_ROUND_RE_277.test(String(prior.round)))
+    ? parseInt(String(prior.round), 10) : 1;
+  if (round <= priorRound) return fail('--round must be above the prior row\'s round (' + priorRound + ')');
+  const sess = fields.reviewer_session == null ? '' : String(fields.reviewer_session);
+  if (!SESSION_UUID_RE.test(sess)) return fail('--reviewer-session is required and must be a canonical Claude Code session id');
+  if (mode !== 'stored' && sess !== String(process.env.CLAUDE_CODE_SESSION_ID || '')) {
+    return fail('--reviewer-session must equal the calling seat\'s own $CLAUDE_CODE_SESSION_ID');
+  }
+  if (sess === String(session == null ? '' : session)) return fail('--reviewer-session must differ from the ledger session');
+  if (prior.reviewer_session && sess === String(prior.reviewer_session)) {
+    return fail('--reviewer-session must differ from the prior row\'s reviewer session');
+  }
+  const failMs = parseClosedAtMs(prior.closedAt) != null ? parseClosedAtMs(prior.closedAt) : parseClosedAtMs(prior.ts);
+  if (failMs === null) return fail('the FAIL row carries no usable closedAt/ts to compare against');
+  const headRaw = fields.head_sha == null ? '' : String(fields.head_sha);
+  if (!headRaw) return fail('--head-sha is required: the commit this PASS covers');
+  if (prior.head_sha && headRaw === String(prior.head_sha)) return fail('--head-sha must differ from the prior row\'s head sha');
+  const headMs = commitCommitterMs277(headRaw);
+  if (headMs === null) return fail('--head-sha does not resolve to a commit in the cwd repo or the ticket\'s own repo');
+  if (!(headMs > failMs)) return fail('--head-sha\'s committer time must be strictly later than the FAIL time');
+  const closeMs = parseClosedAtMs(fields.closedAt);
+  if (closeMs === null) return fail('--closed-at is required and must be a real timestamp');
+  if (!(closeMs > failMs)) return fail('--closed-at must be strictly later than the FAIL time');
+  if (!launchLogProves277(task, round, sess)) {
+    return fail('no launch-log row proves this seat (needs task=<this ticket>, role=execution-review, ' +
+      'seat=claude, a name= holding -r' + round + '-, and job= equal to the first 8 characters of ' +
+      '--reviewer-session; a missing, unreadable or over-cap log proves nothing)');
+  }
+  return { ok: true };
+}
+
+// The FAIL row a stored later-round PASS row must supersede: the LAST FAIL-verdict row in the role's
+// verdict-bearing history (null when none). A row-finder only — the RULE lives solely in
+// laterRoundPass277 above.
+function findLatestFailRow277(vrows) {
+  for (let i = vrows.length - 1; i >= 0; i--) {
+    if (vrows[i] && vrows[i].verdict === 'FAIL') return vrows[i];
+  }
+  return null;
+}
+
+
 // The monotonicity ruling (Intent §"The monotonicity ruling"): a later verdict-bearing row supersedes a
 // currently-effective NEGATIVE verdict ONLY when it carries an agentId DISTINCT from the negative row's AND
 // a closedAt STRICTLY newer than the negative row's (parsed-epoch comparison; equal is NOT strictly newer
@@ -5692,6 +6129,12 @@ function supersedesNegative(candidate, negative, role, session, task) {
   if (!candidate) return false;
   const candMs = parseClosedAtMs(candidate.closedAt);
   if (candMs === null) return false;
+  // #277 — a launch-proven later-round PASS row (round + reviewer_session + head_sha all stored) supersedes
+  // the negative through the ONE evaluator re-run on the STORED fields (check-side mode: the reviewer
+  // session was proven against the caller's env when the row was written). Typed fields alone never pass —
+  // a hand-seeded row with no matching launch-log row stays refused and the negative stays effective.
+  if (candidate.round != null && candidate.reviewer_session && candidate.head_sha &&
+      laterRoundPass277(role, negative, candidate, task, session, 'stored').ok) return true;
   let distinct;
   if (candidate.agentId) {
     distinct = !negative.agentId || (candidate.agentId !== negative.agentId);
@@ -5828,6 +6271,10 @@ function cmdCheck(o) {
   const checkOpts = { rejectVacuousOracle: ('reject-vacuous-oracle' in o), mergeHead: o['merge-head'] || '',
     requirePublishedReview: ('require-published-review' in o),
     branch: o['branch'] || '', pr: o['pr'] || '' };
+  // #277 — the FAIL row a stored later-round PASS row must supersede, found ONCE here and handed to
+  // checkRole through checkOpts (the last FAIL-verdict row in the execution-review history; null when
+  // none — a route row over no FAIL row then stays refused, fail closed).
+  checkOpts.negRow277 = findLatestFailRow277(verdictRows(rowsForRole(lines, 'execution-review')));
   const problems = [];
   // #2496 — tracks ONLY the "missing X ledger line" problems the REQUIRED_ROLES loop below pushes (never
   // any other problem class: checkRole content failures, laneA/laneB, model-policy, tracked, kind,
@@ -5858,7 +6305,7 @@ function cmdCheck(o) {
     // empty-string result means "admissible AND fully verified", i.e. this role's pass came from the
     // subprocess arm, not the ordinary agentId arm. #2075 AC-3: label the ROW's actual dispatch value, never
     // a hardcoded vendor literal — a subprocess-ollama row must not be mislabeled subprocess-openrouter.
-    if (checkSubprocessProvenance(role, e, session, task) === '') {
+    if (checkSubprocessProvenance(role, e, session, task, checkOpts) === '') {   // #351: + mergeHead via checkOpts
       // D7: label from the SAME source checkSubprocessProvenance itself just verified against — a
       // subprocess-local row's model lives on the OVERLAY, never `seats[role]` (#2075 AC-3: label the row's
       // actual dispatch value + the model it was actually verified against, never a mismatched re-derivation).
@@ -8466,15 +8913,17 @@ function lintRoutesConfig(routes) {
       }
     }
   }
-  // #3060 D1 -- seats.<seat>.size_models: only the L key is defined, and its value must be a model the seat's own
+  // #3060 D1 -- seats.<seat>.size_models: keys from the closed set {L, M} only (#178 joins M to the
+  // builder tier; S stays refused -- no rule wants it), and each value must be a model the seat's own
   // provider declares in model_vocabulary (fail closed: an undeclared slug would be dispatched as a hand-typed id).
+  const SIZE_MODEL_KEYS = { L: true, M: true };
   for (const [sid, seat] of Object.entries(routes.seats || {})) {
     if (!seat || typeof seat !== 'object' || !('size_models' in seat)) continue;
     const sm = seat.size_models;
     if (!sm || typeof sm !== 'object' || Array.isArray(sm)) { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models must be an object'); continue; }
     const vocab = ((providers[seat.provider] || {}).model_vocabulary) || {};
     for (const [k, v] of Object.entries(sm)) {
-      if (k !== 'L') { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' -- only the L key is defined'); continue; }
+      if (!SIZE_MODEL_KEYS[k]) { problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' -- only the L and M keys are defined'); continue; }
       if (typeof v !== 'string' || !Object.prototype.hasOwnProperty.call(vocab, v)) {
         problems.push('SIZE-MODEL-UNDECLARED: seats.' + sid + '.size_models.' + k + ' = "' + v + '" is not in providers.' + seat.provider + '.model_vocabulary');
       }
@@ -8924,10 +9373,10 @@ function readTicketExecution(session, task) {
 // model_vocabulary, is the #2985 rule unchanged (L -> fallback tier): the config-only rollback, failing closed.
 // Additive JSON fields `route_reason` + `zai_strikes` are produced for the EXECUTOR seat only (`zai_strikes`
 // never plan-review; `route_reason` reaches a size_models-declaring plan-review seat too since #3145 D1).
-function executorSizeModel(seat) {
+function executorSizeModelFor(seat, size) {
   const sm = seat && seat.size_models;
   if (!sm || typeof sm !== 'object' || Array.isArray(sm)) return '';
-  const v = sm.L;
+  const v = sm[size];
   if (typeof v !== 'string' || !v) return '';
   const loaded = loadRoutesConfig();
   const prov = loaded.ok && loaded.routes && loaded.routes.providers ? loaded.routes.providers[seat.provider] : null;
@@ -8935,6 +9384,53 @@ function executorSizeModel(seat) {
   if (!vocab || typeof vocab !== 'object' || !Object.prototype.hasOwnProperty.call(vocab, v)) return '';
   return v;
 }
+
+// #3576 — size_routes: the GENERIC per-size route vocabulary, available to ANY seat row (the
+// executor's model-only size_models ladder stays z.ai machinery; no review-seat size ladder
+// existed before this). Each entry is a PARTIAL row -- provider, model, effort; every absent key
+// inherits the seat row's own value. Structural violations (a key outside S/M/L, a field outside
+// the three, a non-string value) are REFUSED by resolve-route before any answer (never a guess);
+// a well-formed but semantically invalid entry for the plan's size (undeclared provider, model
+// outside that provider's model_vocabulary) falls back to the seat row -- the same
+// fail-closed-to-declared-default shape size_models has. A row may not declare BOTH maps.
+function sizeRoutesShapeProblem(seat) {
+  const sr = seat && seat.size_routes;
+  if (!sr || typeof sr !== 'object' || Array.isArray(sr)) return 'size_routes must be an object';
+  const keys = Object.keys(sr);
+  const FIELDS = ['provider', 'model', 'effort'];
+  for (const k of keys) {
+    if (!['S', 'M', 'L'].includes(k)) return 'size_routes.' + k + ' -- only the S, M and L keys are defined';
+    const e = sr[k];
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return 'size_routes.' + k + ' must be an object';
+    for (const f of Object.keys(e)) {
+      if (!FIELDS.includes(f)) return 'size_routes.' + k + '.' + f + ' -- only provider, model and effort are defined';
+      const v = e[f];
+      if (v === undefined || v === null || v === '') continue;   // absent/empty: inherit the seat row
+      if (typeof v !== 'string' || /\s/.test(v)) return 'size_routes.' + k + '.' + f + ' is not a plain one-word string';
+    }
+  }
+  return '';
+}
+function sizeRoutesEntryFor(seat, size) {
+  const sr = seat && seat.size_routes;
+  if (!sr || typeof sr !== 'object' || Array.isArray(sr)) return null;
+  const e = sr[size];
+  if (!e || typeof e !== 'object' || Array.isArray(e)) return null;
+  const prov = (typeof e.provider === 'string' && e.provider) ? e.provider : seat.provider;
+  const model = (typeof e.model === 'string' && e.model) ? e.model : seat.model;
+  const effort = (e.effort !== undefined && e.effort !== null && e.effort !== '') ? e.effort : seat.effort;
+  const loaded = loadRoutesConfig();
+  const providers = loaded.ok && loaded.routes && loaded.routes.providers ? loaded.routes.providers : null;
+  if (!providers || !providers[prov] || typeof providers[prov] !== 'object') return null;
+  const vocab = providers[prov].model_vocabulary;
+  if (!vocab || typeof vocab !== 'object' || !Object.prototype.hasOwnProperty.call(vocab, model)) return null;
+  return { provider: prov, model, effort: (effort === undefined || effort === null) ? '' : effort };
+}
+
+// #178 — the size-taking sibling is the ONE body; the L-arity wrapper keeps every pre-#178 call-site
+// (the plan-review ladder, unsized-full, the D5 twin) byte-identical: L is still the only size those
+// consumers may size on.
+function executorSizeModel(seat) { return executorSizeModelFor(seat, 'L'); }
 
 function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
   const out = { effective_dispatch: seat.dispatch || '', effective_tier: '', effective_model: seat.model || '' };
@@ -8952,6 +9448,20 @@ function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
           out.zai_strikes = facts.task ? countExecutorStrikes(facts.task) : 0;
           if (out.zai_strikes >= 2) { leave = true; out.route_reason = 'zai-strikes'; }
           else { out.effective_model = sizeModel; out.route_reason = 'size-L-zai'; }
+        }
+      } else if (facts.size === 'M') {
+        // #178 — the builder-tier flip: size M routes EXACTLY like L already does, on the SSOT's
+        // size_models.M (route_reason size-M-zai) with the SAME shared >= 2-strike agent-tool Sonnet
+        // fallback. WITHOUT a usable size_models.M the answer is today's `size-SM` seat-model output
+        // BYTE-IDENTICAL — that asymmetry with L is deliberate (it is the config-only rollback):
+        // deleting the M key puts M back on the seat's glm-5.3-flash, where for L no key means the
+        // #2985 Sonnet rule. The L arm above is untouched.
+        const sizeModelM = executorSizeModelFor(seat, 'M');
+        if (!sizeModelM) { out.route_reason = 'size-SM'; }
+        else {
+          out.zai_strikes = facts.task ? countExecutorStrikes(facts.task) : 0;
+          if (out.zai_strikes >= 2) { leave = true; out.route_reason = 'zai-strikes'; }
+          else { out.effective_model = sizeModelM; out.route_reason = 'size-M-zai'; }
         }
       } else out.route_reason = 'size-SM';
     }
@@ -8979,6 +9489,22 @@ function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
     } else {
       out.effective_model = sizeModel;
       out.route_reason = 'unsized-full';
+    }
+  } else if (seat.size_routes && !seat.size_models) {
+    // #3576 — the GENERIC per-size arm, for ANY seat other than executor/plan-review whose row
+    // declares a usable size_routes[<plan size>] entry: the effective provider/model/effort come
+    // from the entry (absent fields inherited), with route_reason size-<S|M|L>-route. It NEVER
+    // leaves for agent-tool on its own (the fallback ladder stays executor-zai machinery), and an
+    // absent/invalid entry for the plan's size keeps the declared seat row — fail closed to the
+    // default, never a guess. A both-maps row is refused by resolve-route before this runs.
+    if (facts.size_source === 'plan' && facts.size) {
+      const e = sizeRoutesEntryFor(seat, facts.size);
+      if (e) {
+        out.effective_model = e.model;
+        out.effective_provider = e.provider;
+        out.effective_effort = e.effort;
+        out.route_reason = 'size-' + facts.size + '-route';
+      }
     }
   }
   if (!leave) return out;
@@ -9205,7 +9731,11 @@ function companionPostmortemEvidence(lines, i, task, kv) {
 // the nearest such row AFTER the FALLBACK row in file order -- the emitter writes FALLBACK then POSTMORTEM back to
 // back) carries `progress=pushed`. Every other case is a strike: no companion row, companion with `progress=none` or
 // `progress=unmeasured`, a missing `progress=` field (every pre-#3073 row), or a FALLBACK reason other than timeout.
-// Fail closed, as the ticket requires. #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
+// Fail closed, as the ticket requires. #361: the ONE exception is `reason=privacy-block` (stamped by exactly one
+// dispatcher arm, the rc=7 mid-run egress short-circuit) — a harness-side privacy refusal is never an
+// executor-quality signal, so such a row counts neither strike nor CONTINUE (skipped in place; the live rc=7
+// exit stays the orchestrator's own immediate-fallback signal, it just never accumulates toward the cap).
+// #3073 D3b: at most CONTINUE_CAP timeout invocations per window may be
 // classified CONTINUE; the 4th and every later timeout-with-pushed counts as a STRIKE (fail closed) so the existing
 // 2-strike route-to-Sonnet rule engages after at most 3 wasted legs.
 // MERGE #3073+#3093 (fix round 3): a timeout invocation is CONTINUE iff its companion POSTMORTEM carries
@@ -9261,6 +9791,10 @@ function needleReceiptAdmits(task, briefId) {
   return false;
 }
 
+// Executor strike doctrine (the #3073/#3065 counter above reads it): strikes are receipt rows for
+// executor-QUALITY failures; quota-closed and pre-flight refusals never strike (#2785). #361 clause:
+// an rc=7 pre-write egress block is a harness-side privacy refusal, never an executor-quality signal —
+// the live rc=7 exit stays the orchestrator's own immediate-fallback signal, it just never accumulates.
 function executorStrikeFacts(task) {
   const lines = readReceiptTail().split('\n');
   const forgiven = forgivenEvidence(task, lines);
@@ -9290,6 +9824,12 @@ function executorStrikeFacts(task) {
     if (kv.role !== 'executor' || kv.task !== task) continue;
     if (kv.drill === '1') continue;
     if ('attempt' in kv && kv.attempt !== '1') continue;
+    // #361 — egress-block-not-a-strike: `reason=privacy-block` is stamped by exactly ONE dispatcher arm
+    // (the rc=7 mid-run privacy-block short-circuit's classify_postmortem privacy-block → PM_REASON → the
+    // FALLBACK row), so the token alone identifies the class — no POSTMORTEM pairing (a lost companion
+    // must fail closed, the #3073 ER-r1 F3 lesson). A harness-side privacy refusal counts neither strike
+    // nor CONTINUE: `continue` past it. Every other reason stays fail-closed below.
+    if (kv.reason === 'privacy-block') continue;
     if (kv.reason !== 'timeout') { strikes++; continue; }
     // #3073 D3 + #3093 D3 (merge): the ONE shared pairing helper (with the #3073 ER-r1 F3 stop rule), so
     // the counter and the forgive verb can never read a row differently. CONTINUE iff the companion
@@ -9730,12 +10270,29 @@ function cmdResolveRoute(opts) {
     process.stderr.write(ROUTE_ACCEPTED_RISK_TOKEN + ': seat ' + seatKey + ' provider ' + a.provider +
       ' posture-at-decision ' + a.posture_at_decision + ' decided ' + a.decided + ' authority ' + a.authority + '\n');
   }
+  // #3576 — a size_routes row refuses BOTH maps (one encoding of the size route per row) and any
+  // structural size_routes violation HERE, before any answer: fail closed, never a guess.
+  if (result.seat && result.seat.size_routes) {
+    if (result.seat.size_models) {
+      console.error('SIZE-ROUTES-BOTH-MAPS: seat ' + seatKey + ' declares BOTH size_models and size_routes -- one encoding of the size route per row (#3576); remove one');
+      process.exit(2);
+    }
+    const shapeProblem = sizeRoutesShapeProblem(result.seat);
+    if (shapeProblem) {
+      console.error('SIZE-ROUTES-SHAPE: seat ' + seatKey + ' ' + shapeProblem);
+      process.exit(2);
+    }
+  }
   if ('json' in opts) {
     const payload = Object.assign({ seat: seatKey }, result.seat);
     if (result.acceptance) payload.accepted_disclosure_applied = result.acceptance;
     if (planFacts) {
       Object.assign(payload, { size: planFacts.size, size_source: planFacts.size_source, data_class: planFacts.data_class },
         effectiveRouteFor(seatKey, result.seat, planFacts, needleAdmit));
+      // #3576 — additive effective-provider/effort fields (the seat row's own values when no
+      // size_routes entry applies; executor's route_reason/zai_strikes untouched above).
+      payload.effective_provider = payload.effective_provider || result.seat.provider || '';
+      payload.effective_effort = payload.effective_effort || result.seat.effort || '';
     }
     console.log(JSON.stringify(payload));
   } else {
@@ -10025,6 +10582,10 @@ function seatOwnAnthropicTier(seatRow, routes) {
 function routePinnedSeatRow(seatRow, routes, provider, model) {
   const next = Object.assign({}, seatRow);
   delete next.size_models;
+  // #3576 — a ROUTE pin replaces the effective row and DROPS size_routes exactly as it drops
+  // size_models (one effective route, never two encodings); effort is KEPT (the operator's
+  // #3576 ship-tail addendum reaches the pinned dispatch through exactly this line).
+  delete next.size_routes;
   next.provider = provider;
   next.model = model;
   if (provider === 'anthropic') {
@@ -10365,6 +10926,10 @@ const MODE_FALLBACK = Object.freeze({
   openrouter_dispatch: 'forbidden',
   local_dispatch: 'forbidden',
   zai_dispatch: 'forbidden',
+  // #3576 — anthropic is the BASELINE provider and the fail-safe asymmetry's own safe side (its
+  // reasoning: garbage state must never resolve to a NON-Anthropic permission; equally, garbage
+  // must never BLOCK the operator's baseline), so the fallback is 'permitted', never 'forbidden'.
+  anthropic_dispatch: 'permitted',
 });
 
 // Redesign (2026-08-29, work/ship-tail pool split; #2518 added zai_dispatch) — builds the full v2
@@ -10382,6 +10947,7 @@ function fallbackResolved(source, reason) {
     openrouter_dispatch: MODE_FALLBACK.openrouter_dispatch,
     local_dispatch: MODE_FALLBACK.local_dispatch,
     zai_dispatch: MODE_FALLBACK.zai_dispatch,
+    anthropic_dispatch: MODE_FALLBACK.anthropic_dispatch,
     source, reason, set_at: '', task: '',
   };
 }
@@ -10478,6 +11044,9 @@ function resolveMode() {
                ceiling: lanes.work_ceiling,
                openrouter_dispatch: row.openrouter_dispatch, local_dispatch: row.local_dispatch,
                zai_dispatch: row.zai_dispatch === 'permitted' ? 'permitted' : 'forbidden',
+               // #3576 — the anthropic axis copies the zai axis's literal-'permitted'-only clamp
+               // (an absent/garbage key in a table row resolves forbidden, never undefined).
+               anthropic_dispatch: row.anthropic_dispatch === 'permitted' ? 'permitted' : 'forbidden',
                source: 'default', reason: '', set_at: '', task: '' };
     }
     return fallbackResolved('invalid-pin-fallback', 'unreadable-pin');
@@ -10513,12 +11082,18 @@ function resolveMode() {
   // non-alias resolution ever unlocks it — anything else (absent key, any other string, alias clamp) is
   // 'forbidden', never 'undefined'.
   const zaiAxis = (!viaAlias && row.zai_dispatch === 'permitted') ? 'permitted' : 'forbidden';
+  // #3576 — the anthropic axis gets the SAME clamp shape at the pin arm: only a LITERAL 'permitted'
+  // on a non-alias resolution ever unlocks it; an alias pin, an absent key or any other string
+  // resolves 'forbidden', never 'undefined' (a partially-written mode row can never mint a
+  // permission in either direction, even though anthropic is the fail-safe's safe side).
+  const anthropicAxis = (!viaAlias && row.anthropic_dispatch === 'permitted') ? 'permitted' : 'forbidden';
   const reasonText = String(pin.reason == null ? '' : pin.reason);
   return { mode: resolved,
            work_base: lanes.work_base, opportunist: lanes.opportunist,
            work_ceiling: lanes.work_ceiling, ship_tail_ceiling: lanes.ship_tail_ceiling,
            ceiling: lanes.work_ceiling,
            openrouter_dispatch: dispatchAxis, local_dispatch: localAxis, zai_dispatch: zaiAxis,
+           anthropic_dispatch: anthropicAxis,
            source: 'pin', reason: viaAlias ? (reasonText ? reasonText + ' [alias-non-authorizing]' : 'alias-non-authorizing') : reasonText,
            set_at: String(pin.set_at == null ? '' : pin.set_at), task: String(pin.task == null ? '' : pin.task) };
 }
@@ -10538,6 +11113,9 @@ function cmdResolveMode(opts) {
   console.log('openrouter_dispatch=' + r.openrouter_dispatch);
   console.log('local_dispatch=' + r.local_dispatch);
   console.log('zai_dispatch=' + r.zai_dispatch);
+  // #3576 — the anthropic baseline-provider axis, additive (a pre-#3576 consumer greps its own
+  // axis line and never sees this one).
+  console.log('anthropic_dispatch=' + r.anthropic_dispatch);
   console.log('source=' + r.source);
   console.log('reason=' + r.reason);
   // AC 20(b) (#2197) — `set_at=` is emitted ONLY on the source=pin arm, and only when the pin actually
