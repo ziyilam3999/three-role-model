@@ -781,7 +781,7 @@ echo "== SECTION 5: #3140 Leg 2 -- size-aware PLANNER spawn gate (fable only for
 # block-once marker is keyed session:task:role, so a reused signature would make a later arm vacuous).
 SZ="$TMP/sz3140"; mkdir -p "$SZ/tasks"
 cat > "$SZ/routes.json" <<'SZJ'
-{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-2":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-2"}}}}
 SZJ
 # szcase <n> <task> <ticket-metadata-json-body|-> <model> -> RC CAP (fresh session ac3140NN-...)
 szcase() {
