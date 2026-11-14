@@ -1597,7 +1597,7 @@ fi
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 T3140="$TMP/t3140"; mkdir -p "$T3140"
 cat > "$T3140/routes.json" <<'T3140J'
-{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-2":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-2"}}}}
 T3140J
 # plan3140 <session> <task> <ticket-size> <planner-model-id> -> RC OUT (check --enforce-role-models exit + output)
 plan3140() {
@@ -1616,10 +1616,10 @@ plan3140() {
 plan3140 s3140a 9001 L claude-opus-5-5
 { [ "$RC" = "2" ] && printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
   && ok "#3140 AC-2.7: size-L ticket + planner on opus -> exit 2 MODEL-POLICY (down-tier vs the size-L expectation)" || bad "#3140 AC-2.7 {L,opus} should block (rc=$RC out=$OUT)"
-plan3140 s3140b 9001 L claude-fable-5-1
+plan3140 s3140b 9001 L claude-fable-5-2
 { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY:'; } \
   && ok "#3140 AC-2.7: size-L ticket + planner on fable -> exit 0, no MODEL-POLICY" || bad "#3140 AC-2.7 {L,fable} should pass (rc=$RC out=$OUT)"
-plan3140 s3140c 9002 S claude-fable-5-1
+plan3140 s3140c 9002 S claude-fable-5-2
 { [ "$RC" = "0" ] && printf '%s' "$OUT" | command grep -q 'CLOSE-UPTIER'; } \
   && ok "#3140 AC-2.7: size-S ticket + planner on fable -> exit 0 with a CLOSE-UPTIER note (unchanged #1624 rule)" || bad "#3140 AC-2.7 {S,fable} should be an allowed up-tier (rc=$RC out=$OUT)"
 plan3140 s3140d 9002 S claude-opus-5-5

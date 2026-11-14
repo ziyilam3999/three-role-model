@@ -2474,26 +2474,38 @@ function seatDispatchIsSubprocess(role) {
 // BEFORE the real `queue-operation`/`enqueue` spawn record on disk — measured live on session
 // bd8c0aec-... (#1947 AC-6 live smoke): the GLM transcript's line 0 was `ai-title`, line 1 the real enqueue.
 // An `ai-title` record structurally can NEVER carry the rendered brief (it has only an `aiTitle` string, no
-// `content`/`message` field), so it is the ONE narrowly-named type this scan skips past. Every other record
+// `content`/`message` field). #3593 — the SAME class on the Claude end: measured live 2026-11-11, BOTH
+// Claude bg-seat transcripts of the #370 r2 dispatch start with `{"type":"session-owner","accountUuid":...,
+// "organizationUuid":...,"sessionId":...}` on line 0 and the real enqueue record on line 1; a session-owner
+// record is equally structurally incapable of carrying the brief. These are the TWO narrowly-named types
+// this scan skips past. Every other record
 // type ends the scan immediately (return whatever text it has, or '' if none) — this still never scans past
-// the first REAL turn, which is what defeats mention-vs-spawn confusion (M2); it only tolerates ONE specific,
-// content-free metadata record shape in front of it.
-function subprocessFirstRecordText(content) {
+// the first REAL turn, which is what defeats mention-vs-spawn confusion (M2); it only tolerates these
+// specific, content-free metadata record shapes in front of it.
+// #3626 — the ONE scan that lands on the nonce-bound first record (skips exactly the two content-free
+// metadata types above). subprocessFirstRecordText (the bound text) and the route-at-run time anchor both
+// come from THIS record, so the bound record and the anchored record can never differ. null on an
+// unparsable line or when only skippable records exist.
+function subprocessBoundRecord(content) {
   const lines = String(content == null ? '' : content).split('\n');
   for (const raw of lines) {
     if (!raw.trim()) continue;
     let rec;
-    try { rec = JSON.parse(raw); } catch (e) { return ''; }
-    if (rec && rec.type === 'ai-title') continue;
-    if (rec && typeof rec.content === 'string') return rec.content;
-    const msg = (rec && rec.message) || {};
-    if (typeof msg.content === 'string') return msg.content;
-    if (Array.isArray(msg.content)) {
-      let text = '';
-      for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
-      return text;
-    }
-    return '';
+    try { rec = JSON.parse(raw); } catch (e) { return null; }
+    if (rec && (rec.type === 'ai-title' || rec.type === 'session-owner')) continue;
+    return rec === undefined ? null : rec;
+  }
+  return null;
+}
+function subprocessFirstRecordText(content) {
+  const rec = subprocessBoundRecord(content);
+  if (rec && typeof rec.content === 'string') return rec.content;
+  const msg = (rec && rec.message) || {};
+  if (typeof msg.content === 'string') return msg.content;
+  if (Array.isArray(msg.content)) {
+    let text = '';
+    for (const c of msg.content) { if (c && c.type === 'text' && typeof c.text === 'string') text += c.text; }
+    return text;
   }
   return '';
 }
@@ -2507,7 +2519,7 @@ function subprocessFirstRecordText(content) {
 // is the CALLER's job, per named risk 2700-pr1-relative-vantage-join: a non-absolute recorded cwd must be
 // ignored, never joined against process.cwd()/HOME).
 function subprocessTranscriptInfo(transcriptPath) {
-  const out = { exists: false, firstText: '', servedModel: '', dispatchCwd: '' };
+  const out = { exists: false, firstText: '', servedModel: '', dispatchCwd: '', anchorTs: '' };
   let p = String(transcriptPath == null ? '' : transcriptPath);
   // transcript_path is stored in portable home-tilde form by normalizeArtifact() (R6) — expand it back to
   // an absolute path before touching the filesystem; fs.* never expands `~` the way a shell does, so a
@@ -2519,6 +2531,8 @@ function subprocessTranscriptInfo(transcriptPath) {
   try {
     const content = fs.readFileSync(p, 'utf8');
     out.firstText = subprocessFirstRecordText(content);
+    const boundRec = subprocessBoundRecord(content);   // #3626 — route-at-run anchor: the BOUND record's own timestamp only
+    if (boundRec && typeof boundRec.timestamp === 'string') out.anchorTs = boundRec.timestamp;
     for (const ln of content.split('\n')) {
       if (!ln.trim()) continue;
       let rec;
@@ -2884,6 +2898,168 @@ function rowSeatDeclAtRun(role, row) {
   return atRun.ok ? atRun : live;
 }
 
+// ---- #3626 — served-model basis: (b) the route in force when the seat ran, then (a) an operator-approved
+// one-off swap. Called ONLY after a served-model mismatch (arms that pass never reach it). No env var, no
+// skip: the only inputs are origin/master's route history and the operator-answered ask table.
+const APPROVAL_STORE_FILE_3626 = 'seat-swap-approvals.jsonl';
+const APPROVAL_ASK_RE_3626 = /^[A-Za-z0-9._-]{1,40}$/;
+const APPROVAL_MAX_ROWS_3626 = 2000;            // INPUT-BOUND: store rows read per check, fails closed past it
+const TIER_RANK_3626 = { haiku: 1, sonnet: 2, opus: 3, fable: 4 };
+const _basisNoted3626 = new Set();
+const _histRoutesMemo3626 = new Map();
+
+function seatSwapStorePath() { return path.join(LEDGER_DIR, APPROVAL_STORE_FILE_3626); }
+
+// The ONE asks-file resolver (writer AND reader): derived only from the running helper's own repo.
+// selfDir -> git common dir -> its parent (the primary clone from any worktree) -> the operator table.
+// Never a store field, cwd, env var or flag. null when unresolvable / absent.
+function seatSwapAsksFile() {
+  try {
+    const res = spawnSync('git', ['-C', selfDir(), 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' });
+    if (res.status !== 0) return null;
+    const common = (res.stdout || '').trim();
+    if (!common || !path.isAbsolute(common)) return null;
+    const f = path.join(path.dirname(common), '.ai-workspace', '_operator', 'items-needed-from-operator.md');
+    return fileExists(f) ? f : null;
+  } catch (e) { return null; }
+}
+// true only when `ask-rows.mjs id-status <ask> <resolved file>` prints ANSWERED.
+function seatSwapAskAnswered(ask) {
+  if (typeof ask !== 'string' || !APPROVAL_ASK_RE_3626.test(ask)) return false;
+  const file = seatSwapAsksFile();
+  if (!file) return false;
+  const tool = path.join(selfDir(), '..', 'tools', 'ask-rows.mjs');
+  if (!fileExists(tool)) return false;
+  try {
+    const res = spawnSync(process.execPath, [tool, 'id-status', ask, file], { encoding: 'utf8', timeout: 15000 });
+    return res.status === 0 && (res.stdout || '').trim() === 'ANSWERED';
+  } catch (e) { return false; }
+}
+// {provider, tier} when `model` sits in EXACTLY one provider's vocabulary, else null.
+function seatSwapModelIdent(routes, model) {
+  const provs = (routes && routes.providers) || {};
+  const hits = [];
+  for (const pn of Object.keys(provs)) {
+    const v = provs[pn] && provs[pn].model_vocabulary;
+    if (v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, model)) {
+      hits.push({ provider: pn, tier: String((v[model] && v[model].tier_equivalent) || '') });
+    }
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function histPlanSize3626(info, task) {
+  const paths = briefPlanPaths(info.firstText);
+  if (paths.length !== 1) return '';
+  const rel = paths[0];
+  const cands = [];
+  if (typeof info.dispatchCwd === 'string' && info.dispatchCwd.startsWith('/')) cands.push(path.join(info.dispatchCwd, rel));
+  cands.push(rel);
+  if (!path.isAbsolute(rel)) cands.push(path.join(selfDir(), '..', rel));
+  for (const c of cands) {
+    const f = resolvePlanFacts(c, task);
+    if (!f.unresolvable) return f.size_source === 'plan' ? String(f.size || '') : '';
+  }
+  return '';
+}
+
+// (b) route at run. Returns a basis line or ''.
+function routeAtRunBasis3626(role, e, info, task) {
+  if ('CC_ROUTES_JSON' in process.env) return '';   // the seam stays terminal (as #3615 arm D)
+  const anchor = info.anchorTs;
+  if (!anchor || isNaN(Date.parse(anchor))) return '';   // fail closed: no anchor, no fallback to ts/closedAt
+  const top = aiBrainToplevel();
+  if (!top) return '';
+  const iso = new Date(Date.parse(anchor)).toISOString();
+  let hist = _histRoutesMemo3626.get(iso);
+  if (hist === undefined) {
+    hist = null;
+    try {
+      const lg = spawnSync('git', ['-C', top, 'log', '-1', '--format=%H', '--before=' + iso, ROUTES_MASTER_REF, '--', 'config/cc-routes.json'], { encoding: 'utf8' });
+      const sha = lg.status === 0 ? (lg.stdout || '').trim() : '';
+      if (/^[0-9a-f]{40}$/.test(sha)) {
+        const raw = readBlobAtRef(top, sha, 'config/cc-routes.json');
+        if (raw != null) {
+          const routes = JSON.parse(raw);
+          if (routes && typeof routes === 'object' && !Array.isArray(routes)) hist = { sha, routes };
+        }
+      }
+    } catch (er) { hist = null; }
+    _histRoutesMemo3626.set(iso, hist);
+  }
+  if (!hist) return '';
+  const seat = (hist.routes.seats || {})[role];
+  if (!seat || typeof seat !== 'object' || seat.dispatch !== e.dispatch) return '';
+  const ok = [seat.model];
+  const size = histPlanSize3626(info, task);
+  if (size) {
+    const sr = seat.size_routes && seat.size_routes[size];
+    if (sr && typeof sr === 'object' && typeof sr.model === 'string' && sr.model) ok.push(sr.model);
+    if (seat.size_models && typeof seat.size_models[size] === 'string' && seat.size_models[size]
+        && seat.agent_tool_fallback && ROLE_MODELS.includes(seat.agent_tool_fallback)) ok.push(seat.size_models[size]);
+  }
+  if (!info.servedModel || !ok.includes(info.servedModel)) return '';
+  return 'SERVED-MODEL-BASIS: ' + role + ' route-at-run origin/master@' + hist.sha.slice(0, 12) + ' seats.' + role + '=' +
+    seat.provider + '/' + seat.model + ' (transcript ts ' + anchor + ')';
+}
+
+// (a) operator-approved one-off swap. Returns a basis line or ''.
+function approvedSwapBasis3626(role, info, task, decl) {
+  const served = info.servedModel;
+  if (!served || !decl || !decl.seat) return '';
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) return '';
+  const sIdent = seatSwapModelIdent(loaded.routes, served);
+  const dIdent = seatSwapModelIdent(loaded.routes, decl.seat.model);
+  if (!sIdent || !dIdent || sIdent.provider !== decl.seat.provider) return '';
+  const rs = TIER_RANK_3626[sIdent.tier], rd = TIER_RANK_3626[dIdent.tier];
+  if (!rs || !rd || !(rs > rd)) return '';
+  let raw;
+  try { raw = fs.readFileSync(seatSwapStorePath(), 'utf8'); } catch (er) { return ''; }
+  const lines = raw.split('\n');
+  if (lines.length > APPROVAL_MAX_ROWS_3626) return '';
+  for (const ln of lines) {
+    if (!ln.trim()) continue;
+    let row; try { row = JSON.parse(ln); } catch (er) { continue; }
+    if (!row || row.task !== task || row.role !== role || row.model !== served) continue;
+    if (!seatSwapAskAnswered(row.ask)) continue;   // criterion 5 (re-checked now); extra row fields are never read
+    return 'SERVED-MODEL-BASIS: ' + role + ' operator-approved swap ask=' + row.ask + ' option=' +
+      (typeof row.option === 'string' && row.option ? row.option : '-') + ' model=' + served + ' (seat ' + decl.seat.model + ')';
+  }
+  return '';
+}
+
+function servedModelBasis3626(role, e, info, task, decl) {
+  let line = '';
+  try { line = routeAtRunBasis3626(role, e, info, task) || approvedSwapBasis3626(role, info, task, decl); }
+  catch (er) { line = ''; }
+  if (!line) return false;
+  if (!_basisNoted3626.has(role)) { _basisNoted3626.add(role); process.stderr.write(line + '\n'); }
+  return true;
+}
+
+function cmdApproveSeatSwap(o) {
+  const refuse = (m) => { console.log('BLOCK: approve-seat-swap: ' + m); process.exit(2); };
+  const task = String(o.task || ''), role = String(o.role || ''), model = String(o.model || ''), ask = String(o.ask || '');
+  const option = ('option' in o && o.option) ? String(o.option) : '';
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(task)) refuse('--task is missing or malformed');
+  if (!REQUIRED_ROLES.includes(role)) refuse('--role must be one of ' + REQUIRED_ROLES.join('|'));
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(model)) refuse('--model is missing or malformed');
+  if (!APPROVAL_ASK_RE_3626.test(ask)) refuse('--ask is missing or malformed');
+  if (option && !/^[A-Za-z0-9._ -]{1,40}$/.test(option)) refuse('--option is malformed');
+  const loaded = loadRoutesConfig();
+  if (!loaded.ok) refuse('cannot load routes: ' + loaded.error);
+  const ident = seatSwapModelIdent(loaded.routes, model);
+  if (!ident) refuse('model "' + model + '" is not in exactly one provider vocabulary');
+  const seatRow = (loaded.routes.seats || {})[role];
+  if (!seatRow || seatRow.provider !== ident.provider) refuse('model "' + model + '" is outside the ' + role + ' seat provider (' + (seatRow && seatRow.provider || '<none>') + ') vocabulary');
+  if (!seatSwapAskAnswered(ask)) refuse('ask "' + ask + '" does not read ANSWERED in the operator asks table');
+  const row = { ts: new Date().toISOString(), ask, task, role, model, provider: ident.provider, option };
+  fs.mkdirSync(LEDGER_DIR, { recursive: true });
+  fs.appendFileSync(seatSwapStorePath(), JSON.stringify(row) + '\n');
+  console.log('OK: approve-seat-swap ' + task + '/' + role + ' model=' + model + ' ask=' + ask);
+}
+
 // The full subprocess-openrouter/subprocess-local provenance arm for one role's ledger row. Returns:
 //   null  -> NOT admissible (SSOT doesn't declare this seat subprocess-dispatched, or the row carries no
 //            dispatch marker) -> checkRole must fall through to the ordinary agentId arm UNCHANGED.
@@ -2930,6 +3106,7 @@ function checkSubprocessProvenance(role, e, session, task, opts) {
       'not carry BOTH the spawn tag (3ROLE_TASK:' + task + ' ROLE:' + role + ') and this dispatch\'s nonce "' +
       (e.nonce || '<missing>') + '" — a replayed/reused transcript is not admissible (M2)';
   }
+  let mismatch3626 = null;
   // #3085 D1/D2/D4 — for the ONE class the dispatcher sizes (executor + subprocess-zai), the expected
   // served model is the dispatcher's own effective route for THIS row's plan (size-aware), never the bare
   // seat default: since #3060 a size-L public plan is deliberately served on size_models.L. Slotted
@@ -2948,7 +3125,7 @@ function checkSubprocessProvenance(role, e, session, task, opts) {
     const okExecModels = [route.model];
     if (route.pre_change_model) okExecModels.push(route.pre_change_model);
     if (!info.servedModel || !okExecModels.includes(info.servedModel)) {
-      return 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+      mismatch3626 = 'executor dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
     }
   } else if (role === 'plan-review' && e.dispatch === 'subprocess-zai' && executorSizeModel(decl.seat)) {
@@ -2964,7 +3141,7 @@ function checkSubprocessProvenance(role, e, session, task, opts) {
     const okModels = [route.model];
     if (route.pre_change_model) okModels.push(route.pre_change_model);
     if (!info.servedModel || !okModels.includes(info.servedModel)) {
-      return 'plan-review dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
+      mismatch3626 = 'plan-review dispatch=subprocess-zai transcript "' + e.transcript_path + '" served model "' +
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size +
         (route.fold_only ? ' fold_only' : '') + ')';
     }
@@ -2981,13 +3158,16 @@ function checkSubprocessProvenance(role, e, session, task, opts) {
     const okSrModels = [route.model];
     if (route.pre_change_model) okSrModels.push(route.pre_change_model);
     if (!info.servedModel || !okSrModels.includes(info.servedModel)) {
-      return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
+      mismatch3626 = role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
         (info.servedModel || '<none>') + '" != route-expected model "' + route.model + '" (size=' + route.size + ')';
     }
   } else if (!info.servedModel || info.servedModel !== decl.seat.model) {
-    return role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
+    mismatch3626 = role + ' dispatch=' + e.dispatch + ' transcript "' + e.transcript_path + '" served model "' +
       (info.servedModel || '<none>') + '" != SSOT-declared seat model "' + decl.seat.model + '"';
   }
+  // #3626 — ONE fallback point after any served-model mismatch: a route-at-run (git history) or an
+  // operator-approved one-off swap admits the row; otherwise the original mismatch string is returned unchanged.
+  if (mismatch3626 !== null && !servedModelBasis3626(role, e, info, task, decl)) return mismatch3626;
   // #2700 D2 — vantage-first, nonce-choice resolution: try the dispatch's own recorded cwd BEFORE today's
   // chain; the FIRST candidate that carries the nonce wins. `ap` below is that winner (or '' if none did).
   const vantageResolved = resolveArtifactVantage(e.artifact_path || '', info.dispatchCwd, e.nonce);
@@ -4008,7 +4188,7 @@ function siblingQualifies(siblingFile, session, task, checkOpts) {
   for (const ln of lines) {
     let j; try { j = JSON.parse(ln); } catch (e) { continue; }
     if (!j || !j.role) continue;
-    byRole[j.role] = j;                                   // last-row-wins, for the three non-execution-review roles.
+    selectRoleRow(byRole, j);                             // #3593 — latest completion-shaped row wins, never shadowed by a bare spawn row.
     if (j.role === 'execution-review') execReviewRows.push(j);
   }
   // #3154 D3 -- the sibling's OWN session + task id (taken from its ledger path), never the caller's: the
@@ -5504,7 +5684,7 @@ function cmdInherit(o) {
   try { lines = fs.readFileSync(pfile, 'utf8').split('\n').filter(l => l.trim()); }
   catch (e) { block('no parent ledger file: ' + pfile); }
   const byRole = {};
-  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) selectRoleRow(byRole, j); } catch (e) { /* skip */ } }
   const planner = byRole['planner'];
   const planReview = byRole['plan-review'];
   if (!planner) block('parent has no planner line');
@@ -5945,6 +6125,42 @@ function rowsForRole(lines, role) {
   return out;
 }
 
+// #3593 — per-role row selection for the completion READ sites (`check`, `siblingQualifies`,
+// `inherit-plan-review`, `resolve-artifact`): the LATEST completion-shaped row wins. A completion-shaped
+// row carries a non-empty `artifact_path` string (a real artifact: plan/review file, PR URL/commit/branch)
+// OR the `skip_reason` key (an inline-skip close is also a completion — the #881 carve-out must stay
+// selectable, never read past). A row that is neither (a bare spawn/reconcile row: agentId + model fields,
+// no artifact, no skip) is lifecycle history, NOT completed evidence — it fills a slot only while that slot
+// holds no completion-shaped row, so a later spawn row can never SHADOW an earlier real completion (the
+// measured live #370 planner shadow: an agent-tool spawn row appended after the real z.ai planner close
+// displaced it under last-row-wins and the check reported the completed work as
+// `planner artifact_path "" not found`). A role whose rows are ALL spawn-shaped still selects its latest
+// spawn row, so checkRole keeps failing with today's exact "artifact_path missing"/agentId strings
+// (fail-closed preserved, error messages still name a real row). One name, one evaluator (#2051): every
+// read site folds rows through THIS step, never its own last-row-wins assignment. The refresh-models
+// sweep deliberately keeps last-row-wins — a write-path backfill with a different contract (it fills blank
+// modelVersion on whatever row lacks one, not a completion read).
+function roleRowIsCompletionShaped(j) {
+  if (!j) return false;
+  // A `pending:true` row is the pre-launch identity/liveness marker, NOT completed evidence (the check's
+  // own pending-stamp wording) — even when it already carries an artifact_path (the #2902 pre-repair
+  // split shape: pending half with artifact, close half with verdict). It never outranks a later row;
+  // selectRoleRow still keeps it when the slot holds nothing else, so a pending-only role keeps today's
+  // honest "carries a pending:true stamp" BLOCK instead of a missing-line string.
+  if (j.pending) return false;
+  if (typeof j.artifact_path === 'string' && j.artifact_path.trim() !== '') return true;
+  return Object.prototype.hasOwnProperty.call(j, 'skip_reason');
+}
+
+// The single parse step every completion read site runs per parsed row: fold `j` into the per-role
+// `byRole` map under the #3593 selection rule above (an empty slot, or a non-completion-shaped holder,
+// always yields to the incoming row; a completion-shaped holder is displaced only by another
+// completion-shaped row).
+function selectRoleRow(byRole, j) {
+  if (!j || !j.role) return;
+  if (roleRowIsCompletionShaped(j) || !roleRowIsCompletionShaped(byRole[j.role])) byRole[j.role] = j;
+}
+
 // Verdict-BEARING rows only (a truthy `.verdict` field). A bare spawn row, an artifact-only re-point, or a
 // provenance/oracle-only row carries no verdict and is read PAST — never treated as evidence by Lane B. A
 // row carrying BOTH a verdict and an oracle is verdict-bearing (the recorded decision outranks a token-file
@@ -6226,6 +6442,7 @@ function cmdCheck(o) {
   const session = o.session, task = o.task;
   if (!session || !task) { console.log('BLOCK: check requires --session and --task'); process.exit(2); }
   enforceSessionShape(session, task, 'check', 2);
+  _routesFromMaster = true; // #3615 — see loadRoutesConfig()
   // #2480 O4 / #2050 AC-1d — an EXPLICITLY empty `--merge-head` value is a USAGE ERROR, distinct from
   // every chain-incomplete message below. `o['merge-head'] || ''` (the checkOpts read further down)
   // treats "flag passed with an empty value" and "flag omitted entirely" identically, so
@@ -6261,7 +6478,7 @@ function cmdCheck(o) {
     process.exit(2);
   }
   const byRole = {};
-  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) selectRoleRow(byRole, j); } catch (e) { /* skip */ } }
   // #1276: the vacuous-oracle rejection is OPT-IN via --reject-vacuous-oracle (only the instrumentation
   // gate passes it), so `check`'s other callers keep today's exists+PASS oracle acceptance.
   // #2088: --merge-head only widens checkRole()'s ref-scoped arm with the current merge head as an EXTRA
@@ -6920,7 +7137,7 @@ function cmdResolveArtifact(o) {
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(l => l.trim()); }
   catch (e) { process.exit(1); }   // no ledger -> caller falls back to convention dir
   const byRole = {};
-  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+  for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) selectRoleRow(byRole, j); } catch (e) { /* skip */ } }
   const e = byRole[role];
   if (!e || !e.artifact_path || String(e.artifact_path).trim() === '') process.exit(1);
   const abs = resolveArtifact(e.artifact_path); // expands ~ / CLAUDE_PROJECT_DIR / cwd / $HOME, '' if not on disk
@@ -7122,7 +7339,7 @@ function cmdRefreshModels(o) {
       try { lines = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
       catch (e) { continue; }
       const byRole = {};
-      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }
+      for (const ln of lines) { try { const j = JSON.parse(ln); if (j && j.role) byRole[j.role] = j; } catch (e) { /* skip */ } }   // deliberately last-row-wins: write-path modelVersion backfill, NOT a completion read (#3593 keeps this unchanged)
       for (const role of REQUIRED_ROLES) {
         const e = byRole[role];
         if (!e) continue;                       // no line for this role yet -> nothing to refresh
@@ -7557,6 +7774,102 @@ function cmdRepairSplitRun(o) {
   }
   fs.renameSync(tmp, file);
   console.log('OK repair-split-run: merged line ' + (matchIdx[1] + 1) + ' onto line ' + (matchIdx[0] + 1) + '; backup at ' + backupFile);
+  process.exit(0);
+}
+
+// #3594 — repair-executor-artifact: fills a MISSING executor artifact_path from mechanical git evidence
+// (the origin/<task-branch> head), never from an assertion. P1 one row, idempotent on repair_ticket,
+// P2 bare only, P3 branch shape, P4 evidence (origin ref carries a commit not on origin/master),
+// P5 no other open pending row, P6 re-read-compare before rename. Every BLOCK exits 3 and writes nothing.
+function cmdRepairExecutorArtifact(o) {
+  const V = 'repair-executor-artifact';
+  const session = o.session, task = o.task, branch = o.branch;
+  const runId = o['run-id'], agent = o.agent;
+  if (!session || !task || !branch || (!!runId === !!agent)) {
+    console.error(V + ': --session, --task, --branch and exactly one of --run-id / --agent are required');
+    process.exit(2);
+  }
+  enforceSessionShape(session, task, V, 2);
+  const file = ledgerFile(session, task);
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) {
+    console.error('BLOCK (3role-ledger ' + V + ' P1): no ledger file exists for task ' + sanitize(task) + '. Nothing written.');
+    process.exit(3);
+  }
+  const rawLines = raw.split('\n').filter((l) => l.trim());
+  const parsed = rawLines.map((ln) => { try { return JSON.parse(ln); } catch (e) { return null; } });
+  const matchIdx = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const j = parsed[i];
+    if (!j || j.role !== 'executor') continue;
+    if (runId ? j.run_id === runId : j.agentId === agent) matchIdx.push(i);
+  }
+  if (matchIdx.length !== 1) {
+    console.error('BLOCK (3role-ledger ' + V + ' P1): ' + matchIdx.length + ' executor row(s) match (need exactly one) — nothing written.');
+    process.exit(3);
+  }
+  const idx = matchIdx[0], row = parsed[idx];
+  if (row.repair_ticket === '3594') {
+    console.log('OK ' + V + ': nothing to repair (row was already repaired by this tool).');
+    process.exit(0);
+  }
+  if (String(row.artifact_path == null ? '' : row.artifact_path).trim() !== '' || row.skip_reason) {
+    console.error('BLOCK (3role-ledger ' + V + ' P2): the row already records an artifact_path or skip_reason; this verb only fills a missing one — nothing written.');
+    process.exit(3);
+  }
+  if (!/^[0-9A-Za-z._-]+$/.test(branch) || !(branch === task || branch.startsWith(task + '-'))) {
+    console.error('BLOCK (3role-ledger ' + V + ' P3): --branch must be ' + sanitize(task) + ' or start with ' + sanitize(task) + '- and use only [0-9A-Za-z._-] — nothing written.');
+    process.exit(3);
+  }
+  const cwd = o.cwd || '.';
+  const git = (args) => spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  const rp = git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/' + branch + '^{commit}']);
+  const sha = rp.status === 0 ? String(rp.stdout).trim() : '';
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    console.error('BLOCK (3role-ledger ' + V + ' P4): no refs/remotes/origin/' + branch + ' commit found (or git error) — nothing written.');
+    process.exit(3);
+  }
+  const anc = git(['merge-base', '--is-ancestor', sha, 'refs/remotes/origin/master']);
+  if (anc.status !== 1) {
+    console.error('BLOCK (3role-ledger ' + V + ' P4): origin/' + branch + ' head is not ahead of origin/master (no executor work to cite, or git error; status=' + anc.status + ') — nothing written.');
+    process.exit(3);
+  }
+  const dryRun = ('dry-run' in o);
+  const fixed = { ...row };
+  fixed.artifact_path = branch + '@' + sha;
+  fixed.repair_ticket = '3594';
+  fixed.repair_at = new Date().toISOString();
+  fixed.repair_source = 'origin-branch-head';
+  fixed.repair_head_sha = sha;
+  console.error('AUDIT: ' + V + ' — session=' + sanitize(session) + ' task=' + sanitize(task) + ' branch=' + branch + ' sha=' + sha + (dryRun ? ' (dry-run)' : ''));
+  console.log('BEFORE: ' + JSON.stringify(row));
+  console.log('AFTER: ' + JSON.stringify(fixed));
+  if (dryRun) {
+    console.log('DRY-RUN OK ' + V + ': would set artifact_path on line ' + (idx + 1) + '. Nothing written.');
+    process.exit(0);
+  }
+  const openPending = parsed.some((j, i) => j && j.pending === true && i !== idx);
+  if (openPending && !('allow-pending' in o)) {
+    console.error('BLOCK (3role-ledger ' + V + ' P5): task ' + sanitize(task) + ' has another pending row still open; ' +
+      'a concurrent close append could be lost (no lock). Re-run when quiesced, or pass --allow-pending. Nothing written.');
+    process.exit(3);
+  }
+  const backupDir = path.join(path.dirname(file), '.repair-backup');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupFile = path.join(backupDir, sanitize(task) + '.jsonl.' + new Date().toISOString().replace(/[:.]/g, '-'));
+  fs.copyFileSync(file, backupFile);
+  const newLines = rawLines.map((l, i) => (i === idx ? JSON.stringify(fixed) : l));
+  const tmp = file + '.tmp-repair-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, newLines.join('\n') + '\n');
+  let again = null;
+  try { again = fs.readFileSync(file, 'utf8'); } catch (e) { again = null; }
+  if (again !== raw) {
+    try { fs.unlinkSync(tmp); } catch (e) { /* best effort */ }
+    console.error('BLOCK (3role-ledger ' + V + ' P6): the ledger changed while this repair was running — nothing written.');
+    process.exit(3);
+  }
+  fs.renameSync(tmp, file);
+  console.log('OK ' + V + ': set artifact_path on line ' + (idx + 1) + ' to ' + fixed.artifact_path + '; backup at ' + backupFile);
   process.exit(0);
 }
 
@@ -8871,7 +9184,48 @@ function resolveRoutesConfigPath() {
 
 // Load + parse the routes SSOT. Never throws: { ok, routes, error, configPath }. A missing file, an unreadable
 // file, and unparseable JSON are all distinct, honestly-labeled ROUTE-* errors (never a silent {}).
+// #3615 — `check` judges served models against MASTER's routes, not the PR head's. ship-tail-merge runs the
+// PR-head helper, whose sibling config/cc-routes.json is whatever the branch was cut with; seats are dispatched
+// from master's routes, so any routes flip on master after the branch point refused the merge (2026-11-12,
+// PRs 2329/2330/2331). cmdCheck sets this flag; no other subcommand does (resolve-route / R-C write clause /
+// ROUTES-STALE route a NEW dispatch and keep the disk read). CC_ROUTES_JSON stays authoritative and terminal.
+// No network I/O: reads the LOCAL mirror ref only; unreadable => today's disk path + one stderr line.
+// Residuals: a branch cut before this fix still runs its own old helper (merge origin/master in); a stale
+// local origin/master mirror judges against pre-flip routes (git fetch origin master).
+let _routesFromMaster = false;
+let _routesMasterCache;
+let _routesSourceNoted = false;
+const ROUTES_MASTER_REF = 'refs/remotes/origin/master';
+function loadRoutesFromMaster3615() {
+  if (_routesMasterCache !== undefined) return _routesMasterCache;
+  let reason = '';
+  let res = null;
+  const top = aiBrainToplevel();
+  if (!top) reason = 'no git toplevel';
+  else {
+    const raw = readBlobAtRef(top, ROUTES_MASTER_REF, 'config/cc-routes.json');
+    if (raw == null) reason = 'ref or blob not readable';
+    else {
+      try {
+        const routes = JSON.parse(raw);
+        if (routes && typeof routes === 'object' && !Array.isArray(routes)) {
+          res = { ok: true, routes, error: '', configPath: ROUTES_MASTER_REF + ':config/cc-routes.json' };
+        } else reason = 'not a JSON object';
+      } catch (e) { reason = 'parse error'; }
+    }
+  }
+  if (!res && !_routesSourceNoted) {
+    _routesSourceNoted = true;
+    process.stderr.write('ROUTES-SOURCE: disk (' + ROUTES_MASTER_REF + ':config/cc-routes.json unreadable: ' + reason + ')\n');
+  }
+  _routesMasterCache = res;
+  return res;
+}
 function loadRoutesConfig() {
+  if (_routesFromMaster && !('CC_ROUTES_JSON' in process.env)) {
+    const m = loadRoutesFromMaster3615();
+    if (m) return m;
+  }
   const configPath = resolveRoutesConfigPath();
   if (!configPath) return { ok: false, routes: null, error: 'ROUTE-NOT-FOUND: no config/cc-routes.json resolved (checked CC_ROUTES_JSON / config/cc-routes.json)', configPath: '' };
   let raw;
@@ -9499,10 +9853,13 @@ function effectiveRouteFor(seatKey, seat, facts, needleAdmit) {
     // default, never a guess. A both-maps row is refused by resolve-route before this runs.
     if (facts.size_source === 'plan' && facts.size) {
       const e = sizeRoutesEntryFor(seat, facts.size);
-      if (e) {
+      // #3629 — a cross-provider entry re-derives dispatch from the new provider (subprocess rows
+      // only); a non-subprocess row cannot serve another provider, so it keeps the declared row.
+      if (e && (e.provider === seat.provider || isSubprocessDispatch(seat.dispatch))) {
         out.effective_model = e.model;
         out.effective_provider = e.provider;
         out.effective_effort = e.effort;
+        if (isSubprocessDispatch(seat.dispatch)) out.effective_dispatch = 'subprocess-' + e.provider;
         out.route_reason = 'size-' + facts.size + '-route';
       }
     }
@@ -11300,6 +11657,7 @@ try {
   else if (cmd === 'repair-crosswire') cmdRepairCrosswire(opts);
   else if (cmd === 'repair-subprocess-models') cmdRepairSubprocessModels(opts);
   else if (cmd === 'repair-split-run') cmdRepairSplitRun(opts);
+  else if (cmd === 'repair-executor-artifact') cmdRepairExecutorArtifact(opts);
   else if (cmd === 'repair-strike-progress') cmdRepairStrikeProgress(opts);
   else if (cmd === 'refresh-lane-intents') cmdRefreshLaneIntents(opts);
   else if (cmd === 'resolve-agent') cmdResolveAgent(opts);
@@ -11328,12 +11686,13 @@ try {
   else if (cmd === 'resolve-mode') cmdResolveMode(opts);
   else if (cmd === 'set-mode') cmdSetMode(opts);
   else if (cmd === 'lane-intents') cmdLaneIntents(opts);
+  else if (cmd === 'approve-seat-swap') cmdApproveSeatSwap(opts);
   else if (cmd === 'set-seat-pin') cmdSetSeatPin(opts);
   else if (cmd === 'clear-seat-pin') cmdClearSeatPin(opts);
   else if (cmd === 'list-seat-pins') cmdListSeatPins(opts);
   else if (cmd === 'usage-backfill') cmdBackfill(opts);
   else {
-    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|refresh-lane-intents|resolve-agent|carried-key|ledger-session|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|spawn-tag|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|clear-seat-pin|list-seat-pins|usage-backfill> ' +
+    console.log('usage: 3role-ledger.mjs <append|check|heartbeat|refresh-models|reconcile-spawns|repair-crosswire|repair-subprocess-models|repair-split-run|repair-executor-artifact|refresh-lane-intents|resolve-agent|carried-key|ledger-session|resolve-artifact|resolve-artifacts-for-task|resolve-published-verdict|resolve-role-model|resolve-effective-tier|inherit-plan-review|gate-plan-review|spawn-tag|size-s-exempt|log-bypass|resolve-route|plan-size|spawn-ticket|plan-review-route|zai-strikes|zai-window-admit|session-aliases|identify-model|lint-routes|provenance-kind|resolve-mode|set-mode|lane-intents|set-seat-pin|approve-seat-swap|clear-seat-pin|list-seat-pins|usage-backfill> ' +
       '--session S --task T [--role R --agent A --artifact P --skip-reason "..." --oracle P] [--parent P (inherit-plan-review)] ' +
       '[--dispatch-nonce TOK --receipt TOK (append, #2169 slice 5 AC-34 delivery-receipt guard)] ' +
       '[--session S (refresh-models)] [--session S (reconcile-spawns, #1229)] [--role R [--with-effort] (resolve-role-model)] [--enforce-role-models (check)] ' +
@@ -11356,6 +11715,7 @@ try {
       ' [--session S --task T --role R --run-id ID [--dry-run] (repair-crosswire, #2701 D4 — P1-P5 fail-closed, backed up, idempotent)]' +
       ' [--session S [--task T] [--dry-run] (repair-subprocess-models, #2782 — rewrites modelVersion/modelTier/provider on subprocess-provenance rows ONLY, from each row\'s own transcript_path; backed up, idempotent, dry-run first)]' +
       ' [--session S --task T --run-id ID [--dry-run] [--allow-pending] (repair-split-run, #2902 — merges a split dispatcher run, P1-P6 fail-closed, backed up, idempotent)]' +
+      ' [--session S --task T (--run-id ID | --agent A) --branch B [--cwd D] [--dry-run] [--allow-pending] (repair-executor-artifact, #3594 — fills a bare executor artifact_path from the origin/<branch> head, P1-P6 fail-closed, backed up, idempotent)]' +
       ' [--session S --task T --role executor --branch B --evidence E [--cwd D] [--dry-run] (repair-strike-progress, #3093 — proves a past timeout pushed to origin/<task-branch> in its dispatch window and appends an OR-STRIKE-FORGIVE receipt line, P1-P6 fail-closed, append-only, idempotent)]');
     process.exit(2);
   }

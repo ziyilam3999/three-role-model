@@ -1653,26 +1653,32 @@ cat > "$OR_FIX/routes.json" <<'ORJSON'
   }
 }
 ORJSON
-mk_or_transcript() {   # $1=path $2=nonce $3=served-model $4=lead-with-ai-title(0|1) $5=dispatch-cwd (optional, #2700)
+mk_or_transcript() {   # $1=path $2=nonce $3=served-model $4=lead(0|1=ai-title|session-owner) $5=dispatch-cwd (optional, #2700) $6=role (optional, #3593; default plan-review)
   node -e '
     const fs = require("fs");
-    const [ , outPath, nonce, model, leadTitle, cwd ] = process.argv;
+    const [ , outPath, nonce, model, leadTitle, cwd, roleArg ] = process.argv;
+    const role = roleArg || "plan-review";
     const lines = [];
     if (leadTitle === "1") lines.push(JSON.stringify({ type: "ai-title", aiTitle: "smoke fixture title", sessionId: "or-fixture" }));
+    // #3593 — the Claude bg-seat bookkeeping lead, measured live 2026-11-11 on BOTH #370 r2 Claude
+    // transcripts: line 0 is {"type":"session-owner","accountUuid":...,"organizationUuid":...,
+    // "sessionId":...} and line 1 the real enqueue record. Fixture ids in the or-fixture style only.
+    if (leadTitle === "session-owner") lines.push(JSON.stringify({ type: "session-owner",
+      accountUuid: "or-fixture-account", organizationUuid: "or-fixture-org", sessionId: "or-fixture" }));
     lines.push(JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-01-01T00:00:00.000Z",
-      sessionId: "or-fixture", content: "3ROLE_TASK:t ROLE:plan-review\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
+      sessionId: "or-fixture", content: "3ROLE_TASK:t ROLE:" + role + "\nDISPATCH-NONCE:" + nonce + "\n\nreview this plan" }));
     // #2700 R3 (measured shape): a dequeue record, then the first `user` record -- the FIRST record that
     // carries `cwd` on the real corpus, never record 1 (the bound enqueue record).
     lines.push(JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-01-01T00:00:01.000Z", sessionId: "or-fixture" }));
     const userRec = { type: "user", timestamp: "2026-01-01T00:00:02.000Z",
-      message: { role: "user", content: "3ROLE_TASK:t ROLE:plan-review\nDISPATCH-NONCE:" + nonce } };
+      message: { role: "user", content: "3ROLE_TASK:t ROLE:" + role + "\nDISPATCH-NONCE:" + nonce } };
     if (cwd) userRec.cwd = cwd;
     lines.push(JSON.stringify(userRec));
     const asstRec = { type: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { model, content: [ { type: "text", text: "ok" } ] } };
     if (cwd) asstRec.cwd = cwd;
     lines.push(JSON.stringify(asstRec));
     fs.writeFileSync(outPath, lines.join("\n") + "\n");
-  ' "$1" "$2" "$3" "$4" "${5:-}"
+  ' "$1" "$2" "$3" "$4" "${5:-}" "${6:-}"
 }
 
 # (a) forged-marker control: role=execution-review carries dispatch=subprocess-openrouter, but the SSOT seat
@@ -1750,6 +1756,134 @@ OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_
 { [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
   && ok "#1947 AC-11 regression(d): a leading ai-title bookkeeping record before the real enqueue record does not defeat the M2 tag+nonce binding -> still exits 0" \
   || bad "#1947 AC-11 regression(d) should still exit 0 with a leading ai-title record (rc=$RC out=$OUT)"
+
+# (e) #3593 AC-1 — the Claude bg-seat bookkeeping lead: a leading {"type":"session-owner",...} record
+#     (measured live 2026-11-11 on BOTH #370 r2 Claude bg-seat transcripts: accountUuid/organizationUuid/
+#     sessionId only — structurally never carries the brief, same class as ai-title) before the real
+#     enqueue record must NOT defeat the M2 tag+nonce binding. The both-ends pair with arm (d): after
+#     #3593 BOTH vendors' bookkeeping shapes are tolerated by the SAME evaluator.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixE --task t --role planner --skip-reason "fixture: not under test in AC-1(e)" >/dev/null
+  node "$LED" append --session orFixE --task t --role executor --skip-reason "fixture: not under test in AC-1(e)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-e.md"
+  node "$LED" append --session orFixE --task t --role execution-review --oracle "$OR_FIX/artifacts/er-e.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixE.jsonl" "OR-NONCE-THIS-RUN-E" "moonshotai/kimi-k3" session-owner
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-E\n' > "$OR_FIX/artifacts/plan-e.md"
+  node "$LED" append --session orFixE --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixE.jsonl" --nonce "OR-NONCE-THIS-RUN-E" \
+    --artifact "$OR_FIX/artifacts/plan-e.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixE --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#3593 AC-1(e): a leading session-owner bookkeeping record before the real enqueue record does not defeat the M2 tag+nonce binding -> exits 0" \
+  || bad "#3593 AC-1(e) should exit 0 with a leading session-owner record (rc=$RC out=$OUT)"
+# (e-neg) the skip never weakens binding: a session-owner lead with a WRONG nonce in the enqueue record
+#     still BLOCKs on M2 — negative control, green on BOTH sides of the change.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"
+  node "$LED" append --session orFixEneg --task t --role planner --skip-reason "fixture: not under test in AC-1(e-neg)" >/dev/null
+  node "$LED" append --session orFixEneg --task t --role executor --skip-reason "fixture: not under test in AC-1(e-neg)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-eneg.md"
+  node "$LED" append --session orFixEneg --task t --role execution-review --oracle "$OR_FIX/artifacts/er-eneg.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixEneg.jsonl" "OR-NONCE-different-run" "moonshotai/kimi-k3" session-owner
+  printf '## Review\nDecision: PASS\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-ENEG\n' > "$OR_FIX/artifacts/plan-eneg.md"
+  node "$LED" append --session orFixEneg --task t --role plan-review --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixEneg.jsonl" --nonce "OR-NONCE-THIS-RUN-ENEG" \
+    --artifact "$OR_FIX/artifacts/plan-eneg.md" --verdict PASS >/dev/null
+)
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes.json"; node "$LED" check --session orFixEneg --task t 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | grep -q "first record does not carry BOTH the spawn tag"; } \
+  && ok "#3593 AC-1(e-neg): a session-owner lead with a WRONG nonce still BLOCKs on M2 — the skip never weakens binding" \
+  || bad "#3593 AC-1(e-neg) should BLOCK on M2 despite the session-owner lead (rc=$RC out=$OUT)"
+
+# (f) #3593 AC-2 — de-shadowing: a synthesized bare agent-tool spawn row (agentId + model fields, NO
+#     artifact_path, NO skip_reason — fake or-fixture ids, never a copy of a real row) written straight
+#     into the fixture ledger AFTER a real planner completion row (subprocess row, artifact + nonce-bound
+#     fixture transcript) must NOT displace it: last-row-wins made the spawn row effective and reported
+#     the completed work as missing (the measured live #370 planner shadow).
+cat > "$OR_FIX/routes-f.json" <<'ORJSONF'
+{
+  "seats": {
+    "planner": { "provider": "openrouter", "model": "moonshotai/kimi-k3", "dispatch": "subprocess-openrouter" }
+  }
+}
+ORJSONF
+OR_FIXF_PROJECTS="$OR_FIX/projects-f"
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"
+  node "$LED" append --session orFixF --task t --role plan-review --skip-reason "fixture: not under test in AC-2(f)" >/dev/null
+  node "$LED" append --session orFixF --task t --role executor --skip-reason "fixture: not under test in AC-2(f)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-f.md"
+  node "$LED" append --session orFixF --task t --role execution-review --oracle "$OR_FIX/artifacts/er-f.md" >/dev/null
+  mk_or_transcript "$OR_FIX/transcripts/fixF.jsonl" "OR-NONCE-THIS-RUN-F" "moonshotai/kimi-k3" 0 "" planner
+  printf '## Plan\n### Binary AC\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-F\n' > "$OR_FIX/artifacts/plan-f.md"
+  node "$LED" append --session orFixF --task t --role planner --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixF.jsonl" --nonce "OR-NONCE-THIS-RUN-F" \
+    --artifact "$OR_FIX/artifacts/plan-f.md" >/dev/null
+  mk_sub orFixF or-fix-spawn-f
+)
+printf '{"session":"orFixF","task":"t","role":"planner","agentId":"or-fix-spawn-f","model":"claude-opus-5-5","modelVersion":"2026-01-01","closedAt":"2026-01-02T00:00:00.000Z"}\n' >> "$OR_FIX/ledger/orFixF/t.jsonl"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"; node "$LED" check --session orFixF --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#3593 AC-2(f): a bare spawn row appended after a real planner completion row no longer shadows it -> check exits 0" \
+  || bad "#3593 AC-2(f) should exit 0 (spawn row must not shadow the completion row) (rc=$RC out=$OUT)"
+# (f1) fail-closed preserved, green on BOTH sides: an executor role holding ONLY the bare spawn row still
+#     BLOCKs with today's exact string — the predicate must not make spawn-only roles pass.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"
+  node "$LED" append --session orFixF1 --task t --role planner --skip-reason "fixture: not under test in AC-2(f1)" >/dev/null
+  node "$LED" append --session orFixF1 --task t --role plan-review --skip-reason "fixture: not under test in AC-2(f1)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-f1.md"
+  node "$LED" append --session orFixF1 --task t --role execution-review --oracle "$OR_FIX/artifacts/er-f1.md" >/dev/null
+  mk_sub orFixF1 or-fix-spawn-f1
+)
+printf '{"session":"orFixF1","task":"t","role":"executor","agentId":"or-fix-spawn-f1","model":"claude-opus-5-5","modelVersion":"2026-01-01","closedAt":"2026-01-02T00:00:00.000Z"}\n' >> "$OR_FIX/ledger/orFixF1/t.jsonl"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"; node "$LED" check --session orFixF1 --task t 2>&1); RC=$?
+{ [ "$RC" != "0" ] && echo "$OUT" | grep -qF 'executor artifact_path missing (PR URL / commit / branch string)'; } \
+  && ok "#3593 AC-2(f1): an executor role holding ONLY the bare spawn row still BLOCKs with today's exact 'artifact_path missing' string (fail-closed preserved)" \
+  || bad "#3593 AC-2(f1) should BLOCK with 'executor artifact_path missing (PR URL / commit / branch string)' (rc=$RC out=$OUT)"
+# (f2) green on BOTH sides: a trailing skip_reason row after a completion row STAYS the effective planner
+#     row (the #881 inline-skip carve-out must stay selectable — a 'latest artifact strictly' predicate
+#     would flip this). The completion row's artifact deliberately does NOT exist, so if it were selected
+#     the check would BLOCK — rc 0 proves the skip row governs, today's behavior unchanged.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"
+  node "$LED" append --session orFixF2 --task t --role plan-review --skip-reason "fixture: not under test in AC-2(f2)" >/dev/null
+  node "$LED" append --session orFixF2 --task t --role executor --skip-reason "fixture: not under test in AC-2(f2)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-f2.md"
+  node "$LED" append --session orFixF2 --task t --role execution-review --oracle "$OR_FIX/artifacts/er-f2.md" >/dev/null
+  mk_sub orFixF2 or-fix-comp-f2
+)
+printf '{"session":"orFixF2","task":"t","role":"planner","agentId":"or-fix-comp-f2","artifact_path":"%s/artifacts/plan-f2-missing.md","closedAt":"2026-01-01T00:00:00.000Z"}\n' "$OR_FIX" >> "$OR_FIX/ledger/orFixF2/t.jsonl"
+printf '{"session":"orFixF2","task":"t","role":"planner","skip_reason":"fixture: trailing inline-skip stays effective (f2)","closedAt":"2026-01-02T00:00:00.000Z"}\n' >> "$OR_FIX/ledger/orFixF2/t.jsonl"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"; node "$LED" check --session orFixF2 --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#3593 AC-2(f2): a trailing skip_reason row after a completion row stays the effective planner row (inline-skip carve-out still selectable, today's behavior unchanged)" \
+  || bad "#3593 AC-2(f2) should stay green with the trailing skip_reason row effective (rc=$RC out=$OUT)"
+# (f3) a `pending:true` row (the pre-launch liveness marker — even one already carrying an artifact_path,
+#     the #2902 pre-repair split shape) appended AFTER a real completion row must not shadow it: the
+#     completion is the evidence, the pending stamp is in-flight state. At base last-row-wins made the
+#     pending row effective and check BLOCKed with the pending-stamp string. Fake or-fixture ids only.
+( export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"
+  node "$LED" append --session orFixF3 --task t --role plan-review --skip-reason "fixture: not under test in AC-2(f3)" >/dev/null
+  node "$LED" append --session orFixF3 --task t --role executor --skip-reason "fixture: not under test in AC-2(f3)" >/dev/null
+  printf 'Decision: PASS\n' > "$OR_FIX/artifacts/er-f3.md"
+  node "$LED" append --session orFixF3 --task t --role execution-review --oracle "$OR_FIX/artifacts/er-f3.md" >/dev/null
+  printf '## Plan\n### Binary AC\nDISPATCH-NONCE:OR-NONCE-THIS-RUN-F3\n' > "$OR_FIX/artifacts/plan-f3.md"
+  mk_or_transcript "$OR_FIX/transcripts/fixF3.jsonl" "OR-NONCE-THIS-RUN-F3" "moonshotai/kimi-k3" 0 "" planner
+  node "$LED" append --session orFixF3 --task t --role planner --dispatch subprocess-openrouter \
+    --transcript "$OR_FIX/transcripts/fixF3.jsonl" --nonce "OR-NONCE-THIS-RUN-F3" \
+    --artifact "$OR_FIX/artifacts/plan-f3.md" >/dev/null
+)
+printf '{"session":"orFixF3","task":"t","role":"planner","pending":true,"artifact_path":"%s/artifacts/plan-f3.md","run_id":"or-fix-pending-f3","closedAt":"2026-01-02T00:00:00.000Z"}\n' "$OR_FIX" >> "$OR_FIX/ledger/orFixF3/t.jsonl"
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"; node "$LED" check --session orFixF3 --task t 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -qi "OK"; } \
+  && ok "#3593 AC-2(f3): a pending:true row appended after a real completion row does not shadow it (pending is the liveness marker, never completed evidence)" \
+  || bad "#3593 AC-2(f3) should exit 0 with the completion row effective, not the pending stamp (rc=$RC out=$OUT)"
+
+# (g) #3593 AC-3 — resolve-artifact de-shadowing: on the (f) fixture ledger (completion row then bare
+#     spawn row), resolve-artifact must print the resolved artifact path and exit 0 — at base the spawn
+#     row made it exit 1, silent (the convention-dir fallback lost the row to the same shadow).
+OUT=$(export THREE_ROLE_LEDGER_DIR="$OR_FIX/ledger"; export CC_ROUTES_JSON="$OR_FIX/routes-f.json"; export THREE_ROLE_PROJECTS_ROOT="$OR_FIXF_PROJECTS"; node "$LED" resolve-artifact --session orFixF --task t --role planner 2>&1); RC=$?
+{ [ "$RC" = "0" ] && echo "$OUT" | grep -q "plan-f.md"; } \
+  && ok "#3593 AC-3(g): resolve-artifact on a completion-then-spawn ledger prints the completion row's artifact path and exits 0" \
+  || bad "#3593 AC-3(g) resolve-artifact should print the plan-f.md path and exit 0 (rc=$RC out=$OUT)"
 
 # ── #2700 AC-5 — the completion gate's `check` (checkRole -> checkSubprocessProvenance, the SAME evaluator
 #    the transition gate's arm 3 consults) must resolve a plan-review artifact that lives ONLY under the
@@ -4949,7 +5083,7 @@ node "$LED" append --session "$SUF" --task uf-c08 --role planner --cairn "cairn:
 node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --dispatch subprocess-openrouter --run-kind bound --run-source dispatch-helper --run-id N1 --dispatch-nonce N1 --pending >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c09 --role plan-review --artifact "$UF_PLAN" --verdict PASS --receipt N1 >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c11 --role executor --dispatch subprocess-openrouter --transcript "$TMP/uf-t.jsonl" --nonce N2 --artifact "PR #uf-c11" >/dev/null 2>&1 || UF_OK=0
-node "$LED" append --session "$SUF" --task uf-c16 --role planner --agent uf-p2 --artifact "$UF_PLAN" --dispatch-nonce TOK1 --reviewed-plan "$UF_PLAN" --sense-reroute --effort xhigh --effort-source assigned --model-tier fable --model-version claude-fable-5-1 >/dev/null 2>&1 || UF_OK=0
+node "$LED" append --session "$SUF" --task uf-c16 --role planner --agent uf-p2 --artifact "$UF_PLAN" --dispatch-nonce TOK1 --reviewed-plan "$UF_PLAN" --sense-reroute --effort xhigh --effort-source assigned --model-tier fable --model-version claude-fable-5-2 >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --artifact "PR #uf-c12" --effort high --model-version claude-sonnet-4-5 --model-tier sonnet --sense-reroute >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c12 --role executor --agent uf-e1 --closed-at 2026-09-04T00:00:00.000Z --self-authored --effort high --sense-reroute >/dev/null 2>&1 || UF_OK=0
 node "$LED" append --session "$SUF" --task uf-c14 --role executor --agent uf-e2 --closed-at 2026-09-04T00:00:00.000Z --self-authored false --pending false >/dev/null 2>&1 || UF_OK=0
@@ -7309,10 +7443,10 @@ fi
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 S3140="$TMP/s3140"; mkdir -p "$S3140/tasks/sess1"
 cat > "$S3140/routes.json" <<'S3140J'
-{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"}}}}
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-2":{"tier_equivalent":"fable"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-2"}}}}
 S3140J
-sed 's/"L":"claude-fable-5-1"/"L":"not-a-model"/' "$S3140/routes.json" > "$S3140/routes-bad.json"
-sed 's/,"size_models":{"L":"claude-fable-5-1"}//' "$S3140/routes.json" > "$S3140/routes-nosize.json"
+sed 's/"L":"claude-fable-5-2"/"L":"not-a-model"/' "$S3140/routes.json" > "$S3140/routes-bad.json"
+sed 's/,"size_models":{"L":"claude-fable-5-2"}//' "$S3140/routes.json" > "$S3140/routes-nosize.json"
 for t3140 in 9001:'"size":"L"' 9002:'"size":"S"' 9003:'"size":"M"' 9004:'"x":1' 9005:'"size":"XL"' 9006:'"size":"l"'; do
   printf '{"id":"%s","subject":"FIXTURE-SUBJECT-SENTINEL","description":"FIXTURE-SUBJECT-SENTINEL","metadata":{%s}}' "${t3140%%:*}" "${t3140#*:}" > "$S3140/tasks/sess1/${t3140%%:*}.json"
 done
@@ -7360,22 +7494,41 @@ OUT=$(env -u CC_ROLES_ENV CC_ROUTES_JSON="$S3140/routes-bad.json" node "$LED" li
 # #3262 item 4: CC_SEAT_PINS_FILE is pinned to a sandbox path that holds no pin, so neither the caller's
 # exported pin file nor the operator's real seat-pin file can reach these two arms.
 if [ -f "$(dirname "$LED")/../config/cc-routes.json" ]; then
+  # TICKET 302 RE-ARM (2026-11-07; #3589): the live planner row has no size_models key (removed by #302), so
+  # the planner answers 'opus medium claude-opus-5-5' at EVERY ticket size, and a tier pin has no effect on
+  # this subprocess seat. Sibling: seat-pin-overlay-smoke-test.sh AC3/path1. The fixture arms above still
+  # prove the size-L overlay mechanism against routes that carry size_models.
   OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
-  [ "$OUT" = "fable medium claude-fable-5-1" ] && ok "#3140 AC-2.1 (live config): 9001 -> 'fable medium claude-fable-5-1'" || bad "#3140 AC-2.1 live config (got: $OUT)"
+  [ "$OUT" = "opus medium claude-opus-5-5" ] && ok "#3140 AC-2.1 (live config, #302 re-arm): size-L 9001 -> 'opus medium claude-opus-5-5' (no size_models overlay)" || bad "#3140 AC-2.1 live config (got: $OUT)"
   OUT=$(env -u CC_ROLES_ENV -u CC_ROUTES_JSON CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9002 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
   [ "$OUT" = "opus medium claude-opus-5-5" ] && ok "#3140 AC-2.1 (live config): 9002 -> 'opus medium claude-opus-5-5'" || bad "#3140 AC-2.1 live config 9002 (got: $OUT)"
-  # AC-2.5: an operator seat pin wins over the size rule, and clearing it restores fable.
+  # AC-2.5 (#302 re-arm): a tier pin (sonnet, != default so a leak turns the arm red) changes nothing on the subprocess planner row.
   export CC_SEAT_PINS_FILE="$S3140/pins.json"
-  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier opus --reason "ac-2.5 fixture" >/dev/null 2>&1
+  env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" set-seat-pin --role planner --tier sonnet --reason "ac-2.5 fixture" >/dev/null 2>&1
   rs3140 live 9001
   PIN_OUT="${RS_OUT%% *}"
   env -u CC_ROLES_ENV -u CC_ROUTES_JSON node "$LED" clear-seat-pin --role planner --reason "ac-2.5 fixture cleanup" >/dev/null 2>&1
   rs3140 live 9001
-  { [ "$PIN_OUT" = "opus" ] && [ "${RS_OUT%% *}" = "fable" ]; } \
-    && ok "#3140 AC-2.5: seat pin wins over the size-L rule (opus), cleared -> fable again" || bad "#3140 AC-2.5 (pinned=$PIN_OUT cleared=${RS_OUT%% *})"
+  { [ "$PIN_OUT" = "opus" ] && [ "${RS_OUT%% *}" = "opus" ]; } \
+    && ok "#3140 AC-2.5 (live config, #302 re-arm): tier pin (sonnet) has no effect on the subprocess planner row -> opus; cleared -> opus" || bad "#3140 AC-2.5 (pinned=$PIN_OUT cleared=${RS_OUT%% *})"
   unset CC_SEAT_PINS_FILE
 else
   ok "#3140 live-config arms SKIPPED: config/cc-routes.json not bundled here (plugin copy)"
+fi
+# #375 — the Fable seat resolves to claude-fable-5-2 at medium. Fixture routes ($S3140/routes.json, size-L
+# planner -> fable) plus the LIVE repo pin config/cc-roles.env (CC_ROLES_ENV unset: a set CC_ROLES_ENV is
+# terminal and short-circuits the routes SSOT). HOME is an empty dir so an operator ~/.config/cc-roles.env
+# (first lookup candidate) cannot shadow the repo pin; CLAUDE_PLUGIN_ROOT is unset for the same reason.
+if [ -f "$(dirname "$LED")/../config/cc-roles.env" ]; then
+  mkdir -p "$S3140/h375-empty" "$S3140/h375/.config"
+  OUT=$(env -u CC_ROLES_ENV -u CLAUDE_PLUGIN_ROOT HOME="$S3140/h375-empty" CC_ROUTES_JSON="$S3140/routes.json" CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  [ "$OUT" = "fable medium claude-fable-5-2" ] && ok "#375: resolved Fable seat reads claude-fable-5-2 at medium (live cc-roles.env pin)" || bad "#375: resolved Fable seat should read claude-fable-5-2 at medium (got: $OUT)"
+  # negative control: vary the pin through the first lookup candidate ($HOME/.config/cc-roles.env)
+  sed 's/^CC_TIER_FABLE_VERSION=.*/CC_TIER_FABLE_VERSION=claude-fable-5-9/' "$(dirname "$LED")/../config/cc-roles.env" > "$S3140/h375/.config/cc-roles.env"
+  OUT=$(env -u CC_ROLES_ENV -u CLAUDE_PLUGIN_ROOT HOME="$S3140/h375" CC_ROUTES_JSON="$S3140/routes.json" CC_SEAT_PINS_FILE="$S3140/no-pins.json" node "$LED" resolve-role-model --role planner --task 9001 --session sess1 --tasks-dir "$S3140/tasks" --with-effort --with-version 2>/dev/null)
+  [ "$OUT" = "fable medium claude-fable-5-9" ] && ok "#375 neg: resolved Fable version follows the cc-roles.env pin (sentinel claude-fable-5-9)" || bad "#375 neg: resolved Fable version should follow the cc-roles.env pin (got: $OUT)"
+else
+  ok "#375 SKIPPED: config/cc-roles.env not bundled here (plugin copy)"
 fi
 # #3149 — grandfather pre-cutover size-L planners at the model-policy gate (both-ends arms A1-A11).
 # Fixture tickets only (synthetic ids 9960-9962, subject FIXTURE-SUBJECT-SENTINEL); self-contained fixture
@@ -7386,7 +7539,7 @@ fi
 S3149="$TMP/s3149"; mkdir -p "$S3149"
 R3149CUT='"size_models_cutover":"2026-10-15T12:18:54Z"'
 cat > "$S3149/routes.json" <<S3149J
-{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-1":{"tier_equivalent":"fable"},"claude-sonnet-5-5":{"tier_equivalent":"sonnet"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-1"},${R3149CUT}}}}
+{"providers":{"anthropic":{"model_vocabulary":{"claude-opus-5-5":{"tier_equivalent":"opus"},"claude-fable-5-2":{"tier_equivalent":"fable"},"claude-sonnet-5-5":{"tier_equivalent":"sonnet"}}}},"seats":{"planner":{"provider":"anthropic","model":"claude-opus-5-5","size_models":{"L":"claude-fable-5-2"},${R3149CUT}}}}
 S3149J
 sed "s/,${R3149CUT}//" "$S3149/routes.json" > "$S3149/routes-nocut.json"
 sed 's/"size_models_cutover":"2026-10-15T12:18:54Z"/"size_models_cutover":"not-a-date"/' "$S3149/routes.json" > "$S3149/routes-badcut.json"
@@ -7471,7 +7624,7 @@ g3149_check ga8 9961 "$S3149/routes.json"
 { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'SIZE-L-GRANDFATHERED' && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
   && ok "3149-A8: size-S + Opus planner post-cutover -> pass, no grandfather note (unchanged path)" || bad "3149-A8 (rc=$RC out=$OUT)"
 # A9: size-L ticket, FABLE planner after the cutover -> passes (the rule satisfied, unchanged path).
-g3149_ledger ga9 9960 L "claude-fable-5-1" "2026-10-15T04:20:00-08:00" "2026-10-15T04:30:00-08:00"
+g3149_ledger ga9 9960 L "claude-fable-5-2" "2026-10-15T04:20:00-08:00" "2026-10-15T04:30:00-08:00"
 g3149_check ga9 9960 "$S3149/routes.json"
 { [ "$RC" = "0" ] && ! printf '%s' "$OUT" | command grep -q 'MODEL-POLICY: role planner'; } \
   && ok "3149-A9: size-L + Fable planner post-cutover -> pass (rule satisfied)" || bad "3149-A9 (rc=$RC out=$OUT)"
